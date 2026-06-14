@@ -60,7 +60,12 @@
       "pv_forecast_today": { "name": "PV forecast today" },
       "pv_forecast_tomorrow": { "name": "PV forecast tomorrow" },
       "battery_current": { "name": "Battery current energy" },
-      "recommendation": { "name": "Recommendation" }
+      "recommendation": { "name": "Recommendation" },
+      "learning_confidence": { "name": "Learning confidence" },
+      "learning_days": { "name": "Learning days" },
+      "learned_slots_count": { "name": "Learned slots count" },
+      "last_quarter_load": { "name": "Last quarter load" },
+      "profile_status": { "name": "Profile status" }
     },
     "binary_sensor": {
       "reserve_satisfied": { "name": "Reserve satisfied" }

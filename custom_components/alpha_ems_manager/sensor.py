@@ -17,7 +17,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfEnergy
+from homeassistant.const import PERCENTAGE, UnitOfEnergy
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -47,10 +47,36 @@ _DEBUG_ATTRIBUTE_KEYS = (
     "last_update",
 )
 
+# Full lifecycle/diagnostic attributes surfaced on the profile status sensor.
+_PROFILE_STATUS_ATTRIBUTE_KEYS = (
+    "source_entity",
+    "source_value",
+    "previous_house_load",
+    "current_house_load",
+    "last_raw_delta",
+    "last_delta_per_slot",
+    "previous_slot",
+    "current_slot",
+    "distributed_slots",
+    "learned_slots_count",
+    "update_count",
+    "last_update",
+    "season",
+    "day_type",
+    "profile_key",
+    "storage_loaded",
+    "storage_saved",
+)
+
 
 def _debug_attributes(data: dict[str, Any]) -> dict[str, Any]:
     """Return the debug attributes dict from coordinator data."""
     return {key: data.get(key) for key in _DEBUG_ATTRIBUTE_KEYS}
+
+
+def _profile_status_attributes(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the profile status attributes dict from coordinator data."""
+    return {key: data.get(key) for key in _PROFILE_STATUS_ATTRIBUTE_KEYS}
 
 
 SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
@@ -113,6 +139,45 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         value_fn=lambda data: (
             "hold" if data.get("reserve_satisfied") else "charge"
         ),
+    ),
+    AlphaEmsSensorDescription(
+        key="learning_confidence",
+        translation_key="learning_confidence",
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=PERCENTAGE,
+        icon="mdi:gauge",
+        value_fn=lambda data: data.get("learning_confidence"),
+    ),
+    AlphaEmsSensorDescription(
+        key="learning_days",
+        translation_key="learning_days",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        native_unit_of_measurement="d",
+        icon="mdi:calendar-check",
+        value_fn=lambda data: data.get("learning_days"),
+    ),
+    AlphaEmsSensorDescription(
+        key="learned_slots_count",
+        translation_key="learned_slots_count",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:view-grid",
+        value_fn=lambda data: data.get("learned_slots_count"),
+    ),
+    AlphaEmsSensorDescription(
+        key="last_quarter_load",
+        translation_key="last_quarter_load",
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        icon="mdi:home-clock-outline",
+        value_fn=lambda data: data.get("last_quarter_load_kwh"),
+    ),
+    AlphaEmsSensorDescription(
+        key="profile_status",
+        translation_key="profile_status",
+        icon="mdi:clipboard-pulse",
+        value_fn=lambda data: data.get("profile_status"),
+        attributes_fn=_profile_status_attributes,
     ),
 )
 

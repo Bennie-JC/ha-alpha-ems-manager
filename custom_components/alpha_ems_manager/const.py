@@ -30,7 +30,17 @@ INTERVALS_PER_DAY: Final = 96
 
 # Exponential moving average weight applied when learning new observations.
 # A small alpha favours historical stability; a larger alpha adapts faster.
-LEARNING_ALPHA: Final = 0.2
+LEARNING_ALPHA: Final = 0.25
+
+# Profile keys. A single "global" profile aggregates everything; season/day-type
+# profiles are maintained alongside it for future, more granular planning.
+GLOBAL_PROFILE_KEY: Final = "global"
+
+# Learning confidence model targets.
+CONFIDENCE_DAYS_TARGET: Final = 30
+CONFIDENCE_UPDATES_TARGET: Final = 200
+# Minimum learned slots before predictions are considered reliable.
+MIN_CONFIDENT_SLOTS: Final = 12
 
 # --- Configuration keys -------------------------------------------------------
 

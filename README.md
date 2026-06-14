@@ -69,16 +69,68 @@ You can change these later from the integration's **Configure** (options) screen
 
 ### Sensors
 
-- `Predicted daily load` — learned total load for today's season/day-type.
+- `Predicted daily load` — learned total load for today (sum of 96 global slots).
 - `Predicted remaining load` — learned load from now until end of day.
 - `Required reserve` — estimated reserve energy needed until the next buy window.
 - `PV forecast today` / `PV forecast tomorrow`.
 - `Battery current energy`.
 - `Recommendation` — `hold` or `charge` (advisory only).
+- `Learning confidence` — 0–100% estimate of how trustworthy the profile is.
+- `Learning days` — number of distinct days with learned data.
+- `Learned slots count` — number of the 96 quarter-hour slots learned so far.
+- `Last quarter load` — energy attributed to the most recent quarter (kWh).
+- `Profile status` — lifecycle label (`learning` / `improving` / `ready`) with
+  full diagnostic attributes (see below).
 
 ### Binary sensors
 
 - `Reserve satisfied` — whether current battery energy meets the required reserve.
+
+## How learning works
+
+Alpha EMS Manager learns from a **cumulative daily house-load sensor**
+(e.g. `sensor.alphaess_today_s_house_load`) that counts up through the day and
+resets to 0 at midnight. Every quarter-hour boundary (:00, :15, :30, :45) the
+integration:
+
+1. Reads the current cumulative value.
+2. Computes `raw_delta = current − previous`.
+3. Ignores invalid samples — a negative delta is treated as the midnight reset,
+   and a delta above 10 kWh per 15 minutes is treated as a spike.
+4. Distributes the delta across **every missed quarter slot** (so a value that
+   arrives late is spread over the slots it actually covers, not dumped into
+   one).
+5. Folds the per-slot value into both a `global` profile and the current
+   `season_daytype` profile using an exponential moving average.
+
+### How long until predictions are useful?
+
+| Elapsed learning | What to expect |
+| --- | --- |
+| **First day** | Values are low and partial — only the slots seen so far are learned, so `Predicted daily load` will be well below your real daily total. This is normal. |
+| **1 full day** | Basic, rough prediction for the slots that occurred. |
+| **~7 days** | Usable prediction for typical days. |
+| **~30 days** | Stable prediction; confidence climbs toward its target. |
+| **90+ days** | Seasonal patterns start to separate (per season/day-type profiles). |
+| **365 days** | Full seasonal learning across the whole year. |
+
+Because learning is incremental, the **first day always shows low values** — the
+profile only contains the quarter-hours observed so far, and confidence stays
+low until enough slots and days accumulate.
+
+### Checking learning progress
+
+Open the **Profile status** sensor and inspect its attributes:
+
+- `source_entity`, `source_value`, `current_house_load`, `previous_house_load`
+- `last_raw_delta`, `last_delta_per_slot`, `distributed_slots`
+- `previous_slot`, `current_slot`, `learned_slots_count`
+- `update_count`, `last_update`, `season`, `day_type`, `profile_key`
+- `storage_loaded`, `storage_saved`
+
+These show exactly what was read, how the delta was distributed, and whether the
+learned data is being persisted.
+
 
 ## Troubleshooting
 
