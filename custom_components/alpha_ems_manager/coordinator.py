@@ -22,8 +22,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from collections.abc import Callable
+
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, State
+from homeassistant.core import HomeAssistant, State, callback
+from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -44,7 +47,6 @@ from .const import (
     CONF_PV_FORECAST_TODAY_SENSOR,
     CONF_PV_FORECAST_TOMORROW_SENSOR,
     CONF_PV_WEST_SENSOR,
-    DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     INTERVAL_MINUTES,
     INTERVALS_PER_DAY,
@@ -142,16 +144,42 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinate state reading, learning and reserve calculation."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        """Initialise the coordinator."""
+        """Initialise the coordinator.
+
+        No fixed ``update_interval`` is used. Instead the coordinator is driven
+        by a wall-clock listener (see :meth:`async_setup_quarter_hour_tracking`)
+        so that learning runs exactly at minutes 0, 15, 30 and 45 and quarter
+        deltas are attributed to the correct wall-clock quarter.
+        """
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=DEFAULT_SCAN_INTERVAL,
+            update_interval=None,
         )
         self.entry = entry
         self._store: Store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
         self.model = LearningModel()
+
+    @callback
+    def async_setup_quarter_hour_tracking(self) -> Callable[[], None]:
+        """Schedule learning updates on wall-clock quarter-hour boundaries.
+
+        Returns an unsubscribe callable that the config entry registers for
+        teardown.
+        """
+
+        @callback
+        def _handle_quarter_hour(now: datetime) -> None:
+            _LOGGER.debug("Quarter-hour boundary reached at %s", now.isoformat())
+            self.hass.async_create_task(self.async_request_refresh())
+
+        return async_track_time_change(
+            self.hass,
+            _handle_quarter_hour,
+            minute=[0, 15, 30, 45],
+            second=0,
+        )
 
     # -- Configuration helpers -------------------------------------------------
 
