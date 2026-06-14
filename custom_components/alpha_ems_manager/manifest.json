@@ -1,0 +1,11 @@
+{
+  "domain": "alpha_ems_manager",
+  "name": "Alpha EMS Manager",
+  "codeowners": ["@Bennie-JC"],
+  "config_flow": true,
+  "documentation": "https://github.com/Bennie-JC/ha-alpha-ems-manager",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/Bennie-JC/ha-alpha-ems-manager/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

@@ -1,0 +1,69 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Alpha EMS Manager",
+        "description": "Select the source entities the learning EMS should use.",
+        "data": {
+          "cumulative_house_load_sensor": "Cumulative house load sensor",
+          "pv_actual_today_sensor": "PV actual today sensor",
+          "pv_forecast_today_sensor": "PV forecast today sensor",
+          "pv_forecast_tomorrow_sensor": "PV forecast tomorrow sensor",
+          "pv_east_sensor": "PV east sensor (optional)",
+          "pv_west_sensor": "PV west sensor (optional)",
+          "frank_prices_today_sensor": "Frank prices today sensor",
+          "frank_prices_tomorrow_sensor": "Frank prices tomorrow sensor",
+          "frank_cheapest_time_today_sensor": "Frank cheapest time today sensor",
+          "frank_most_expensive_time_today_sensor": "Frank most expensive time today sensor",
+          "frank_cheapest_time_tomorrow_sensor": "Frank cheapest time tomorrow sensor",
+          "frank_most_expensive_time_tomorrow_sensor": "Frank most expensive time tomorrow sensor",
+          "battery_current_kwh_sensor": "Battery current energy (kWh) sensor",
+          "battery_capacity_kwh_entity": "Battery capacity (kWh) entity",
+          "battery_soc_sensor": "Battery state of charge sensor (optional)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Alpha EMS Manager is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Alpha EMS Manager options",
+        "description": "Update the source entities used by the learning EMS.",
+        "data": {
+          "cumulative_house_load_sensor": "Cumulative house load sensor",
+          "pv_actual_today_sensor": "PV actual today sensor",
+          "pv_forecast_today_sensor": "PV forecast today sensor",
+          "pv_forecast_tomorrow_sensor": "PV forecast tomorrow sensor",
+          "pv_east_sensor": "PV east sensor (optional)",
+          "pv_west_sensor": "PV west sensor (optional)",
+          "frank_prices_today_sensor": "Frank prices today sensor",
+          "frank_prices_tomorrow_sensor": "Frank prices tomorrow sensor",
+          "frank_cheapest_time_today_sensor": "Frank cheapest time today sensor",
+          "frank_most_expensive_time_today_sensor": "Frank most expensive time today sensor",
+          "frank_cheapest_time_tomorrow_sensor": "Frank cheapest time tomorrow sensor",
+          "frank_most_expensive_time_tomorrow_sensor": "Frank most expensive time tomorrow sensor",
+          "battery_current_kwh_sensor": "Battery current energy (kWh) sensor",
+          "battery_capacity_kwh_entity": "Battery capacity (kWh) entity",
+          "battery_soc_sensor": "Battery state of charge sensor (optional)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "predicted_daily_load": { "name": "Predicted daily load" },
+      "predicted_remaining_load": { "name": "Predicted remaining load" },
+      "required_reserve": { "name": "Required reserve" },
+      "pv_forecast_today": { "name": "PV forecast today" },
+      "pv_forecast_tomorrow": { "name": "PV forecast tomorrow" },
+      "battery_current": { "name": "Battery current energy" },
+      "recommendation": { "name": "Recommendation" }
+    },
+    "binary_sensor": {
+      "reserve_satisfied": { "name": "Reserve satisfied" }
+    }
+  }
+}
