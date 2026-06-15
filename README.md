@@ -81,6 +81,11 @@ You can change these later from the integration's **Configure** (options) screen
 - `Last quarter load` — energy attributed to the most recent quarter (kWh).
 - `Profile status` — lifecycle label (`learning` / `improving` / `ready`) with
   full diagnostic attributes (see below).
+- `PV correction factor` — the effective Solcast correction (`global × season`).
+- `Corrected PV forecast today` / `Corrected PV forecast tomorrow` (kWh).
+- `Expected remaining PV today` — corrected forecast minus actual PV so far.
+- `PV learning confidence` — 0–100% estimate of PV correction trustworthiness.
+- `PV profile status` — PV lifecycle label with full PV diagnostic attributes.
 
 ### Binary sensors
 
@@ -118,7 +123,88 @@ Because learning is incremental, the **first day always shows low values** — t
 profile only contains the quarter-hours observed so far, and confidence stays
 low until enough slots and days accumulate.
 
-### Checking learning progress
+## How PV learning works
+
+In parallel with house-load learning, Alpha EMS Manager runs a second,
+self-learning system that **corrects the Solcast PV forecast** using your own
+measured production.
+
+### How Solcast correction works
+
+1. Throughout the day the integration tracks the latest *actual PV today*
+   (`sensor.alphaess_today_s_energy_from_pv`) and the *Solcast forecast today*.
+2. At midnight (day rollover) it finalises the completed day and computes the
+   forecast error factor:
+
+   ```
+   error_factor = actual_today / forecast_today
+   ```
+
+3. The factor is clamped to a sane range (`0.50 … 1.20`) to reject outliers,
+   then folded into a **global** factor and a **per-season** factor with an
+   exponential moving average:
+
+   ```
+   new_factor = old_factor × 0.80 + error_factor × 0.20
+   ```
+
+4. Corrected forecasts are then produced on every update:
+
+   ```
+   corrected_forecast_today    = forecast_today    × global_factor × season_factor
+   corrected_forecast_tomorrow = forecast_tomorrow × global_factor × season_factor
+   ```
+
+5. The PV still expected for the rest of today is:
+
+   ```
+   expected_remaining_pv_today = max(corrected_forecast_today − actual_pv_today, 0)
+   ```
+
+Both factors start neutral at `1.0`, so before any learning the corrected
+forecast equals the raw Solcast forecast.
+
+### How reserve is calculated
+
+The reserve only covers the **remaining** part of the day, so it uses
+`predicted_remaining_load` (never the full daily load) and subtracts the PV that
+is still expected:
+
+```
+safety_margin   = predicted_remaining_load × (1 − confidence/100) × 0.25
+required_reserve = predicted_remaining_load − expected_remaining_pv_today + safety_margin
+```
+
+`required_reserve` is clamped between `0` and the battery capacity. The
+recommendation is then simply:
+
+- `hold` when `battery_current_energy > required_reserve`
+- `charge` when `battery_current_energy < required_reserve`
+
+### How PV confidence grows
+
+PV confidence grows with the number of distinct learned days (and update count),
+so it follows the same maturing curve as house-load learning:
+
+| Elapsed PV learning | What to expect |
+| --- | --- |
+| **Day 1** | Rough estimate — corrected forecast ≈ raw Solcast forecast. |
+| **~7 days** | Reasonable correction of systematic forecast bias. |
+| **~30 days** | Stable correction factor. |
+| **90+ days** | Season-aware correction (per-season factors diverge). |
+
+### Checking PV learning progress
+
+Open the **PV profile status** sensor and inspect its attributes:
+
+- `actual_pv_today`, `raw_forecast_today`, `raw_forecast_tomorrow`
+- `corrected_forecast_today`, `corrected_forecast_tomorrow`
+- `expected_remaining_pv_today`
+- `global_pv_factor`, `season_pv_factor`
+- `last_pv_error`, `last_pv_error_factor`, `pv_learning_days`
+- `season`, `storage_loaded`, `storage_saved`, `last_update`
+
+### Checking house-load learning progress
 
 Open the **Profile status** sensor and inspect its attributes:
 

@@ -65,7 +65,13 @@
       "learning_days": { "name": "Learning days" },
       "learned_slots_count": { "name": "Learned slots count" },
       "last_quarter_load": { "name": "Last quarter load" },
-      "profile_status": { "name": "Profile status" }
+      "profile_status": { "name": "Profile status" },
+      "pv_correction_factor": { "name": "PV correction factor" },
+      "corrected_pv_forecast_today": { "name": "Corrected PV forecast today" },
+      "corrected_pv_forecast_tomorrow": { "name": "Corrected PV forecast tomorrow" },
+      "expected_remaining_pv_today": { "name": "Expected remaining PV today" },
+      "pv_learning_confidence": { "name": "PV learning confidence" },
+      "pv_profile_status": { "name": "PV profile status" }
     },
     "binary_sensor": {
       "reserve_satisfied": { "name": "Reserve satisfied" }

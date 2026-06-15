@@ -41,6 +41,21 @@ async def async_get_config_entry_diagnostics(
         "last_update": model.last_update,
     }
 
+    pv_model = coordinator.pv_model
+    pv_summary = {
+        "global_factor": pv_model.global_factor,
+        "season_factors": pv_model.season_factors,
+        "pv_learning_days": pv_model.pv_learning_days,
+        "update_count": pv_model.update_count,
+        "last_pv_error": pv_model.last_pv_error,
+        "last_pv_error_factor": pv_model.last_pv_error_factor,
+        "current_date": pv_model.current_date,
+        "current_season": pv_model.current_season,
+        "last_actual_today": pv_model.last_actual_today,
+        "last_forecast_today": pv_model.last_forecast_today,
+        "last_update": pv_model.last_update,
+    }
+
     return {
         "entry": {
             "title": entry.title,
@@ -52,5 +67,6 @@ async def async_get_config_entry_diagnostics(
             "options": async_redact_data(dict(entry.options), TO_REDACT),
         },
         "profile_summary": profile_summary,
+        "pv_profile_summary": pv_summary,
         "coordinator_data": coordinator.data,
     }

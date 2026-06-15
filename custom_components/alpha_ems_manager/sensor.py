@@ -79,6 +79,31 @@ def _profile_status_attributes(data: dict[str, Any]) -> dict[str, Any]:
     return {key: data.get(key) for key in _PROFILE_STATUS_ATTRIBUTE_KEYS}
 
 
+def _pv_profile_status_attributes(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the PV profile status attributes from coordinator data."""
+    return {
+        "actual_pv_today": data.get("pv_actual_today_kwh"),
+        "raw_forecast_today": data.get("pv_forecast_today_kwh"),
+        "raw_forecast_tomorrow": data.get("pv_forecast_tomorrow_kwh"),
+        "corrected_forecast_today": data.get("corrected_pv_forecast_today_kwh"),
+        "corrected_forecast_tomorrow": data.get(
+            "corrected_pv_forecast_tomorrow_kwh"
+        ),
+        "expected_remaining_pv_today": data.get(
+            "expected_remaining_pv_today_kwh"
+        ),
+        "global_pv_factor": data.get("global_pv_factor"),
+        "season_pv_factor": data.get("season_pv_factor"),
+        "last_pv_error": data.get("last_pv_error"),
+        "last_pv_error_factor": data.get("last_pv_error_factor"),
+        "pv_learning_days": data.get("pv_learning_days"),
+        "season": data.get("season"),
+        "storage_loaded": data.get("storage_loaded"),
+        "storage_saved": data.get("storage_saved"),
+        "last_update": data.get("last_update"),
+    }
+
+
 SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
     AlphaEmsSensorDescription(
         key="predicted_daily_load",
@@ -178,6 +203,53 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         icon="mdi:clipboard-pulse",
         value_fn=lambda data: data.get("profile_status"),
         attributes_fn=_profile_status_attributes,
+    ),
+    AlphaEmsSensorDescription(
+        key="pv_correction_factor",
+        translation_key="pv_correction_factor",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:tune-variant",
+        value_fn=lambda data: data.get("pv_correction_factor"),
+    ),
+    AlphaEmsSensorDescription(
+        key="corrected_pv_forecast_today",
+        translation_key="corrected_pv_forecast_today",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        icon="mdi:solar-power-variant",
+        value_fn=lambda data: data.get("corrected_pv_forecast_today_kwh"),
+    ),
+    AlphaEmsSensorDescription(
+        key="corrected_pv_forecast_tomorrow",
+        translation_key="corrected_pv_forecast_tomorrow",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        icon="mdi:solar-power-variant",
+        value_fn=lambda data: data.get("corrected_pv_forecast_tomorrow_kwh"),
+    ),
+    AlphaEmsSensorDescription(
+        key="expected_remaining_pv_today",
+        translation_key="expected_remaining_pv_today",
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        icon="mdi:weather-sunset",
+        value_fn=lambda data: data.get("expected_remaining_pv_today_kwh"),
+    ),
+    AlphaEmsSensorDescription(
+        key="pv_learning_confidence",
+        translation_key="pv_learning_confidence",
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=PERCENTAGE,
+        icon="mdi:gauge",
+        value_fn=lambda data: data.get("pv_learning_confidence"),
+    ),
+    AlphaEmsSensorDescription(
+        key="pv_profile_status",
+        translation_key="pv_profile_status",
+        icon="mdi:clipboard-pulse-outline",
+        value_fn=lambda data: data.get("pv_profile_status"),
+        attributes_fn=_pv_profile_status_attributes,
     ),
 )
 

@@ -42,6 +42,23 @@ CONFIDENCE_UPDATES_TARGET: Final = 200
 # Minimum learned slots before predictions are considered reliable.
 MIN_CONFIDENT_SLOTS: Final = 12
 
+# --- PV learning --------------------------------------------------------------
+
+# Meteorological seasons used for season-aware PV correction factors.
+SEASONS: Final = ("winter", "spring", "summer", "autumn")
+
+# Exponential moving average weight for the PV forecast correction factor.
+PV_FACTOR_ALPHA: Final = 0.2
+
+# Clamp range for a single day's Solcast forecast error factor
+# (actual / forecast).
+PV_FACTOR_MIN: Final = 0.50
+PV_FACTOR_MAX: Final = 1.20
+
+# Number of learned PV days targeted for full PV learning confidence.
+PV_CONFIDENCE_DAYS_TARGET: Final = 30
+PV_CONFIDENCE_UPDATES_TARGET: Final = 200
+
 # --- Configuration keys -------------------------------------------------------
 
 # Household load (cumulative, resets daily).

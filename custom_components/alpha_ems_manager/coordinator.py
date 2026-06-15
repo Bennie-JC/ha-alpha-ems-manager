@@ -56,6 +56,12 @@ from .const import (
     LEARNING_ALPHA,
     MAX_QUARTER_DELTA_KWH,
     MIN_CONFIDENT_SLOTS,
+    PV_CONFIDENCE_DAYS_TARGET,
+    PV_CONFIDENCE_UPDATES_TARGET,
+    PV_FACTOR_ALPHA,
+    PV_FACTOR_MAX,
+    PV_FACTOR_MIN,
+    SEASONS,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
@@ -175,6 +181,82 @@ class LearningModel:
         )
 
 
+@dataclass
+class PvLearningModel:
+    """Learned Solcast PV forecast-correction state.
+
+    Learns a multiplicative correction factor (``actual / forecast``) for the
+    daily Solcast forecast, both globally and per season, using an exponential
+    moving average. The corrected forecast feeds the PV-aware reserve
+    calculation. This is intentionally simple (daily totals); a future version
+    can move to quarter-hour PV profiles.
+    """
+
+    # Correction factors (start neutral at 1.0).
+    global_factor: float = 1.0
+    season_factors: dict[str, float] = field(
+        default_factory=lambda: {season: 1.0 for season in SEASONS}
+    )
+    # Running tracking of the active day so it can be finalised at rollover.
+    current_date: str | None = None
+    current_season: str | None = None
+    last_actual_today: float | None = None
+    last_forecast_today: float | None = None
+    # Diagnostics for the most recently finalised day.
+    last_pv_error: float | None = None
+    last_pv_error_factor: float | None = None
+    last_update: str | None = None
+    update_count: int = 0
+    # Distinct calendar dates on which a PV correction was learned.
+    pv_learned_dates: list[str] = field(default_factory=list)
+
+    @property
+    def pv_learning_days(self) -> int:
+        """Return the number of distinct days with learned PV corrections."""
+        return len(self.pv_learned_dates)
+
+    def season_factor(self, season: str) -> float:
+        """Return the correction factor for a season (default neutral)."""
+        return self.season_factors.get(season, 1.0)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise the PV model for persistent storage."""
+        return {
+            "global_factor": self.global_factor,
+            "season_factors": self.season_factors,
+            "current_date": self.current_date,
+            "current_season": self.current_season,
+            "last_actual_today": self.last_actual_today,
+            "last_forecast_today": self.last_forecast_today,
+            "last_pv_error": self.last_pv_error,
+            "last_pv_error_factor": self.last_pv_error_factor,
+            "last_update": self.last_update,
+            "update_count": self.update_count,
+            "pv_learned_dates": self.pv_learned_dates,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> PvLearningModel:
+        """Restore a PV model from persistent storage."""
+        if not data:
+            return cls()
+        season_factors = {season: 1.0 for season in SEASONS}
+        season_factors.update(data.get("season_factors", {}))
+        return cls(
+            global_factor=data.get("global_factor", 1.0),
+            season_factors=season_factors,
+            current_date=data.get("current_date"),
+            current_season=data.get("current_season"),
+            last_actual_today=data.get("last_actual_today"),
+            last_forecast_today=data.get("last_forecast_today"),
+            last_pv_error=data.get("last_pv_error"),
+            last_pv_error_factor=data.get("last_pv_error_factor"),
+            last_update=data.get("last_update"),
+            update_count=data.get("update_count", 0),
+            pv_learned_dates=data.get("pv_learned_dates", []),
+        )
+
+
 class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinate state reading, learning and reserve calculation."""
 
@@ -195,6 +277,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.entry = entry
         self._store: Store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
         self.model = LearningModel()
+        self.pv_model = PvLearningModel()
         self.storage_loaded = False
         self.storage_saved = False
 
@@ -244,26 +327,35 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # -- Persistent storage ----------------------------------------------------
 
     async def async_load_store(self) -> None:
-        """Load the learned model from disk."""
+        """Load the learned models (house load + PV) from disk."""
         stored = await self._store.async_load()
         self.model = LearningModel.from_dict(stored)
+        # PV learning data is nested under "pv" so the existing house-load
+        # schema at the top level stays backward compatible.
+        self.pv_model = PvLearningModel.from_dict(
+            stored.get("pv") if stored else None
+        )
         self.storage_loaded = True
         _LOGGER.debug(
-            "Store loaded: %s profiles, %s learned days, %s updates",
+            "Store loaded: %s load profiles, %s load days, %s PV days, "
+            "global_pv_factor=%.3f",
             len(self.model.profiles),
             self.model.learned_days,
-            self.model.update_count,
+            self.pv_model.pv_learning_days,
+            self.pv_model.global_factor,
         )
 
     async def async_save_store(self) -> None:
-        """Persist the learned model to disk."""
-        await self._store.async_save(self.model.to_dict())
+        """Persist the learned models (house load + PV) to disk."""
+        data = self.model.to_dict()
+        data["pv"] = self.pv_model.to_dict()
+        await self._store.async_save(data)
         self.storage_saved = True
         _LOGGER.debug(
-            "Store saved: %s profiles, %s learned days, %s updates",
+            "Store saved: %s load profiles, %s load days, %s PV days",
             len(self.model.profiles),
             self.model.learned_days,
-            self.model.update_count,
+            self.pv_model.pv_learning_days,
         )
 
     # -- Learning --------------------------------------------------------------
@@ -456,21 +548,170 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         index = _interval_index(now)
         return round(sum(self.model.global_profile()[index:]), 3)
 
+    # -- PV learning -----------------------------------------------------------
+
+    def _finalise_pv_day(
+        self, actual: float | None, forecast: float | None, season: str, date: str
+    ) -> None:
+        """Fold a completed day's Solcast error into the correction factors."""
+        if forecast is None or actual is None or forecast <= 0:
+            _LOGGER.debug(
+                "PV day %s not finalised (actual=%s forecast=%s)",
+                date,
+                actual,
+                forecast,
+            )
+            return
+
+        raw_factor = actual / forecast
+        factor = max(PV_FACTOR_MIN, min(PV_FACTOR_MAX, raw_factor))
+
+        self.pv_model.last_pv_error = round(actual - forecast, 3)
+        self.pv_model.last_pv_error_factor = round(factor, 4)
+
+        # EMA: new = old * 0.80 + factor * 0.20.
+        self.pv_model.global_factor = round(
+            self.pv_model.global_factor * (1 - PV_FACTOR_ALPHA)
+            + factor * PV_FACTOR_ALPHA,
+            4,
+        )
+        old_season = self.pv_model.season_factor(season)
+        self.pv_model.season_factors[season] = round(
+            old_season * (1 - PV_FACTOR_ALPHA) + factor * PV_FACTOR_ALPHA, 4
+        )
+
+        if date not in self.pv_model.pv_learned_dates:
+            self.pv_model.pv_learned_dates.append(date)
+
+        _LOGGER.debug(
+            "PV day %s finalised: actual=%.3f forecast=%.3f raw_factor=%.3f "
+            "clamped=%.3f -> global=%.3f season[%s]=%.3f",
+            date,
+            actual,
+            forecast,
+            raw_factor,
+            factor,
+            self.pv_model.global_factor,
+            season,
+            self.pv_model.season_factors[season],
+        )
+
+    def _learn_pv(self, now: datetime) -> bool:
+        """Track daily PV totals and finalise the correction at day rollover.
+
+        Returns ``True`` when the PV model changed and should be persisted.
+        """
+        actual = self._float(CONF_PV_ACTUAL_TODAY_SENSOR)
+        forecast = self._float(CONF_PV_FORECAST_TODAY_SENSOR)
+        today = now.date().isoformat()
+        season = _season_for(now)
+
+        self.pv_model.update_count += 1
+        self.pv_model.last_update = now.isoformat()
+
+        _LOGGER.debug(
+            "PV read: actual_today=%s forecast_today=%s date=%s season=%s",
+            actual,
+            forecast,
+            today,
+            season,
+        )
+
+        if self.pv_model.current_date is None:
+            # First observation: start tracking the current day.
+            self.pv_model.current_date = today
+            self.pv_model.current_season = season
+        elif today != self.pv_model.current_date:
+            # Day rollover: finalise the previous day using its last readings.
+            self._finalise_pv_day(
+                self.pv_model.last_actual_today,
+                self.pv_model.last_forecast_today,
+                self.pv_model.current_season or season,
+                self.pv_model.current_date,
+            )
+            self.pv_model.current_date = today
+            self.pv_model.current_season = season
+            self.pv_model.last_actual_today = None
+            self.pv_model.last_forecast_today = None
+
+        # Update the running end-of-day values for the active day.
+        if actual is not None:
+            self.pv_model.last_actual_today = actual
+        if forecast is not None:
+            self.pv_model.last_forecast_today = forecast
+
+        return True
+
+    def _corrected_forecast(self, raw_forecast: float | None, season: str) -> float | None:
+        """Apply global and season correction factors to a raw forecast."""
+        if raw_forecast is None:
+            return None
+        corrected = (
+            raw_forecast
+            * self.pv_model.global_factor
+            * self.pv_model.season_factor(season)
+        )
+        return round(max(corrected, 0.0), 3)
+
+    def _expected_remaining_pv_today(
+        self, corrected_today: float | None, actual_today: float | None
+    ) -> float:
+        """Return corrected forecast minus actual PV so far today (>= 0)."""
+        if corrected_today is None:
+            return 0.0
+        actual = actual_today or 0.0
+        return round(max(corrected_today - actual, 0.0), 3)
+
+    def _pv_learning_confidence(self) -> float:
+        """Return a 0..100 confidence score for the PV correction."""
+        days = self.pv_model.pv_learning_days
+        confidence = (
+            (days / PV_CONFIDENCE_DAYS_TARGET) * 80
+            + (self.pv_model.update_count / PV_CONFIDENCE_UPDATES_TARGET) * 20
+        )
+        confidence = max(0.0, min(100.0, confidence))
+        _LOGGER.debug(
+            "PV confidence: days=%s updates=%s -> %.1f%%",
+            days,
+            self.pv_model.update_count,
+            confidence,
+        )
+        return round(confidence, 1)
+
     # -- Reserve calculation ---------------------------------------------------
 
-    def _required_reserve(self, now: datetime) -> float:
-        """Estimate reserve energy (kWh) needed until the next buy window.
+    def _required_reserve(
+        self,
+        now: datetime,
+        predicted_remaining_load: float,
+        expected_remaining_pv: float,
+        confidence: float,
+    ) -> float:
+        """Estimate reserve energy (kWh) needed for the rest of the day.
 
-        Temporary logic until sell-to-next-buy reserve is implemented: the
-        reserve equals the learned load still expected for the rest of today,
-        clamped between 0 and the battery capacity.
+        Uses the *remaining* learned load (never the full daily load) reduced by
+        the expected remaining PV, plus a confidence-scaled safety margin.
+        Clamped between 0 and the battery capacity.
         """
-        remaining_load = self._predicted_remaining_load(now)
+        safety_margin = predicted_remaining_load * (1 - confidence / 100) * 0.25
+
+        reserve = predicted_remaining_load - expected_remaining_pv + safety_margin
+        reserve = max(reserve, 0.0)
 
         capacity = self._float(CONF_BATTERY_CAPACITY_KWH_ENTITY)
-        reserve = max(remaining_load, 0.0)
         if capacity is not None:
             reserve = min(reserve, capacity)
+
+        _LOGGER.debug(
+            "Reserve: remaining_load=%.3f - expected_pv=%.3f + safety=%.3f "
+            "(confidence=%.1f%%) -> %.3f kWh (capacity=%s)",
+            predicted_remaining_load,
+            expected_remaining_pv,
+            safety_margin,
+            confidence,
+            reserve,
+            capacity,
+        )
         return round(reserve, 3)
 
     # -- Coordinator update ----------------------------------------------------
@@ -480,19 +721,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         now = dt_util.now()
 
         changed = self._learn_house_load(now)
+        pv_changed = self._learn_pv(now)
 
         # Persist learned data after each learning cycle.
-        if changed:
+        if changed or pv_changed:
             await self.async_save_store()
 
         battery_current = self._float(CONF_BATTERY_CURRENT_KWH_SENSOR)
         battery_capacity = self._float(CONF_BATTERY_CAPACITY_KWH_ENTITY)
         battery_soc = self._float(CONF_BATTERY_SOC_SENSOR)
-
-        required_reserve = self._required_reserve(now)
-        reserve_satisfied = (
-            battery_current is not None and battery_current >= required_reserve
-        )
 
         season = _season_for(now)
         day_type = _day_type_for(now)
@@ -502,6 +739,55 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         confidence = self._learning_confidence()
         current_house_load = self._float(CONF_CUMULATIVE_HOUSE_LOAD_SENSOR)
 
+        # PV correction and forecasts.
+        raw_forecast_today = self._float(CONF_PV_FORECAST_TODAY_SENSOR)
+        raw_forecast_tomorrow = self._float(CONF_PV_FORECAST_TOMORROW_SENSOR)
+        actual_pv_today = self._float(CONF_PV_ACTUAL_TODAY_SENSOR)
+        global_pv_factor = round(self.pv_model.global_factor, 4)
+        season_pv_factor = round(self.pv_model.season_factor(season), 4)
+        effective_pv_factor = round(global_pv_factor * season_pv_factor, 4)
+        corrected_forecast_today = self._corrected_forecast(
+            raw_forecast_today, season
+        )
+        corrected_forecast_tomorrow = self._corrected_forecast(
+            raw_forecast_tomorrow, season
+        )
+        expected_remaining_pv_today = self._expected_remaining_pv_today(
+            corrected_forecast_today, actual_pv_today
+        )
+        pv_confidence = self._pv_learning_confidence()
+        pv_learning_days = self.pv_model.pv_learning_days
+
+        _LOGGER.debug(
+            "PV forecasts: raw_today=%s corrected_today=%s raw_tomorrow=%s "
+            "corrected_tomorrow=%s expected_remaining=%s (factor=%.3f)",
+            raw_forecast_today,
+            corrected_forecast_today,
+            raw_forecast_tomorrow,
+            corrected_forecast_tomorrow,
+            expected_remaining_pv_today,
+            effective_pv_factor,
+        )
+
+        # Reserve now considers learned remaining load AND expected PV.
+        predicted_remaining_load = self._predicted_remaining_load(now)
+        required_reserve = self._required_reserve(
+            now,
+            predicted_remaining_load,
+            expected_remaining_pv_today,
+            confidence,
+        )
+        reserve_satisfied = (
+            battery_current is not None and battery_current >= required_reserve
+        )
+        recommendation = "hold" if reserve_satisfied else "charge"
+        _LOGGER.debug(
+            "Recommendation: battery_current=%s vs required_reserve=%.3f -> %s",
+            battery_current,
+            required_reserve,
+            recommendation,
+        )
+
         # Profile status: a short human-readable lifecycle label.
         if learned_slots_count < MIN_CONFIDENT_SLOTS:
             profile_status = "learning"
@@ -510,6 +796,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         else:
             profile_status = "ready"
 
+        # PV profile lifecycle label.
+        if pv_learning_days == 0:
+            pv_profile_status = "learning"
+        elif pv_learning_days < 7:
+            pv_profile_status = "improving"
+        else:
+            pv_profile_status = "ready"
+
         return {
             "season": season,
             "day_type": day_type,
@@ -517,10 +811,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "interval_index": current_slot,
             "intervals_per_day": INTERVALS_PER_DAY,
             "predicted_daily_load_kwh": self._predicted_daily_load(),
-            "predicted_remaining_load_kwh": self._predicted_remaining_load(now),
-            "pv_forecast_today_kwh": self._float(CONF_PV_FORECAST_TODAY_SENSOR),
-            "pv_forecast_tomorrow_kwh": self._float(CONF_PV_FORECAST_TOMORROW_SENSOR),
-            "pv_actual_today_kwh": self._float(CONF_PV_ACTUAL_TODAY_SENSOR),
+            "predicted_remaining_load_kwh": predicted_remaining_load,
+            "pv_forecast_today_kwh": raw_forecast_today,
+            "pv_forecast_tomorrow_kwh": raw_forecast_tomorrow,
+            "pv_actual_today_kwh": actual_pv_today,
             "pv_east_kwh": self._float(CONF_PV_EAST_SENSOR),
             "pv_west_kwh": self._float(CONF_PV_WEST_SENSOR),
             "frank_price_today": self._float(CONF_FRANK_PRICES_TODAY_SENSOR),
@@ -542,6 +836,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "battery_soc": battery_soc,
             "required_reserve_kwh": required_reserve,
             "reserve_satisfied": reserve_satisfied,
+            "recommendation": recommendation,
             "learned_profiles": len(self.model.profiles),
             # Learning metrics surfaced as dedicated sensors.
             "learning_confidence": confidence,
@@ -549,6 +844,18 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "learned_slots_count": learned_slots_count,
             "last_quarter_load_kwh": self.model.last_delta_per_slot,
             "profile_status": profile_status,
+            # PV correction metrics surfaced as dedicated sensors.
+            "pv_correction_factor": effective_pv_factor,
+            "global_pv_factor": global_pv_factor,
+            "season_pv_factor": season_pv_factor,
+            "corrected_pv_forecast_today_kwh": corrected_forecast_today,
+            "corrected_pv_forecast_tomorrow_kwh": corrected_forecast_tomorrow,
+            "expected_remaining_pv_today_kwh": expected_remaining_pv_today,
+            "pv_learning_confidence": pv_confidence,
+            "pv_learning_days": pv_learning_days,
+            "pv_profile_status": pv_profile_status,
+            "last_pv_error": self.pv_model.last_pv_error,
+            "last_pv_error_factor": self.pv_model.last_pv_error_factor,
             # Diagnostic / debug fields.
             "source_entity": self._config(CONF_CUMULATIVE_HOUSE_LOAD_SENSOR),
             "source_value": current_house_load,
