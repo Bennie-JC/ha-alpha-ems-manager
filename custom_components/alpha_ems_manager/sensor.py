@@ -120,6 +120,9 @@ def _reserve_profile_status_attributes(data: dict[str, Any]) -> dict[str, Any]:
         "expected_remaining_pv_today": data.get(
             "expected_remaining_pv_today_kwh"
         ),
+        "day_min_battery_energy": data.get("reserve_day_min_battery_energy"),
+        "last_miss_date": data.get("reserve_last_miss_date"),
+        "last_success_date": data.get("reserve_last_success_date"),
         "storage_loaded": data.get("storage_loaded"),
         "storage_saved": data.get("storage_saved"),
         "last_update": data.get("last_update"),

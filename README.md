@@ -181,6 +181,12 @@ recommendation is then simply:
 - `hold` when `battery_current_energy > required_reserve`
 - `charge` when `battery_current_energy < required_reserve`
 
+Reserve learning is evaluated **once per day**, not every quarter-hour. The
+integration tracks the day's minimum battery energy and, at the day rollover,
+records at most one miss (day minimum touched the floor) or one success (day
+minimum stayed above `floor + 2.0 kWh`) for the finished day, nudging the
+reserve correction factor accordingly.
+
 ### How PV confidence grows
 
 PV confidence grows with the number of distinct learned days (and update count),

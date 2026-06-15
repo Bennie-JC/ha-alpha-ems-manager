@@ -283,10 +283,11 @@ class ReserveLearningModel:
     last_reserve_success: str | None = None
     last_battery_energy: float | None = None
     reserve_learning_status: str = "learning"
-    # Internal day tracking for success detection.
+    # Internal day tracking for once-per-day miss/success evaluation.
     current_date: str | None = None
-    day_min_battery: float | None = None
-    day_had_miss: bool = False
+    day_min_battery_energy: float | None = None
+    last_miss_date: str | None = None
+    last_success_date: str | None = None
     last_update: str | None = None
     update_count: int = 0
     # Distinct calendar dates that were evaluated (miss or success).
@@ -308,8 +309,9 @@ class ReserveLearningModel:
             "last_battery_energy": self.last_battery_energy,
             "reserve_learning_status": self.reserve_learning_status,
             "current_date": self.current_date,
-            "day_min_battery": self.day_min_battery,
-            "day_had_miss": self.day_had_miss,
+            "day_min_battery_energy": self.day_min_battery_energy,
+            "last_miss_date": self.last_miss_date,
+            "last_success_date": self.last_success_date,
             "last_update": self.last_update,
             "update_count": self.update_count,
             "reserve_learned_dates": self.reserve_learned_dates,
@@ -329,8 +331,11 @@ class ReserveLearningModel:
             last_battery_energy=data.get("last_battery_energy"),
             reserve_learning_status=data.get("reserve_learning_status", "learning"),
             current_date=data.get("current_date"),
-            day_min_battery=data.get("day_min_battery"),
-            day_had_miss=data.get("day_had_miss", False),
+            day_min_battery_energy=data.get(
+                "day_min_battery_energy", data.get("day_min_battery")
+            ),
+            last_miss_date=data.get("last_miss_date"),
+            last_success_date=data.get("last_success_date"),
             last_update=data.get("last_update"),
             update_count=data.get("update_count", 0),
             reserve_learned_dates=data.get("reserve_learned_dates", []),
@@ -783,9 +788,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _learn_reserve(self, now: datetime, battery_energy: float | None) -> bool:
         """Learn from the observed battery energy versus the reserve floor.
 
-        A *miss* (reserve too optimistic) is detected the moment the battery
-        reaches or drops below the protective floor. A *success* is credited
-        when a full calendar day stays safely above ``floor + margin``.
+        Reserve learning is evaluated *once per calendar day*. Throughout the
+        day the running minimum battery energy is tracked. When the day rolls
+        over the finished day is judged exactly once: a *miss* (reserve too
+        optimistic) if the day's minimum touched the floor, or a *success* if
+        it stayed safely above ``floor + margin``. Each calendar day can
+        produce at most one miss and at most one success.
 
         Returns ``True`` when the persisted reserve model changed.
         """
@@ -796,69 +804,81 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         today = now.date().isoformat()
         changed = False
 
-        # Day rollover: evaluate the day that just finished for a success.
+        # Day rollover: judge the day that just finished exactly once.
         if model.current_date is not None and model.current_date != today:
-            if (
-                not model.day_had_miss
-                and model.day_min_battery is not None
-                and model.day_min_battery
-                > (BATTERY_FLOOR_KWH + RESERVE_SUCCESS_MARGIN_KWH)
-            ):
-                model.reserve_success_count += 1
-                model.last_reserve_success = now.isoformat()
-                # Ease the factor back toward neutral (1.0), never below it.
-                model.reserve_correction_factor = max(
-                    RESERVE_FACTOR_MIN,
-                    model.reserve_correction_factor * (1 - RESERVE_FACTOR_ALPHA)
-                    + RESERVE_FACTOR_MIN * RESERVE_FACTOR_ALPHA,
-                )
-                if model.current_date not in model.reserve_learned_dates:
-                    model.reserve_learned_dates.append(model.current_date)
-                _LOGGER.debug(
-                    "Reserve success for %s: min=%.3f > %.3f -> factor=%.4f",
-                    model.current_date,
-                    model.day_min_battery,
-                    BATTERY_FLOOR_KWH + RESERVE_SUCCESS_MARGIN_KWH,
-                    model.reserve_correction_factor,
-                )
-            # Start the new day fresh.
-            model.day_min_battery = battery_energy
-            model.day_had_miss = False
+            previous_day = model.current_date
+            day_min = model.day_min_battery_energy
+
+            if day_min is not None:
+                if (
+                    day_min <= BATTERY_FLOOR_KWH
+                    and previous_day != model.last_miss_date
+                ):
+                    # Reserve miss: the battery touched the protective floor.
+                    model.reserve_miss_count += 1
+                    model.last_reserve_miss = now.isoformat()
+                    model.last_miss_date = previous_day
+                    target = min(
+                        model.reserve_correction_factor
+                        * RESERVE_MISS_TARGET_MULTIPLIER,
+                        RESERVE_FACTOR_MAX,
+                    )
+                    model.reserve_correction_factor = min(
+                        RESERVE_FACTOR_MAX,
+                        model.reserve_correction_factor
+                        * (1 - RESERVE_FACTOR_ALPHA)
+                        + target * RESERVE_FACTOR_ALPHA,
+                    )
+                    if previous_day not in model.reserve_learned_dates:
+                        model.reserve_learned_dates.append(previous_day)
+                    _LOGGER.debug(
+                        "Reserve miss for %s: day_min=%.3f <= floor=%.3f "
+                        "-> factor=%.4f",
+                        previous_day,
+                        day_min,
+                        BATTERY_FLOOR_KWH,
+                        model.reserve_correction_factor,
+                    )
+                elif (
+                    day_min >= (BATTERY_FLOOR_KWH + RESERVE_SUCCESS_MARGIN_KWH)
+                    and previous_day != model.last_success_date
+                ):
+                    # Reserve success: the battery stayed comfortably above floor.
+                    model.reserve_success_count += 1
+                    model.last_reserve_success = now.isoformat()
+                    model.last_success_date = previous_day
+                    # Ease the factor back toward neutral (1.0), never below it.
+                    model.reserve_correction_factor = max(
+                        RESERVE_FACTOR_MIN,
+                        model.reserve_correction_factor
+                        * (1 - RESERVE_FACTOR_ALPHA)
+                        + RESERVE_FACTOR_MIN * RESERVE_FACTOR_ALPHA,
+                    )
+                    if previous_day not in model.reserve_learned_dates:
+                        model.reserve_learned_dates.append(previous_day)
+                    _LOGGER.debug(
+                        "Reserve success for %s: day_min=%.3f >= %.3f "
+                        "-> factor=%.4f",
+                        previous_day,
+                        day_min,
+                        BATTERY_FLOOR_KWH + RESERVE_SUCCESS_MARGIN_KWH,
+                        model.reserve_correction_factor,
+                    )
+
+            # Reset the running minimum for the new day.
+            model.day_min_battery_energy = battery_energy
             changed = True
         elif model.current_date is None:
-            model.day_min_battery = battery_energy
-            model.day_had_miss = False
+            model.day_min_battery_energy = battery_energy
 
         model.current_date = today
 
-        # Track the running minimum battery energy for the day.
-        if model.day_min_battery is None or battery_energy < model.day_min_battery:
-            model.day_min_battery = battery_energy
-
-        # Miss detection: the reserve was too optimistic.
-        if battery_energy <= BATTERY_FLOOR_KWH:
-            model.reserve_miss_count += 1
-            model.last_reserve_miss = now.isoformat()
-            model.day_had_miss = True
-            # Push the factor up toward a slightly higher value, capped at 2.0.
-            target = min(
-                model.reserve_correction_factor * RESERVE_MISS_TARGET_MULTIPLIER,
-                RESERVE_FACTOR_MAX,
-            )
-            model.reserve_correction_factor = min(
-                RESERVE_FACTOR_MAX,
-                model.reserve_correction_factor * (1 - RESERVE_FACTOR_ALPHA)
-                + target * RESERVE_FACTOR_ALPHA,
-            )
-            if today not in model.reserve_learned_dates:
-                model.reserve_learned_dates.append(today)
-            _LOGGER.debug(
-                "Reserve miss: battery=%.3f <= floor=%.3f -> factor=%.4f",
-                battery_energy,
-                BATTERY_FLOOR_KWH,
-                model.reserve_correction_factor,
-            )
-            changed = True
+        # Track the running minimum battery energy for the current day.
+        if (
+            model.day_min_battery_energy is None
+            or battery_energy < model.day_min_battery_energy
+        ):
+            model.day_min_battery_energy = battery_energy
 
         model.last_battery_energy = battery_energy
         model.reserve_learning_status = self._reserve_learning_status()
@@ -1071,6 +1091,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "last_reserve_miss": self.reserve_model.last_reserve_miss,
             "last_reserve_success": self.reserve_model.last_reserve_success,
             "reserve_last_battery_energy": self.reserve_model.last_battery_energy,
+            "reserve_day_min_battery_energy": (
+                self.reserve_model.day_min_battery_energy
+            ),
+            "reserve_last_miss_date": self.reserve_model.last_miss_date,
+            "reserve_last_success_date": self.reserve_model.last_success_date,
             # Diagnostic / debug fields.
             "source_entity": self._config(CONF_CUMULATIVE_HOUSE_LOAD_SENSOR),
             "source_value": current_house_load,
