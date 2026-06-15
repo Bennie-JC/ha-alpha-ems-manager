@@ -49,6 +49,7 @@ from .const import (
     CONF_PV_WEST_SENSOR,
     CONFIDENCE_DAYS_TARGET,
     CONFIDENCE_UPDATES_TARGET,
+    BATTERY_FLOOR_KWH,
     DOMAIN,
     GLOBAL_PROFILE_KEY,
     INTERVAL_MINUTES,
@@ -61,6 +62,12 @@ from .const import (
     PV_FACTOR_ALPHA,
     PV_FACTOR_MAX,
     PV_FACTOR_MIN,
+    RESERVE_CONFIDENCE_DAYS_TARGET,
+    RESERVE_FACTOR_ALPHA,
+    RESERVE_FACTOR_MAX,
+    RESERVE_FACTOR_MIN,
+    RESERVE_MISS_TARGET_MULTIPLIER,
+    RESERVE_SUCCESS_MARGIN_KWH,
     SEASONS,
     STORAGE_KEY,
     STORAGE_VERSION,
@@ -257,6 +264,79 @@ class PvLearningModel:
         )
 
 
+@dataclass
+class ReserveLearningModel:
+    """Self-learning correction for the reserve calculation.
+
+    Observes the integration's own battery current energy (kWh) and learns
+    whether the reserve estimate was too optimistic (the battery hit the
+    protective floor) or comfortably conservative (it stayed safely above the
+    floor for a whole day), nudging a multiplicative correction factor with an
+    exponential moving average. The factor never drops below ``1.0`` and is
+    capped at ``2.0``.
+    """
+
+    reserve_correction_factor: float = 1.0
+    reserve_miss_count: int = 0
+    reserve_success_count: int = 0
+    last_reserve_miss: str | None = None
+    last_reserve_success: str | None = None
+    last_battery_energy: float | None = None
+    reserve_learning_status: str = "learning"
+    # Internal day tracking for success detection.
+    current_date: str | None = None
+    day_min_battery: float | None = None
+    day_had_miss: bool = False
+    last_update: str | None = None
+    update_count: int = 0
+    # Distinct calendar dates that were evaluated (miss or success).
+    reserve_learned_dates: list[str] = field(default_factory=list)
+
+    @property
+    def reserve_learning_days(self) -> int:
+        """Return the number of distinct evaluated reserve days."""
+        return len(self.reserve_learned_dates)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise the reserve model for persistent storage."""
+        return {
+            "reserve_correction_factor": self.reserve_correction_factor,
+            "reserve_miss_count": self.reserve_miss_count,
+            "reserve_success_count": self.reserve_success_count,
+            "last_reserve_miss": self.last_reserve_miss,
+            "last_reserve_success": self.last_reserve_success,
+            "last_battery_energy": self.last_battery_energy,
+            "reserve_learning_status": self.reserve_learning_status,
+            "current_date": self.current_date,
+            "day_min_battery": self.day_min_battery,
+            "day_had_miss": self.day_had_miss,
+            "last_update": self.last_update,
+            "update_count": self.update_count,
+            "reserve_learned_dates": self.reserve_learned_dates,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> ReserveLearningModel:
+        """Restore a reserve model from persistent storage."""
+        if not data:
+            return cls()
+        return cls(
+            reserve_correction_factor=data.get("reserve_correction_factor", 1.0),
+            reserve_miss_count=data.get("reserve_miss_count", 0),
+            reserve_success_count=data.get("reserve_success_count", 0),
+            last_reserve_miss=data.get("last_reserve_miss"),
+            last_reserve_success=data.get("last_reserve_success"),
+            last_battery_energy=data.get("last_battery_energy"),
+            reserve_learning_status=data.get("reserve_learning_status", "learning"),
+            current_date=data.get("current_date"),
+            day_min_battery=data.get("day_min_battery"),
+            day_had_miss=data.get("day_had_miss", False),
+            last_update=data.get("last_update"),
+            update_count=data.get("update_count", 0),
+            reserve_learned_dates=data.get("reserve_learned_dates", []),
+        )
+
+
 class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinate state reading, learning and reserve calculation."""
 
@@ -278,6 +358,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._store: Store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
         self.model = LearningModel()
         self.pv_model = PvLearningModel()
+        self.reserve_model = ReserveLearningModel()
         self.storage_loaded = False
         self.storage_saved = False
 
@@ -335,27 +416,35 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.pv_model = PvLearningModel.from_dict(
             stored.get("pv") if stored else None
         )
+        # Reserve learning data is nested under "reserve" for the same reason.
+        self.reserve_model = ReserveLearningModel.from_dict(
+            stored.get("reserve") if stored else None
+        )
         self.storage_loaded = True
         _LOGGER.debug(
             "Store loaded: %s load profiles, %s load days, %s PV days, "
-            "global_pv_factor=%.3f",
+            "global_pv_factor=%.3f, reserve_factor=%.3f",
             len(self.model.profiles),
             self.model.learned_days,
             self.pv_model.pv_learning_days,
             self.pv_model.global_factor,
+            self.reserve_model.reserve_correction_factor,
         )
 
     async def async_save_store(self) -> None:
-        """Persist the learned models (house load + PV) to disk."""
+        """Persist the learned models (house load + PV + reserve) to disk."""
         data = self.model.to_dict()
         data["pv"] = self.pv_model.to_dict()
+        data["reserve"] = self.reserve_model.to_dict()
         await self._store.async_save(data)
         self.storage_saved = True
         _LOGGER.debug(
-            "Store saved: %s load profiles, %s load days, %s PV days",
+            "Store saved: %s load profiles, %s load days, %s PV days, "
+            "%s reserve days",
             len(self.model.profiles),
             self.model.learned_days,
             self.pv_model.pv_learning_days,
+            self.reserve_model.reserve_learning_days,
         )
 
     # -- Learning --------------------------------------------------------------
@@ -680,22 +769,127 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # -- Reserve calculation ---------------------------------------------------
 
+    def _reserve_learning_status(self) -> str:
+        """Return a lifecycle label for the reserve correction model."""
+        days = self.reserve_model.reserve_learning_days
+        if days < 3:
+            return "learning"
+        if days < 7:
+            return "improving"
+        if days < RESERVE_CONFIDENCE_DAYS_TARGET:
+            return "good"
+        return "excellent"
+
+    def _learn_reserve(self, now: datetime, battery_energy: float | None) -> bool:
+        """Learn from the observed battery energy versus the reserve floor.
+
+        A *miss* (reserve too optimistic) is detected the moment the battery
+        reaches or drops below the protective floor. A *success* is credited
+        when a full calendar day stays safely above ``floor + margin``.
+
+        Returns ``True`` when the persisted reserve model changed.
+        """
+        if battery_energy is None:
+            return False
+
+        model = self.reserve_model
+        today = now.date().isoformat()
+        changed = False
+
+        # Day rollover: evaluate the day that just finished for a success.
+        if model.current_date is not None and model.current_date != today:
+            if (
+                not model.day_had_miss
+                and model.day_min_battery is not None
+                and model.day_min_battery
+                > (BATTERY_FLOOR_KWH + RESERVE_SUCCESS_MARGIN_KWH)
+            ):
+                model.reserve_success_count += 1
+                model.last_reserve_success = now.isoformat()
+                # Ease the factor back toward neutral (1.0), never below it.
+                model.reserve_correction_factor = max(
+                    RESERVE_FACTOR_MIN,
+                    model.reserve_correction_factor * (1 - RESERVE_FACTOR_ALPHA)
+                    + RESERVE_FACTOR_MIN * RESERVE_FACTOR_ALPHA,
+                )
+                if model.current_date not in model.reserve_learned_dates:
+                    model.reserve_learned_dates.append(model.current_date)
+                _LOGGER.debug(
+                    "Reserve success for %s: min=%.3f > %.3f -> factor=%.4f",
+                    model.current_date,
+                    model.day_min_battery,
+                    BATTERY_FLOOR_KWH + RESERVE_SUCCESS_MARGIN_KWH,
+                    model.reserve_correction_factor,
+                )
+            # Start the new day fresh.
+            model.day_min_battery = battery_energy
+            model.day_had_miss = False
+            changed = True
+        elif model.current_date is None:
+            model.day_min_battery = battery_energy
+            model.day_had_miss = False
+
+        model.current_date = today
+
+        # Track the running minimum battery energy for the day.
+        if model.day_min_battery is None or battery_energy < model.day_min_battery:
+            model.day_min_battery = battery_energy
+
+        # Miss detection: the reserve was too optimistic.
+        if battery_energy <= BATTERY_FLOOR_KWH:
+            model.reserve_miss_count += 1
+            model.last_reserve_miss = now.isoformat()
+            model.day_had_miss = True
+            # Push the factor up toward a slightly higher value, capped at 2.0.
+            target = min(
+                model.reserve_correction_factor * RESERVE_MISS_TARGET_MULTIPLIER,
+                RESERVE_FACTOR_MAX,
+            )
+            model.reserve_correction_factor = min(
+                RESERVE_FACTOR_MAX,
+                model.reserve_correction_factor * (1 - RESERVE_FACTOR_ALPHA)
+                + target * RESERVE_FACTOR_ALPHA,
+            )
+            if today not in model.reserve_learned_dates:
+                model.reserve_learned_dates.append(today)
+            _LOGGER.debug(
+                "Reserve miss: battery=%.3f <= floor=%.3f -> factor=%.4f",
+                battery_energy,
+                BATTERY_FLOOR_KWH,
+                model.reserve_correction_factor,
+            )
+            changed = True
+
+        model.last_battery_energy = battery_energy
+        model.reserve_learning_status = self._reserve_learning_status()
+        model.last_update = now.isoformat()
+        model.update_count += 1
+        return True
+
     def _required_reserve(
         self,
         now: datetime,
         predicted_remaining_load: float,
         expected_remaining_pv: float,
         confidence: float,
+        correction_factor: float,
     ) -> float:
         """Estimate reserve energy (kWh) needed for the rest of the day.
 
-        Uses the *remaining* learned load (never the full daily load) reduced by
-        the expected remaining PV, plus a confidence-scaled safety margin.
-        Clamped between 0 and the battery capacity.
+        Uses the *remaining* learned load (never the full daily load) scaled by
+        the self-learning reserve correction factor, reduced by the expected
+        remaining PV, plus a confidence-scaled safety margin. The result is
+        never lower than the protective battery floor and is clamped between 0
+        and the battery capacity.
         """
         safety_margin = predicted_remaining_load * (1 - confidence / 100) * 0.25
 
-        reserve = predicted_remaining_load - expected_remaining_pv + safety_margin
+        reserve = max(
+            BATTERY_FLOOR_KWH,
+            (predicted_remaining_load * correction_factor)
+            - expected_remaining_pv
+            + safety_margin,
+        )
         reserve = max(reserve, 0.0)
 
         capacity = self._float(CONF_BATTERY_CAPACITY_KWH_ENTITY)
@@ -703,9 +897,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             reserve = min(reserve, capacity)
 
         _LOGGER.debug(
-            "Reserve: remaining_load=%.3f - expected_pv=%.3f + safety=%.3f "
-            "(confidence=%.1f%%) -> %.3f kWh (capacity=%s)",
+            "Reserve: floor=%.3f, remaining_load=%.3f * factor=%.3f - "
+            "expected_pv=%.3f + safety=%.3f (confidence=%.1f%%) -> %.3f kWh "
+            "(capacity=%s)",
+            BATTERY_FLOOR_KWH,
             predicted_remaining_load,
+            correction_factor,
             expected_remaining_pv,
             safety_margin,
             confidence,
@@ -776,6 +973,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             predicted_remaining_load,
             expected_remaining_pv_today,
             confidence,
+            self.reserve_model.reserve_correction_factor,
+        )
+        # Learn from the observed battery energy versus the protective floor.
+        reserve_changed = self._learn_reserve(now, battery_current)
+        if reserve_changed:
+            await self.async_save_store()
+        reserve_correction_factor = round(
+            self.reserve_model.reserve_correction_factor, 4
         )
         reserve_satisfied = (
             battery_current is not None and battery_current >= required_reserve
@@ -856,6 +1061,16 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "pv_profile_status": pv_profile_status,
             "last_pv_error": self.pv_model.last_pv_error,
             "last_pv_error_factor": self.pv_model.last_pv_error_factor,
+            # Reserve correction metrics surfaced as dedicated sensors.
+            "reserve_correction_factor": reserve_correction_factor,
+            "reserve_floor_kwh": round(BATTERY_FLOOR_KWH, 3),
+            "reserve_learning_days": self.reserve_model.reserve_learning_days,
+            "reserve_miss_count": self.reserve_model.reserve_miss_count,
+            "reserve_success_count": self.reserve_model.reserve_success_count,
+            "reserve_learning_status": self.reserve_model.reserve_learning_status,
+            "last_reserve_miss": self.reserve_model.last_reserve_miss,
+            "last_reserve_success": self.reserve_model.last_reserve_success,
+            "reserve_last_battery_energy": self.reserve_model.last_battery_energy,
             # Diagnostic / debug fields.
             "source_entity": self._config(CONF_CUMULATIVE_HOUSE_LOAD_SENSOR),
             "source_value": current_house_load,

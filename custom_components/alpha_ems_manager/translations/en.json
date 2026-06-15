@@ -71,7 +71,13 @@
       "corrected_pv_forecast_tomorrow": { "name": "Corrected PV forecast tomorrow" },
       "expected_remaining_pv_today": { "name": "Expected remaining PV today" },
       "pv_learning_confidence": { "name": "PV learning confidence" },
-      "pv_profile_status": { "name": "PV profile status" }
+      "pv_profile_status": { "name": "PV profile status" },
+      "reserve_correction_factor": { "name": "Reserve correction factor" },
+      "reserve_floor": { "name": "Reserve floor" },
+      "reserve_learning_days": { "name": "Reserve learning days" },
+      "reserve_miss_count": { "name": "Reserve miss count" },
+      "reserve_success_count": { "name": "Reserve success count" },
+      "reserve_learning_status": { "name": "Reserve learning status" }
     },
     "binary_sensor": {
       "reserve_satisfied": { "name": "Reserve satisfied" }

@@ -59,6 +59,31 @@ PV_FACTOR_MAX: Final = 1.20
 PV_CONFIDENCE_DAYS_TARGET: Final = 30
 PV_CONFIDENCE_UPDATES_TARGET: Final = 200
 
+# --- Reserve learning ---------------------------------------------------------
+
+# Nominal usable battery capacity (kWh) used for the protective reserve floor.
+BATTERY_CAPACITY_KWH: Final = 22.8
+
+# The reserve must never drop below 10% of capacity.
+BATTERY_FLOOR_FACTOR: Final = 0.10
+BATTERY_FLOOR_KWH: Final = BATTERY_CAPACITY_KWH * BATTERY_FLOOR_FACTOR  # 2.28 kWh
+
+# Extra headroom above the floor that defines a "safe" day for success learning.
+RESERVE_SUCCESS_MARGIN_KWH: Final = 2.0
+
+# Exponential moving average weight for the reserve correction factor.
+RESERVE_FACTOR_ALPHA: Final = 0.1
+
+# A reserve miss pushes the factor up toward this multiple of its current value.
+RESERVE_MISS_TARGET_MULTIPLIER: Final = 1.10
+
+# Correction-factor bounds. It never drops below neutral and is capped at 2.0.
+RESERVE_FACTOR_MIN: Final = 1.0
+RESERVE_FACTOR_MAX: Final = 2.0
+
+# Distinct learned days targeted for a mature reserve correction.
+RESERVE_CONFIDENCE_DAYS_TARGET: Final = 30
+
 # --- Configuration keys -------------------------------------------------------
 
 # Household load (cumulative, resets daily).

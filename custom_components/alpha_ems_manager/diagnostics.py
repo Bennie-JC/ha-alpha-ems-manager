@@ -56,6 +56,23 @@ async def async_get_config_entry_diagnostics(
         "last_update": pv_model.last_update,
     }
 
+    reserve_model = coordinator.reserve_model
+    reserve_summary = {
+        "reserve_correction_factor": reserve_model.reserve_correction_factor,
+        "reserve_learning_days": reserve_model.reserve_learning_days,
+        "reserve_miss_count": reserve_model.reserve_miss_count,
+        "reserve_success_count": reserve_model.reserve_success_count,
+        "reserve_learning_status": reserve_model.reserve_learning_status,
+        "last_reserve_miss": reserve_model.last_reserve_miss,
+        "last_reserve_success": reserve_model.last_reserve_success,
+        "last_battery_energy": reserve_model.last_battery_energy,
+        "day_min_battery": reserve_model.day_min_battery,
+        "day_had_miss": reserve_model.day_had_miss,
+        "current_date": reserve_model.current_date,
+        "update_count": reserve_model.update_count,
+        "last_update": reserve_model.last_update,
+    }
+
     return {
         "entry": {
             "title": entry.title,
@@ -68,5 +85,6 @@ async def async_get_config_entry_diagnostics(
         },
         "profile_summary": profile_summary,
         "pv_profile_summary": pv_summary,
+        "reserve_profile_summary": reserve_summary,
         "coordinator_data": coordinator.data,
     }

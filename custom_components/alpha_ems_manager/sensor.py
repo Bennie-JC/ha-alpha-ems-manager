@@ -104,6 +104,28 @@ def _pv_profile_status_attributes(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _reserve_profile_status_attributes(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the reserve profile status attributes from coordinator data."""
+    return {
+        "battery_floor_kwh": data.get("reserve_floor_kwh"),
+        "battery_current_energy": data.get("battery_current_kwh"),
+        "reserve_correction_factor": data.get("reserve_correction_factor"),
+        "reserve_learning_days": data.get("reserve_learning_days"),
+        "reserve_miss_count": data.get("reserve_miss_count"),
+        "reserve_success_count": data.get("reserve_success_count"),
+        "last_reserve_miss": data.get("last_reserve_miss"),
+        "last_reserve_success": data.get("last_reserve_success"),
+        "required_reserve": data.get("required_reserve_kwh"),
+        "predicted_remaining_load": data.get("predicted_remaining_load_kwh"),
+        "expected_remaining_pv_today": data.get(
+            "expected_remaining_pv_today_kwh"
+        ),
+        "storage_loaded": data.get("storage_loaded"),
+        "storage_saved": data.get("storage_saved"),
+        "last_update": data.get("last_update"),
+    }
+
+
 SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
     AlphaEmsSensorDescription(
         key="predicted_daily_load",
@@ -250,6 +272,52 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         icon="mdi:clipboard-pulse-outline",
         value_fn=lambda data: data.get("pv_profile_status"),
         attributes_fn=_pv_profile_status_attributes,
+    ),
+    AlphaEmsSensorDescription(
+        key="reserve_correction_factor",
+        translation_key="reserve_correction_factor",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:tune-vertical",
+        value_fn=lambda data: data.get("reserve_correction_factor"),
+        attributes_fn=_reserve_profile_status_attributes,
+    ),
+    AlphaEmsSensorDescription(
+        key="reserve_floor",
+        translation_key="reserve_floor",
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        icon="mdi:battery-low",
+        value_fn=lambda data: data.get("reserve_floor_kwh"),
+    ),
+    AlphaEmsSensorDescription(
+        key="reserve_learning_days",
+        translation_key="reserve_learning_days",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        native_unit_of_measurement="d",
+        icon="mdi:calendar-check-outline",
+        value_fn=lambda data: data.get("reserve_learning_days"),
+    ),
+    AlphaEmsSensorDescription(
+        key="reserve_miss_count",
+        translation_key="reserve_miss_count",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        icon="mdi:battery-alert",
+        value_fn=lambda data: data.get("reserve_miss_count"),
+    ),
+    AlphaEmsSensorDescription(
+        key="reserve_success_count",
+        translation_key="reserve_success_count",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        icon="mdi:battery-check",
+        value_fn=lambda data: data.get("reserve_success_count"),
+    ),
+    AlphaEmsSensorDescription(
+        key="reserve_learning_status",
+        translation_key="reserve_learning_status",
+        icon="mdi:clipboard-pulse",
+        value_fn=lambda data: data.get("reserve_learning_status"),
+        attributes_fn=_reserve_profile_status_attributes,
     ),
 )
 
