@@ -162,6 +162,9 @@ OPTIONAL_KEYS: Final = (
 # Hard-coded entity for the minimum-spread input helper configured by the user.
 MINIMUM_SPREAD_ENTITY: Final = "input_number.minimum_spread_helper"
 
+# Fallback value used when the helper entity is unavailable or missing.
+TRADE_MINIMUM_SPREAD_DEFAULT: Final = 0.05
+
 # Default battery parameters used by the trade engine.
 TRADE_BATTERY_CAPACITY_KWH: Final = 22.8
 TRADE_CHARGE_EFFICIENCY: Final = 0.95

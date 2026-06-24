@@ -59,6 +59,7 @@ from .const import (
     MAX_QUARTER_DELTA_KWH,
     MIN_CONFIDENT_SLOTS,
     MINIMUM_SPREAD_ENTITY,
+    TRADE_MINIMUM_SPREAD_DEFAULT,
     PV_CONFIDENCE_DAYS_TARGET,
     PV_CONFIDENCE_UPDATES_TARGET,
     PV_FACTOR_ALPHA,
@@ -1097,13 +1098,32 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             st = self._state(key)
             return dict(st.attributes) if st is not None else {}
 
-        minimum_spread: float | None = None
+        # Read minimum spread from the HA input_number helper.
+        # Always resolves to a concrete float — falls back to the default when the
+        # entity is missing, unavailable, or unparseable so the trade engine can
+        # still evaluate rather than short-circuiting on None.
+        minimum_spread_entity = MINIMUM_SPREAD_ENTITY
+        minimum_spread_value: float = TRADE_MINIMUM_SPREAD_DEFAULT
+        minimum_spread_source: str
+
         spread_state = self.hass.states.get(MINIMUM_SPREAD_ENTITY)
-        if spread_state and spread_state.state not in ("unknown", "unavailable", ""):
+        if spread_state is None:
+            minimum_spread_source = "fallback_default"
+        elif spread_state.state in ("unknown", "unavailable", ""):
+            minimum_spread_source = "unavailable"
+        else:
             try:
-                minimum_spread = float(spread_state.state)
+                minimum_spread_value = float(spread_state.state)
+                minimum_spread_source = "helper"
             except (TypeError, ValueError):
-                pass
+                minimum_spread_source = "fallback_default"
+
+        _LOGGER.debug(
+            "Minimum spread: value=%.4f source=%s entity=%s",
+            minimum_spread_value,
+            minimum_spread_source,
+            minimum_spread_entity,
+        )
 
         # Sun entity for PV curve sunrise/sunset slot indices.
         trade_sunrise_slot: int | None = None
@@ -1176,7 +1196,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             frank_prices_tomorrow_attrs=_state_attrs(CONF_FRANK_PRICES_TOMORROW_SENSOR),
             frank_price_today=self._float(CONF_FRANK_PRICES_TODAY_SENSOR),
             frank_price_tomorrow=self._float(CONF_FRANK_PRICES_TOMORROW_SENSOR),
-            minimum_spread=minimum_spread,
+            minimum_spread=minimum_spread_value,
             trade_model=self.trade_model,
         )
         if trade_model_changed:
@@ -1286,8 +1306,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "last_slot": self.model.previous_slot,
             # Trade prediction results (all keys prefixed in trade_engine).
             **trade_result,
-            # Minimum spread value for diagnostic attributes.
-            "minimum_spread": minimum_spread,
+            # Minimum spread diagnostics.
+            "minimum_spread": minimum_spread_value,
+            "minimum_spread_entity": minimum_spread_entity,
+            "minimum_spread_value": minimum_spread_value,
+            "minimum_spread_source": minimum_spread_source,
         }
 
     def _raw_state(self, key: str) -> str | None:
