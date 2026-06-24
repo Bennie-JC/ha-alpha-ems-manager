@@ -156,3 +156,23 @@ OPTIONAL_KEYS: Final = (
     CONF_BATTERY_SOC_SENSOR,
     CONF_EV_CHARGER_POWER_SENSOR,
 )
+
+# --- Trade Prediction Engine --------------------------------------------------
+
+# Hard-coded entity for the minimum-spread input helper configured by the user.
+MINIMUM_SPREAD_ENTITY: Final = "input_number.minimum_spread_helper"
+
+# Default battery parameters used by the trade engine.
+TRADE_BATTERY_CAPACITY_KWH: Final = 22.8
+TRADE_CHARGE_EFFICIENCY: Final = 0.95
+TRADE_DISCHARGE_EFFICIENCY: Final = 0.95
+TRADE_ROUNDTRIP_EFFICIENCY: Final = 0.90
+TRADE_MAX_CHARGE_POWER_KW: Final = 10.0
+TRADE_MAX_DISCHARGE_POWER_KW: Final = 10.0
+
+# Learning model target for trade prediction confidence.
+TRADE_CONFIDENCE_DAYS_TARGET: Final = 30
+
+# Dutch daylight slot bounds for PV distribution (slot = hour*4 + minute//15).
+PV_DAYLIGHT_START_SLOT: Final = 24   # 06:00
+PV_DAYLIGHT_END_SLOT: Final = 84     # 21:00

@@ -32,6 +32,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    BATTERY_FLOOR_KWH,
     CONF_BATTERY_CAPACITY_KWH_ENTITY,
     CONF_BATTERY_CURRENT_KWH_SENSOR,
     CONF_BATTERY_SOC_SENSOR,
@@ -50,7 +51,6 @@ from .const import (
     CONF_PV_WEST_SENSOR,
     CONFIDENCE_DAYS_TARGET,
     CONFIDENCE_UPDATES_TARGET,
-    BATTERY_FLOOR_KWH,
     DOMAIN,
     GLOBAL_PROFILE_KEY,
     INTERVAL_MINUTES,
@@ -58,6 +58,7 @@ from .const import (
     LEARNING_ALPHA,
     MAX_QUARTER_DELTA_KWH,
     MIN_CONFIDENT_SLOTS,
+    MINIMUM_SPREAD_ENTITY,
     PV_CONFIDENCE_DAYS_TARGET,
     PV_CONFIDENCE_UPDATES_TARGET,
     PV_FACTOR_ALPHA,
@@ -72,7 +73,9 @@ from .const import (
     SEASONS,
     STORAGE_KEY,
     STORAGE_VERSION,
+    TRADE_BATTERY_CAPACITY_KWH,
 )
+from .trade_engine import TradePredictionLearningModel, compute_trade_prediction
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -378,6 +381,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.model = LearningModel()
         self.pv_model = PvLearningModel()
         self.reserve_model = ReserveLearningModel()
+        self.trade_model = TradePredictionLearningModel()
         self.storage_loaded = False
         self.storage_saved = False
 
@@ -439,6 +443,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.reserve_model = ReserveLearningModel.from_dict(
             stored.get("reserve") if stored else None
         )
+        # Trade prediction learning data nested under "trade".
+        self.trade_model = TradePredictionLearningModel.from_dict(
+            stored.get("trade") if stored else None
+        )
         self.storage_loaded = True
         _LOGGER.debug(
             "Store loaded: %s load profiles, %s load days, %s PV days, "
@@ -455,6 +463,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         data = self.model.to_dict()
         data["pv"] = self.pv_model.to_dict()
         data["reserve"] = self.reserve_model.to_dict()
+        data["trade"] = self.trade_model.to_dict()
         await self._store.async_save(data)
         self.storage_saved = True
         _LOGGER.debug(
@@ -1083,6 +1092,96 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         else:
             pv_profile_status = "ready"
 
+        # --- Trade Prediction Engine -----------------------------------------
+        def _state_attrs(key: str) -> dict:
+            st = self._state(key)
+            return dict(st.attributes) if st is not None else {}
+
+        minimum_spread: float | None = None
+        spread_state = self.hass.states.get(MINIMUM_SPREAD_ENTITY)
+        if spread_state and spread_state.state not in ("unknown", "unavailable", ""):
+            try:
+                minimum_spread = float(spread_state.state)
+            except (TypeError, ValueError):
+                pass
+
+        # Sun entity for PV curve sunrise/sunset slot indices.
+        trade_sunrise_slot: int | None = None
+        trade_sunset_slot: int | None = None
+        sun_state = self.hass.states.get("sun.sun")
+        if sun_state is not None:
+            for _sun_attr, _is_rising in (
+                ("next_rising", True),
+                ("next_setting", False),
+            ):
+                _attr_val = sun_state.attributes.get(_sun_attr)
+                if _attr_val:
+                    try:
+                        _sun_dt = dt_util.parse_datetime(str(_attr_val))
+                        if _sun_dt:
+                            _local_dt = dt_util.as_local(_sun_dt)
+                            if _is_rising:
+                                trade_sunrise_slot = _interval_index(_local_dt)
+                            else:
+                                trade_sunset_slot = _interval_index(_local_dt)
+                    except (ValueError, TypeError):
+                        pass
+
+        # Battery capacity source tracking.
+        battery_capacity_source = (
+            "configured_entity" if battery_capacity is not None else "default_fallback"
+        )
+        trade_battery_capacity = battery_capacity or TRADE_BATTERY_CAPACITY_KWH
+
+        trade_result, trade_model_changed = compute_trade_prediction(
+            now=now,
+            battery_current_kwh=battery_current,
+            battery_capacity_kwh=trade_battery_capacity,
+            battery_capacity_source=battery_capacity_source,
+            global_load_profile=self.model.global_profile(),
+            learning_confidence=confidence,
+            expected_remaining_pv_today=expected_remaining_pv_today,
+            corrected_forecast_tomorrow=corrected_forecast_tomorrow,
+            pv_east_kwh=self._float(CONF_PV_EAST_SENSOR),
+            pv_west_kwh=self._float(CONF_PV_WEST_SENSOR),
+            sunrise_slot=trade_sunrise_slot,
+            sunset_slot=trade_sunset_slot,
+            reserve_floor_kwh=BATTERY_FLOOR_KWH,
+            reserve_correction_factor=self.reserve_model.reserve_correction_factor,
+            frank_cheapest_time_today=self._raw_state(
+                CONF_FRANK_CHEAPEST_TIME_TODAY_SENSOR
+            ),
+            frank_cheapest_time_tomorrow=self._raw_state(
+                CONF_FRANK_CHEAPEST_TIME_TOMORROW_SENSOR
+            ),
+            frank_most_expensive_time_today=self._raw_state(
+                CONF_FRANK_MOST_EXPENSIVE_TIME_TODAY_SENSOR
+            ),
+            frank_most_expensive_time_tomorrow=self._raw_state(
+                CONF_FRANK_MOST_EXPENSIVE_TIME_TOMORROW_SENSOR
+            ),
+            frank_cheapest_today_attrs=_state_attrs(
+                CONF_FRANK_CHEAPEST_TIME_TODAY_SENSOR
+            ),
+            frank_cheapest_tomorrow_attrs=_state_attrs(
+                CONF_FRANK_CHEAPEST_TIME_TOMORROW_SENSOR
+            ),
+            frank_expensive_today_attrs=_state_attrs(
+                CONF_FRANK_MOST_EXPENSIVE_TIME_TODAY_SENSOR
+            ),
+            frank_expensive_tomorrow_attrs=_state_attrs(
+                CONF_FRANK_MOST_EXPENSIVE_TIME_TOMORROW_SENSOR
+            ),
+            frank_prices_today_attrs=_state_attrs(CONF_FRANK_PRICES_TODAY_SENSOR),
+            frank_prices_tomorrow_attrs=_state_attrs(CONF_FRANK_PRICES_TOMORROW_SENSOR),
+            frank_price_today=self._float(CONF_FRANK_PRICES_TODAY_SENSOR),
+            frank_price_tomorrow=self._float(CONF_FRANK_PRICES_TOMORROW_SENSOR),
+            minimum_spread=minimum_spread,
+            trade_model=self.trade_model,
+        )
+        if trade_model_changed:
+            await self.async_save_store()
+
         return {
             "season": season,
             "day_type": day_type,
@@ -1150,6 +1249,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
             "reserve_last_miss_date": self.reserve_model.last_miss_date,
             "reserve_last_success_date": self.reserve_model.last_success_date,
+            # --- Trade prediction -----------------------------------------------
+            # (populated below by compute_trade_prediction)
             # EV exclusion diagnostic fields.
             "ev_charger_power_sensor": self._config(CONF_EV_CHARGER_POWER_SENSOR),
             "ev_charger_power_kw": (
@@ -1183,6 +1284,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "last_house_load": self.model.previous_house_load,
             "last_delta": self.model.last_raw_delta,
             "last_slot": self.model.previous_slot,
+            # Trade prediction results (all keys prefixed in trade_engine).
+            **trade_result,
+            # Minimum spread value for diagnostic attributes.
+            "minimum_spread": minimum_spread,
         }
 
     def _raw_state(self, key: str) -> str | None:

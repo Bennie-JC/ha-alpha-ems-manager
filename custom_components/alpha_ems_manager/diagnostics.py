@@ -89,6 +89,18 @@ async def async_get_config_entry_diagnostics(
         "last_update": reserve_model.last_update,
     }
 
+    trade_model = coordinator.trade_model
+    trade_summary = {
+        "trade_prediction_days": trade_model.trade_prediction_days,
+        "trade_prediction_success_count": trade_model.trade_prediction_success_count,
+        "trade_prediction_miss_count": trade_model.trade_prediction_miss_count,
+        "trade_prediction_confidence": trade_model.trade_prediction_confidence,
+        "trade_prediction_status": trade_model.trade_prediction_status,
+        "current_date": trade_model.current_date,
+        "last_update": trade_model.last_update,
+        "learned_days_count": len(trade_model.learned_dates),
+    }
+
     return {
         "entry": {
             "title": entry.title,
@@ -102,5 +114,6 @@ async def async_get_config_entry_diagnostics(
         "profile_summary": profile_summary,
         "pv_profile_summary": pv_summary,
         "reserve_profile_summary": reserve_summary,
+        "trade_prediction_summary": trade_summary,
         "coordinator_data": coordinator.data,
     }
