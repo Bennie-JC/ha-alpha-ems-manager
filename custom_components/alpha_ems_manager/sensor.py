@@ -19,6 +19,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfPower
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -402,21 +403,26 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-arrow-down",
+        icon="mdi:battery-plus",
         value_fn=lambda data: data.get("predicted_buy_kwh"),
     ),
     AlphaEmsSensorDescription(
         key="predicted_buy_time",
         translation_key="predicted_buy_time",
-        icon="mdi:clock-arrow-down",
-        value_fn=lambda data: data.get("predicted_buy_time"),
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:clock-start",
+        value_fn=lambda data: (
+            dt_util.parse_datetime(t)
+            if (t := data.get("predicted_buy_time"))
+            else None
+        ),
     ),
     AlphaEmsSensorDescription(
         key="predicted_buy_price",
         translation_key="predicted_buy_price",
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="€/kWh",
-        icon="mdi:currency-eur",
+        icon="mdi:cash-minus",
         value_fn=lambda data: data.get("predicted_buy_price"),
     ),
     AlphaEmsSensorDescription(
@@ -425,21 +431,26 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-arrow-up",
+        icon="mdi:battery-minus",
         value_fn=lambda data: data.get("predicted_sell_kwh"),
     ),
     AlphaEmsSensorDescription(
         key="predicted_sell_time",
         translation_key="predicted_sell_time",
-        icon="mdi:clock-arrow-up",
-        value_fn=lambda data: data.get("predicted_sell_time"),
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:clock-end",
+        value_fn=lambda data: (
+            dt_util.parse_datetime(t)
+            if (t := data.get("predicted_sell_time"))
+            else None
+        ),
     ),
     AlphaEmsSensorDescription(
         key="predicted_sell_price",
         translation_key="predicted_sell_price",
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="€/kWh",
-        icon="mdi:currency-eur",
+        icon="mdi:cash-plus",
         value_fn=lambda data: data.get("predicted_sell_price"),
     ),
     AlphaEmsSensorDescription(
@@ -447,7 +458,7 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         translation_key="predicted_profit",
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="€",
-        icon="mdi:cash-plus",
+        icon="mdi:cash-multiple",
         value_fn=lambda data: data.get("predicted_profit"),
     ),
     AlphaEmsSensorDescription(
@@ -455,7 +466,7 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         translation_key="trade_spread",
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="€/kWh",
-        icon="mdi:arrow-expand-vertical",
+        icon="mdi:chart-bell-curve",
         value_fn=lambda data: data.get("trade_spread"),
     ),
     AlphaEmsSensorDescription(
@@ -464,7 +475,7 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-charging-outline",
+        icon="mdi:battery-lock",
         value_fn=lambda data: data.get("required_reserve_after_sell"),
     ),
     AlphaEmsSensorDescription(
@@ -473,7 +484,7 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-high",
+        icon="mdi:battery-charging-high",
         value_fn=lambda data: data.get("expected_battery_at_sell"),
     ),
     AlphaEmsSensorDescription(
@@ -482,7 +493,7 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-medium",
+        icon="mdi:battery-charging-outline",
         value_fn=lambda data: data.get("expected_battery_at_buy"),
     ),
     AlphaEmsSensorDescription(
@@ -497,13 +508,13 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-alert-variant",
+        icon="mdi:battery-alert",
         value_fn=lambda data: data.get("predicted_missing_kwh_for_full"),
     ),
     AlphaEmsSensorDescription(
         key="safety_buy_needed",
         translation_key="safety_buy_needed",
-        icon="mdi:shield-battery",
+        icon="mdi:shield-alert",
         value_fn=lambda data: data.get("safety_buy_needed"),
     ),
     AlphaEmsSensorDescription(
@@ -512,19 +523,24 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:shield-arrow-down",
+        icon="mdi:battery-alert-variant",
         value_fn=lambda data: data.get("safety_buy_kwh"),
     ),
     AlphaEmsSensorDescription(
         key="safety_buy_time",
         translation_key="safety_buy_time",
+        device_class=SensorDeviceClass.TIMESTAMP,
         icon="mdi:clock-alert",
-        value_fn=lambda data: data.get("safety_buy_time"),
+        value_fn=lambda data: (
+            dt_util.parse_datetime(t)
+            if (t := data.get("safety_buy_time"))
+            else None
+        ),
     ),
     AlphaEmsSensorDescription(
         key="safety_buy_reason",
         translation_key="safety_buy_reason",
-        icon="mdi:information-variant-circle",
+        icon="mdi:information-outline",
         value_fn=lambda data: data.get("safety_buy_reason"),
     ),
     AlphaEmsSensorDescription(
@@ -546,13 +562,13 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
     AlphaEmsSensorDescription(
         key="trade_prediction_status",
         translation_key="trade_prediction_status",
-        icon="mdi:clipboard-clock",
+        icon="mdi:clipboard-pulse",
         value_fn=lambda data: data.get("trade_prediction_status"),
     ),
     AlphaEmsSensorDescription(
         key="next_buy_source",
         translation_key="next_buy_source",
-        icon="mdi:calendar-question",
+        icon="mdi:database-search",
         value_fn=lambda data: data.get("next_buy_source"),
     ),
     # --- EV exclusion sensors --------------------------------------------------
@@ -571,7 +587,7 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:ev-station",
+        icon="mdi:ev-plug-type2",
         value_fn=lambda data: data.get("ev_excluded_last_quarter_kwh"),
     ),
     AlphaEmsSensorDescription(
@@ -580,7 +596,7 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:ev-station",
+        icon="mdi:car-electric",
         value_fn=lambda data: data.get("ev_excluded_today_kwh"),
     ),
     AlphaEmsSensorDescription(
@@ -589,7 +605,7 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:home-lightning-bolt-outline",
+        icon="mdi:home-lightning-bolt",
         value_fn=lambda data: data.get("house_load_raw_last_quarter_kwh"),
     ),
     AlphaEmsSensorDescription(
@@ -598,7 +614,7 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:home-lightning-bolt",
+        icon="mdi:home-check",
         value_fn=lambda data: data.get("house_load_corrected_last_quarter_kwh"),
     ),
 )
