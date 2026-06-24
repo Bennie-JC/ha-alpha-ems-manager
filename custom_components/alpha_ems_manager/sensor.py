@@ -380,6 +380,20 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
             "pv_east_used": data.get("pv_east_used"),
             "pv_west_used": data.get("pv_west_used"),
             "ev_exclusion_used": data.get("ev_exclusion_used"),
+            # Spread selection diagnostics.
+            "spread_selection_mode": data.get("spread_selection_mode"),
+            "best_buy_time": data.get("predicted_buy_time"),
+            "best_buy_price": data.get("predicted_buy_price"),
+            "best_sell_time": data.get("predicted_sell_time"),
+            "best_sell_price": data.get("predicted_sell_price"),
+            "best_valid_spread": data.get("trade_spread"),
+            "valid_spread_pairs_checked": data.get("valid_spread_pairs_checked"),
+            "rejected_non_chronological_pairs": data.get(
+                "rejected_non_chronological_pairs"
+            ),
+            "best_today_trade_spread": data.get("best_today_trade_spread"),
+            "best_tomorrow_trade_spread": data.get("best_tomorrow_trade_spread"),
+            "best_cross_day_trade_spread": data.get("best_cross_day_trade_spread"),
         },
     ),
     AlphaEmsSensorDescription(
@@ -435,6 +449,14 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         native_unit_of_measurement="€",
         icon="mdi:cash-plus",
         value_fn=lambda data: data.get("predicted_profit"),
+    ),
+    AlphaEmsSensorDescription(
+        key="trade_spread",
+        translation_key="trade_spread",
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement="€/kWh",
+        icon="mdi:arrow-expand-vertical",
+        value_fn=lambda data: data.get("trade_spread"),
     ),
     AlphaEmsSensorDescription(
         key="required_reserve_after_sell",

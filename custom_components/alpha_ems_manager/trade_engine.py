@@ -136,6 +136,179 @@ def _extract_price_from_attrs(
 
 
 # ---------------------------------------------------------------------------
+# Quarter-price extraction and chronological spread selection
+# ---------------------------------------------------------------------------
+
+def _extract_all_quarter_prices(
+    attrs: dict,
+    ref_date: date,
+) -> list[tuple[datetime, float]]:
+    """Extract all (slot_datetime, price) pairs from Frank price sensor attributes.
+
+    Tries list-of-dicts format first (under 'prices', 'data', 'price_data',
+    'tariffs', or 'forecast' key), then falls back to HH:MM-keyed dict.
+    Returns timezone-aware local datetimes paired with their prices.
+    """
+    if not attrs:
+        return []
+    result: list[tuple[datetime, float]] = []
+
+    for list_key in ("prices", "data", "price_data", "tariffs", "forecast"):
+        prices_data = attrs.get(list_key)
+        if not isinstance(prices_data, list):
+            continue
+        for item in prices_data:
+            if not isinstance(item, dict):
+                continue
+            slot_dt: datetime | None = None
+            for dt_key in ("datetime", "start", "time", "from", "hour"):
+                dt_val = item.get(dt_key)
+                if not dt_val:
+                    continue
+                try:
+                    parsed = dt_util.parse_datetime(str(dt_val))
+                    if parsed is not None:
+                        slot_dt = dt_util.as_local(parsed)
+                    else:
+                        parts = str(dt_val).split(":")
+                        if len(parts) >= 2:
+                            h, m = int(parts[0]), int(parts[1])
+                            naive = datetime(
+                                ref_date.year, ref_date.month, ref_date.day, h, m
+                            )
+                            slot_dt = dt_util.as_local(naive)
+                    if slot_dt is not None:
+                        break
+                except (ValueError, TypeError, AttributeError, OverflowError):
+                    continue
+            if slot_dt is None:
+                continue
+            for pk in ("price", "value", "tariff", "rate"):
+                if pk in item:
+                    try:
+                        result.append((slot_dt, float(item[pk])))
+                    except (TypeError, ValueError):
+                        pass
+                    break
+        if result:
+            return result
+
+    # Fallback: HH:MM-keyed dict at the top level of attrs.
+    for k, v in attrs.items():
+        if not isinstance(k, str) or ":" not in k:
+            continue
+        parts = k.split(":")
+        if len(parts) < 2:
+            continue
+        try:
+            h, m = int(parts[0]), int(parts[1])
+            naive = datetime(ref_date.year, ref_date.month, ref_date.day, h, m)
+            slot_dt = dt_util.as_local(naive)
+            result.append((slot_dt, float(v)))
+        except (TypeError, ValueError):
+            continue
+
+    return result
+
+
+def _select_best_spread_pair(
+    all_prices: list[tuple[datetime, float]],
+    today_date: date,
+    tomorrow_date: date,
+) -> tuple[
+    datetime | None,
+    float | None,
+    datetime | None,
+    float | None,
+    float | None,
+    dict,
+]:
+    """Find the chronological (buy, sell) quarter pair with the highest spread.
+
+    Iterates every valid pair (buy_time < sell_time) in the pre-sorted price
+    list and returns the pair that maximises sell_price − buy_price.
+
+    With ≤ 192 quarter-hour slots (today remainder + tomorrow), the O(n²)
+    pass is at most ~18 k iterations — negligible on any HA host.
+
+    Returns:
+        (buy_dt, buy_price, sell_dt, sell_price, best_spread, diag_dict)
+    The diag_dict always contains the five spread-diagnostic keys.
+    """
+    empty_diag: dict = {
+        "valid_spread_pairs_checked": 0,
+        "rejected_non_chronological_pairs": 0,
+        "best_today_trade_spread": None,
+        "best_tomorrow_trade_spread": None,
+        "best_cross_day_trade_spread": None,
+    }
+    n = len(all_prices)
+    if n < 2:
+        return None, None, None, None, None, empty_diag
+
+    best_buy_dt: datetime | None = None
+    best_buy_price: float | None = None
+    best_sell_dt: datetime | None = None
+    best_sell_price: float | None = None
+    best_spread: float | None = None
+    best_today: float | None = None
+    best_tomorrow: float | None = None
+    best_cross: float | None = None
+    valid_pairs = 0
+
+    for i in range(n):
+        buy_dt_i, buy_price_i = all_prices[i]
+        for j in range(i + 1, n):
+            sell_dt_j, sell_price_j = all_prices[j]
+            # all_prices is sorted so sell_dt_j >= buy_dt_i; strict >
+            # guards against same-slot duplicates in combined list.
+            if sell_dt_j <= buy_dt_i:
+                continue
+            valid_pairs += 1
+            spread = sell_price_j - buy_price_i
+
+            if best_spread is None or spread > best_spread:
+                best_spread = spread
+                best_buy_dt = buy_dt_i
+                best_buy_price = buy_price_i
+                best_sell_dt = sell_dt_j
+                best_sell_price = sell_price_j
+
+            bd = buy_dt_i.date()
+            sd = sell_dt_j.date()
+            if bd == today_date and sd == today_date:
+                if best_today is None or spread > best_today:
+                    best_today = spread
+            elif bd == tomorrow_date and sd == tomorrow_date:
+                if best_tomorrow is None or spread > best_tomorrow:
+                    best_tomorrow = spread
+            elif bd == today_date and sd == tomorrow_date:
+                if best_cross is None or spread > best_cross:
+                    best_cross = spread
+
+    return (
+        best_buy_dt,
+        best_buy_price,
+        best_sell_dt,
+        best_sell_price,
+        best_spread,
+        {
+            "valid_spread_pairs_checked": valid_pairs,
+            "rejected_non_chronological_pairs": 0,
+            "best_today_trade_spread": (
+                round(best_today, 4) if best_today is not None else None
+            ),
+            "best_tomorrow_trade_spread": (
+                round(best_tomorrow, 4) if best_tomorrow is not None else None
+            ),
+            "best_cross_day_trade_spread": (
+                round(best_cross, 4) if best_cross is not None else None
+            ),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Load window helper  (unchanged from v1)
 # ---------------------------------------------------------------------------
 
@@ -475,6 +648,14 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
         "trade_prediction_days": trade_model.trade_prediction_days,
         "trade_prediction_confidence": trade_model.trade_prediction_confidence,
         "trade_prediction_status": trade_model.trade_prediction_status,
+        # Spread selection diagnostics (populated after price extraction).
+        "trade_spread": None,
+        "spread_selection_mode": "chronological_quarter_pairs",
+        "valid_spread_pairs_checked": 0,
+        "rejected_non_chronological_pairs": 0,
+        "best_today_trade_spread": None,
+        "best_tomorrow_trade_spread": None,
+        "best_cross_day_trade_spread": None,
     }
 
     # --- Day rollover --------------------------------------------------------
@@ -503,80 +684,141 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
         return result, model_changed
 
     now_slot = _slot_index(now)
+    today_date = now.date()
 
-    # --- Resolve cheapest buy window (prefer tomorrow) -----------------------
+    # --- Extract quarter-hour prices and select best chronological pair ------
+    #
+    # Primary: build a sorted list of all future quarter-hour (datetime, price)
+    # slots from the Frank full-price sensors and find the (buy, sell) pair
+    # that maximises spread while guaranteeing buy_time < sell_time.
+    #
+    # Fallback: when the full-price list is unavailable, revert to the two
+    # Frank time-point sensors (cheapest / most-expensive), which gives a
+    # degenerate 1-pair evaluation with the old chronological guard.
+    # ---------------------------------------------------------------------------
+
+    prices_today_raw = _extract_all_quarter_prices(frank_prices_today_attrs, today_date)
+    prices_today = [(dt, p) for dt, p in prices_today_raw if dt > now]
+    prices_tomorrow = _extract_all_quarter_prices(frank_prices_tomorrow_attrs, tomorrow_date)
+    all_prices = sorted(prices_today + prices_tomorrow, key=lambda x: x[0])
+
     buy_dt: datetime | None = None
     buy_price: float | None = None
-    next_buy_source = "today_fallback"
-
-    if frank_cheapest_time_tomorrow:
-        buy_dt = _parse_frank_time(frank_cheapest_time_tomorrow, tomorrow_date)
-        if buy_dt is not None:
-            next_buy_source = "tomorrow_prices"
-            buy_price = _extract_price_from_attrs(frank_cheapest_tomorrow_attrs, buy_dt)
-            if buy_price is None:
-                buy_price = _extract_price_from_attrs(frank_prices_tomorrow_attrs, buy_dt)
-            if buy_price is None:
-                buy_price = frank_price_tomorrow
-
-    if buy_dt is None and frank_cheapest_time_today:
-        cand = _parse_frank_time(frank_cheapest_time_today, now.date())
-        if cand is not None and cand > now:
-            buy_dt = cand
-            next_buy_source = "today_fallback"
-            buy_price = _extract_price_from_attrs(frank_cheapest_today_attrs, buy_dt)
-            if buy_price is None:
-                buy_price = _extract_price_from_attrs(frank_prices_today_attrs, buy_dt)
-            if buy_price is None:
-                buy_price = frank_price_today
-
-    result["next_buy_source"] = next_buy_source
-    if buy_dt is not None:
-        result["predicted_buy_time"] = buy_dt.isoformat()
-        result["predicted_buy_price"] = buy_price
-
-    # --- Resolve most expensive sell window (must be after buy) --------------
     sell_dt: datetime | None = None
     sell_price: float | None = None
-    sell_candidates: list[tuple[datetime, float | None]] = []
+    best_spread: float | None = None
+    next_buy_source = "insufficient_data"
+    safety_buy_dt: datetime | None = None
+    spread_selection_mode: str
 
-    if frank_most_expensive_time_today:
-        cand = _parse_frank_time(frank_most_expensive_time_today, now.date())
-        if cand is not None and cand > now:
-            p = _extract_price_from_attrs(frank_expensive_today_attrs, cand)
-            if p is None:
-                p = _extract_price_from_attrs(frank_prices_today_attrs, cand)
-            sell_candidates.append((cand, p))
+    if len(all_prices) >= 2:
+        spread_selection_mode = "chronological_quarter_pairs"
+        buy_dt, buy_price, sell_dt, sell_price, best_spread, spread_diag = (
+            _select_best_spread_pair(all_prices, today_date, tomorrow_date)
+        )
+        if buy_dt is not None:
+            next_buy_source = (
+                "tomorrow_prices" if buy_dt.date() == tomorrow_date else "today_prices"
+            )
+        # Safety buy uses the globally cheapest future quarter for scheduling.
+        safety_buy_dt = min(all_prices, key=lambda x: x[1])[0]
+    else:
+        # Fallback: only Frank time-point sensors are available — evaluate the
+        # single (cheapest, most-expensive) pair with a chronological guard.
+        spread_selection_mode = "fallback_two_point"
+        spread_diag = {
+            "valid_spread_pairs_checked": 0,
+            "rejected_non_chronological_pairs": 0,
+            "best_today_trade_spread": None,
+            "best_tomorrow_trade_spread": None,
+            "best_cross_day_trade_spread": None,
+        }
+        if frank_cheapest_time_tomorrow:
+            buy_dt = _parse_frank_time(frank_cheapest_time_tomorrow, tomorrow_date)
+            if buy_dt is not None:
+                next_buy_source = "tomorrow_prices"
+                buy_price = _extract_price_from_attrs(frank_cheapest_tomorrow_attrs, buy_dt)
+                if buy_price is None:
+                    buy_price = _extract_price_from_attrs(frank_prices_tomorrow_attrs, buy_dt)
+                if buy_price is None:
+                    buy_price = frank_price_tomorrow
+        if buy_dt is None and frank_cheapest_time_today:
+            cand = _parse_frank_time(frank_cheapest_time_today, today_date)
+            if cand is not None and cand > now:
+                buy_dt = cand
+                next_buy_source = "today_fallback"
+                buy_price = _extract_price_from_attrs(frank_cheapest_today_attrs, buy_dt)
+                if buy_price is None:
+                    buy_price = _extract_price_from_attrs(frank_prices_today_attrs, buy_dt)
+                if buy_price is None:
+                    buy_price = frank_price_today
+        sell_candidates: list[tuple[datetime, float | None]] = []
+        if frank_most_expensive_time_today:
+            cand = _parse_frank_time(frank_most_expensive_time_today, today_date)
+            if cand is not None and cand > now:
+                p = _extract_price_from_attrs(frank_expensive_today_attrs, cand)
+                if p is None:
+                    p = _extract_price_from_attrs(frank_prices_today_attrs, cand)
+                sell_candidates.append((cand, p))
+        if frank_most_expensive_time_tomorrow:
+            cand = _parse_frank_time(frank_most_expensive_time_tomorrow, tomorrow_date)
+            if cand is not None:
+                p = _extract_price_from_attrs(frank_expensive_tomorrow_attrs, cand)
+                if p is None:
+                    p = _extract_price_from_attrs(frank_prices_tomorrow_attrs, cand)
+                sell_candidates.append((cand, p))
+        for cand_dt, cand_price in sell_candidates:
+            if buy_dt is not None and cand_dt <= buy_dt:
+                continue
+            if sell_dt is None:
+                sell_dt, sell_price = cand_dt, cand_price
+            elif (
+                cand_price is not None
+                and sell_price is not None
+                and cand_price > sell_price
+            ):
+                sell_dt, sell_price = cand_dt, cand_price
+        best_spread = (
+            (sell_price - buy_price)
+            if sell_price is not None and buy_price is not None
+            else None
+        )
+        safety_buy_dt = buy_dt
 
-    if frank_most_expensive_time_tomorrow:
-        cand = _parse_frank_time(frank_most_expensive_time_tomorrow, tomorrow_date)
-        if cand is not None:
-            p = _extract_price_from_attrs(frank_expensive_tomorrow_attrs, cand)
-            if p is None:
-                p = _extract_price_from_attrs(frank_prices_tomorrow_attrs, cand)
-            sell_candidates.append((cand, p))
-
-    for cand_dt, cand_price in sell_candidates:
-        if buy_dt is not None and cand_dt <= buy_dt:
-            continue
-        if sell_dt is None:
-            sell_dt, sell_price = cand_dt, cand_price
-        elif (
-            cand_price is not None
-            and sell_price is not None
-            and cand_price > sell_price
-        ):
-            sell_dt, sell_price = cand_dt, cand_price
-
+    # Publish resolved pair + spread diagnostics into result.
+    result["spread_selection_mode"] = spread_selection_mode
+    result["next_buy_source"] = next_buy_source
+    result.update(spread_diag)
+    if buy_dt is not None:
+        result["predicted_buy_time"] = buy_dt.isoformat()
+        result["predicted_buy_price"] = (
+            round(buy_price, 4) if buy_price is not None else None
+        )
     if sell_dt is not None:
         result["predicted_sell_time"] = sell_dt.isoformat()
-        result["predicted_sell_price"] = sell_price
+        result["predicted_sell_price"] = (
+            round(sell_price, 4) if sell_price is not None else None
+        )
+    if best_spread is not None:
+        result["trade_spread"] = round(best_spread, 4)
+
+    _LOGGER.debug(
+        "Spread selection: mode=%s pairs_checked=%d buy=%s@%.4f "
+        "sell=%s@%.4f spread=%.4f",
+        spread_selection_mode,
+        spread_diag["valid_spread_pairs_checked"],
+        buy_dt.isoformat() if buy_dt else "None",
+        buy_price or 0.0,
+        sell_dt.isoformat() if sell_dt else "None",
+        sell_price or 0.0,
+        best_spread or 0.0,
+    )
 
     # --- Minimum spread check ------------------------------------------------
     if minimum_spread is None or buy_price is None or sell_price is None:
         result["safety_buy_reason"] = "insufficient_data"
         _compute_safety_buy(
-            result, now_slot, buy_dt, battery_current_kwh, battery_capacity_kwh,
+            result, now_slot, safety_buy_dt, battery_current_kwh, battery_capacity_kwh,
             global_load_profile, pv_weights,
             expected_remaining_pv_today, forecast_tomorrow,
             reserve_floor_kwh, reserve_correction_factor, learning_confidence,
@@ -584,9 +826,9 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
         )
         return result, model_changed
 
-    spread = sell_price - buy_price
     trade_possible = (
-        spread >= minimum_spread
+        best_spread is not None
+        and best_spread >= minimum_spread
         and buy_dt is not None
         and sell_dt is not None
     )
@@ -733,9 +975,9 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
             result["trade_possible"],
         )
 
-    # --- Safety buy (always evaluated) -------------------------------------
+    # --- Safety buy (always evaluated, uses cheapest future quarter) --------
     _compute_safety_buy(
-        result, now_slot, buy_dt, battery_current_kwh, battery_capacity_kwh,
+        result, now_slot, safety_buy_dt, battery_current_kwh, battery_capacity_kwh,
         global_load_profile, pv_weights,
         expected_remaining_pv_today, forecast_tomorrow,
         reserve_floor_kwh, reserve_correction_factor, learning_confidence,
