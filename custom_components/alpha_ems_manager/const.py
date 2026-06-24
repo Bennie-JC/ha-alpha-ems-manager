@@ -113,6 +113,9 @@ CONF_BATTERY_CURRENT_KWH_SENSOR: Final = "battery_current_kwh_sensor"
 CONF_BATTERY_CAPACITY_KWH_ENTITY: Final = "battery_capacity_kwh_entity"
 CONF_BATTERY_SOC_SENSOR: Final = "battery_soc_sensor"
 
+# EV charger.
+CONF_EV_CHARGER_POWER_SENSOR: Final = "ev_charger_power_sensor"
+
 # Default entity ids used to pre-populate the config flow.
 DEFAULTS: Final = {
     CONF_CUMULATIVE_HOUSE_LOAD_SENSOR: "sensor.alphaess_today_s_house_load",
@@ -151,4 +154,5 @@ OPTIONAL_KEYS: Final = (
     CONF_PV_EAST_SENSOR,
     CONF_PV_WEST_SENSOR,
     CONF_BATTERY_SOC_SENSOR,
+    CONF_EV_CHARGER_POWER_SENSOR,
 )

@@ -19,7 +19,8 @@
           "frank_most_expensive_time_tomorrow_sensor": "Frank most expensive time tomorrow sensor",
           "battery_current_kwh_sensor": "Battery current energy (kWh) sensor",
           "battery_capacity_kwh_entity": "Battery capacity (kWh) entity",
-          "battery_soc_sensor": "Battery state of charge sensor (optional)"
+          "battery_soc_sensor": "Battery state of charge sensor (optional)",
+          "ev_charger_power_sensor": "EV charger power sensor (optional, e.g. Easee)"
         }
       }
     },
@@ -47,7 +48,8 @@
           "frank_most_expensive_time_tomorrow_sensor": "Frank most expensive time tomorrow sensor",
           "battery_current_kwh_sensor": "Battery current energy (kWh) sensor",
           "battery_capacity_kwh_entity": "Battery capacity (kWh) entity",
-          "battery_soc_sensor": "Battery state of charge sensor (optional)"
+          "battery_soc_sensor": "Battery state of charge sensor (optional)",
+          "ev_charger_power_sensor": "EV charger power sensor (optional, e.g. Easee)"
         }
       }
     }
@@ -77,7 +79,12 @@
       "reserve_learning_days": { "name": "Reserve learning days" },
       "reserve_miss_count": { "name": "Reserve miss count" },
       "reserve_success_count": { "name": "Reserve success count" },
-      "reserve_learning_status": { "name": "Reserve learning status" }
+      "reserve_learning_status": { "name": "Reserve learning status" },
+      "ev_charger_power": { "name": "EV charger power" },
+      "ev_excluded_last_quarter": { "name": "EV excluded last quarter" },
+      "ev_excluded_today": { "name": "EV excluded today" },
+      "house_load_raw_last_quarter": { "name": "House load raw last quarter" },
+      "house_load_corrected_last_quarter": { "name": "House load corrected last quarter" }
     },
     "binary_sensor": {
       "reserve_satisfied": { "name": "Reserve satisfied" }

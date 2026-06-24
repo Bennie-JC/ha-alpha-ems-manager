@@ -260,6 +260,48 @@ sensor, so it needs time and valid source data before values appear.
 > Deltas below 0 kWh are treated as the midnight reset (baseline rebased), and
 > deltas above 10 kWh per 15 minutes are treated as invalid spikes and ignored.
 
+## EV charging exclusion
+
+If an EV charger power sensor is configured, Alpha EMS Manager excludes EV
+charging energy from the learned household load profile. This prevents EV
+charging sessions from corrupting predicted daily load and reserve calculations.
+
+Configure the sensor in the integration's **Configure** screen — it is optional.
+Any sensor that reports the charger's current draw in kW works, for example the
+Easee charger power sensor (`sensor.epp82dew_vermogen`).
+
+**How it works:** at every quarter-hour boundary the integration reads the EV
+charger power (kW) and converts it to a 15-minute energy equivalent:
+
+```
+ev_delta_kwh          = ev_charger_power_kw × 0.25
+corrected_delta_kwh   = max(raw_house_load_delta − ev_delta_kwh, 0)
+```
+
+The corrected delta is what gets folded into the household load profile.
+The raw measurement is never modified.
+
+Example:
+
+```
+House load delta:  2.5 kWh
+EV charging delta: 2.0 kWh
+Learned household delta: 0.5 kWh
+```
+
+If the EV sensor is unavailable or not configured, `ev_delta_kwh` is treated as
+0 and learning is completely unchanged.
+
+Diagnostic sensors added by this feature:
+
+| Sensor | Unit | Description |
+| --- | --- | --- |
+| `EV charger power` | kW | Current EV charger draw (unavailable if not configured) |
+| `EV excluded last quarter` | kWh | EV energy subtracted in the last learning cycle |
+| `EV excluded today` | kWh | Cumulative EV energy excluded since midnight |
+| `House load raw last quarter` | kWh | Raw measured load delta (before EV exclusion) |
+| `House load corrected last quarter` | kWh | Net household load delta (after EV exclusion) |
+
 ## Roadmap
 
 - Sell-time/buy-time aware reserve windows using Frank price timestamps.

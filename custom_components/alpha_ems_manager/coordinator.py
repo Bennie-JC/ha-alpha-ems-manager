@@ -36,6 +36,7 @@ from .const import (
     CONF_BATTERY_CURRENT_KWH_SENSOR,
     CONF_BATTERY_SOC_SENSOR,
     CONF_CUMULATIVE_HOUSE_LOAD_SENSOR,
+    CONF_EV_CHARGER_POWER_SENSOR,
     CONF_FRANK_CHEAPEST_TIME_TODAY_SENSOR,
     CONF_FRANK_CHEAPEST_TIME_TOMORROW_SENSOR,
     CONF_FRANK_MOST_EXPENSIVE_TIME_TODAY_SENSOR,
@@ -127,6 +128,14 @@ class LearningModel:
     update_count: int = 0
     # Distinct calendar dates on which a valid sample was learned.
     learned_dates: list[str] = field(default_factory=list)
+    # EV exclusion diagnostics (per learning cycle, not persisted except totals).
+    last_ev_power_kw: float = 0.0
+    ev_excluded_last_quarter_kwh: float = 0.0
+    ev_excluded_today_kwh: float = 0.0
+    ev_today_date: str | None = None
+    house_load_raw_last_quarter_kwh: float | None = None
+    house_load_corrected_last_quarter_kwh: float | None = None
+    ev_exclusion_active: bool = False
 
     @property
     def learned_days(self) -> int:
@@ -157,6 +166,9 @@ class LearningModel:
             "last_update": self.last_update,
             "update_count": self.update_count,
             "learned_dates": self.learned_dates,
+            # EV exclusion daily totals (persist so restart mid-day is accurate).
+            "ev_excluded_today_kwh": self.ev_excluded_today_kwh,
+            "ev_today_date": self.ev_today_date,
         }
 
     @classmethod
@@ -185,6 +197,8 @@ class LearningModel:
             last_update=data.get("last_update"),
             update_count=data.get("update_count", 0),
             learned_dates=data.get("learned_dates", []),
+            ev_excluded_today_kwh=data.get("ev_excluded_today_kwh", 0.0),
+            ev_today_date=data.get("ev_today_date"),
         )
 
 
@@ -567,7 +581,47 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not target_slots:
             target_slots = [slot]
 
-        delta_per_slot = raw_delta / len(target_slots)
+        # --- EV exclusion: subtract EV charging energy from the raw delta -----
+        ev_sensor = self._config(CONF_EV_CHARGER_POWER_SENSOR)
+        ev_power_kw = 0.0
+        if ev_sensor:
+            raw_ev = self._float(CONF_EV_CHARGER_POWER_SENSOR)
+            if raw_ev is not None and raw_ev >= 0:
+                ev_power_kw = raw_ev
+        ev_delta_kwh = ev_power_kw * 0.25
+        corrected_delta = max(raw_delta - ev_delta_kwh, 0.0)
+        ev_excluded_this_quarter = raw_delta - corrected_delta
+
+        # Daily accumulator: reset when the calendar date changes.
+        date_str_ev = now.date().isoformat()
+        if self.model.ev_today_date != date_str_ev:
+            self.model.ev_excluded_today_kwh = 0.0
+            self.model.ev_today_date = date_str_ev
+        self.model.ev_excluded_today_kwh = round(
+            self.model.ev_excluded_today_kwh + ev_excluded_this_quarter, 3
+        )
+
+        self.model.last_ev_power_kw = round(ev_power_kw, 3)
+        self.model.ev_excluded_last_quarter_kwh = round(ev_excluded_this_quarter, 3)
+        self.model.house_load_raw_last_quarter_kwh = round(raw_delta, 3)
+        self.model.house_load_corrected_last_quarter_kwh = round(corrected_delta, 3)
+        self.model.ev_exclusion_active = (
+            bool(ev_sensor) and ev_power_kw > 0 and ev_excluded_this_quarter > 0
+        )
+
+        if ev_excluded_this_quarter > 0:
+            _LOGGER.debug(
+                "EV exclusion: raw_delta=%.3f kWh, ev_power=%.3f kW, "
+                "ev_delta=%.3f kWh, corrected_delta=%.3f kWh (today_total=%.3f kWh)",
+                raw_delta,
+                ev_power_kw,
+                ev_delta_kwh,
+                corrected_delta,
+                self.model.ev_excluded_today_kwh,
+            )
+        # -----------------------------------------------------------------------
+
+        delta_per_slot = corrected_delta / len(target_slots)
         self.model.last_delta_per_slot = round(delta_per_slot, 4)
         self.model.distributed_slots = list(target_slots)
         self.model.last_learned_slots = list(target_slots)
@@ -1096,6 +1150,20 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
             "reserve_last_miss_date": self.reserve_model.last_miss_date,
             "reserve_last_success_date": self.reserve_model.last_success_date,
+            # EV exclusion diagnostic fields.
+            "ev_charger_power_sensor": self._config(CONF_EV_CHARGER_POWER_SENSOR),
+            "ev_charger_power_kw": (
+                max(self._float(CONF_EV_CHARGER_POWER_SENSOR) or 0.0, 0.0)
+                if self._config(CONF_EV_CHARGER_POWER_SENSOR)
+                else None
+            ),
+            "ev_excluded_last_quarter_kwh": self.model.ev_excluded_last_quarter_kwh,
+            "ev_excluded_today_kwh": self.model.ev_excluded_today_kwh,
+            "house_load_raw_last_quarter_kwh": self.model.house_load_raw_last_quarter_kwh,
+            "house_load_corrected_last_quarter_kwh": (
+                self.model.house_load_corrected_last_quarter_kwh
+            ),
+            "ev_exclusion_active": self.model.ev_exclusion_active,
             # Diagnostic / debug fields.
             "source_entity": self._config(CONF_CUMULATIVE_HOUSE_LOAD_SENSOR),
             "source_value": current_house_load,

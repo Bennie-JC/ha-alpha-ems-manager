@@ -20,6 +20,7 @@ from .const import (
     CONF_BATTERY_CURRENT_KWH_SENSOR,
     CONF_BATTERY_SOC_SENSOR,
     CONF_CUMULATIVE_HOUSE_LOAD_SENSOR,
+    CONF_EV_CHARGER_POWER_SENSOR,
     CONF_FRANK_CHEAPEST_TIME_TODAY_SENSOR,
     CONF_FRANK_CHEAPEST_TIME_TOMORROW_SENSOR,
     CONF_FRANK_MOST_EXPENSIVE_TIME_TODAY_SENSOR,
@@ -123,6 +124,11 @@ def _build_schema(source: dict[str, Any]) -> vol.Schema:
             vol.Optional(
                 CONF_BATTERY_SOC_SENSOR,
                 default=_default(CONF_BATTERY_SOC_SENSOR, source),
+            ): _SENSOR_SELECTOR,
+            # --- EV charger ----------------------------------------------------
+            vol.Optional(
+                CONF_EV_CHARGER_POWER_SENSOR,
+                default=_default(CONF_EV_CHARGER_POWER_SENSOR, source),
             ): _SENSOR_SELECTOR,
         }
     )

@@ -39,6 +39,21 @@ async def async_get_config_entry_diagnostics(
         "previous_house_load": model.previous_house_load,
         "previous_slot": model.previous_slot,
         "last_update": model.last_update,
+        "ev_exclusion": {
+            "ev_charger_power_sensor": coordinator.entry.options.get(
+                "ev_charger_power_sensor",
+                coordinator.entry.data.get("ev_charger_power_sensor"),
+            ),
+            "last_ev_power_kw": model.last_ev_power_kw,
+            "ev_excluded_last_quarter_kwh": model.ev_excluded_last_quarter_kwh,
+            "ev_excluded_today_kwh": model.ev_excluded_today_kwh,
+            "house_load_raw_last_quarter_kwh": model.house_load_raw_last_quarter_kwh,
+            "house_load_corrected_last_quarter_kwh": (
+                model.house_load_corrected_last_quarter_kwh
+            ),
+            "ev_exclusion_active": model.ev_exclusion_active,
+            "ev_today_date": model.ev_today_date,
+        },
     }
 
     pv_model = coordinator.pv_model

@@ -17,7 +17,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfEnergy
+from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfPower
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -66,6 +66,14 @@ _PROFILE_STATUS_ATTRIBUTE_KEYS = (
     "profile_key",
     "storage_loaded",
     "storage_saved",
+    # EV exclusion diagnostics.
+    "ev_charger_power_sensor",
+    "ev_charger_power_kw",
+    "ev_excluded_last_quarter_kwh",
+    "ev_excluded_today_kwh",
+    "house_load_raw_last_quarter_kwh",
+    "house_load_corrected_last_quarter_kwh",
+    "ev_exclusion_active",
 )
 
 
@@ -321,6 +329,52 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         icon="mdi:clipboard-pulse",
         value_fn=lambda data: data.get("reserve_learning_status"),
         attributes_fn=_reserve_profile_status_attributes,
+    ),
+    # --- EV exclusion sensors --------------------------------------------------
+    AlphaEmsSensorDescription(
+        key="ev_charger_power",
+        translation_key="ev_charger_power",
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfPower.KILO_WATT,
+        icon="mdi:ev-station",
+        value_fn=lambda data: data.get("ev_charger_power_kw"),
+    ),
+    AlphaEmsSensorDescription(
+        key="ev_excluded_last_quarter",
+        translation_key="ev_excluded_last_quarter",
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        icon="mdi:ev-station",
+        value_fn=lambda data: data.get("ev_excluded_last_quarter_kwh"),
+    ),
+    AlphaEmsSensorDescription(
+        key="ev_excluded_today",
+        translation_key="ev_excluded_today",
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        icon="mdi:ev-station",
+        value_fn=lambda data: data.get("ev_excluded_today_kwh"),
+    ),
+    AlphaEmsSensorDescription(
+        key="house_load_raw_last_quarter",
+        translation_key="house_load_raw_last_quarter",
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        icon="mdi:home-lightning-bolt-outline",
+        value_fn=lambda data: data.get("house_load_raw_last_quarter_kwh"),
+    ),
+    AlphaEmsSensorDescription(
+        key="house_load_corrected_last_quarter",
+        translation_key="house_load_corrected_last_quarter",
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        icon="mdi:home-lightning-bolt",
+        value_fn=lambda data: data.get("house_load_corrected_last_quarter_kwh"),
     ),
 )
 
