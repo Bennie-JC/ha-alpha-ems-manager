@@ -338,9 +338,22 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
         icon="mdi:swap-horizontal-bold",
         value_fn=lambda data: data.get("trade_possible"),
         attributes_fn=lambda data: {
+            "trade_found": data.get("trade_found"),
+            "trade_executable": data.get("trade_executable"),
+            "trade_block_reason": data.get("trade_block_reason"),
+            "best_valid_spread": data.get("trade_spread"),
+            "minimum_spread": data.get("minimum_spread"),
+            "spread_above_minimum": (
+                round(data["trade_spread"] - data["minimum_spread"], 4)
+                if data.get("trade_spread") is not None
+                and data.get("minimum_spread") is not None
+                else None
+            ),
+            "predicted_sell_kwh": data.get("predicted_sell_kwh"),
+            "required_reserve_after_sell": data.get("required_reserve_after_sell"),
+            "available_energy_after_reserve": data.get("available_energy_after_reserve"),
             "buy_price": data.get("predicted_buy_price"),
             "sell_price": data.get("predicted_sell_price"),
-            "minimum_spread": data.get("minimum_spread"),
             "minimum_spread_entity": data.get("minimum_spread_entity"),
             "minimum_spread_value": data.get("minimum_spread_value"),
             "minimum_spread_source": data.get("minimum_spread_source"),
@@ -399,6 +412,48 @@ SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
             "best_tomorrow_trade_spread": data.get("best_tomorrow_trade_spread"),
             "best_cross_day_trade_spread": data.get("best_cross_day_trade_spread"),
         },
+    ),
+    AlphaEmsSensorDescription(
+        key="trade_found",
+        translation_key="trade_found",
+        icon="mdi:chart-timeline-variant-shimmer",
+        value_fn=lambda data: data.get("trade_found"),
+        attributes_fn=lambda data: {
+            "trade_found": data.get("trade_found"),
+            "trade_executable": data.get("trade_executable"),
+            "trade_block_reason": data.get("trade_block_reason"),
+            "best_valid_spread": data.get("trade_spread"),
+            "minimum_spread": data.get("minimum_spread"),
+            "spread_above_minimum": (
+                round(data["trade_spread"] - data["minimum_spread"], 4)
+                if data.get("trade_spread") is not None
+                and data.get("minimum_spread") is not None
+                else None
+            ),
+            "predicted_sell_kwh": data.get("predicted_sell_kwh"),
+            "required_reserve_after_sell": data.get("required_reserve_after_sell"),
+            "battery_capacity_kwh": data.get("battery_capacity_kwh"),
+            "expected_battery_at_sell": data.get("expected_battery_at_sell"),
+            "available_energy_after_reserve": data.get("available_energy_after_reserve"),
+            "battery_at_sell_target": data.get("battery_at_sell_target"),
+            "available_battery_space_kwh": data.get("available_battery_space_kwh"),
+            "max_buy_possible_kwh": data.get("max_buy_possible_kwh"),
+            "expected_pv_between_buy_and_sell": data.get("expected_pv_between_buy_and_sell"),
+            "expected_load_between_buy_and_sell": data.get("expected_load_between_buy_and_sell"),
+            "buy_to_full_reason": data.get("buy_to_full_reason"),
+        },
+    ),
+    AlphaEmsSensorDescription(
+        key="trade_executable",
+        translation_key="trade_executable",
+        icon="mdi:battery-sync",
+        value_fn=lambda data: data.get("trade_executable"),
+    ),
+    AlphaEmsSensorDescription(
+        key="trade_block_reason",
+        translation_key="trade_block_reason",
+        icon="mdi:alert-circle-outline",
+        value_fn=lambda data: data.get("trade_block_reason"),
     ),
     AlphaEmsSensorDescription(
         key="predicted_buy_kwh",

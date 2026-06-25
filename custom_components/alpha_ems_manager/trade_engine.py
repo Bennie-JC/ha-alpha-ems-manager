@@ -594,7 +594,17 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
 
     # --- Default result dict -------------------------------------------------
     result: dict[str, Any] = {
+        "trade_found": False,
+        "trade_executable": False,
+        "trade_block_reason": "insufficient_data",
         "trade_possible": False,
+        "available_energy_after_reserve": None,
+        "battery_at_sell_target": None,
+        "expected_pv_between_buy_and_sell": None,
+        "expected_load_between_buy_and_sell": None,
+        "available_battery_space_kwh": None,
+        "max_buy_possible_kwh": None,
+        "buy_to_full_reason": None,
         "predicted_buy_kwh": None,
         "predicted_buy_time": None,
         "predicted_buy_price": None,
@@ -816,6 +826,7 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
 
     # --- Minimum spread check ------------------------------------------------
     if minimum_spread is None or buy_price is None or sell_price is None:
+        result["trade_block_reason"] = "insufficient_data"
         result["safety_buy_reason"] = "insufficient_data"
         _compute_safety_buy(
             result, now_slot, safety_buy_dt, battery_current_kwh, battery_capacity_kwh,
@@ -826,154 +837,224 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
         )
         return result, model_changed
 
-    trade_possible = (
+    # --- Trade found: depends only on spread, not on battery/reserve/PV -----
+    trade_found = (
         best_spread is not None
         and best_spread >= minimum_spread
         and buy_dt is not None
         and sell_dt is not None
     )
-    result["trade_possible"] = trade_possible
+    result["trade_found"] = trade_found
 
-    # --- Trade calculation ---------------------------------------------------
-    if trade_possible and buy_dt is not None and sell_dt is not None:
-        sell_slot = _slot_index(sell_dt)
-        spans_to_sell = sell_dt.date() > now.date()
-
-        exp_load_until_sell = _load_in_window(
-            global_load_profile, now_slot, sell_slot, spans_to_sell
-        )
-        exp_pv_until_sell = _pv_in_window_curve(
-            pv_weights, now_slot, now_slot, sell_slot, spans_to_sell,
-            expected_remaining_pv_today, forecast_tomorrow,
-        )
-
-        batt_at_sell_no_buy = (
-            battery_current_kwh + exp_pv_until_sell - exp_load_until_sell
-        )
-
-        # ------------------------------------------------------------------
-        # Grid vs battery energy distinction (Red Flag 3 + 4 fix).
-        #
-        # required_buy_battery = battery energy needed to reach 100% at sell
-        # required_buy_grid    = grid energy to purchase (÷ charge_efficiency)
-        # max_buy_grid         = max grid energy purchasable before sell
-        # predicted_buy_kwh    = GRID energy purchased (sensor value)
-        # battery_energy_added = energy actually stored (× charge_efficiency)
-        # ------------------------------------------------------------------
-        required_buy_battery = max(
-            0.0, battery_capacity_kwh - batt_at_sell_no_buy
-        )
-        required_buy_grid = required_buy_battery / TRADE_CHARGE_EFFICIENCY
-
-        if not spans_to_sell:
-            quarters_until_sell = max(0, sell_slot - now_slot)
+    if not trade_found:
+        if best_spread is None or buy_dt is None or sell_dt is None:
+            block_reason = "no_valid_spread"
         else:
-            quarters_until_sell = max(0, (INTERVALS_PER_DAY - now_slot) + sell_slot)
-
-        max_buy_grid = quarters_until_sell * TRADE_MAX_CHARGE_POWER_KW * 0.25
-        predicted_buy_kwh = round(min(required_buy_grid, max_buy_grid), 3)
-        battery_energy_added = predicted_buy_kwh * TRADE_CHARGE_EFFICIENCY
-
-        can_reach_full = required_buy_grid <= max_buy_grid
-        missing_for_full = (
-            round(max(0.0, required_buy_grid - max_buy_grid), 3)
-            if not can_reach_full
-            else 0.0
+            block_reason = "spread_below_minimum"
+        result["trade_block_reason"] = block_reason
+        result["trade_executable"] = False
+        result["trade_possible"] = False
+        _compute_safety_buy(
+            result, now_slot, safety_buy_dt, battery_current_kwh, battery_capacity_kwh,
+            global_load_profile, pv_weights,
+            expected_remaining_pv_today, forecast_tomorrow,
+            reserve_floor_kwh, reserve_correction_factor, learning_confidence,
+            tomorrow_date,
         )
-        buy_limited = not can_reach_full
+        return result, model_changed
 
-        # Battery energy at sell (clamped to capacity).
-        exp_batt_at_sell = round(
-            max(0.0, min(batt_at_sell_no_buy + battery_energy_added, battery_capacity_kwh)),
-            3,
-        )
+    # --- Trade calculation (always runs when trade_found = True) -------------
+    # buy_dt and sell_dt are guaranteed non-None here (trade_found assertion).
+    sell_slot = _slot_index(sell_dt)
+    spans_to_sell = sell_dt.date() > now.date()
 
-        # Grid energy available from selling (discharge efficiency applied).
-        effective_sell_energy = exp_batt_at_sell * TRADE_DISCHARGE_EFFICIENCY
+    exp_load_until_sell = _load_in_window(
+        global_load_profile, now_slot, sell_slot, spans_to_sell
+    )
+    exp_pv_until_sell = _pv_in_window_curve(
+        pv_weights, now_slot, now_slot, sell_slot, spans_to_sell,
+        expected_remaining_pv_today, forecast_tomorrow,
+    )
 
-        # ------------------------------------------------------------------
-        # Reserve from sell to next cheapest buy (which is buy_dt itself).
-        # ------------------------------------------------------------------
-        next_buy_slot = _slot_index(buy_dt)
-        spans_sell_to_buy = buy_dt.date() > sell_dt.date()
+    batt_at_sell_no_buy = (
+        battery_current_kwh + exp_pv_until_sell - exp_load_until_sell
+    )
 
-        exp_load_sell_to_buy = _load_in_window(
-            global_load_profile, sell_slot, next_buy_slot, spans_sell_to_buy
-        )
-        remaining_after_sell = max(
-            0.0, expected_remaining_pv_today - exp_pv_until_sell
-        )
-        pv_sell_to_buy = _pv_in_window_curve(
-            pv_weights, sell_slot, sell_slot, next_buy_slot, spans_sell_to_buy,
-            remaining_after_sell, forecast_tomorrow,
-        )
+    # ------------------------------------------------------------------
+    # Grid vs battery energy distinction.
+    #
+    # required_buy_battery = battery energy needed to reach 100% at sell
+    # required_buy_grid    = grid energy to purchase (÷ charge_efficiency)
+    # max_buy_grid         = max grid energy purchasable before sell
+    # predicted_buy_kwh    = GRID energy purchased (sensor value)
+    # battery_energy_added = energy actually stored (× charge_efficiency)
+    # ------------------------------------------------------------------
+    required_buy_battery = max(
+        0.0, battery_capacity_kwh - batt_at_sell_no_buy
+    )
+    required_buy_grid = required_buy_battery / TRADE_CHARGE_EFFICIENCY
 
-        safety_margin_sell = (
-            exp_load_sell_to_buy * (1 - learning_confidence / 100) * 0.25
-        )
-        req_reserve_after_sell = max(
-            reserve_floor_kwh,
-            exp_load_sell_to_buy * reserve_correction_factor
-            - pv_sell_to_buy
-            + reserve_floor_kwh
-            + safety_margin_sell,
-        )
+    if not spans_to_sell:
+        quarters_until_sell = max(0, sell_slot - now_slot)
+    else:
+        quarters_until_sell = max(0, (INTERVALS_PER_DAY - now_slot) + sell_slot)
 
-        predicted_sell_kwh = round(
-            max(0.0, effective_sell_energy - req_reserve_after_sell), 3
-        )
-        if predicted_sell_kwh <= 0:
-            result["trade_possible"] = False
-            trade_possible = False
+    max_buy_grid = quarters_until_sell * TRADE_MAX_CHARGE_POWER_KW * 0.25
+    predicted_buy_kwh = round(min(required_buy_grid, max_buy_grid), 3)
+    battery_energy_added = predicted_buy_kwh * TRADE_CHARGE_EFFICIENCY
 
-        # Check if the intended sell can be discharged in time.
-        sell_slot_distance = 1  # sell happens AT the sell quarter
-        max_sell_grid = sell_slot_distance * TRADE_MAX_DISCHARGE_POWER_KW * 0.25
-        sell_limited = predicted_sell_kwh > max_sell_grid
+    can_reach_full = required_buy_grid <= max_buy_grid
+    missing_for_full = (
+        round(max(0.0, required_buy_grid - max_buy_grid), 3)
+        if not can_reach_full
+        else 0.0
+    )
+    buy_limited = not can_reach_full
 
-        # ------------------------------------------------------------------
-        # Profit accounting (grid energy × price; efficiency already baked in)
-        # ------------------------------------------------------------------
-        buy_cost = round(predicted_buy_kwh * buy_price, 4)
-        sell_income = round(predicted_sell_kwh * sell_price, 4)
-        predicted_profit = round(sell_income - buy_cost, 4)
+    # Battery energy at sell (clamped to capacity).
+    exp_batt_at_sell = round(
+        max(0.0, min(batt_at_sell_no_buy + battery_energy_added, battery_capacity_kwh)),
+        3,
+    )
 
-        # Gross profit = what we'd earn if round-trip efficiency were 100%.
-        gross_profit = round(predicted_buy_kwh * (sell_price - buy_price), 4)
+    # Grid energy available from selling (discharge efficiency applied).
+    effective_sell_energy = exp_batt_at_sell * TRADE_DISCHARGE_EFFICIENCY
 
-        # Total efficiency loss in kWh.
-        charge_loss = predicted_buy_kwh * (1.0 - TRADE_CHARGE_EFFICIENCY)
-        discharge_loss = exp_batt_at_sell * (1.0 - TRADE_DISCHARGE_EFFICIENCY)
-        efficiency_loss_kwh = round(charge_loss + discharge_loss, 3)
+    # ------------------------------------------------------------------
+    # Reserve from sell to next cheapest buy (which is buy_dt itself).
+    # ------------------------------------------------------------------
+    next_buy_slot = _slot_index(buy_dt)
+    spans_sell_to_buy = buy_dt.date() > sell_dt.date()
 
-        result.update({
-            "predicted_buy_kwh": predicted_buy_kwh,
-            "predicted_sell_kwh": predicted_sell_kwh,
-            "predicted_profit": predicted_profit,
-            "gross_profit": gross_profit,
-            "efficiency_loss_kwh": efficiency_loss_kwh,
-            "required_reserve_after_sell": round(req_reserve_after_sell, 3),
-            "expected_battery_at_sell": exp_batt_at_sell,
-            "battery_can_reach_full_before_sell": can_reach_full,
-            "predicted_missing_kwh_for_full": missing_for_full,
-            "buy_limited_by_charge_power": buy_limited,
-            "sell_limited_by_discharge_power": sell_limited,
-            "expected_pv_until_sell": round(exp_pv_until_sell, 3),
-            "expected_load_until_sell": round(exp_load_until_sell, 3),
-            "expected_pv_sell_to_next_buy": round(pv_sell_to_buy, 3),
-            "expected_load_sell_to_next_buy": round(exp_load_sell_to_buy, 3),
-            "buy_cost": buy_cost,
-            "sell_income": sell_income,
-        })
+    exp_load_sell_to_buy = _load_in_window(
+        global_load_profile, sell_slot, next_buy_slot, spans_sell_to_buy
+    )
+    remaining_after_sell = max(
+        0.0, expected_remaining_pv_today - exp_pv_until_sell
+    )
+    pv_sell_to_buy = _pv_in_window_curve(
+        pv_weights, sell_slot, sell_slot, next_buy_slot, spans_sell_to_buy,
+        remaining_after_sell, forecast_tomorrow,
+    )
 
-        _LOGGER.debug(
-            "Trade: buy_grid=%.3f kWh @ %.4f  sell=%.3f kWh @ %.4f  "
-            "profit=%.4f  gross=%.4f  eff_loss=%.3f kWh  trade_possible=%s",
-            predicted_buy_kwh, buy_price,
-            predicted_sell_kwh, sell_price,
-            predicted_profit, gross_profit, efficiency_loss_kwh,
-            result["trade_possible"],
-        )
+    safety_margin_sell = (
+        exp_load_sell_to_buy * (1 - learning_confidence / 100) * 0.25
+    )
+    req_reserve_after_sell = max(
+        reserve_floor_kwh,
+        exp_load_sell_to_buy * reserve_correction_factor
+        - pv_sell_to_buy
+        + reserve_floor_kwh
+        + safety_margin_sell,
+    )
+
+    predicted_sell_kwh = round(
+        max(0.0, effective_sell_energy - req_reserve_after_sell), 3
+    )
+
+    # Check if the intended sell can be discharged in time.
+    sell_slot_distance = 1  # sell happens AT the sell quarter
+    max_sell_grid = sell_slot_distance * TRADE_MAX_DISCHARGE_POWER_KW * 0.25
+    sell_limited = predicted_sell_kwh > max_sell_grid
+
+    # ------------------------------------------------------------------
+    # Profit accounting (grid energy × price; efficiency already baked in)
+    # ------------------------------------------------------------------
+    buy_cost = round(predicted_buy_kwh * buy_price, 4)
+    sell_income = round(predicted_sell_kwh * sell_price, 4)
+    predicted_profit = round(sell_income - buy_cost, 4)
+
+    # Gross profit = what we'd earn if round-trip efficiency were 100%.
+    gross_profit = round(predicted_buy_kwh * (sell_price - buy_price), 4)
+
+    # Total efficiency loss in kWh.
+    charge_loss = predicted_buy_kwh * (1.0 - TRADE_CHARGE_EFFICIENCY)
+    discharge_loss = exp_batt_at_sell * (1.0 - TRADE_DISCHARGE_EFFICIENCY)
+    efficiency_loss_kwh = round(charge_loss + discharge_loss, 3)
+
+    # ------------------------------------------------------------------
+    # Buy-to-full attributes (always computed when trade_found).
+    # ------------------------------------------------------------------
+    available_battery_space = max(0.0, battery_capacity_kwh - battery_current_kwh)
+
+    # PV and load specifically between buy window and sell window.
+    buy_slot_btw = _slot_index(buy_dt)
+    spans_buy_to_sell = sell_dt.date() > buy_dt.date()
+    exp_load_buy_to_sell = _load_in_window(
+        global_load_profile, buy_slot_btw, sell_slot, spans_buy_to_sell
+    )
+    exp_pv_buy_to_sell = _pv_in_window_curve(
+        pv_weights, now_slot, buy_slot_btw, sell_slot, spans_buy_to_sell,
+        expected_remaining_pv_today, forecast_tomorrow,
+    )
+
+    if available_battery_space <= 0.05:
+        buy_to_full_reason = "already_full_enough"
+    elif exp_pv_buy_to_sell >= available_battery_space:
+        buy_to_full_reason = "solar_will_fill_battery"
+    elif not can_reach_full:
+        buy_to_full_reason = "charge_power_limited"
+    elif predicted_buy_kwh > 0:
+        buy_to_full_reason = "buy_needed_to_reach_full"
+    else:
+        buy_to_full_reason = "already_full_enough"
+
+    # ------------------------------------------------------------------
+    # Trade executable: trade_found AND sell energy is available.
+    # ------------------------------------------------------------------
+    available_energy_after_reserve_raw = effective_sell_energy - req_reserve_after_sell
+
+    if req_reserve_after_sell > battery_capacity_kwh:
+        trade_block_reason = "reserve_after_sell_too_high"
+        trade_executable = False
+    elif predicted_sell_kwh <= 0:
+        trade_block_reason = "predicted_sell_energy_zero"
+        trade_executable = False
+    else:
+        trade_block_reason = "none"
+        trade_executable = True
+
+    result.update({
+        "predicted_buy_kwh": predicted_buy_kwh,
+        "predicted_sell_kwh": predicted_sell_kwh,
+        "predicted_profit": predicted_profit,
+        "gross_profit": gross_profit,
+        "efficiency_loss_kwh": efficiency_loss_kwh,
+        "required_reserve_after_sell": round(req_reserve_after_sell, 3),
+        "expected_battery_at_sell": exp_batt_at_sell,
+        "battery_can_reach_full_before_sell": can_reach_full,
+        "predicted_missing_kwh_for_full": missing_for_full,
+        "buy_limited_by_charge_power": buy_limited,
+        "sell_limited_by_discharge_power": sell_limited,
+        "expected_pv_until_sell": round(exp_pv_until_sell, 3),
+        "expected_load_until_sell": round(exp_load_until_sell, 3),
+        "expected_pv_sell_to_next_buy": round(pv_sell_to_buy, 3),
+        "expected_load_sell_to_next_buy": round(exp_load_sell_to_buy, 3),
+        "buy_cost": buy_cost,
+        "sell_income": sell_income,
+        # New trade status fields.
+        "trade_executable": trade_executable,
+        "trade_possible": trade_executable,
+        "trade_block_reason": trade_block_reason,
+        "available_energy_after_reserve": round(available_energy_after_reserve_raw, 3),
+        # Buy-to-full diagnostics.
+        "battery_at_sell_target": round(battery_capacity_kwh, 3),
+        "available_battery_space_kwh": round(available_battery_space, 3),
+        "max_buy_possible_kwh": round(max_buy_grid, 3),
+        "expected_pv_between_buy_and_sell": round(exp_pv_buy_to_sell, 3),
+        "expected_load_between_buy_and_sell": round(exp_load_buy_to_sell, 3),
+        "buy_to_full_reason": buy_to_full_reason,
+    })
+
+    _LOGGER.debug(
+        "Trade: buy_grid=%.3f kWh @ %.4f  sell=%.3f kWh @ %.4f  "
+        "profit=%.4f  gross=%.4f  eff_loss=%.3f kWh  "
+        "trade_found=%s trade_executable=%s block=%s",
+        predicted_buy_kwh, buy_price,
+        predicted_sell_kwh, sell_price,
+        predicted_profit, gross_profit, efficiency_loss_kwh,
+        trade_found, trade_executable, trade_block_reason,
+    )
 
     # --- Safety buy (always evaluated, uses cheapest future quarter) --------
     _compute_safety_buy(
