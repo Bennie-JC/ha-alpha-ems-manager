@@ -5,6 +5,10 @@ learned house load and PV correction models combined with Frank dynamic prices.
 
 This module is PREDICTION ONLY. It does not issue any write commands, does not
 control the battery, and does not modify any existing learning models.
+
+Trade selection is TODAY ONLY (buy_today < sell_today, both on the same calendar
+day). Tomorrow prices are used exclusively to determine the next reserve buy
+window that follows today's sell.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Slot / time helpers  (unchanged from v1)
+# Slot / time helpers
 # ---------------------------------------------------------------------------
 
 def _slot_index(dt: datetime) -> int:
@@ -309,7 +313,7 @@ def _select_best_spread_pair(
 
 
 # ---------------------------------------------------------------------------
-# Load window helper  (unchanged from v1)
+# Load window helper
 # ---------------------------------------------------------------------------
 
 def _load_in_window(
@@ -327,7 +331,7 @@ def _load_in_window(
 
 
 # ---------------------------------------------------------------------------
-# Bell-curve PV distribution  (replaces uniform daylight distribution)
+# Bell-curve PV distribution
 # ---------------------------------------------------------------------------
 
 def _build_pv_slot_weights(
@@ -437,7 +441,7 @@ def _pv_in_window_curve(
 
 
 # ---------------------------------------------------------------------------
-# Trade Prediction Learning Model  (unchanged from v1)
+# Trade Prediction Learning Model
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -499,7 +503,7 @@ class TradePredictionLearningModel:
 # Main computation entry point
 # ---------------------------------------------------------------------------
 
-def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
+def compute_trade_prediction(  # noqa: C901
     now: datetime,
     # Battery state.
     battery_current_kwh: float | None,
@@ -543,23 +547,21 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
     trade-related keys to merge into coordinator data and ``model_changed`` is
     ``True`` when ``trade_model`` was mutated (day rollover) and should be saved.
 
-    The global_load_profile is the EV-corrected learned load — EV charging never
-    inflates any predicted load or safety buy values.
+    Trade selection is TODAY ONLY (buy_today < sell_today on the same calendar
+    date). Tomorrow prices are used exclusively for the reserve window that
+    follows the sell: sell_today → cheapest_tomorrow (or cheapest_today_fallback).
     """
     model_changed = False
     tomorrow_date = now.date() + timedelta(days=1)
     forecast_tomorrow = corrected_forecast_tomorrow or 0.0
 
     # --- Build PV bell-curve -------------------------------------------------
-    # Determine sunrise/sunset slots (sun entity preferred, fallback to constants).
     sr_slot = sunrise_slot if sunrise_slot is not None else PV_DAYLIGHT_START_SLOT
     ss_slot = sunset_slot if sunset_slot is not None else PV_DAYLIGHT_END_SLOT
-    # Guard against inverted or degenerate values.
     if ss_slot <= sr_slot:
         sr_slot = PV_DAYLIGHT_START_SLOT
         ss_slot = PV_DAYLIGHT_END_SLOT
 
-    # Determine east/west fraction from actual production sensors.
     east_fraction: float | None = None
     east_used = False
     west_used = False
@@ -594,10 +596,25 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
 
     # --- Default result dict -------------------------------------------------
     result: dict[str, Any] = {
+        # Trade selection scope (always today_only).
+        "trade_selection_scope": "today_only",
         "trade_found": False,
         "trade_executable": False,
         "trade_block_reason": "insufficient_data",
         "trade_possible": False,
+        # Selected today trade.
+        "best_today_buy_time": None,
+        "best_today_buy_price": None,
+        "best_today_sell_time": None,
+        "best_today_sell_price": None,
+        "best_today_trade_spread": None,
+        # Reserve window diagnostics.
+        "reserve_window_start": None,
+        "reserve_window_end": None,
+        "next_reserve_buy_time": None,
+        "next_reserve_buy_price": None,
+        "next_reserve_buy_source": "insufficient_data",
+        # Energy calculations.
         "available_energy_after_reserve": None,
         "battery_at_sell_target": None,
         "expected_pv_between_buy_and_sell": None,
@@ -625,7 +642,7 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
         "safety_buy_kwh": 0.0,
         "safety_buy_time": None,
         "safety_buy_reason": "insufficient_data",
-        "next_buy_source": "today_fallback",
+        "next_buy_source": "insufficient_data",
         "expected_pv_until_sell": None,
         "expected_load_until_sell": None,
         "expected_pv_until_buy": None,
@@ -658,12 +675,11 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
         "trade_prediction_days": trade_model.trade_prediction_days,
         "trade_prediction_confidence": trade_model.trade_prediction_confidence,
         "trade_prediction_status": trade_model.trade_prediction_status,
-        # Spread selection diagnostics (populated after price extraction).
+        # Spread selection diagnostics.
         "trade_spread": None,
         "spread_selection_mode": "chronological_quarter_pairs",
         "valid_spread_pairs_checked": 0,
         "rejected_non_chronological_pairs": 0,
-        "best_today_trade_spread": None,
         "best_tomorrow_trade_spread": None,
         "best_cross_day_trade_spread": None,
     }
@@ -696,45 +712,38 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
     now_slot = _slot_index(now)
     today_date = now.date()
 
-    # --- Extract quarter-hour prices and select best chronological pair ------
+    # =========================================================================
+    # STEP 1: TRADE SELECTION — TODAY ONLY
     #
-    # Primary: build a sorted list of all future quarter-hour (datetime, price)
-    # slots from the Frank full-price sensors and find the (buy, sell) pair
-    # that maximises spread while guaranteeing buy_time < sell_time.
-    #
-    # Fallback: when the full-price list is unavailable, revert to the two
-    # Frank time-point sensors (cheapest / most-expensive), which gives a
-    # degenerate 1-pair evaluation with the old chronological guard.
-    # ---------------------------------------------------------------------------
+    # Extract quarter prices for today only. Find the (buy_today, sell_today)
+    # pair that maximises spread where buy_today < sell_today, both on today.
+    # Tomorrow prices are NEVER used for trade selection.
+    # =========================================================================
 
     prices_today_raw = _extract_all_quarter_prices(frank_prices_today_attrs, today_date)
-    prices_today = [(dt, p) for dt, p in prices_today_raw if dt > now]
+    # Only future slots on today's calendar date.
+    prices_today = [
+        (dt, p) for dt, p in prices_today_raw
+        if dt.date() == today_date and dt > now
+    ]
     prices_tomorrow = _extract_all_quarter_prices(frank_prices_tomorrow_attrs, tomorrow_date)
-    all_prices = sorted(prices_today + prices_tomorrow, key=lambda x: x[0])
 
     buy_dt: datetime | None = None
     buy_price: float | None = None
     sell_dt: datetime | None = None
     sell_price: float | None = None
     best_spread: float | None = None
-    next_buy_source = "insufficient_data"
-    safety_buy_dt: datetime | None = None
     spread_selection_mode: str
+    spread_diag: dict
 
-    if len(all_prices) >= 2:
+    if len(prices_today) >= 2:
         spread_selection_mode = "chronological_quarter_pairs"
+        # Pass only today prices — trade selection is today_only.
         buy_dt, buy_price, sell_dt, sell_price, best_spread, spread_diag = (
-            _select_best_spread_pair(all_prices, today_date, tomorrow_date)
+            _select_best_spread_pair(prices_today, today_date, tomorrow_date)
         )
-        if buy_dt is not None:
-            next_buy_source = (
-                "tomorrow_prices" if buy_dt.date() == tomorrow_date else "today_prices"
-            )
-        # Safety buy uses the globally cheapest future quarter for scheduling.
-        safety_buy_dt = min(all_prices, key=lambda x: x[1])[0]
     else:
-        # Fallback: only Frank time-point sensors are available — evaluate the
-        # single (cheapest, most-expensive) pair with a chronological guard.
+        # Fallback: use Frank time-point sensors for today only.
         spread_selection_mode = "fallback_two_point"
         spread_diag = {
             "valid_spread_pairs_checked": 0,
@@ -743,65 +752,95 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
             "best_tomorrow_trade_spread": None,
             "best_cross_day_trade_spread": None,
         }
-        if frank_cheapest_time_tomorrow:
-            buy_dt = _parse_frank_time(frank_cheapest_time_tomorrow, tomorrow_date)
-            if buy_dt is not None:
-                next_buy_source = "tomorrow_prices"
-                buy_price = _extract_price_from_attrs(frank_cheapest_tomorrow_attrs, buy_dt)
-                if buy_price is None:
-                    buy_price = _extract_price_from_attrs(frank_prices_tomorrow_attrs, buy_dt)
-                if buy_price is None:
-                    buy_price = frank_price_tomorrow
-        if buy_dt is None and frank_cheapest_time_today:
+
+        # Buy candidate: cheapest today only (must be future and today).
+        if frank_cheapest_time_today:
             cand = _parse_frank_time(frank_cheapest_time_today, today_date)
-            if cand is not None and cand > now:
+            if cand is not None and cand > now and cand.date() == today_date:
                 buy_dt = cand
-                next_buy_source = "today_fallback"
                 buy_price = _extract_price_from_attrs(frank_cheapest_today_attrs, buy_dt)
                 if buy_price is None:
                     buy_price = _extract_price_from_attrs(frank_prices_today_attrs, buy_dt)
                 if buy_price is None:
                     buy_price = frank_price_today
-        sell_candidates: list[tuple[datetime, float | None]] = []
+
+        # Sell candidate: most expensive today only (must be future, today, and after buy).
         if frank_most_expensive_time_today:
             cand = _parse_frank_time(frank_most_expensive_time_today, today_date)
-            if cand is not None and cand > now:
-                p = _extract_price_from_attrs(frank_expensive_today_attrs, cand)
-                if p is None:
-                    p = _extract_price_from_attrs(frank_prices_today_attrs, cand)
-                sell_candidates.append((cand, p))
-        if frank_most_expensive_time_tomorrow:
-            cand = _parse_frank_time(frank_most_expensive_time_tomorrow, tomorrow_date)
-            if cand is not None:
-                p = _extract_price_from_attrs(frank_expensive_tomorrow_attrs, cand)
-                if p is None:
-                    p = _extract_price_from_attrs(frank_prices_tomorrow_attrs, cand)
-                sell_candidates.append((cand, p))
-        for cand_dt, cand_price in sell_candidates:
-            if buy_dt is not None and cand_dt <= buy_dt:
-                continue
-            if sell_dt is None:
-                sell_dt, sell_price = cand_dt, cand_price
-            elif (
-                cand_price is not None
-                and sell_price is not None
-                and cand_price > sell_price
+            if (
+                cand is not None
+                and cand > now
+                and cand.date() == today_date
+                and (buy_dt is None or cand > buy_dt)
             ):
-                sell_dt, sell_price = cand_dt, cand_price
+                sell_dt = cand
+                sell_price = _extract_price_from_attrs(frank_expensive_today_attrs, cand)
+                if sell_price is None:
+                    sell_price = _extract_price_from_attrs(frank_prices_today_attrs, cand)
+
         best_spread = (
             (sell_price - buy_price)
             if sell_price is not None and buy_price is not None
             else None
         )
-        safety_buy_dt = buy_dt
 
-    # Publish resolved pair + spread diagnostics into result.
+    # =========================================================================
+    # STEP 2: NEXT RESERVE BUY
+    #
+    # After the sell, determine the next opportunity to buy cheaply.
+    # Prefer the cheapest tomorrow quarter. If tomorrow prices are unavailable,
+    # fall back to the cheapest remaining today quarter after sell_dt.
+    # This is ONLY used for the reserve window calculation — not for the trade.
+    # =========================================================================
+
+    next_reserve_buy_dt: datetime | None = None
+    next_reserve_buy_price: float | None = None
+    next_reserve_buy_source: str = "insufficient_data"
+
+    if prices_tomorrow:
+        cheapest_tomorrow = min(prices_tomorrow, key=lambda x: x[1])
+        next_reserve_buy_dt = cheapest_tomorrow[0]
+        next_reserve_buy_price = cheapest_tomorrow[1]
+        next_reserve_buy_source = "tomorrow_prices"
+    elif sell_dt is not None and prices_today:
+        # Fallback: cheapest remaining today quarter after sell.
+        candidates_after_sell = [(dt, p) for dt, p in prices_today if dt > sell_dt]
+        if candidates_after_sell:
+            cheapest_today_fallback = min(candidates_after_sell, key=lambda x: x[1])
+            next_reserve_buy_dt = cheapest_today_fallback[0]
+            next_reserve_buy_price = cheapest_today_fallback[1]
+            next_reserve_buy_source = "today_fallback"
+    elif prices_today:
+        # No sell yet or no candidates after sell: cheapest remaining today.
+        cheapest_today_fallback = min(prices_today, key=lambda x: x[1])
+        next_reserve_buy_dt = cheapest_today_fallback[0]
+        next_reserve_buy_price = cheapest_today_fallback[1]
+        next_reserve_buy_source = "today_fallback"
+
+    # Safety buy uses the same next_reserve_buy_dt (cheapest next opportunity).
+    safety_buy_dt = next_reserve_buy_dt
+
+    # Publish spread selection + reserve buy diagnostics.
     result["spread_selection_mode"] = spread_selection_mode
-    result["next_buy_source"] = next_buy_source
+    result["next_buy_source"] = next_reserve_buy_source
+    result["next_reserve_buy_source"] = next_reserve_buy_source
     result.update(spread_diag)
+
+    if next_reserve_buy_dt is not None:
+        result["next_reserve_buy_time"] = next_reserve_buy_dt.isoformat()
+        result["next_reserve_buy_price"] = (
+            round(next_reserve_buy_price, 4)
+            if next_reserve_buy_price is not None
+            else None
+        )
+
     if buy_dt is not None:
         result["predicted_buy_time"] = buy_dt.isoformat()
         result["predicted_buy_price"] = (
+            round(buy_price, 4) if buy_price is not None else None
+        )
+        result["best_today_buy_time"] = buy_dt.isoformat()
+        result["best_today_buy_price"] = (
             round(buy_price, 4) if buy_price is not None else None
         )
     if sell_dt is not None:
@@ -809,12 +848,17 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
         result["predicted_sell_price"] = (
             round(sell_price, 4) if sell_price is not None else None
         )
+        result["best_today_sell_time"] = sell_dt.isoformat()
+        result["best_today_sell_price"] = (
+            round(sell_price, 4) if sell_price is not None else None
+        )
     if best_spread is not None:
         result["trade_spread"] = round(best_spread, 4)
+        result["best_today_trade_spread"] = round(best_spread, 4)
 
     _LOGGER.debug(
-        "Spread selection: mode=%s pairs_checked=%d buy=%s@%.4f "
-        "sell=%s@%.4f spread=%.4f",
+        "Trade selection (today_only): mode=%s pairs_checked=%d buy=%s@%.4f "
+        "sell=%s@%.4f spread=%.4f | next_reserve_buy=%s source=%s",
         spread_selection_mode,
         spread_diag["valid_spread_pairs_checked"],
         buy_dt.isoformat() if buy_dt else "None",
@@ -822,6 +866,8 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
         sell_dt.isoformat() if sell_dt else "None",
         sell_price or 0.0,
         best_spread or 0.0,
+        next_reserve_buy_dt.isoformat() if next_reserve_buy_dt else "None",
+        next_reserve_buy_source,
     )
 
     # --- Minimum spread check ------------------------------------------------
@@ -837,7 +883,7 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
         )
         return result, model_changed
 
-    # --- Trade found: depends only on spread, not on battery/reserve/PV -----
+    # --- Trade found: depends only on spread, not on battery/reserve/PV ------
     trade_found = (
         best_spread is not None
         and best_spread >= minimum_spread
@@ -863,53 +909,84 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
         )
         return result, model_changed
 
-    # --- Trade calculation (always runs when trade_found = True) -------------
-    # buy_dt and sell_dt are guaranteed non-None here (trade_found assertion).
-    sell_slot = _slot_index(sell_dt)
-    spans_to_sell = sell_dt.date() > now.date()
+    # =========================================================================
+    # STEP 3: TRADE CALCULATION
+    #
+    # buy_dt and sell_dt are both today (guaranteed by trade selection).
+    # =========================================================================
 
-    exp_load_until_sell = _load_in_window(
-        global_load_profile, now_slot, sell_slot, spans_to_sell
-    )
+    sell_slot = _slot_index(sell_dt)
+    buy_slot = _slot_index(buy_dt)
+
+    # Both buy and sell are today — no midnight crossing for trade window.
+    exp_load_until_sell = _load_in_window(global_load_profile, now_slot, sell_slot, False)
     exp_pv_until_sell = _pv_in_window_curve(
-        pv_weights, now_slot, now_slot, sell_slot, spans_to_sell,
+        pv_weights, now_slot, now_slot, sell_slot, False,
         expected_remaining_pv_today, forecast_tomorrow,
     )
 
-    batt_at_sell_no_buy = (
-        battery_current_kwh + exp_pv_until_sell - exp_load_until_sell
-    )
+    # Battery at sell without any trade buy (natural PV and load only).
+    batt_at_sell_no_buy = battery_current_kwh + exp_pv_until_sell - exp_load_until_sell
 
-    # ------------------------------------------------------------------
-    # Grid vs battery energy distinction.
+    # =========================================================================
+    # STEP 4: PREDICTED BUY ENERGY
     #
-    # required_buy_battery = battery energy needed to reach 100% at sell
-    # required_buy_grid    = grid energy to purchase (÷ charge_efficiency)
-    # max_buy_grid         = max grid energy purchasable before sell
-    # predicted_buy_kwh    = GRID energy purchased (sensor value)
-    # battery_energy_added = energy actually stored (× charge_efficiency)
-    # ------------------------------------------------------------------
-    required_buy_battery = max(
-        0.0, battery_capacity_kwh - batt_at_sell_no_buy
-    )
-    required_buy_grid = required_buy_battery / TRADE_CHARGE_EFFICIENCY
+    # How much grid energy must be purchased at buy_today so the battery
+    # reaches 100% at sell_today, accounting for PV and load between buy/sell.
+    #
+    # Formula:
+    #   predicted_buy_kwh = battery_capacity - current_battery
+    #                       - expected_pv_between_buy_and_sell
+    #                       + expected_load_between_buy_and_sell
+    #
+    # Clamped [0, battery_space] and limited by charging capability.
+    # =========================================================================
 
-    if not spans_to_sell:
-        quarters_until_sell = max(0, sell_slot - now_slot)
+    exp_pv_buy_to_sell = _pv_in_window_curve(
+        pv_weights, now_slot, buy_slot, sell_slot, False,
+        expected_remaining_pv_today, forecast_tomorrow,
+    )
+    exp_load_buy_to_sell = _load_in_window(global_load_profile, buy_slot, sell_slot, False)
+
+    battery_space = max(0.0, battery_capacity_kwh - battery_current_kwh)
+
+    raw_buy_kwh = (
+        battery_capacity_kwh
+        - battery_current_kwh
+        - exp_pv_buy_to_sell
+        + exp_load_buy_to_sell
+    )
+
+    max_buy_possible = 0.0
+
+    if raw_buy_kwh <= 0 or exp_pv_buy_to_sell >= battery_space:
+        predicted_buy_kwh = 0.0
+        buy_to_full_reason = "solar_will_fill_battery"
+        can_reach_full = True
+        missing_for_full = 0.0
+        buy_limited = False
+    elif battery_space <= 0.05:
+        predicted_buy_kwh = 0.0
+        buy_to_full_reason = "already_full_enough"
+        can_reach_full = True
+        missing_for_full = 0.0
+        buy_limited = False
     else:
-        quarters_until_sell = max(0, (INTERVALS_PER_DAY - now_slot) + sell_slot)
+        quarters_until_buy = max(0, buy_slot - now_slot)
+        max_buy_possible = quarters_until_buy * TRADE_MAX_CHARGE_POWER_KW * 0.25
+        predicted_buy_kwh = round(
+            min(raw_buy_kwh, battery_space, max_buy_possible), 3
+        )
+        can_reach_full = raw_buy_kwh <= max_buy_possible and raw_buy_kwh <= battery_space
+        missing_for_full = (
+            round(max(0.0, raw_buy_kwh - max_buy_possible), 3) if not can_reach_full else 0.0
+        )
+        buy_limited = not can_reach_full
+        buy_to_full_reason = (
+            "charge_power_limited" if buy_limited else "buy_needed_to_reach_full"
+        )
 
-    max_buy_grid = quarters_until_sell * TRADE_MAX_CHARGE_POWER_KW * 0.25
-    predicted_buy_kwh = round(min(required_buy_grid, max_buy_grid), 3)
     battery_energy_added = predicted_buy_kwh * TRADE_CHARGE_EFFICIENCY
-
-    can_reach_full = required_buy_grid <= max_buy_grid
-    missing_for_full = (
-        round(max(0.0, required_buy_grid - max_buy_grid), 3)
-        if not can_reach_full
-        else 0.0
-    )
-    buy_limited = not can_reach_full
 
     # Battery energy at sell (clamped to capacity).
     exp_batt_at_sell = round(
@@ -917,97 +994,134 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
         3,
     )
 
-    # Grid energy available from selling (discharge efficiency applied).
-    effective_sell_energy = exp_batt_at_sell * TRADE_DISCHARGE_EFFICIENCY
+    # =========================================================================
+    # STEP 5: RESERVE WINDOW — sell_today → next_reserve_buy
+    #
+    # Calculate reserve only for the window between the selected sell and the
+    # next opportunity to buy (cheapest tomorrow, or fallback cheapest today).
+    # Formula:
+    #   required_reserve_after_sell =
+    #     max(reserve_floor,
+    #         expected_load_sell_to_next_buy * reserve_correction_factor
+    #         - expected_pv_sell_to_next_buy
+    #         + reserve_floor
+    #         + safety_margin)
+    # =========================================================================
 
-    # ------------------------------------------------------------------
-    # Reserve from sell to next cheapest buy (which is buy_dt itself).
-    # ------------------------------------------------------------------
-    next_buy_slot = _slot_index(buy_dt)
-    spans_sell_to_buy = buy_dt.date() > sell_dt.date()
+    exp_load_sell_to_next_buy = 0.0
+    pv_sell_to_next_buy = 0.0
+    req_reserve_after_sell: float
 
-    exp_load_sell_to_buy = _load_in_window(
-        global_load_profile, sell_slot, next_buy_slot, spans_sell_to_buy
-    )
-    remaining_after_sell = max(
-        0.0, expected_remaining_pv_today - exp_pv_until_sell
-    )
-    pv_sell_to_buy = _pv_in_window_curve(
-        pv_weights, sell_slot, sell_slot, next_buy_slot, spans_sell_to_buy,
-        remaining_after_sell, forecast_tomorrow,
-    )
+    if next_reserve_buy_dt is not None:
+        next_buy_slot_reserve = _slot_index(next_reserve_buy_dt)
+        spans_sell_to_reserve_buy = next_reserve_buy_dt.date() > sell_dt.date()
 
-    safety_margin_sell = (
-        exp_load_sell_to_buy * (1 - learning_confidence / 100) * 0.25
-    )
-    req_reserve_after_sell = max(
-        reserve_floor_kwh,
-        exp_load_sell_to_buy * reserve_correction_factor
-        - pv_sell_to_buy
-        + reserve_floor_kwh
-        + safety_margin_sell,
-    )
+        exp_load_sell_to_next_buy = _load_in_window(
+            global_load_profile, sell_slot, next_buy_slot_reserve, spans_sell_to_reserve_buy
+        )
+        remaining_pv_after_sell = max(0.0, expected_remaining_pv_today - exp_pv_until_sell)
+        pv_sell_to_next_buy = _pv_in_window_curve(
+            pv_weights, sell_slot, sell_slot, next_buy_slot_reserve,
+            spans_sell_to_reserve_buy,
+            remaining_pv_after_sell, forecast_tomorrow,
+        )
 
-    predicted_sell_kwh = round(
-        max(0.0, effective_sell_energy - req_reserve_after_sell), 3
-    )
+        safety_margin_sell = (
+            exp_load_sell_to_next_buy * (1 - learning_confidence / 100) * 0.25
+        )
+        req_reserve_after_sell = max(
+            reserve_floor_kwh,
+            exp_load_sell_to_next_buy * reserve_correction_factor
+            - pv_sell_to_next_buy
+            + reserve_floor_kwh
+            + safety_margin_sell,
+        )
 
-    # Check if the intended sell can be discharged in time.
-    sell_slot_distance = 1  # sell happens AT the sell quarter
-    max_sell_grid = sell_slot_distance * TRADE_MAX_DISCHARGE_POWER_KW * 0.25
+        result.update({
+            "reserve_window_start": sell_dt.isoformat(),
+            "reserve_window_end": next_reserve_buy_dt.isoformat(),
+            "expected_load_sell_to_next_buy": round(exp_load_sell_to_next_buy, 3),
+            "expected_pv_sell_to_next_buy": round(pv_sell_to_next_buy, 3),
+        })
+
+        _LOGGER.debug(
+            "Reserve window: sell=%s → next_buy=%s (source=%s) "
+            "load=%.3f pv=%.3f safety=%.3f → reserve=%.3f",
+            sell_dt.isoformat(), next_reserve_buy_dt.isoformat(),
+            next_reserve_buy_source,
+            exp_load_sell_to_next_buy, pv_sell_to_next_buy,
+            safety_margin_sell, req_reserve_after_sell,
+        )
+    else:
+        # No next buy info → hold the reserve floor as a minimum.
+        req_reserve_after_sell = reserve_floor_kwh
+        result.update({
+            "reserve_window_start": sell_dt.isoformat(),
+            "reserve_window_end": None,
+            "expected_load_sell_to_next_buy": 0.0,
+            "expected_pv_sell_to_next_buy": 0.0,
+        })
+
+    # Guard: reserve cannot exceed battery capacity.
+    if req_reserve_after_sell > battery_capacity_kwh:
+        result.update({
+            "required_reserve_after_sell": round(req_reserve_after_sell, 3),
+            "expected_battery_at_sell": exp_batt_at_sell,
+            "trade_block_reason": "reserve_after_sell_too_high",
+            "trade_executable": False,
+            "trade_possible": False,
+            "predicted_buy_kwh": predicted_buy_kwh,
+            "predicted_sell_kwh": 0.0,
+            "expected_pv_until_sell": round(exp_pv_until_sell, 3),
+            "expected_load_until_sell": round(exp_load_until_sell, 3),
+            "expected_pv_between_buy_and_sell": round(exp_pv_buy_to_sell, 3),
+            "expected_load_between_buy_and_sell": round(exp_load_buy_to_sell, 3),
+            "available_battery_space_kwh": round(battery_space, 3),
+            "max_buy_possible_kwh": round(max_buy_possible, 3),
+            "buy_to_full_reason": buy_to_full_reason,
+            "battery_can_reach_full_before_sell": can_reach_full,
+            "predicted_missing_kwh_for_full": missing_for_full,
+            "buy_limited_by_charge_power": buy_limited,
+        })
+        _compute_safety_buy(
+            result, now_slot, safety_buy_dt, battery_current_kwh, battery_capacity_kwh,
+            global_load_profile, pv_weights,
+            expected_remaining_pv_today, forecast_tomorrow,
+            reserve_floor_kwh, reserve_correction_factor, learning_confidence,
+            tomorrow_date,
+        )
+        return result, model_changed
+
+    # =========================================================================
+    # STEP 6: PREDICTED SELL ENERGY
+    #
+    # Formula:
+    #   predicted_sell_kwh = expected_battery_at_sell - required_reserve_after_sell
+    # Clamped >= 0.
+    # =========================================================================
+
+    predicted_sell_kwh = round(max(0.0, exp_batt_at_sell - req_reserve_after_sell), 3)
+
+    # Discharge power limit (single sell quarter).
+    max_sell_grid = TRADE_MAX_DISCHARGE_POWER_KW * 0.25
     sell_limited = predicted_sell_kwh > max_sell_grid
 
-    # ------------------------------------------------------------------
-    # Profit accounting (grid energy × price; efficiency already baked in)
-    # ------------------------------------------------------------------
+    # --- Profit accounting ---------------------------------------------------
     buy_cost = round(predicted_buy_kwh * buy_price, 4)
     sell_income = round(predicted_sell_kwh * sell_price, 4)
     predicted_profit = round(sell_income - buy_cost, 4)
 
-    # Gross profit = what we'd earn if round-trip efficiency were 100%.
     gross_profit = round(predicted_buy_kwh * (sell_price - buy_price), 4)
 
-    # Total efficiency loss in kWh.
     charge_loss = predicted_buy_kwh * (1.0 - TRADE_CHARGE_EFFICIENCY)
     discharge_loss = exp_batt_at_sell * (1.0 - TRADE_DISCHARGE_EFFICIENCY)
     efficiency_loss_kwh = round(charge_loss + discharge_loss, 3)
 
-    # ------------------------------------------------------------------
-    # Buy-to-full attributes (always computed when trade_found).
-    # ------------------------------------------------------------------
     available_battery_space = max(0.0, battery_capacity_kwh - battery_current_kwh)
+    available_energy_after_reserve_raw = exp_batt_at_sell - req_reserve_after_sell
 
-    # PV and load specifically between buy window and sell window.
-    buy_slot_btw = _slot_index(buy_dt)
-    spans_buy_to_sell = sell_dt.date() > buy_dt.date()
-    exp_load_buy_to_sell = _load_in_window(
-        global_load_profile, buy_slot_btw, sell_slot, spans_buy_to_sell
-    )
-    exp_pv_buy_to_sell = _pv_in_window_curve(
-        pv_weights, now_slot, buy_slot_btw, sell_slot, spans_buy_to_sell,
-        expected_remaining_pv_today, forecast_tomorrow,
-    )
-
-    if available_battery_space <= 0.05:
-        buy_to_full_reason = "already_full_enough"
-    elif exp_pv_buy_to_sell >= available_battery_space:
-        buy_to_full_reason = "solar_will_fill_battery"
-    elif not can_reach_full:
-        buy_to_full_reason = "charge_power_limited"
-    elif predicted_buy_kwh > 0:
-        buy_to_full_reason = "buy_needed_to_reach_full"
-    else:
-        buy_to_full_reason = "already_full_enough"
-
-    # ------------------------------------------------------------------
-    # Trade executable: trade_found AND sell energy is available.
-    # ------------------------------------------------------------------
-    available_energy_after_reserve_raw = effective_sell_energy - req_reserve_after_sell
-
-    if req_reserve_after_sell > battery_capacity_kwh:
-        trade_block_reason = "reserve_after_sell_too_high"
-        trade_executable = False
-    elif predicted_sell_kwh <= 0:
+    # --- Trade executable ----------------------------------------------------
+    if predicted_sell_kwh <= 0:
         trade_block_reason = "predicted_sell_energy_zero"
         trade_executable = False
     else:
@@ -1028,19 +1142,15 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
         "sell_limited_by_discharge_power": sell_limited,
         "expected_pv_until_sell": round(exp_pv_until_sell, 3),
         "expected_load_until_sell": round(exp_load_until_sell, 3),
-        "expected_pv_sell_to_next_buy": round(pv_sell_to_buy, 3),
-        "expected_load_sell_to_next_buy": round(exp_load_sell_to_buy, 3),
         "buy_cost": buy_cost,
         "sell_income": sell_income,
-        # New trade status fields.
         "trade_executable": trade_executable,
         "trade_possible": trade_executable,
         "trade_block_reason": trade_block_reason,
         "available_energy_after_reserve": round(available_energy_after_reserve_raw, 3),
-        # Buy-to-full diagnostics.
         "battery_at_sell_target": round(battery_capacity_kwh, 3),
         "available_battery_space_kwh": round(available_battery_space, 3),
-        "max_buy_possible_kwh": round(max_buy_grid, 3),
+        "max_buy_possible_kwh": round(max_buy_possible, 3),
         "expected_pv_between_buy_and_sell": round(exp_pv_buy_to_sell, 3),
         "expected_load_between_buy_and_sell": round(exp_load_buy_to_sell, 3),
         "buy_to_full_reason": buy_to_full_reason,
@@ -1049,14 +1159,16 @@ def compute_trade_prediction(  # noqa: C901 (intentionally long for clarity)
     _LOGGER.debug(
         "Trade: buy_grid=%.3f kWh @ %.4f  sell=%.3f kWh @ %.4f  "
         "profit=%.4f  gross=%.4f  eff_loss=%.3f kWh  "
+        "reserve_after_sell=%.3f  batt_at_sell=%.3f  "
         "trade_found=%s trade_executable=%s block=%s",
         predicted_buy_kwh, buy_price,
         predicted_sell_kwh, sell_price,
         predicted_profit, gross_profit, efficiency_loss_kwh,
+        req_reserve_after_sell, exp_batt_at_sell,
         trade_found, trade_executable, trade_block_reason,
     )
 
-    # --- Safety buy (always evaluated, uses cheapest future quarter) --------
+    # --- Safety buy (always evaluated, uses cheapest next opportunity) -------
     _compute_safety_buy(
         result, now_slot, safety_buy_dt, battery_current_kwh, battery_capacity_kwh,
         global_load_profile, pv_weights,
@@ -1087,7 +1199,7 @@ def _compute_safety_buy(
     if buy_dt is None:
         result["safety_buy_reason"] = (
             "waiting_for_tomorrow_prices"
-            if result.get("next_buy_source") == "today_fallback"
+            if result.get("next_reserve_buy_source") == "today_fallback"
             else "insufficient_data"
         )
         return
