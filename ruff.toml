@@ -1,0 +1,48 @@
+# Lint configuration for Alpha EMS Manager.
+#
+# Made explicit rather than relying on Ruff's defaults so that a Ruff upgrade
+# cannot silently change which rules apply, and so a contributor's editor
+# enforces exactly what CI does. A standalone ruff.toml is used in preference to
+# pyproject.toml because this repository is a Home Assistant custom component,
+# not an installable Python package.
+
+# Home Assistant 2025.1 requires Python 3.12, so 3.12 syntax is the floor the
+# integration may assume.
+target-version = "py312"
+line-length = 88
+
+exclude = ["custom_components/*/translations"]
+
+[lint]
+select = [
+    "ASYNC", # blocking calls in async functions -- this integration is fully async
+    "B",     # flake8-bugbear: mutable defaults, loop-variable binding, silent except
+    "C4",    # comprehension clarity
+    "E",     # pycodestyle errors
+    "F",     # pyflakes: undefined and unused names
+    "I",     # import sorting
+    "PT",    # pytest style
+    "RUF",   # Ruff-specific correctness rules
+    "SIM",   # obvious simplifications
+    "UP",    # outdated syntax for the target version
+    "W",     # pycodestyle warnings
+]
+
+ignore = [
+    # Compound narrowing assertions such as `assert a is not None and b is not
+    # None` read better as one line than as two, and splitting them throughout
+    # the suite would be churn without a correctness gain.
+    "PT018",
+    # An explicit if/else is clearer than a ternary for the sign-convention
+    # branches in normalization.py, where the whole point is that the two cases
+    # are visibly symmetrical.
+    "SIM108",
+]
+
+[lint.per-file-ignores]
+# Tests routinely import inside a function to keep module import order explicit
+# and to avoid circular fixture imports, and they assert on private helpers.
+"tests/*" = ["SLF001"]
+
+[format]
+docstring-code-format = true

@@ -1,0 +1,45 @@
+name: Feature request
+description: Suggest a capability for a future release.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Please read first.** This project is in **Phase 1**, which is
+        deliberately observation only: it measures, learns and forecasts, and
+        never writes to the inverter.
+
+        Already planned for later phases, so no request is needed:
+        battery charge/discharge control, reserve calculation, self-consumption
+        optimisation, price-based arbitrage, negative-price handling, PV-aware
+        battery planning, safety buying, and EV charge scheduling.
+
+        Requests to add any of those *now* will be closed as out of scope, with
+        no offence intended — sequencing them after a validated learning
+        foundation is the whole point.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve
+      description: Describe the situation, not the implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+    validations:
+      required: true
+
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Does this fit Phase 1 (observe, learn, forecast — never control)?
+      options:
+        - "Yes, it is observation or forecasting only"
+        - "No, it involves control or trading (a later phase)"
+        - "Not sure"
+    validations:
+      required: true

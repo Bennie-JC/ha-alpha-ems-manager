@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/Bennie-JC/ha-alpha-ems-manager/discussions
+    about: Ask how something works, or suggest a direction for a later phase.

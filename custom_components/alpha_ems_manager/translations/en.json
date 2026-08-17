@@ -1,118 +1,156 @@
 {
+  "title": "Alpha EMS Manager",
   "config": {
     "step": {
       "user": {
         "title": "Alpha EMS Manager",
-        "description": "Select the source entities the learning EMS should use.",
+        "description": "Alpha EMS Manager learns how much electricity your household actually uses. It reads entities that other integrations already provide and never contacts an external service itself.",
         "data": {
-          "cumulative_house_load_sensor": "Cumulative house load sensor",
-          "pv_actual_today_sensor": "PV actual today sensor",
-          "pv_forecast_today_sensor": "PV forecast today sensor",
-          "pv_forecast_tomorrow_sensor": "PV forecast tomorrow sensor",
-          "pv_east_sensor": "PV east sensor (optional)",
-          "pv_west_sensor": "PV west sensor (optional)",
-          "frank_prices_today_sensor": "Frank prices today sensor",
-          "frank_prices_tomorrow_sensor": "Frank prices tomorrow sensor",
-          "frank_cheapest_time_today_sensor": "Frank cheapest time today sensor",
-          "frank_most_expensive_time_today_sensor": "Frank most expensive time today sensor",
-          "frank_cheapest_time_tomorrow_sensor": "Frank cheapest time tomorrow sensor",
-          "frank_most_expensive_time_tomorrow_sensor": "Frank most expensive time tomorrow sensor",
-          "battery_current_kwh_sensor": "Battery current energy (kWh) sensor",
-          "battery_capacity_kwh_entity": "Battery capacity (kWh) entity",
-          "battery_soc_sensor": "Battery state of charge sensor (optional)",
-          "ev_charger_power_sensor": "EV charger power sensor (optional, e.g. Easee)"
+          "name": "Instance name",
+          "house_load_entity": "House load power",
+          "daily_house_load_entity": "Daily house load (validation, optional)",
+          "has_pv": "This system has solar panels",
+          "use_pv_forecast": "Use a PV forecast source",
+          "ev_power_entity": "EV charger power (optional)"
+        },
+        "data_description": {
+          "name": "Used for the device name and the entity ids. Leave it as Alpha EMS unless you run more than one instance.",
+          "house_load_entity": "Instantaneous household consumption in W or kW, independent of solar, battery and grid flows. On AlphaESS this is Current House Load.",
+          "daily_house_load_entity": "Optional cumulative daily total in kWh, used only as an end-of-day cross-check. It is never used as the learning source.",
+          "has_pv": "Enables the solar production source on the next screens.",
+          "use_pv_forecast": "Requires a configured Solcast PV Forecast integration. Phase 1 only validates that the source is reachable; it does not yet change the load forecast.",
+          "ev_power_entity": "Optional. If your EV charges behind the house-load meter, select its power sensor here and Alpha EMS will learn household demand with EV charging removed. Any W or kW sensor works; no particular charger brand is assumed."
+        }
+      },
+      "battery": {
+        "title": "Battery",
+        "description": "Select the battery sensors and confirm how your system reports charging.",
+        "data": {
+          "battery_soc_entity": "Battery state of charge",
+          "battery_power_entity": "Battery power",
+          "battery_power_sign": "Battery power sign convention"
+        },
+        "data_description": {
+          "battery_soc_entity": "A percentage sensor, for example AlphaESS SoC Battery.",
+          "battery_power_entity": "Instantaneous battery power in W or kW.",
+          "battery_power_sign": "Check a moment when the battery is charging. AlphaESS reports a negative value while charging, which is the default here."
+        }
+      },
+      "solar": {
+        "title": "Solar production",
+        "description": "Select the sensor that reports how much your panels are generating right now.",
+        "data": {
+          "pv_power_entity": "PV production power"
+        },
+        "data_description": {
+          "pv_power_entity": "Instantaneous solar generation in W or kW. This is recorded for the energy-balance check only; it never changes the learned household load."
+        }
+      },
+      "grid": {
+        "title": "Grid meter",
+        "description": "Any meter integration works here, such as HomeWizard P1, DSMR or SlimmeLezer.",
+        "data": {
+          "grid_power_entity": "Grid power",
+          "grid_power_sign": "Grid power sign convention"
+        },
+        "data_description": {
+          "grid_power_entity": "Instantaneous grid exchange in W or kW.",
+          "grid_power_sign": "Check a moment when you are drawing from the grid. Most Dutch meters report a positive value while importing, which is the default here."
+        }
+      },
+      "sources": {
+        "title": "Prices and forecast",
+        "description": "Alpha EMS Manager reads these integrations through Home Assistant. It never calls their APIs and never duplicates their entities.",
+        "data": {
+          "frank_entry_id": "Frank Quarter Prices instance",
+          "solcast_entry_id": "Solcast PV Forecast instance"
+        },
+        "data_description": {
+          "frank_entry_id": "Selecting the integration instead of individual entities means renaming an entity later will not break anything.",
+          "solcast_entry_id": "Only required because you enabled the PV forecast."
         }
       }
     },
+    "error": {
+      "entity_not_found": "That entity does not exist. Pick one that is currently available.",
+      "invalid_power_entity": "This must be a power sensor measured in W or kW.",
+      "invalid_energy_entity": "This must be an energy sensor measured in Wh or kWh.",
+      "invalid_percentage_entity": "This must be a percentage sensor measured in %.",
+      "entity_not_numeric": "That entity does not report a number, so it cannot be used as a measurement.",
+      "solcast_not_configured": "You enabled the PV forecast, but Solcast PV Forecast is not set up. Add that integration first, or turn the PV forecast off."
+    },
     "abort": {
-      "already_configured": "Alpha EMS Manager is already configured."
+      "frank_not_configured": "Frank Quarter Prices is not set up yet. Add and configure that integration first, then add Alpha EMS Manager.",
+      "solcast_not_configured": "You enabled the PV forecast, but Solcast PV Forecast is not set up. Add that integration first, or go back and turn the PV forecast off."
     }
   },
   "options": {
+    "abort": {
+      "frank_not_configured": "Frank Quarter Prices is no longer set up, so the price source cannot be selected. Add and configure that integration again, then reopen these options. Your learned history is untouched."
+    },
+    "error": {
+      "entity_not_found": "That entity does not exist. Pick one that is currently available.",
+      "invalid_power_entity": "This must be a power sensor measured in W or kW.",
+      "invalid_energy_entity": "This must be an energy sensor measured in Wh or kWh.",
+      "invalid_percentage_entity": "This must be a percentage sensor measured in %.",
+      "entity_not_numeric": "That entity does not report a number, so it cannot be used as a measurement.",
+      "pv_entity_required": "You marked this system as having solar panels, so a PV production sensor is required.",
+      "solcast_entry_required": "You enabled the PV forecast, so a Solcast instance is required."
+    },
     "step": {
       "init": {
-        "title": "Alpha EMS Manager options",
-        "description": "Update the source entities used by the learning EMS.",
+        "title": "Alpha EMS Manager settings",
+        "description": "Changing a source reloads the integration. Learned history is kept.",
         "data": {
-          "cumulative_house_load_sensor": "Cumulative house load sensor",
-          "pv_actual_today_sensor": "PV actual today sensor",
-          "pv_forecast_today_sensor": "PV forecast today sensor",
-          "pv_forecast_tomorrow_sensor": "PV forecast tomorrow sensor",
-          "pv_east_sensor": "PV east sensor (optional)",
-          "pv_west_sensor": "PV west sensor (optional)",
-          "frank_prices_today_sensor": "Frank prices today sensor",
-          "frank_prices_tomorrow_sensor": "Frank prices tomorrow sensor",
-          "frank_cheapest_time_today_sensor": "Frank cheapest time today sensor",
-          "frank_most_expensive_time_today_sensor": "Frank most expensive time today sensor",
-          "frank_cheapest_time_tomorrow_sensor": "Frank cheapest time tomorrow sensor",
-          "frank_most_expensive_time_tomorrow_sensor": "Frank most expensive time tomorrow sensor",
-          "battery_current_kwh_sensor": "Battery current energy (kWh) sensor",
-          "battery_capacity_kwh_entity": "Battery capacity (kWh) entity",
-          "battery_soc_sensor": "Battery state of charge sensor (optional)",
-          "ev_charger_power_sensor": "EV charger power sensor (optional, e.g. Easee)"
+          "house_load_entity": "House load power",
+          "daily_house_load_entity": "Daily house load (validation, optional)",
+          "battery_soc_entity": "Battery state of charge",
+          "battery_power_entity": "Battery power",
+          "battery_power_sign": "Battery power sign convention",
+          "has_pv": "This system has solar panels",
+          "pv_power_entity": "PV production power",
+          "grid_power_entity": "Grid power",
+          "grid_power_sign": "Grid power sign convention",
+          "frank_entry_id": "Frank Quarter Prices instance",
+          "use_pv_forecast": "Use a PV forecast source",
+          "solcast_entry_id": "Solcast PV Forecast instance",
+          "ev_power_entity": "EV charger power (optional)"
+        },
+        "data_description": {
+          "house_load_entity": "Instantaneous household consumption in W or kW, independent of solar, battery and grid flows.",
+          "daily_house_load_entity": "Optional cumulative daily total in kWh, used only as an end-of-day cross-check.",
+          "battery_soc_entity": "A percentage sensor, for example AlphaESS SoC Battery.",
+          "battery_power_entity": "Instantaneous battery power in W or kW.",
+          "battery_power_sign": "AlphaESS reports a negative value while charging.",
+          "has_pv": "Turn this on to record solar production for the energy-balance check.",
+          "pv_power_entity": "Required when this system has solar panels.",
+          "grid_power_entity": "Instantaneous grid exchange in W or kW.",
+          "grid_power_sign": "Most Dutch meters report a positive value while importing.",
+          "frank_entry_id": "The Frank Quarter Prices instance to read prices from.",
+          "use_pv_forecast": "Requires a configured Solcast PV Forecast integration.",
+          "solcast_entry_id": "Required when the PV forecast is enabled.",
+          "ev_power_entity": "Optional flexible load. Learned demand excludes EV charging when this is set."
         }
       }
     }
   },
-  "entity": {
-    "sensor": {
-      "predicted_daily_load":              { "name": "Predicted Daily Load" },
-      "predicted_remaining_load":          { "name": "Predicted Remaining Load" },
-      "required_reserve":                  { "name": "Required Reserve" },
-      "pv_forecast_today":                 { "name": "PV Forecast Today" },
-      "pv_forecast_tomorrow":              { "name": "PV Forecast Tomorrow" },
-      "battery_current":                   { "name": "Battery Current Energy" },
-      "recommendation":                    { "name": "Recommendation" },
-      "learning_confidence":               { "name": "Learning Confidence" },
-      "learning_days":                     { "name": "Learning Days" },
-      "learned_slots_count":               { "name": "Learned Slots Count" },
-      "last_quarter_load":                 { "name": "Last Quarter Load" },
-      "profile_status":                    { "name": "Profile Status" },
-      "pv_correction_factor":              { "name": "PV Correction Factor" },
-      "corrected_pv_forecast_today":       { "name": "Corrected PV Forecast Today" },
-      "corrected_pv_forecast_tomorrow":    { "name": "Corrected PV Forecast Tomorrow" },
-      "expected_remaining_pv_today":       { "name": "Expected Remaining PV Today" },
-      "pv_learning_confidence":            { "name": "PV Learning Confidence" },
-      "pv_profile_status":                 { "name": "PV Profile Status" },
-      "reserve_correction_factor":         { "name": "Reserve Correction Factor" },
-      "reserve_floor":                     { "name": "Reserve Floor" },
-      "reserve_learning_days":             { "name": "Reserve Learning Days" },
-      "reserve_miss_count":                { "name": "Reserve Miss Count" },
-      "reserve_success_count":             { "name": "Reserve Success Count" },
-      "reserve_learning_status":           { "name": "Reserve Learning Status" },
-      "trade_possible":                    { "name": "Trade Possible" },
-      "trade_found":                       { "name": "Trade Found" },
-      "trade_executable":                  { "name": "Trade Executable" },
-      "trade_block_reason":                { "name": "Trade Block Reason" },
-      "predicted_buy_kwh":                 { "name": "Predicted Buy Energy" },
-      "predicted_buy_time":                { "name": "Predicted Buy Time" },
-      "predicted_buy_price":               { "name": "Predicted Buy Price" },
-      "predicted_sell_kwh":                { "name": "Predicted Sell Energy" },
-      "predicted_sell_time":               { "name": "Predicted Sell Time" },
-      "predicted_sell_price":              { "name": "Predicted Sell Price" },
-      "predicted_profit":                  { "name": "Predicted Profit" },
-      "trade_spread":                      { "name": "Trade Spread" },
-      "required_reserve_after_sell":       { "name": "Required Reserve After Sell" },
-      "expected_battery_at_sell":          { "name": "Expected Battery At Sell" },
-      "expected_battery_at_buy":           { "name": "Expected Battery At Buy" },
-      "battery_can_reach_full_before_sell":{ "name": "Battery Can Reach Full Before Sell" },
-      "predicted_missing_kwh_for_full":    { "name": "Missing Energy For Full Battery" },
-      "safety_buy_needed":                 { "name": "Safety Buy Needed" },
-      "safety_buy_kwh":                    { "name": "Safety Buy Energy" },
-      "safety_buy_time":                   { "name": "Safety Buy Time" },
-      "safety_buy_reason":                 { "name": "Safety Buy Reason" },
-      "trade_prediction_days":             { "name": "Trade Prediction Days" },
-      "trade_prediction_confidence":       { "name": "Trade Prediction Confidence" },
-      "trade_prediction_status":           { "name": "Trade Prediction Status" },
-      "next_buy_source":                   { "name": "Next Buy Source" },
-      "ev_charger_power":                  { "name": "EV Charger Power" },
-      "ev_excluded_last_quarter":          { "name": "EV Excluded Last Quarter" },
-      "ev_excluded_today":                 { "name": "EV Excluded Today" },
-      "house_load_raw_last_quarter":       { "name": "House Load Raw Last Quarter" },
-      "house_load_corrected_last_quarter": { "name": "House Load Corrected Last Quarter" }
+  "selector": {
+    "battery_power_sign": {
+      "options": {
+        "negative_is_charge": "Negative means charging (AlphaESS default)",
+        "positive_is_charge": "Positive means charging"
+      }
     },
-    "binary_sensor": {
-      "reserve_satisfied": { "name": "Reserve Satisfied" }
+    "grid_power_sign": {
+      "options": {
+        "positive_is_import": "Positive means importing from the grid",
+        "negative_is_import": "Negative means importing from the grid"
+      }
+    }
+  },
+  "exceptions": {
+    "house_load_source_missing": {
+      "message": "Alpha EMS Manager has no house-load source configured, so it cannot learn anything. Remove the integration and add it again to select an instantaneous house-load power sensor."
     }
   }
 }

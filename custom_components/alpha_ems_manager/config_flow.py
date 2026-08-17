@@ -1,181 +1,502 @@
-"""Config flow for the Alpha EMS Manager integration."""
+"""Config and options flows for Alpha EMS Manager.
+
+The flow is split into a handful of small, coherent steps rather than one wall
+of technical fields. Each step validates its selections against the live state
+machine before moving on, so a mistyped or incompatible entity is caught while
+the user is still looking at the form.
+
+Two selection styles are used deliberately:
+
+* **Entity selectors** for the battery, house-load, PV and grid sources. The
+  AlphaESS Modbus package that provides "Current House Load" is a YAML template
+  package with no config entry and no device, so there is nothing to discover;
+  the user picks the entities. Nothing is auto-bound, because silently binding
+  the wrong entity is far worse than asking.
+* **Config-entry pickers** for Frank Quarter Prices and Solcast, which *are*
+  real config-entry integrations. Referencing the entry survives entity renames,
+  which a hard-coded entity id would not.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
 import voluptuous as vol
-
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlow,
 )
-from homeassistant.core import callback
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import selector
 
 from .const import (
-    CONF_BATTERY_CAPACITY_KWH_ENTITY,
-    CONF_BATTERY_CURRENT_KWH_SENSOR,
-    CONF_BATTERY_SOC_SENSOR,
-    CONF_CUMULATIVE_HOUSE_LOAD_SENSOR,
-    CONF_EV_CHARGER_POWER_SENSOR,
-    CONF_FRANK_CHEAPEST_TIME_TODAY_SENSOR,
-    CONF_FRANK_CHEAPEST_TIME_TOMORROW_SENSOR,
-    CONF_FRANK_MOST_EXPENSIVE_TIME_TODAY_SENSOR,
-    CONF_FRANK_MOST_EXPENSIVE_TIME_TOMORROW_SENSOR,
-    CONF_FRANK_PRICES_TODAY_SENSOR,
-    CONF_FRANK_PRICES_TOMORROW_SENSOR,
-    CONF_PV_ACTUAL_TODAY_SENSOR,
-    CONF_PV_EAST_SENSOR,
-    CONF_PV_FORECAST_TODAY_SENSOR,
-    CONF_PV_FORECAST_TOMORROW_SENSOR,
-    CONF_PV_WEST_SENSOR,
-    DEFAULTS,
+    BATTERY_SIGN_OPTIONS,
+    CONF_BATTERY_POWER_ENTITY,
+    CONF_BATTERY_POWER_SIGN,
+    CONF_BATTERY_SOC_ENTITY,
+    CONF_DAILY_HOUSE_LOAD_ENTITY,
+    CONF_EV_POWER_ENTITY,
+    CONF_FRANK_ENTRY_ID,
+    CONF_GRID_POWER_ENTITY,
+    CONF_GRID_POWER_SIGN,
+    CONF_HAS_PV,
+    CONF_HOUSE_LOAD_ENTITY,
+    CONF_NAME,
+    CONF_PV_POWER_ENTITY,
+    CONF_SOLCAST_ENTRY_ID,
+    CONF_USE_PV_FORECAST,
+    CONFIG_ENTRY_VERSION,
+    DEFAULT_BATTERY_POWER_SIGN,
+    DEFAULT_GRID_POWER_SIGN,
+    DEFAULT_INSTANCE_NAME,
     DOMAIN,
-    NAME,
+    DOMAIN_FRANK,
+    DOMAIN_SOLCAST,
+    GRID_SIGN_OPTIONS,
+)
+from .validation import (
+    validate_energy_entity,
+    validate_percentage_entity,
+    validate_power_entity,
 )
 
-# A sensor-domain entity selector reused for every field.
-_SENSOR_SELECTOR = selector.EntitySelector(
-    selector.EntitySelectorConfig(domain="sensor")
+# Filtered by domain only, deliberately *not* by ``device_class``.
+#
+# Validation accepts an entity on its ``unit_of_measurement`` (see validation.py),
+# because that is what actually determines whether a reading can be interpreted.
+# A ``device_class`` filter here is frontend-only -- it never rejects a submitted
+# value -- so adding one would hide entities the integration happily accepts and
+# make them unselectable through the UI. That is not hypothetical: the AlphaESS
+# Modbus source is a YAML template package, and a template sensor with
+# ``unit_of_measurement: W`` but no ``device_class`` is exactly the primary
+# house-load source this integration was written for.
+_POWER_SELECTOR = selector.EntitySelector(
+    selector.EntitySelectorConfig(domain=Platform.SENSOR)
 )
-# The battery capacity may be exposed via a number/input_number helper, so allow
-# both sensor and number domains for that field.
-_CAPACITY_SELECTOR = selector.EntitySelector(
-    selector.EntitySelectorConfig(domain=["sensor", "number", "input_number"])
+_ENERGY_SELECTOR = selector.EntitySelector(
+    selector.EntitySelectorConfig(domain=Platform.SENSOR)
+)
+_BATTERY_SELECTOR = selector.EntitySelector(
+    selector.EntitySelectorConfig(domain=Platform.SENSOR)
 )
 
 
-def _default(key: str, source: dict[str, Any]) -> Any:
-    """Return an existing value or the documented default for a key."""
-    if key in source:
-        return source[key]
-    return DEFAULTS.get(key, vol.UNDEFINED)
-
-
-def _build_schema(source: dict[str, Any]) -> vol.Schema:
-    """Build the data schema, pre-filling defaults from ``source``."""
-    return vol.Schema(
-        {
-            # --- Household load ------------------------------------------------
-            vol.Required(
-                CONF_CUMULATIVE_HOUSE_LOAD_SENSOR,
-                default=_default(CONF_CUMULATIVE_HOUSE_LOAD_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-            # --- PV production -------------------------------------------------
-            vol.Required(
-                CONF_PV_ACTUAL_TODAY_SENSOR,
-                default=_default(CONF_PV_ACTUAL_TODAY_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-            vol.Required(
-                CONF_PV_FORECAST_TODAY_SENSOR,
-                default=_default(CONF_PV_FORECAST_TODAY_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-            vol.Required(
-                CONF_PV_FORECAST_TOMORROW_SENSOR,
-                default=_default(CONF_PV_FORECAST_TOMORROW_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-            vol.Optional(
-                CONF_PV_EAST_SENSOR,
-                default=_default(CONF_PV_EAST_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-            vol.Optional(
-                CONF_PV_WEST_SENSOR,
-                default=_default(CONF_PV_WEST_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-            # --- Frank dynamic prices -----------------------------------------
-            vol.Required(
-                CONF_FRANK_PRICES_TODAY_SENSOR,
-                default=_default(CONF_FRANK_PRICES_TODAY_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-            vol.Required(
-                CONF_FRANK_PRICES_TOMORROW_SENSOR,
-                default=_default(CONF_FRANK_PRICES_TOMORROW_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-            vol.Required(
-                CONF_FRANK_CHEAPEST_TIME_TODAY_SENSOR,
-                default=_default(CONF_FRANK_CHEAPEST_TIME_TODAY_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-            vol.Required(
-                CONF_FRANK_MOST_EXPENSIVE_TIME_TODAY_SENSOR,
-                default=_default(CONF_FRANK_MOST_EXPENSIVE_TIME_TODAY_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-            vol.Required(
-                CONF_FRANK_CHEAPEST_TIME_TOMORROW_SENSOR,
-                default=_default(CONF_FRANK_CHEAPEST_TIME_TOMORROW_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-            vol.Required(
-                CONF_FRANK_MOST_EXPENSIVE_TIME_TOMORROW_SENSOR,
-                default=_default(
-                    CONF_FRANK_MOST_EXPENSIVE_TIME_TOMORROW_SENSOR, source
-                ),
-            ): _SENSOR_SELECTOR,
-            # --- Battery -------------------------------------------------------
-            vol.Required(
-                CONF_BATTERY_CURRENT_KWH_SENSOR,
-                default=_default(CONF_BATTERY_CURRENT_KWH_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-            vol.Required(
-                CONF_BATTERY_CAPACITY_KWH_ENTITY,
-                default=_default(CONF_BATTERY_CAPACITY_KWH_ENTITY, source),
-            ): _CAPACITY_SELECTOR,
-            vol.Optional(
-                CONF_BATTERY_SOC_SENSOR,
-                default=_default(CONF_BATTERY_SOC_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-            # --- EV charger ----------------------------------------------------
-            vol.Optional(
-                CONF_EV_CHARGER_POWER_SENSOR,
-                default=_default(CONF_EV_CHARGER_POWER_SENSOR, source),
-            ): _SENSOR_SELECTOR,
-        }
+def _sign_selector(options: tuple[str, ...], key: str) -> selector.SelectSelector:
+    """Return a translated dropdown for a sign convention."""
+    return selector.SelectSelector(
+        selector.SelectSelectorConfig(
+            options=list(options),
+            mode=selector.SelectSelectorMode.DROPDOWN,
+            translation_key=key,
+        )
     )
 
 
-class AlphaEmsConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Handle the config flow for Alpha EMS Manager."""
+def _entry_options(hass: HomeAssistant, domain: str) -> list[selector.SelectOptionDict]:
+    """Return selectable config entries of ``domain``."""
+    return [
+        selector.SelectOptionDict(value=entry.entry_id, label=entry.title)
+        for entry in hass.config_entries.async_entries(domain)
+    ]
 
-    VERSION = 1
+
+def _valid_default(
+    value: str | None, options: list[selector.SelectOptionDict]
+) -> str | vol.Undefined:
+    """Return ``value`` if it is still a selectable option, else no default.
+
+    A ``SelectSelector`` validates a submitted value against its option list on
+    the server side, and a form default is not exempt. Pre-filling a stale
+    config-entry id therefore produces a form that renders normally and then
+    refuses every submission.
+    """
+    if value is not None and any(option["value"] == value for option in options):
+        return value
+    return vol.UNDEFINED
+
+
+class AlphaEmsConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Guided setup for one Alpha EMS Manager instance."""
+
+    # v1 was the previous integration's source model. Bumping this is what lets
+    # async_migrate_entry recognise and reject a legacy entry instead of loading
+    # it with no usable sources.
+    VERSION = CONFIG_ENTRY_VERSION
+
+    def __init__(self) -> None:
+        """Start with an empty draft configuration."""
+        self._data: dict[str, Any] = {}
+
+    # -- step 1: identity and shape --------------------------------------
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle the initial step."""
-        # Only allow a single instance of the integration.
-        await self.async_set_unique_id(DOMAIN)
-        self._abort_if_unique_id_configured()
+        """Collect the instance name, learning source and system shape."""
+        errors: dict[str, str] = {}
+
+        # Frank Quarter Prices is a hard requirement, so say so before the user
+        # fills in four screens of entity selections.
+        if not _entry_options(self.hass, DOMAIN_FRANK):
+            return self.async_abort(reason="frank_not_configured")
 
         if user_input is not None:
-            return self.async_create_entry(title=NAME, data=user_input)
+            error = validate_power_entity(self.hass, user_input[CONF_HOUSE_LOAD_ENTITY])
+            if error:
+                errors[CONF_HOUSE_LOAD_ENTITY] = error
 
+            daily = user_input.get(CONF_DAILY_HOUSE_LOAD_ENTITY)
+            if daily:
+                error = validate_energy_entity(self.hass, daily)
+                if error:
+                    errors[CONF_DAILY_HOUSE_LOAD_ENTITY] = error
+
+            ev = user_input.get(CONF_EV_POWER_ENTITY)
+            if ev:
+                error = validate_power_entity(self.hass, ev)
+                if error:
+                    errors[CONF_EV_POWER_ENTITY] = error
+
+            # Reported inline rather than as an abort: turning the forecast off
+            # is a perfectly good way forward, and an abort would throw away
+            # everything already typed.
+            if user_input.get(CONF_USE_PV_FORECAST) and not _entry_options(
+                self.hass, DOMAIN_SOLCAST
+            ):
+                errors[CONF_USE_PV_FORECAST] = "solcast_not_configured"
+
+            if not errors:
+                self._data.update(user_input)
+                return await self.async_step_battery()
+
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_NAME, default=DEFAULT_INSTANCE_NAME
+                ): selector.TextSelector(),
+                vol.Required(CONF_HOUSE_LOAD_ENTITY): _POWER_SELECTOR,
+                vol.Optional(CONF_DAILY_HOUSE_LOAD_ENTITY): _ENERGY_SELECTOR,
+                vol.Optional(CONF_EV_POWER_ENTITY): _POWER_SELECTOR,
+                vol.Required(CONF_HAS_PV, default=True): selector.BooleanSelector(),
+                vol.Required(
+                    CONF_USE_PV_FORECAST, default=False
+                ): selector.BooleanSelector(),
+            }
+        )
         return self.async_show_form(
             step_id="user",
-            data_schema=_build_schema({}),
+            data_schema=self.add_suggested_values_to_schema(schema, user_input),
+            errors=errors,
+        )
+
+    # -- step 2: battery --------------------------------------------------
+
+    async def async_step_battery(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Collect the battery sources and their sign convention."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            error = validate_percentage_entity(
+                self.hass, user_input[CONF_BATTERY_SOC_ENTITY]
+            )
+            if error:
+                errors[CONF_BATTERY_SOC_ENTITY] = error
+            error = validate_power_entity(
+                self.hass, user_input[CONF_BATTERY_POWER_ENTITY]
+            )
+            if error:
+                errors[CONF_BATTERY_POWER_ENTITY] = error
+
+            if not errors:
+                self._data.update(user_input)
+                if self._data.get(CONF_HAS_PV):
+                    return await self.async_step_solar()
+                return await self.async_step_grid()
+
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_BATTERY_SOC_ENTITY): _BATTERY_SELECTOR,
+                vol.Required(CONF_BATTERY_POWER_ENTITY): _POWER_SELECTOR,
+                vol.Required(
+                    CONF_BATTERY_POWER_SIGN, default=DEFAULT_BATTERY_POWER_SIGN
+                ): _sign_selector(BATTERY_SIGN_OPTIONS, "battery_power_sign"),
+            }
+        )
+        return self.async_show_form(
+            step_id="battery",
+            data_schema=self.add_suggested_values_to_schema(schema, user_input),
+            errors=errors,
+        )
+
+    # -- step 3: solar (conditional) --------------------------------------
+
+    async def async_step_solar(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Collect the PV production source. Only reached when PV is present."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            error = validate_power_entity(self.hass, user_input[CONF_PV_POWER_ENTITY])
+            if error:
+                errors[CONF_PV_POWER_ENTITY] = error
+            if not errors:
+                self._data.update(user_input)
+                return await self.async_step_grid()
+
+        schema = vol.Schema({vol.Required(CONF_PV_POWER_ENTITY): _POWER_SELECTOR})
+        return self.async_show_form(
+            step_id="solar",
+            data_schema=self.add_suggested_values_to_schema(schema, user_input),
+            errors=errors,
+        )
+
+    # -- step 4: grid -----------------------------------------------------
+
+    async def async_step_grid(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Collect the grid meter source and its sign convention."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            error = validate_power_entity(self.hass, user_input[CONF_GRID_POWER_ENTITY])
+            if error:
+                errors[CONF_GRID_POWER_ENTITY] = error
+            if not errors:
+                self._data.update(user_input)
+                return await self.async_step_sources()
+
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_GRID_POWER_ENTITY): _POWER_SELECTOR,
+                vol.Required(
+                    CONF_GRID_POWER_SIGN, default=DEFAULT_GRID_POWER_SIGN
+                ): _sign_selector(GRID_SIGN_OPTIONS, "grid_power_sign"),
+            }
+        )
+        return self.async_show_form(
+            step_id="grid",
+            data_schema=self.add_suggested_values_to_schema(schema, user_input),
+            errors=errors,
+        )
+
+    # -- step 5: consumed integrations ------------------------------------
+
+    async def async_step_sources(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Select the Frank Quarter Prices and Solcast config entries."""
+        frank_options = _entry_options(self.hass, DOMAIN_FRANK)
+        if not frank_options:
+            return self.async_abort(reason="frank_not_configured")
+
+        wants_forecast = bool(self._data.get(CONF_USE_PV_FORECAST))
+        solcast_options = _entry_options(self.hass, DOMAIN_SOLCAST)
+        if wants_forecast and not solcast_options:
+            return self.async_abort(reason="solcast_not_configured")
+
+        if user_input is not None:
+            self._data.update(user_input)
+            return self.async_create_entry(
+                title=self._data.get(CONF_NAME) or DEFAULT_INSTANCE_NAME,
+                data=self._data,
+            )
+
+        fields: dict[Any, Any] = {
+            vol.Required(CONF_FRANK_ENTRY_ID): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=frank_options,
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            )
+        }
+        if wants_forecast:
+            fields[vol.Required(CONF_SOLCAST_ENTRY_ID)] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=solcast_options,
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            )
+
+        return self.async_show_form(
+            step_id="sources",
+            data_schema=self.add_suggested_values_to_schema(
+                vol.Schema(fields), user_input
+            ),
         )
 
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry: ConfigEntry) -> AlphaEmsOptionsFlow:
+    def async_get_options_flow(entry: ConfigEntry) -> AlphaEmsOptionsFlow:
         """Return the options flow handler."""
         return AlphaEmsOptionsFlow()
 
 
 class AlphaEmsOptionsFlow(OptionsFlow):
-    """Handle reconfiguration of selected entities."""
+    """Lets every source selection be changed without re-adding the entry."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Manage the options."""
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+        """Show and validate the full set of changeable options."""
+        entry = self.config_entry
+        errors: dict[str, str] = {}
 
-        # Pre-fill with current options, falling back to the original entry data.
-        current = {**self.config_entry.data, **self.config_entry.options}
+        def current(key: str, default: Any = None) -> Any:
+            return entry.options.get(key, entry.data.get(key, default))
+
+        if user_input is not None:
+            errors = self._validate(user_input)
+            if not errors:
+                # Start from the existing options so a key that is not part of
+                # this form -- now or after a future release adds one -- is
+                # never dropped by an unrelated edit.
+                merged = {**entry.options, **user_input}
+                # An optional field that the user cleared vanishes from
+                # user_input entirely. Deleting the key would not clear it,
+                # because the effective configuration falls back to entry.data,
+                # which still holds the original selection -- so the cleared
+                # state is recorded as an explicit None that shadows it.
+                for optional in (
+                    CONF_DAILY_HOUSE_LOAD_ENTITY,
+                    CONF_EV_POWER_ENTITY,
+                    CONF_PV_POWER_ENTITY,
+                    CONF_SOLCAST_ENTRY_ID,
+                ):
+                    if optional not in user_input:
+                        merged[optional] = None
+                return self.async_create_entry(title="", data=merged)
+
+        frank_options = _entry_options(self.hass, DOMAIN_FRANK)
+        solcast_options = _entry_options(self.hass, DOMAIN_SOLCAST)
+
+        # Frank is a required dropdown built from the config entries that exist
+        # right now. If it has been removed and re-added, the stored entry id is
+        # no longer a valid choice and voluptuous rejects the form on submit --
+        # leaving the user unable to change *any* option, including repointing an
+        # unrelated sensor, with deleting the entry (and all learned history) as
+        # the only way out. Aborting with an explanation is far better than a
+        # form that renders but can never be saved.
+        if not frank_options:
+            return self.async_abort(reason="frank_not_configured")
+
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_HOUSE_LOAD_ENTITY,
+                    default=current(CONF_HOUSE_LOAD_ENTITY),
+                ): _POWER_SELECTOR,
+                vol.Optional(
+                    CONF_DAILY_HOUSE_LOAD_ENTITY,
+                    description={
+                        "suggested_value": current(CONF_DAILY_HOUSE_LOAD_ENTITY)
+                    },
+                ): _ENERGY_SELECTOR,
+                vol.Optional(
+                    CONF_EV_POWER_ENTITY,
+                    description={"suggested_value": current(CONF_EV_POWER_ENTITY)},
+                ): _POWER_SELECTOR,
+                vol.Required(
+                    CONF_BATTERY_SOC_ENTITY,
+                    default=current(CONF_BATTERY_SOC_ENTITY),
+                ): _BATTERY_SELECTOR,
+                vol.Required(
+                    CONF_BATTERY_POWER_ENTITY,
+                    default=current(CONF_BATTERY_POWER_ENTITY),
+                ): _POWER_SELECTOR,
+                vol.Required(
+                    CONF_BATTERY_POWER_SIGN,
+                    default=current(
+                        CONF_BATTERY_POWER_SIGN, DEFAULT_BATTERY_POWER_SIGN
+                    ),
+                ): _sign_selector(BATTERY_SIGN_OPTIONS, "battery_power_sign"),
+                vol.Required(
+                    CONF_HAS_PV, default=bool(current(CONF_HAS_PV, False))
+                ): selector.BooleanSelector(),
+                vol.Optional(
+                    CONF_PV_POWER_ENTITY,
+                    description={"suggested_value": current(CONF_PV_POWER_ENTITY)},
+                ): _POWER_SELECTOR,
+                vol.Required(
+                    CONF_GRID_POWER_ENTITY,
+                    default=current(CONF_GRID_POWER_ENTITY),
+                ): _POWER_SELECTOR,
+                vol.Required(
+                    CONF_GRID_POWER_SIGN,
+                    default=current(CONF_GRID_POWER_SIGN, DEFAULT_GRID_POWER_SIGN),
+                ): _sign_selector(GRID_SIGN_OPTIONS, "grid_power_sign"),
+                # Only offered as a default when it is still a valid choice. A
+                # stale id -- Frank removed and re-added, so a different entry
+                # exists under a new id -- would otherwise fail schema validation
+                # on submit; leaving the field empty makes the user pick instead.
+                vol.Required(
+                    CONF_FRANK_ENTRY_ID,
+                    default=_valid_default(current(CONF_FRANK_ENTRY_ID), frank_options),
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=frank_options,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+                vol.Required(
+                    CONF_USE_PV_FORECAST,
+                    default=bool(current(CONF_USE_PV_FORECAST, False)),
+                ): selector.BooleanSelector(),
+                vol.Optional(
+                    CONF_SOLCAST_ENTRY_ID,
+                    description={"suggested_value": current(CONF_SOLCAST_ENTRY_ID)},
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=solcast_options,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+            }
+        )
 
         return self.async_show_form(
             step_id="init",
-            data_schema=_build_schema(current),
+            data_schema=self.add_suggested_values_to_schema(schema, user_input),
+            errors=errors,
         )
+
+    def _validate(self, user_input: dict[str, Any]) -> dict[str, str]:
+        """Return per-field error keys for an options submission."""
+        errors: dict[str, str] = {}
+
+        checks = (
+            (CONF_HOUSE_LOAD_ENTITY, validate_power_entity, True),
+            (CONF_BATTERY_SOC_ENTITY, validate_percentage_entity, True),
+            (CONF_BATTERY_POWER_ENTITY, validate_power_entity, True),
+            (CONF_GRID_POWER_ENTITY, validate_power_entity, True),
+            (CONF_DAILY_HOUSE_LOAD_ENTITY, validate_energy_entity, False),
+            (CONF_EV_POWER_ENTITY, validate_power_entity, False),
+            (CONF_PV_POWER_ENTITY, validate_power_entity, False),
+        )
+        for key, validator, required in checks:
+            value = user_input.get(key)
+            if not value:
+                if required:
+                    errors[key] = "entity_not_found"
+                continue
+            error = validator(self.hass, value)
+            if error:
+                errors[key] = error
+
+        # A system declared to have PV must say where its production is read.
+        if user_input.get(CONF_HAS_PV) and not user_input.get(CONF_PV_POWER_ENTITY):
+            errors[CONF_PV_POWER_ENTITY] = "pv_entity_required"
+
+        # Likewise, forecasting without a Solcast entry cannot work.
+        if user_input.get(CONF_USE_PV_FORECAST) and not user_input.get(
+            CONF_SOLCAST_ENTRY_ID
+        ):
+            errors[CONF_SOLCAST_ENTRY_ID] = "solcast_entry_required"
+
+        return errors

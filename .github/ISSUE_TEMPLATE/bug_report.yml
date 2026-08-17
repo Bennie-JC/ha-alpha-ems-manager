@@ -1,0 +1,97 @@
+name: Bug report
+description: Something behaves incorrectly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        **Before filing:** two behaviours are correct by design and are not bugs.
+
+        - **A forecast that reads `unknown`.** The model needs enough valid
+          learned history before it will predict anything. It deliberately does
+          not invent a number to look busy.
+        - **Learning confidence rising slowly.** Maturity saturates on purpose;
+          about 30 days of history is only ~63 %.
+
+        See the README's Troubleshooting section first.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you observed, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Alpha EMS Manager version
+      description: From Settings → Devices & Services → Alpha EMS Manager, or the manifest.
+      placeholder: 1.0.0-beta.1
+    validations:
+      required: true
+
+  - type: input
+    id: ha-version
+    attributes:
+      label: Home Assistant version
+      placeholder: "2025.8.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: sources
+    attributes:
+      label: Configured sources
+      description: >
+        Which integration provides each source (house load, battery SoC, battery
+        power, PV, grid, optional EV), and the two sign-convention settings.
+      placeholder: |
+        House load: AlphaESS Modbus template sensor
+        Grid: HomeWizard P1
+        Battery sign: negative means charging
+        Grid sign: positive means import
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: >
+        Settings → Devices & Services → Alpha EMS Manager → Download diagnostics,
+        then paste the relevant part. The payload contains no credentials, but it
+        does contain your entity ids — redact anything you would rather not share.
+      render: json
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: >
+        Set `custom_components.alpha_ems_manager: debug` under `logger:` in
+        configuration.yaml, restart, and paste what appears.
+      render: text
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have read the Troubleshooting section of the README.
+          required: true
+        - label: I have removed any personal data from what I pasted above.
+          required: true

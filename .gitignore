@@ -216,3 +216,39 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# Project-specific: private local development artifacts
+# ---------------------------------------------------------------------------
+# Local assistant/editor instruction files and scratch notes. These are personal
+# working aids, not project documentation -- the public architecture reference is
+# docs/ARCHITECTURE.md. Listed so they can never be committed by accident.
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+.cursor/
+.cursorrules
+.aider*
+.github/copilot-instructions.md
+GEMINI.md
+AGENTS.md
+NOTES.md
+TODO.local.md
+scratch/
+scratchpad/
+*.scratch.md
+
+# Home Assistant local test instance. A real config directory contains
+# secrets.yaml, access tokens and the .storage state of a live installation.
+config/
+.storage/
+home-assistant*.log*
+home-assistant_v2.db*
+secrets.yaml
+!tests/**/secrets.yaml
+
+# Downloaded diagnostics dumps. These contain a real installation's entity ids
+# and readings and must never enter the repository.
+*-diagnostics-*.json
+diagnostics*.json
+config_entry-*.json

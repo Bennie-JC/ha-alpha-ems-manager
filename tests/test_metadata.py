@@ -1,0 +1,182 @@
+"""Repository metadata must not claim support we do not have.
+
+`hacs.json` previously declared Home Assistant 2024.1.0 while the code used APIs
+introduced well after it, so an installation on that core would have crashed
+immediately. These tests keep the declared floor honest and consistent.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+
+COMPONENT = Path("custom_components/alpha_ems_manager")
+
+#: The lowest Home Assistant release this project claims to support.
+MINIMUM_HA = "2025.1.0"
+
+
+def read_json(path: Path) -> dict:
+    """Return a parsed JSON document."""
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+#: The single authoritative version. Home Assistant's manifest is the only place
+#: the integration version is declared; every other reference is checked against
+#: it rather than repeating it.
+VERSION: str = read_json(COMPONENT / "manifest.json")["version"]
+
+
+def test_hacs_declares_the_supported_minimum() -> None:
+    """HACS blocks installation below this version."""
+    assert read_json(Path("hacs.json"))["homeassistant"] == MINIMUM_HA
+
+
+def test_the_readme_documents_the_same_minimum() -> None:
+    """A user reading the README gets the same answer HACS enforces."""
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert f"Minimum Home Assistant version: {MINIMUM_HA}" in readme
+    # The old, wrong floor must not linger anywhere in the document.
+    assert "2024.1.0" not in readme
+
+
+def test_the_architecture_notes_document_the_same_minimum() -> None:
+    """The architecture reference agrees too."""
+    notes = Path("docs/ARCHITECTURE.md").read_text(encoding="utf-8")
+
+    assert MINIMUM_HA in notes
+    assert "2024.1.0" not in notes
+
+
+def test_the_minimum_is_at_least_as_new_as_the_apis_used() -> None:
+    """The floor is justified by what the code actually calls.
+
+    ``entry.runtime_data`` and generic ``ConfigEntry`` typing arrived in 2024.6
+    and coordinator ``config_entry`` support in 2024.8, so anything below 2025.1
+    would be optimistic at best.
+    """
+    sources = "\n".join(
+        path.read_text(encoding="utf-8") for path in COMPONENT.glob("*.py")
+    )
+    assert "runtime_data" in sources
+    assert "config_entry=entry" in sources
+
+    major, minor, _patch = MINIMUM_HA.split(".")
+    assert (int(major), int(minor)) >= (2024, 8)
+
+
+def test_the_manifest_is_internally_consistent() -> None:
+    """Required keys are present and correctly ordered for hassfest."""
+    manifest = read_json(COMPONENT / "manifest.json")
+
+    required = {"domain", "name", "codeowners", "documentation", "iot_class"}
+    assert required <= set(manifest)
+    assert manifest["domain"] == "alpha_ems_manager"
+    assert manifest["requirements"] == []
+
+    after_first_two = [key for key in manifest if key not in ("domain", "name")]
+    assert after_first_two == sorted(after_first_two)
+
+
+@pytest.mark.parametrize("language", ["en", "nl"])
+def test_the_translation_files_parse(language: str) -> None:
+    """Both bundles are valid JSON with the expected top-level sections."""
+    payload = read_json(COMPONENT / "translations" / f"{language}.json")
+
+    assert {"config", "options", "selector", "exceptions"} <= set(payload)
+
+
+def test_the_changelog_preserves_the_historical_release() -> None:
+    """The 0.1.0 entry is history and must not be rewritten or dropped."""
+    changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+
+    assert "## [0.1.0] - 2026-06-14" in changelog
+    # Its original wording, describing the architecture that actually shipped.
+    assert "1-minute interval" in changelog
+    assert "Binary sensor: reserve satisfied." in changelog
+
+
+def test_the_changelog_documents_the_current_release() -> None:
+    """The version in the manifest has a matching changelog section."""
+    changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+
+    assert "## [Unreleased]" in changelog
+    assert f"## [{VERSION}]" in changelog
+
+
+def test_no_stable_release_is_claimed_anywhere() -> None:
+    """The guard that matters most: this must not read as a stable 1.0.0.
+
+    Learning and forecast behaviour has not been validated across enough real
+    days. A stable section in the changelog, or a stable manifest version, would
+    be a promise the project cannot currently keep.
+    """
+    changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+
+    assert "## [1.0.0]" not in changelog
+    assert "## [0.2.0]" not in changelog
+    assert VERSION != "1.0.0"
+    assert "-beta." in VERSION
+
+
+def test_the_manifest_version_is_valid_semver_prerelease() -> None:
+    """HACS and Home Assistant both parse this string; a typo breaks install."""
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)-(?:alpha|beta|rc)\.(\d+)", VERSION)
+
+    assert match is not None, f"{VERSION!r} is not a SemVer pre-release"
+
+
+def test_the_readme_states_the_current_version_and_beta_status() -> None:
+    """A user landing on the repository must not mistake this for stable."""
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert VERSION in readme
+    assert "public beta" in readme.lower()
+
+
+def test_no_hacs_default_inclusion_is_claimed() -> None:
+    """The project is not in the HACS default repository, and must not imply it.
+
+    Claiming default inclusion would be false, and would send users looking for
+    an entry in HACS that does not exist.
+    """
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert "not in the HACS default repository" in readme
+    assert "custom repositor" in readme.lower()
+
+
+def test_the_private_development_notes_are_not_part_of_the_repository() -> None:
+    """Local assistant/editor instruction files must never be committed.
+
+    The public developer reference is ``docs/ARCHITECTURE.md``. Anything named
+    below is a personal working aid, is listed in ``.gitignore``, and would leak
+    local workflow into the published repository.
+    """
+    tracked = set(
+        subprocess.run(
+            ["git", "ls-files"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+    )
+
+    for private in (
+        "CLAUDE.md",
+        "CLAUDE.local.md",
+        "GEMINI.md",
+        "AGENTS.md",
+        ".cursorrules",
+        "NOTES.md",
+    ):
+        assert private not in tracked, f"{private} must not be tracked"
+
+    # Checked on disk rather than in the index, so this passes in a working tree
+    # where the file is staged, committed or merely present.
+    assert Path("docs/ARCHITECTURE.md").is_file()

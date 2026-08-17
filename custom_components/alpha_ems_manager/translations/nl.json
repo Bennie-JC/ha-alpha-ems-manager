@@ -1,0 +1,156 @@
+{
+  "title": "Alpha EMS Manager",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Alpha EMS Manager",
+        "description": "Alpha EMS Manager leert hoeveel stroom je huishouden werkelijk verbruikt. De integratie leest entiteiten die andere integraties al leveren en benadert zelf nooit een externe dienst.",
+        "data": {
+          "name": "Naam van deze instantie",
+          "house_load_entity": "Huisverbruik vermogen",
+          "daily_house_load_entity": "Dagelijks huisverbruik (validatie, optioneel)",
+          "has_pv": "Dit systeem heeft zonnepanelen",
+          "use_pv_forecast": "Gebruik een PV-voorspellingsbron",
+          "ev_power_entity": "Laadvermogen elektrische auto (optioneel)"
+        },
+        "data_description": {
+          "name": "Wordt gebruikt voor de apparaatnaam en de entiteit-id's. Laat dit op Alpha EMS staan tenzij je meerdere instanties draait.",
+          "house_load_entity": "Momentaan huishoudelijk verbruik in W of kW, los van zon, accu en net. Bij AlphaESS is dit Current House Load.",
+          "daily_house_load_entity": "Optioneel cumulatief dagtotaal in kWh, alleen als controle aan het eind van de dag. Dit wordt nooit als leerbron gebruikt.",
+          "has_pv": "Schakelt de zonneproductiebron in op de volgende schermen.",
+          "use_pv_forecast": "Vereist een geconfigureerde Solcast PV Forecast-integratie. Fase 1 controleert alleen of de bron bereikbaar is en past de verbruiksvoorspelling nog niet aan.",
+          "ev_power_entity": "Optioneel. Als je auto achter de huisverbruikmeter laadt, kies hier dan de vermogenssensor van de lader. Alpha EMS leert het huishoudelijk verbruik dan zonder het laden mee te tellen. Elke W- of kW-sensor werkt; er wordt geen specifiek merk verondersteld."
+        }
+      },
+      "battery": {
+        "title": "Accu",
+        "description": "Kies de accusensoren en bevestig hoe jouw systeem laden rapporteert.",
+        "data": {
+          "battery_soc_entity": "Laadtoestand accu",
+          "battery_power_entity": "Accuvermogen",
+          "battery_power_sign": "Tekenconventie accuvermogen"
+        },
+        "data_description": {
+          "battery_soc_entity": "Een percentagesensor, bijvoorbeeld AlphaESS SoC Battery.",
+          "battery_power_entity": "Momentaan accuvermogen in W of kW.",
+          "battery_power_sign": "Kijk op een moment dat de accu laadt. AlphaESS rapporteert tijdens laden een negatieve waarde; dat is hier de standaard."
+        }
+      },
+      "solar": {
+        "title": "Zonneproductie",
+        "description": "Kies de sensor die aangeeft hoeveel je panelen op dit moment opwekken.",
+        "data": {
+          "pv_power_entity": "PV-productievermogen"
+        },
+        "data_description": {
+          "pv_power_entity": "Momentane zonneopwekking in W of kW. Dit wordt alleen vastgelegd voor de energiebalanscontrole en verandert nooit het geleerde huisverbruik."
+        }
+      },
+      "grid": {
+        "title": "Netmeter",
+        "description": "Elke metingsintegratie werkt hier, zoals HomeWizard P1, DSMR of SlimmeLezer.",
+        "data": {
+          "grid_power_entity": "Netvermogen",
+          "grid_power_sign": "Tekenconventie netvermogen"
+        },
+        "data_description": {
+          "grid_power_entity": "Momentane netuitwisseling in W of kW.",
+          "grid_power_sign": "Kijk op een moment dat je van het net afneemt. De meeste Nederlandse meters rapporteren tijdens afname een positieve waarde; dat is hier de standaard."
+        }
+      },
+      "sources": {
+        "title": "Prijzen en voorspelling",
+        "description": "Alpha EMS Manager leest deze integraties via Home Assistant. De API's worden nooit aangeroepen en entiteiten worden nooit gedupliceerd.",
+        "data": {
+          "frank_entry_id": "Frank Quarter Prices-instantie",
+          "solcast_entry_id": "Solcast PV Forecast-instantie"
+        },
+        "data_description": {
+          "frank_entry_id": "Door de integratie te kiezen in plaats van losse entiteiten blijft alles werken als je later een entiteit hernoemt.",
+          "solcast_entry_id": "Alleen vereist omdat je de PV-voorspelling hebt ingeschakeld."
+        }
+      }
+    },
+    "error": {
+      "entity_not_found": "Die entiteit bestaat niet. Kies er een die op dit moment beschikbaar is.",
+      "invalid_power_entity": "Dit moet een vermogenssensor in W of kW zijn.",
+      "invalid_energy_entity": "Dit moet een energiesensor in Wh of kWh zijn.",
+      "invalid_percentage_entity": "Dit moet een percentagesensor in % zijn.",
+      "entity_not_numeric": "Die entiteit levert geen getal en kan daarom niet als meting worden gebruikt.",
+      "solcast_not_configured": "Je hebt de PV-voorspelling ingeschakeld, maar Solcast PV Forecast is niet ingesteld. Voeg die integratie eerst toe, of zet de PV-voorspelling uit."
+    },
+    "abort": {
+      "frank_not_configured": "Frank Quarter Prices is nog niet ingesteld. Voeg die integratie eerst toe en configureer hem, en voeg daarna Alpha EMS Manager toe.",
+      "solcast_not_configured": "Je hebt de PV-voorspelling ingeschakeld, maar Solcast PV Forecast is niet ingesteld. Voeg die integratie eerst toe, of ga terug en zet de PV-voorspelling uit."
+    }
+  },
+  "options": {
+    "abort": {
+      "frank_not_configured": "Frank Quarter Prices is niet langer ingesteld, waardoor de prijsbron niet gekozen kan worden. Voeg die integratie opnieuw toe en open daarna deze opties opnieuw. Je geleerde geschiedenis blijft ongewijzigd."
+    },
+    "error": {
+      "entity_not_found": "Die entiteit bestaat niet. Kies er een die op dit moment beschikbaar is.",
+      "invalid_power_entity": "Dit moet een vermogenssensor in W of kW zijn.",
+      "invalid_energy_entity": "Dit moet een energiesensor in Wh of kWh zijn.",
+      "invalid_percentage_entity": "Dit moet een percentagesensor in % zijn.",
+      "entity_not_numeric": "Die entiteit levert geen getal en kan daarom niet als meting worden gebruikt.",
+      "pv_entity_required": "Je hebt aangegeven dat dit systeem zonnepanelen heeft, dus een PV-productiesensor is vereist.",
+      "solcast_entry_required": "Je hebt de PV-voorspelling ingeschakeld, dus een Solcast-instantie is vereist."
+    },
+    "step": {
+      "init": {
+        "title": "Instellingen Alpha EMS Manager",
+        "description": "Het wijzigen van een bron herlaadt de integratie. De geleerde historie blijft behouden.",
+        "data": {
+          "house_load_entity": "Huisverbruik vermogen",
+          "daily_house_load_entity": "Dagelijks huisverbruik (validatie, optioneel)",
+          "battery_soc_entity": "Laadtoestand accu",
+          "battery_power_entity": "Accuvermogen",
+          "battery_power_sign": "Tekenconventie accuvermogen",
+          "has_pv": "Dit systeem heeft zonnepanelen",
+          "pv_power_entity": "PV-productievermogen",
+          "grid_power_entity": "Netvermogen",
+          "grid_power_sign": "Tekenconventie netvermogen",
+          "frank_entry_id": "Frank Quarter Prices-instantie",
+          "use_pv_forecast": "Gebruik een PV-voorspellingsbron",
+          "solcast_entry_id": "Solcast PV Forecast-instantie",
+          "ev_power_entity": "Laadvermogen elektrische auto (optioneel)"
+        },
+        "data_description": {
+          "house_load_entity": "Momentaan huishoudelijk verbruik in W of kW, los van zon, accu en net.",
+          "daily_house_load_entity": "Optioneel cumulatief dagtotaal in kWh, alleen als controle aan het eind van de dag.",
+          "battery_soc_entity": "Een percentagesensor, bijvoorbeeld AlphaESS SoC Battery.",
+          "battery_power_entity": "Momentaan accuvermogen in W of kW.",
+          "battery_power_sign": "AlphaESS rapporteert tijdens laden een negatieve waarde.",
+          "has_pv": "Zet dit aan om zonneproductie vast te leggen voor de energiebalanscontrole.",
+          "pv_power_entity": "Vereist wanneer dit systeem zonnepanelen heeft.",
+          "grid_power_entity": "Momentane netuitwisseling in W of kW.",
+          "grid_power_sign": "De meeste Nederlandse meters rapporteren tijdens afname een positieve waarde.",
+          "frank_entry_id": "De Frank Quarter Prices-instantie waaruit prijzen worden gelezen.",
+          "use_pv_forecast": "Vereist een geconfigureerde Solcast PV Forecast-integratie.",
+          "solcast_entry_id": "Vereist wanneer de PV-voorspelling is ingeschakeld.",
+          "ev_power_entity": "Optionele flexibele belasting. Het geleerde verbruik sluit het laden van de auto uit wanneer dit is ingesteld."
+        }
+      }
+    }
+  },
+  "selector": {
+    "battery_power_sign": {
+      "options": {
+        "negative_is_charge": "Negatief betekent laden (AlphaESS-standaard)",
+        "positive_is_charge": "Positief betekent laden"
+      }
+    },
+    "grid_power_sign": {
+      "options": {
+        "positive_is_import": "Positief betekent afname van het net",
+        "negative_is_import": "Negatief betekent afname van het net"
+      }
+    }
+  },
+  "exceptions": {
+    "house_load_source_missing": {
+      "message": "Alpha EMS Manager heeft geen bron voor huisverbruik ingesteld en kan daardoor niets leren. Verwijder de integratie en voeg hem opnieuw toe om een momentane vermogenssensor voor huisverbruik te kiezen."
+    }
+  }
+}

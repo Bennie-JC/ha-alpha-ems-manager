@@ -1,7 +1,17 @@
 """Sensor platform for Alpha EMS Manager.
 
-These sensors expose the learned load, PV forecast, reserve and recommendation
-values produced by the coordinator. No control is performed here.
+Phase 1 exposes exactly four entities. Every other quantity the integration
+computes -- per-slot profiles, window means, balance residuals, coverage
+statistics -- is available through diagnostics instead. Ninety-six quarter
+sensors and five window averages would be technically easy and practically
+awful.
+
+Entity names are literal English rather than translation keys, matching the
+sibling Frank Quarter Prices integration. Home Assistant derives an entity id
+from the *translated* name, so a translation key would hand a Dutch user
+``sensor.alpha_ems_verwachte_huisbelasting_vandaag``. Stable ids that automations
+can rely on are worth more here than a translated default name the user can
+override in the UI anyway.
 """
 
 from __future__ import annotations
@@ -16,683 +26,205 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfPower
+from homeassistant.const import PERCENTAGE, UnitOfEnergy
 from homeassistant.core import HomeAssistant
-from homeassistant.util import dt as dt_util
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, NAME, VERSION
+from . import AlphaEmsConfigEntry
+from .const import (
+    DOMAIN,
+    NAME,
+    SENSOR_EXPECTED_LOAD_TODAY,
+    SENSOR_EXPECTED_LOAD_TOMORROW,
+    SENSOR_LEARNING_CONFIDENCE,
+    SENSOR_LEARNING_DAYS,
+)
 from .coordinator import AlphaEmsCoordinator
 
 
 @dataclass(frozen=True, kw_only=True)
 class AlphaEmsSensorDescription(SensorEntityDescription):
-    """Describe an Alpha EMS sensor and how to read it from coordinator data."""
+    """Describes one Alpha EMS sensor and how to derive it."""
 
-    value_fn: Callable[[dict[str, Any]], Any]
-    attributes_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None
-
-
-# Debug/diagnostic attributes surfaced on the predicted daily load sensor.
-_DEBUG_ATTRIBUTE_KEYS = (
-    "source_entity",
-    "source_value",
-    "last_house_load",
-    "last_delta",
-    "last_slot",
-    "learned_slots_count",
-    "update_count",
-    "last_update",
-)
-
-# Full lifecycle/diagnostic attributes surfaced on the profile status sensor.
-_PROFILE_STATUS_ATTRIBUTE_KEYS = (
-    "source_entity",
-    "source_value",
-    "previous_house_load",
-    "current_house_load",
-    "last_raw_delta",
-    "last_delta_per_slot",
-    "previous_slot",
-    "current_slot",
-    "distributed_slots",
-    "learned_slots_count",
-    "update_count",
-    "last_update",
-    "season",
-    "day_type",
-    "profile_key",
-    "storage_loaded",
-    "storage_saved",
-    # EV exclusion diagnostics.
-    "ev_charger_power_sensor",
-    "ev_charger_power_kw",
-    "ev_excluded_last_quarter_kwh",
-    "ev_excluded_today_kwh",
-    "house_load_raw_last_quarter_kwh",
-    "house_load_corrected_last_quarter_kwh",
-    "ev_exclusion_active",
-)
+    value_fn: Callable[[AlphaEmsCoordinator], float | int | None]
+    attributes_fn: Callable[[AlphaEmsCoordinator], dict[str, Any]] | None = None
 
 
-def _debug_attributes(data: dict[str, Any]) -> dict[str, Any]:
-    """Return the debug attributes dict from coordinator data."""
-    return {key: data.get(key) for key in _DEBUG_ATTRIBUTE_KEYS}
+def _round(value: float | None, digits: int = 2) -> float | None:
+    """Round a forecast, preserving ``None``."""
+    return None if value is None else round(value, digits)
 
 
-def _profile_status_attributes(data: dict[str, Any]) -> dict[str, Any]:
-    """Return the profile status attributes dict from coordinator data."""
-    return {key: data.get(key) for key in _PROFILE_STATUS_ATTRIBUTE_KEYS}
+def _today_value(coordinator: AlphaEmsCoordinator) -> float | None:
+    """Return today's expected total household consumption."""
+    forecast = coordinator.today_forecast
+    baseline = (coordinator.data or {}).get("today_baseline")
+    if forecast is None or baseline is None or not baseline.available:
+        return None
+    return _round(forecast.forecast_total_kwh)
 
 
-def _pv_profile_status_attributes(data: dict[str, Any]) -> dict[str, Any]:
-    """Return the PV profile status attributes from coordinator data."""
+def _today_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return the small attribute set for today's forecast."""
+    forecast = coordinator.today_forecast
+    baseline = (coordinator.data or {}).get("today_baseline")
+    confidence = coordinator.confidence
+    if forecast is None or baseline is None:
+        return {}
+    data = coordinator.data or {}
+    # The same gate the state uses. Without it an unavailable forecast still
+    # published `forecast_total_kwh: 0.0`, so a template reading the attribute
+    # got a plausible-looking zero-kWh prediction instead of nothing -- the
+    # "learned nothing must never read as zero" failure the storage layer goes to
+    # such lengths to avoid, reintroduced one layer up.
+    predicted = baseline.available
     return {
-        "actual_pv_today": data.get("pv_actual_today_kwh"),
-        "raw_forecast_today": data.get("pv_forecast_today_kwh"),
-        "raw_forecast_tomorrow": data.get("pv_forecast_tomorrow_kwh"),
-        "corrected_forecast_today": data.get("corrected_pv_forecast_today_kwh"),
-        "corrected_forecast_tomorrow": data.get(
-            "corrected_pv_forecast_tomorrow_kwh"
+        # Baseline: measured household load minus any configured flexible load.
+        "actual_so_far_kwh": _round(forecast.actual_so_far_kwh),
+        "forecast_remaining_kwh": (
+            _round(forecast.forecast_remaining_kwh) if predicted else None
         ),
-        "expected_remaining_pv_today": data.get(
-            "expected_remaining_pv_today_kwh"
+        "forecast_total_kwh": (
+            _round(forecast.forecast_total_kwh) if predicted else None
         ),
-        "global_pv_factor": data.get("global_pv_factor"),
-        "season_pv_factor": data.get("season_pv_factor"),
-        "last_pv_error": data.get("last_pv_error"),
-        "last_pv_error_factor": data.get("last_pv_error_factor"),
-        "pv_learning_days": data.get("pv_learning_days"),
-        "season": data.get("season"),
-        "storage_loaded": data.get("storage_loaded"),
-        "storage_saved": data.get("storage_saved"),
-        "last_update": data.get("last_update"),
+        # Measured ground truth, shown alongside so the two never get confused.
+        "measured_so_far_kwh": _round(data.get("measured_so_far_kwh")),
+        "flexible_load_so_far_kwh": (
+            _round(data.get("ev_so_far_kwh")) if coordinator.ev_configured else None
+        ),
+        "model_days": baseline.source_days,
+        "confidence_percent": (
+            None if confidence is None else round(confidence.percent, 1)
+        ),
+        "adaptation_applied": forecast.adapted if predicted else False,
+        "adaptation_ratio": round(forecast.adaptation_ratio, 3),
+        "day_type": baseline.day_type,
+        "intervals_today": baseline.interval_count,
     }
 
 
-def _reserve_profile_status_attributes(data: dict[str, Any]) -> dict[str, Any]:
-    """Return the reserve profile status attributes from coordinator data."""
+def _tomorrow_value(coordinator: AlphaEmsCoordinator) -> float | None:
+    """Return tomorrow's expected total household consumption."""
+    forecast = coordinator.tomorrow_forecast
+    if forecast is None or not forecast.available:
+        return None
+    return _round(forecast.total_kwh)
+
+
+def _tomorrow_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return the small attribute set for tomorrow's forecast."""
+    forecast = coordinator.tomorrow_forecast
+    confidence = coordinator.confidence
+    if forecast is None:
+        return {}
     return {
-        "battery_floor_kwh": data.get("reserve_floor_kwh"),
-        "battery_current_energy": data.get("battery_current_kwh"),
-        "reserve_correction_factor": data.get("reserve_correction_factor"),
-        "reserve_learning_days": data.get("reserve_learning_days"),
-        "reserve_miss_count": data.get("reserve_miss_count"),
-        "reserve_success_count": data.get("reserve_success_count"),
-        "last_reserve_miss": data.get("last_reserve_miss"),
-        "last_reserve_success": data.get("last_reserve_success"),
-        "required_reserve": data.get("required_reserve_kwh"),
-        "predicted_remaining_load": data.get("predicted_remaining_load_kwh"),
-        "expected_remaining_pv_today": data.get(
-            "expected_remaining_pv_today_kwh"
+        "forecast_total_kwh": _round(forecast.total_kwh),
+        "model_days": forecast.source_days,
+        "day_type": forecast.day_type,
+        "day_type_pooled": forecast.day_type_pooled,
+        "windows_used_days": list(forecast.windows_used),
+        # 92 / 96 / 100 depending on the target day's daylight-saving shape.
+        "intervals_tomorrow": forecast.interval_count,
+        "confidence_percent": (
+            None if confidence is None else round(confidence.percent, 1)
         ),
-        "day_min_battery_energy": data.get("reserve_day_min_battery_energy"),
-        "last_miss_date": data.get("reserve_last_miss_date"),
-        "last_success_date": data.get("reserve_last_success_date"),
-        "storage_loaded": data.get("storage_loaded"),
-        "storage_saved": data.get("storage_saved"),
-        "last_update": data.get("last_update"),
     }
 
 
-SENSOR_DESCRIPTIONS: tuple[AlphaEmsSensorDescription, ...] = (
+def _confidence_value(coordinator: AlphaEmsCoordinator) -> float | None:
+    """Return the learning confidence percentage."""
+    confidence = coordinator.confidence
+    return None if confidence is None else round(confidence.percent, 1)
+
+
+def _confidence_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return the component breakdown behind the confidence score."""
+    confidence = coordinator.confidence
+    if confidence is None:
+        return {}
+    breakdown = confidence.as_dict()
+    breakdown.pop("percent", None)
+    return breakdown
+
+
+def _days_value(coordinator: AlphaEmsCoordinator) -> int | None:
+    """Return the number of calendar days that count as learned."""
+    confidence = coordinator.confidence
+    return None if confidence is None else confidence.learned_days
+
+
+def _days_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return retention and rejection context for the learned-day count."""
+    oldest, newest = coordinator.store.span
+    return {
+        "retained_days": len(coordinator.store.days),
+        "retained_intervals": coordinator.store.retained_intervals,
+        "history_start": None if oldest is None else oldest.isoformat(),
+        "history_end": None if newest is None else newest.isoformat(),
+        "rejected_quarters": coordinator.rejected_quarters,
+        "flexible_load_configured": coordinator.ev_configured,
+        "intervals_without_flexible_data": coordinator.invalid_ev_quarters,
+        "open_quarter_coverage": round(coordinator.open_quarter_coverage, 3),
+    }
+
+
+SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
     AlphaEmsSensorDescription(
-        key="predicted_daily_load",
-        translation_key="predicted_daily_load",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        key=SENSOR_EXPECTED_LOAD_TODAY,
+        name="Expected House Load Today",
         icon="mdi:home-lightning-bolt",
-        value_fn=lambda data: data.get("predicted_daily_load_kwh"),
-        attributes_fn=_debug_attributes,
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        # No state_class: this is a forecast, and long-term statistics or an
+        # Energy dashboard entry built on a prediction would be misleading.
+        value_fn=_today_value,
+        attributes_fn=_today_attributes,
     ),
     AlphaEmsSensorDescription(
-        key="predicted_remaining_load",
-        translation_key="predicted_remaining_load",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        key=SENSOR_EXPECTED_LOAD_TOMORROW,
+        name="Expected House Load Tomorrow",
         icon="mdi:home-clock",
-        value_fn=lambda data: data.get("predicted_remaining_load_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="required_reserve",
-        translation_key="required_reserve",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-charging-medium",
-        value_fn=lambda data: data.get("required_reserve_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="pv_forecast_today",
-        translation_key="pv_forecast_today",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:solar-power",
-        value_fn=lambda data: data.get("pv_forecast_today_kwh"),
+        value_fn=_tomorrow_value,
+        attributes_fn=_tomorrow_attributes,
     ),
     AlphaEmsSensorDescription(
-        key="pv_forecast_tomorrow",
-        translation_key="pv_forecast_tomorrow",
-        device_class=SensorDeviceClass.ENERGY,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:solar-power",
-        value_fn=lambda data: data.get("pv_forecast_tomorrow_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="battery_current",
-        translation_key="battery_current",
-        device_class=SensorDeviceClass.ENERGY_STORAGE,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery",
-        value_fn=lambda data: data.get("battery_current_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="recommendation",
-        translation_key="recommendation",
-        icon="mdi:lightbulb-on",
-        value_fn=lambda data: (
-            "hold" if data.get("reserve_satisfied") else "charge"
-        ),
-    ),
-    AlphaEmsSensorDescription(
-        key="learning_confidence",
-        translation_key="learning_confidence",
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=PERCENTAGE,
+        key=SENSOR_LEARNING_CONFIDENCE,
+        name="Learning Confidence",
         icon="mdi:gauge",
-        value_fn=lambda data: data.get("learning_confidence"),
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=_confidence_value,
+        attributes_fn=_confidence_attributes,
     ),
     AlphaEmsSensorDescription(
-        key="learning_days",
-        translation_key="learning_days",
-        state_class=SensorStateClass.TOTAL_INCREASING,
-        native_unit_of_measurement="d",
+        key=SENSOR_LEARNING_DAYS,
+        name="Learning Days",
         icon="mdi:calendar-check",
-        value_fn=lambda data: data.get("learning_days"),
-    ),
-    AlphaEmsSensorDescription(
-        key="learned_slots_count",
-        translation_key="learned_slots_count",
         state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:view-grid",
-        value_fn=lambda data: data.get("learned_slots_count"),
-    ),
-    AlphaEmsSensorDescription(
-        key="last_quarter_load",
-        translation_key="last_quarter_load",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:home-clock-outline",
-        value_fn=lambda data: data.get("last_quarter_load_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="profile_status",
-        translation_key="profile_status",
-        icon="mdi:clipboard-pulse",
-        value_fn=lambda data: data.get("profile_status"),
-        attributes_fn=_profile_status_attributes,
-    ),
-    AlphaEmsSensorDescription(
-        key="pv_correction_factor",
-        translation_key="pv_correction_factor",
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:tune-variant",
-        value_fn=lambda data: data.get("pv_correction_factor"),
-    ),
-    AlphaEmsSensorDescription(
-        key="corrected_pv_forecast_today",
-        translation_key="corrected_pv_forecast_today",
-        device_class=SensorDeviceClass.ENERGY,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:solar-power-variant",
-        value_fn=lambda data: data.get("corrected_pv_forecast_today_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="corrected_pv_forecast_tomorrow",
-        translation_key="corrected_pv_forecast_tomorrow",
-        device_class=SensorDeviceClass.ENERGY,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:solar-power-variant",
-        value_fn=lambda data: data.get("corrected_pv_forecast_tomorrow_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="expected_remaining_pv_today",
-        translation_key="expected_remaining_pv_today",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:weather-sunset",
-        value_fn=lambda data: data.get("expected_remaining_pv_today_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="pv_learning_confidence",
-        translation_key="pv_learning_confidence",
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=PERCENTAGE,
-        icon="mdi:gauge",
-        value_fn=lambda data: data.get("pv_learning_confidence"),
-    ),
-    AlphaEmsSensorDescription(
-        key="pv_profile_status",
-        translation_key="pv_profile_status",
-        icon="mdi:clipboard-pulse-outline",
-        value_fn=lambda data: data.get("pv_profile_status"),
-        attributes_fn=_pv_profile_status_attributes,
-    ),
-    AlphaEmsSensorDescription(
-        key="reserve_correction_factor",
-        translation_key="reserve_correction_factor",
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:tune-vertical",
-        value_fn=lambda data: data.get("reserve_correction_factor"),
-        attributes_fn=_reserve_profile_status_attributes,
-    ),
-    AlphaEmsSensorDescription(
-        key="reserve_floor",
-        translation_key="reserve_floor",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-low",
-        value_fn=lambda data: data.get("reserve_floor_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="reserve_learning_days",
-        translation_key="reserve_learning_days",
-        state_class=SensorStateClass.TOTAL_INCREASING,
-        native_unit_of_measurement="d",
-        icon="mdi:calendar-check-outline",
-        value_fn=lambda data: data.get("reserve_learning_days"),
-    ),
-    AlphaEmsSensorDescription(
-        key="reserve_miss_count",
-        translation_key="reserve_miss_count",
-        state_class=SensorStateClass.TOTAL_INCREASING,
-        icon="mdi:battery-alert",
-        value_fn=lambda data: data.get("reserve_miss_count"),
-    ),
-    AlphaEmsSensorDescription(
-        key="reserve_success_count",
-        translation_key="reserve_success_count",
-        state_class=SensorStateClass.TOTAL_INCREASING,
-        icon="mdi:battery-check",
-        value_fn=lambda data: data.get("reserve_success_count"),
-    ),
-    AlphaEmsSensorDescription(
-        key="reserve_learning_status",
-        translation_key="reserve_learning_status",
-        icon="mdi:clipboard-pulse",
-        value_fn=lambda data: data.get("reserve_learning_status"),
-        attributes_fn=_reserve_profile_status_attributes,
-    ),
-    # --- Trade Prediction Engine sensors --------------------------------------
-    AlphaEmsSensorDescription(
-        key="trade_possible",
-        translation_key="trade_possible",
-        icon="mdi:swap-horizontal-bold",
-        value_fn=lambda data: data.get("trade_possible"),
-        attributes_fn=lambda data: {
-            "trade_found": data.get("trade_found"),
-            "trade_executable": data.get("trade_executable"),
-            "trade_block_reason": data.get("trade_block_reason"),
-            "best_valid_spread": data.get("trade_spread"),
-            "minimum_spread": data.get("minimum_spread"),
-            "spread_above_minimum": (
-                round(data["trade_spread"] - data["minimum_spread"], 4)
-                if data.get("trade_spread") is not None
-                and data.get("minimum_spread") is not None
-                else None
-            ),
-            "predicted_sell_kwh": data.get("predicted_sell_kwh"),
-            "required_reserve_after_sell": data.get("required_reserve_after_sell"),
-            "available_energy_after_reserve": data.get("available_energy_after_reserve"),
-            "buy_price": data.get("predicted_buy_price"),
-            "sell_price": data.get("predicted_sell_price"),
-            "minimum_spread_entity": data.get("minimum_spread_entity"),
-            "minimum_spread_value": data.get("minimum_spread_value"),
-            "minimum_spread_source": data.get("minimum_spread_source"),
-            "next_buy_source": data.get("next_buy_source"),
-            "current_battery_energy": data.get("battery_current_kwh"),
-            "battery_capacity_kwh": data.get("battery_capacity_kwh"),
-            "battery_capacity_source": data.get("battery_capacity_source"),
-            "expected_pv_until_sell": data.get("expected_pv_until_sell"),
-            "expected_load_until_sell": data.get("expected_load_until_sell"),
-            "expected_pv_until_buy": data.get("expected_pv_until_buy"),
-            "expected_load_until_buy": data.get("expected_load_until_buy"),
-            "expected_pv_sell_to_next_buy": data.get("expected_pv_sell_to_next_buy"),
-            "expected_load_sell_to_next_buy": data.get("expected_load_sell_to_next_buy"),
-            "reserve_floor_kwh": data.get("reserve_floor_kwh"),
-            "reserve_correction_factor": data.get("reserve_correction_factor"),
-            "pv_correction_factor": data.get("pv_correction_factor"),
-            "buy_cost": data.get("buy_cost"),
-            "sell_income": data.get("sell_income"),
-            "predicted_profit": data.get("predicted_profit"),
-            "gross_profit": data.get("gross_profit"),
-            "efficiency_loss_kwh": data.get("efficiency_loss_kwh"),
-            "battery_can_reach_full_before_sell": data.get(
-                "battery_can_reach_full_before_sell"
-            ),
-            "buy_limited_by_charge_power": data.get("buy_limited_by_charge_power"),
-            "sell_limited_by_discharge_power": data.get(
-                "sell_limited_by_discharge_power"
-            ),
-            "max_charge_power_kw": data.get("max_charge_power_kw"),
-            "max_discharge_power_kw": data.get("max_discharge_power_kw"),
-            "max_buy_kwh_per_quarter": data.get("max_buy_kwh_per_quarter"),
-            "max_sell_kwh_per_quarter": data.get("max_sell_kwh_per_quarter"),
-            "charge_efficiency": data.get("charge_efficiency"),
-            "discharge_efficiency": data.get("discharge_efficiency"),
-            "roundtrip_efficiency": data.get("roundtrip_efficiency"),
-            "pv_distribution_mode": data.get("pv_distribution_mode"),
-            "pv_sunrise_slot": data.get("pv_sunrise_slot"),
-            "pv_sunset_slot": data.get("pv_sunset_slot"),
-            "pv_daylight_slots": data.get("pv_daylight_slots"),
-            "pv_curve_peak_slot": data.get("pv_curve_peak_slot"),
-            "pv_east_used": data.get("pv_east_used"),
-            "pv_west_used": data.get("pv_west_used"),
-            "ev_exclusion_used": data.get("ev_exclusion_used"),
-            # Spread selection diagnostics.
-            "spread_selection_mode": data.get("spread_selection_mode"),
-            "best_buy_time": data.get("predicted_buy_time"),
-            "best_buy_price": data.get("predicted_buy_price"),
-            "best_sell_time": data.get("predicted_sell_time"),
-            "best_sell_price": data.get("predicted_sell_price"),
-            "best_valid_spread": data.get("trade_spread"),
-            "valid_spread_pairs_checked": data.get("valid_spread_pairs_checked"),
-            "rejected_non_chronological_pairs": data.get(
-                "rejected_non_chronological_pairs"
-            ),
-            "best_today_trade_spread": data.get("best_today_trade_spread"),
-            "best_tomorrow_trade_spread": data.get("best_tomorrow_trade_spread"),
-            "best_cross_day_trade_spread": data.get("best_cross_day_trade_spread"),
-        },
-    ),
-    AlphaEmsSensorDescription(
-        key="trade_found",
-        translation_key="trade_found",
-        icon="mdi:chart-timeline-variant-shimmer",
-        value_fn=lambda data: data.get("trade_found"),
-        attributes_fn=lambda data: {
-            "trade_found": data.get("trade_found"),
-            "trade_executable": data.get("trade_executable"),
-            "trade_block_reason": data.get("trade_block_reason"),
-            "best_valid_spread": data.get("trade_spread"),
-            "minimum_spread": data.get("minimum_spread"),
-            "spread_above_minimum": (
-                round(data["trade_spread"] - data["minimum_spread"], 4)
-                if data.get("trade_spread") is not None
-                and data.get("minimum_spread") is not None
-                else None
-            ),
-            "predicted_sell_kwh": data.get("predicted_sell_kwh"),
-            "required_reserve_after_sell": data.get("required_reserve_after_sell"),
-            "battery_capacity_kwh": data.get("battery_capacity_kwh"),
-            "expected_battery_at_sell": data.get("expected_battery_at_sell"),
-            "available_energy_after_reserve": data.get("available_energy_after_reserve"),
-            "battery_at_sell_target": data.get("battery_at_sell_target"),
-            "available_battery_space_kwh": data.get("available_battery_space_kwh"),
-            "max_buy_possible_kwh": data.get("max_buy_possible_kwh"),
-            "expected_pv_between_buy_and_sell": data.get("expected_pv_between_buy_and_sell"),
-            "expected_load_between_buy_and_sell": data.get("expected_load_between_buy_and_sell"),
-            "buy_to_full_reason": data.get("buy_to_full_reason"),
-        },
-    ),
-    AlphaEmsSensorDescription(
-        key="trade_executable",
-        translation_key="trade_executable",
-        icon="mdi:battery-sync",
-        value_fn=lambda data: data.get("trade_executable"),
-    ),
-    AlphaEmsSensorDescription(
-        key="trade_block_reason",
-        translation_key="trade_block_reason",
-        icon="mdi:alert-circle-outline",
-        value_fn=lambda data: data.get("trade_block_reason"),
-    ),
-    AlphaEmsSensorDescription(
-        key="predicted_buy_kwh",
-        translation_key="predicted_buy_kwh",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-plus",
-        value_fn=lambda data: data.get("predicted_buy_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="predicted_buy_time",
-        translation_key="predicted_buy_time",
-        device_class=SensorDeviceClass.TIMESTAMP,
-        icon="mdi:clock-start",
-        value_fn=lambda data: (
-            dt_util.parse_datetime(t)
-            if (t := data.get("predicted_buy_time"))
-            else None
-        ),
-    ),
-    AlphaEmsSensorDescription(
-        key="predicted_buy_price",
-        translation_key="predicted_buy_price",
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement="€/kWh",
-        icon="mdi:cash-minus",
-        value_fn=lambda data: data.get("predicted_buy_price"),
-    ),
-    AlphaEmsSensorDescription(
-        key="predicted_sell_kwh",
-        translation_key="predicted_sell_kwh",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-minus",
-        value_fn=lambda data: data.get("predicted_sell_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="predicted_sell_time",
-        translation_key="predicted_sell_time",
-        device_class=SensorDeviceClass.TIMESTAMP,
-        icon="mdi:clock-end",
-        value_fn=lambda data: (
-            dt_util.parse_datetime(t)
-            if (t := data.get("predicted_sell_time"))
-            else None
-        ),
-    ),
-    AlphaEmsSensorDescription(
-        key="predicted_sell_price",
-        translation_key="predicted_sell_price",
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement="€/kWh",
-        icon="mdi:cash-plus",
-        value_fn=lambda data: data.get("predicted_sell_price"),
-    ),
-    AlphaEmsSensorDescription(
-        key="predicted_profit",
-        translation_key="predicted_profit",
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement="€",
-        icon="mdi:cash-multiple",
-        value_fn=lambda data: data.get("predicted_profit"),
-    ),
-    AlphaEmsSensorDescription(
-        key="trade_spread",
-        translation_key="trade_spread",
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement="€/kWh",
-        icon="mdi:chart-bell-curve",
-        value_fn=lambda data: data.get("trade_spread"),
-    ),
-    AlphaEmsSensorDescription(
-        key="required_reserve_after_sell",
-        translation_key="required_reserve_after_sell",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-lock",
-        value_fn=lambda data: data.get("required_reserve_after_sell"),
-    ),
-    AlphaEmsSensorDescription(
-        key="expected_battery_at_sell",
-        translation_key="expected_battery_at_sell",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-charging-high",
-        value_fn=lambda data: data.get("expected_battery_at_sell"),
-    ),
-    AlphaEmsSensorDescription(
-        key="expected_battery_at_buy",
-        translation_key="expected_battery_at_buy",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-charging-outline",
-        value_fn=lambda data: data.get("expected_battery_at_buy"),
-    ),
-    AlphaEmsSensorDescription(
-        key="battery_can_reach_full_before_sell",
-        translation_key="battery_can_reach_full_before_sell",
-        icon="mdi:battery-check",
-        value_fn=lambda data: data.get("battery_can_reach_full_before_sell"),
-    ),
-    AlphaEmsSensorDescription(
-        key="predicted_missing_kwh_for_full",
-        translation_key="predicted_missing_kwh_for_full",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-alert",
-        value_fn=lambda data: data.get("predicted_missing_kwh_for_full"),
-    ),
-    AlphaEmsSensorDescription(
-        key="safety_buy_needed",
-        translation_key="safety_buy_needed",
-        icon="mdi:shield-alert",
-        value_fn=lambda data: data.get("safety_buy_needed"),
-    ),
-    AlphaEmsSensorDescription(
-        key="safety_buy_kwh",
-        translation_key="safety_buy_kwh",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:battery-alert-variant",
-        value_fn=lambda data: data.get("safety_buy_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="safety_buy_time",
-        translation_key="safety_buy_time",
-        device_class=SensorDeviceClass.TIMESTAMP,
-        icon="mdi:clock-alert",
-        value_fn=lambda data: (
-            dt_util.parse_datetime(t)
-            if (t := data.get("safety_buy_time"))
-            else None
-        ),
-    ),
-    AlphaEmsSensorDescription(
-        key="safety_buy_reason",
-        translation_key="safety_buy_reason",
-        icon="mdi:information-outline",
-        value_fn=lambda data: data.get("safety_buy_reason"),
-    ),
-    AlphaEmsSensorDescription(
-        key="trade_prediction_days",
-        translation_key="trade_prediction_days",
-        state_class=SensorStateClass.TOTAL_INCREASING,
-        native_unit_of_measurement="d",
-        icon="mdi:calendar-clock",
-        value_fn=lambda data: data.get("trade_prediction_days"),
-    ),
-    AlphaEmsSensorDescription(
-        key="trade_prediction_confidence",
-        translation_key="trade_prediction_confidence",
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=PERCENTAGE,
-        icon="mdi:gauge",
-        value_fn=lambda data: data.get("trade_prediction_confidence"),
-    ),
-    AlphaEmsSensorDescription(
-        key="trade_prediction_status",
-        translation_key="trade_prediction_status",
-        icon="mdi:clipboard-pulse",
-        value_fn=lambda data: data.get("trade_prediction_status"),
-    ),
-    AlphaEmsSensorDescription(
-        key="next_buy_source",
-        translation_key="next_buy_source",
-        icon="mdi:database-search",
-        value_fn=lambda data: data.get("next_buy_source"),
-    ),
-    # --- EV exclusion sensors --------------------------------------------------
-    AlphaEmsSensorDescription(
-        key="ev_charger_power",
-        translation_key="ev_charger_power",
-        device_class=SensorDeviceClass.POWER,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfPower.KILO_WATT,
-        icon="mdi:ev-station",
-        value_fn=lambda data: data.get("ev_charger_power_kw"),
-    ),
-    AlphaEmsSensorDescription(
-        key="ev_excluded_last_quarter",
-        translation_key="ev_excluded_last_quarter",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:ev-plug-type2",
-        value_fn=lambda data: data.get("ev_excluded_last_quarter_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="ev_excluded_today",
-        translation_key="ev_excluded_today",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:car-electric",
-        value_fn=lambda data: data.get("ev_excluded_today_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="house_load_raw_last_quarter",
-        translation_key="house_load_raw_last_quarter",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:home-lightning-bolt",
-        value_fn=lambda data: data.get("house_load_raw_last_quarter_kwh"),
-    ),
-    AlphaEmsSensorDescription(
-        key="house_load_corrected_last_quarter",
-        translation_key="house_load_corrected_last_quarter",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        icon="mdi:home-check",
-        value_fn=lambda data: data.get("house_load_corrected_last_quarter_kwh"),
+        value_fn=_days_value,
+        attributes_fn=_days_attributes,
     ),
 )
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: AlphaEmsConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the sensor entities."""
-    coordinator: AlphaEmsCoordinator = hass.data[DOMAIN][entry.entry_id]
+    """Set up the four Alpha EMS sensors."""
+    coordinator: AlphaEmsCoordinator = entry.runtime_data
     async_add_entities(
-        AlphaEmsSensor(coordinator, entry, description)
-        for description in SENSOR_DESCRIPTIONS
+        AlphaEmsSensor(coordinator, description) for description in SENSORS
     )
 
 
 class AlphaEmsSensor(CoordinatorEntity[AlphaEmsCoordinator], SensorEntity):
-    """A sensor backed by the Alpha EMS coordinator."""
+    """A coordinator-backed Alpha EMS sensor."""
 
     _attr_has_entity_name = True
     entity_description: AlphaEmsSensorDescription
@@ -700,34 +232,30 @@ class AlphaEmsSensor(CoordinatorEntity[AlphaEmsCoordinator], SensorEntity):
     def __init__(
         self,
         coordinator: AlphaEmsCoordinator,
-        entry: ConfigEntry,
         description: AlphaEmsSensorDescription,
     ) -> None:
-        """Initialise the sensor."""
+        """Bind the sensor to its coordinator and description."""
         super().__init__(coordinator)
         self.entity_description = description
+        entry = coordinator.entry
+        # Config-entry scoped, so two Alpha EMS instances never collide.
         self._attr_unique_id = f"{entry.entry_id}_{description.key}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
-            name=NAME,
-            manufacturer="Bennie-JC",
-            model="Learning EMS",
-            sw_version=VERSION,
+            name=entry.title,
+            manufacturer="Alpha EMS",
+            model=NAME,
+            entry_type=DeviceEntryType.SERVICE,
         )
 
     @property
-    def native_value(self) -> Any:
-        """Return the current value from the coordinator data."""
-        if self.coordinator.data is None:
-            return None
-        return self.entity_description.value_fn(self.coordinator.data)
+    def native_value(self) -> float | int | None:
+        """Return the current sensor value."""
+        return self.entity_description.value_fn(self.coordinator)
 
     @property
-    def extra_state_attributes(self) -> dict[str, Any] | None:
-        """Return debug/diagnostic attributes, if this sensor exposes any."""
-        if (
-            self.coordinator.data is None
-            or self.entity_description.attributes_fn is None
-        ):
-            return None
-        return self.entity_description.attributes_fn(self.coordinator.data)
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the sensor's small attribute set."""
+        if self.entity_description.attributes_fn is None:
+            return {}
+        return self.entity_description.attributes_fn(self.coordinator)
