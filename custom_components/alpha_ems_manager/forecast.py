@@ -61,6 +61,21 @@ from .storage import (
 #: One observation of a behavioural slot: (age in days, day type, kWh).
 _Observation = tuple[int, str, float]
 
+# Why a forecast is not published. Reported through diagnostics so a live
+# installation can be diagnosed without reading the source: the withholding is
+# usually correct, but "unknown" on its own does not say which safeguard fired.
+
+#: No completed day has been recorded yet.
+REASON_NO_HISTORY = "no_history"
+#: History exists, but no behavioural slot reached MIN_OBSERVATIONS_PER_WINDOW --
+#: the usual cause is a single prior day, since a window needs at least two.
+REASON_INSUFFICIENT_MODEL_DAYS = "insufficient_model_days"
+#: Some slots blended, but too little of the target day could be modelled to
+#: publish a whole-day figure without extrapolating.
+REASON_INSUFFICIENT_COVERAGE = "insufficient_baseline_coverage"
+#: The forecast object was never populated, e.g. read before the first refresh.
+REASON_NOT_BUILT = "forecast_not_built"
+
 
 @dataclass(slots=True)
 class DayForecast:
@@ -79,6 +94,14 @@ class DayForecast:
     source_days: int = 0
     #: True when the day-type split was too thin and all days were pooled.
     day_type_pooled: bool = False
+    #: Past days that contributed at least one observation, learned or not.
+    usable_days: int = 0
+    #: Intervals that a look-back window could actually be blended for.
+    modelled_intervals: int = 0
+    #: Why nothing is published, or ``None`` when the forecast is available.
+    #: Diagnostics only -- this bug was found on a live system where the
+    #: withholding was correct but impossible to explain from the outside.
+    unavailable_reason: str | None = REASON_NOT_BUILT
 
     @property
     def available(self) -> bool:
@@ -92,13 +115,22 @@ class DayForecast:
             return None
         return sum(value for value in self.intervals if value is not None)
 
-    def remaining_kwh(self, from_index: int) -> float:
-        """Return the forecast energy from ``from_index`` to the end of the day.
+    def remaining_kwh(self, from_index: int) -> float | None:
+        """Return forecast energy from ``from_index`` on, or ``None`` if withheld.
+
+        Gated on :attr:`available` for the same reason :attr:`total_kwh` is.
+        Without that gate this summed whatever intervals happened to blend, even
+        when the forecast had been deliberately withheld -- so a baseline the
+        entity refused to publish still produced a confident-looking remainder
+        for anything reading it directly, and diagnostics reported a day total
+        for a sensor showing ``unknown``.
 
         ``from_index`` is a chronological interval index, which advances
         monotonically through a DST fold. A wall-clock slot index would move
         backwards during the repeated hour and re-count energy already consumed.
         """
+        if not self.available:
+            return None
         start = min(max(0, from_index), self.interval_count)
         return sum(
             value
@@ -114,13 +146,19 @@ class TodayForecast:
     #: Baseline energy already measured today.
     actual_so_far_kwh: float
     #: Forecast baseline energy for the remainder of the day, after adaptation.
-    forecast_remaining_kwh: float
-    #: Whole-day total: measured so far plus adapted remainder.
-    forecast_total_kwh: float
+    #: ``None`` when the underlying baseline is not publishable.
+    forecast_remaining_kwh: float | None
+    #: Whole-day total: measured so far plus adapted remainder. ``None`` when the
+    #: underlying baseline is not publishable -- measured energy alone is not a
+    #: forecast, and reporting it as one is what made diagnostics disagree with
+    #: the entity.
+    forecast_total_kwh: float | None
     #: The damped ratio that was applied. 1.0 means no adaptation.
     adaptation_ratio: float
     #: Whether adaptation was actually applied, as opposed to suppressed.
     adapted: bool
+    #: Whether the baseline behind this was publishable at all.
+    available: bool = False
 
 
 def _collect_observations(
@@ -188,6 +226,7 @@ def build_forecast(
 
     usable = [record for record in records if record.day < reference]
     if not usable:
+        forecast.unavailable_reason = REASON_NO_HISTORY
         return forecast
 
     same_type = [record for record in usable if record.day_type == day_type]
@@ -203,8 +242,12 @@ def build_forecast(
     forecast.source_days = sum(1 for record in counted if record.is_learned)
 
     buckets = _collect_observations(usable, reference)
+    forecast.usable_days = len(
+        {record.day for record in usable if record.baseline_valid_count > 0}
+    )
     if not buckets:
         forecast.source_days = 0
+        forecast.unavailable_reason = REASON_NO_HISTORY
         return forecast
 
     windows_used: set[int] = set()
@@ -228,11 +271,24 @@ def build_forecast(
     # correct answer here, and the same threshold that decides whether a day
     # counts as learned decides whether a day can be forecast.
     known = sum(1 for value in forecast.intervals if value is not None)
+    forecast.modelled_intervals = known
     if known < interval_count * MIN_DAY_COMPLETENESS:
         forecast.source_days = 0
+        # Nothing blended at all means no slot reached the observation minimum,
+        # which is what a single prior day always produces. Some blending means
+        # the history is there but too thin to cover the day. The two look
+        # identical from outside and call for completely different user action:
+        # wait one more day, versus look at why coverage is patchy.
+        forecast.unavailable_reason = (
+            REASON_INSUFFICIENT_MODEL_DAYS
+            if known == 0
+            else REASON_INSUFFICIENT_COVERAGE
+        )
         return forecast
 
     _fill_unknown_intervals(forecast)
+    forecast.modelled_intervals = interval_count
+    forecast.unavailable_reason = None
     return forecast
 
 
@@ -314,8 +370,22 @@ def adapt_today(
     ``elapsed_intervals`` is a chronological index, so it never moves backwards
     through a daylight-saving fold.
     """
+    # A baseline that was withheld has no remainder to adapt. Measured energy is
+    # still real and keeps being reported, but it is not a forecast: presenting
+    # "what the house has used so far" as a whole-day total is precisely how
+    # diagnostics came to show 4.5 kWh for a sensor reading `unknown`.
+    if not baseline.available:
+        return TodayForecast(
+            actual_so_far_kwh=measured_total_kwh,
+            forecast_remaining_kwh=None,
+            forecast_total_kwh=None,
+            adaptation_ratio=1.0,
+            adapted=False,
+            available=False,
+        )
+
     elapsed = max(0, min(baseline.interval_count, elapsed_intervals))
-    baseline_remaining = baseline.remaining_kwh(elapsed)
+    baseline_remaining = baseline.remaining_kwh(elapsed) or 0.0
 
     comparable = [
         index
@@ -347,4 +417,5 @@ def adapt_today(
         forecast_total_kwh=measured_total_kwh + remaining,
         adaptation_ratio=ratio,
         adapted=adapted,
+        available=True,
     )

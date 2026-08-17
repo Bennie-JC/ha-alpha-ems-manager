@@ -28,6 +28,7 @@ from .const import (
 )
 from .coordinator import AlphaEmsCoordinator
 from .energy_balance import infer_balance_mode
+from .forecast import REASON_NOT_BUILT, DayForecast
 
 
 def _source_report(hass: HomeAssistant, entity_id: str | None) -> dict[str, Any]:
@@ -45,6 +46,35 @@ def _source_report(hass: HomeAssistant, entity_id: str | None) -> dict[str, Any]
         "unit": state.attributes.get("unit_of_measurement"),
         "device_class": state.attributes.get("device_class"),
         "state_class": state.attributes.get("state_class"),
+    }
+
+
+def _forecast_report(forecast: DayForecast | None) -> dict[str, Any]:
+    """Summarise one baseline forecast, including why it is withheld.
+
+    ``unavailable_reason`` is the field that matters in support: the safeguards
+    are deliberate, so a withheld forecast is normally healthy, and this says
+    which one fired rather than leaving the user guessing.
+    """
+    if forecast is None:
+        return {"available": False, "unavailable_reason": REASON_NOT_BUILT}
+    return {
+        "available": forecast.available,
+        "unavailable_reason": forecast.unavailable_reason,
+        "total_kwh": (
+            None if forecast.total_kwh is None else round(forecast.total_kwh, 3)
+        ),
+        # Learned days behind the model. Deliberately distinct from the
+        # Learning Days sensor: that counts every day complete enough to learn,
+        # this counts the ones actually backing a published forecast.
+        "model_days": forecast.source_days,
+        # Past days that contributed any observation at all, learned or not.
+        "usable_days": forecast.usable_days,
+        "modelled_intervals": forecast.modelled_intervals,
+        "interval_count": forecast.interval_count,
+        "day_type": forecast.day_type,
+        "day_type_pooled": forecast.day_type_pooled,
+        "windows_used_days": list(forecast.windows_used),
     }
 
 
@@ -86,6 +116,10 @@ async def async_get_config_entry_diagnostics(
 
     today = coordinator.today_forecast
     tomorrow = coordinator.tomorrow_forecast
+    # Today's *baseline* forecast, before same-day adaptation. This is the
+    # object the Today entity gates its availability on, so reporting it is
+    # what keeps diagnostics and the entity telling the same story.
+    today_baseline = (coordinator.data or {}).get("today_baseline")
     confidence = coordinator.confidence
 
     return {
@@ -156,9 +190,22 @@ async def async_get_config_entry_diagnostics(
                 "configured but unreadable flexible load has no valid baseline"
             ),
         },
+        # The two forecasts report the same fields, including *why* nothing is
+        # published. A withheld forecast is usually correct, but "unknown" alone
+        # cannot be told apart from a fault without this -- which is exactly how
+        # a live installation ended up showing a day total here for a sensor
+        # reading `unknown`. These figures now come from the same availability
+        # rule the entities use, so the two can no longer disagree.
         "forecast": {
             "today_total_kwh": (
-                None if today is None else round(today.forecast_total_kwh, 3)
+                None
+                if today is None or today.forecast_total_kwh is None
+                else round(today.forecast_total_kwh, 3)
+            ),
+            "today_remaining_kwh": (
+                None
+                if today is None or today.forecast_remaining_kwh is None
+                else round(today.forecast_remaining_kwh, 3)
             ),
             "today_actual_so_far_kwh": (
                 None if today is None else round(today.actual_so_far_kwh, 3)
@@ -166,6 +213,7 @@ async def async_get_config_entry_diagnostics(
             "today_adaptation_ratio": (
                 None if today is None else round(today.adaptation_ratio, 3)
             ),
+            "today_available": None if today is None else today.available,
             "tomorrow_total_kwh": (
                 None
                 if tomorrow is None or tomorrow.total_kwh is None
@@ -178,6 +226,8 @@ async def async_get_config_entry_diagnostics(
             "windows_used_days": (
                 [] if tomorrow is None else list(tomorrow.windows_used)
             ),
+            "forecast_today": _forecast_report(today_baseline),
+            "forecast_tomorrow": _forecast_report(tomorrow),
         },
         "confidence": None if confidence is None else confidence.as_dict(),
         # Session-scoped counters plus the persisted tally. The session view is

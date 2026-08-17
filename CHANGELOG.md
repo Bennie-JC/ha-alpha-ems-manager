@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.2] - 2026-08-18
+
+A Phase-1 bugfix beta, from a defect found during live Home Assistant testing of
+`1.0.0-beta.1`. No new functionality, no behaviour change to learning, storage or
+the forecast model itself.
+
+### Fixed
+
+- **Diagnostics could report a house-load forecast that the entity had
+  deliberately withheld.** On a live installation two days after install, the
+  Today entity correctly read `unknown` with `model_days: 0` while diagnostics
+  for the same refresh reported `today_total_kwh: 4.546`. The withholding was
+  correct — a single learned day and two partial days cannot model a full day —
+  but `DayForecast.remaining_kwh()` summed whatever intervals happened to blend
+  without consulting the availability rule the entity uses. Same-day adaptation
+  called it unconditionally, so an unpublishable baseline still produced a
+  confident-looking day total for anything reading it directly.
+- Forecast publication and diagnostics now apply one availability rule, so the
+  two can no longer disagree about whether a forecast exists.
+- Same-day adaptation is no longer reported as applied when there is no
+  publishable baseline to adapt against.
+
+### Added
+
+- Diagnostics now explain **why** a forecast is unavailable, under
+  `forecast.forecast_today` and `forecast.forecast_tomorrow`:
+  `available`, `unavailable_reason`, `total_kwh`, `model_days`, `usable_days`,
+  `modelled_intervals`, `interval_count`, `day_type`, `day_type_pooled` and
+  `windows_used_days`. Reasons are `no_history`, `insufficient_model_days`,
+  `insufficient_baseline_coverage` and `forecast_not_built`.
+  This bug was only visible because two numbers disagreed; a withheld forecast
+  is normally healthy, and `unknown` alone could not be told apart from a fault.
+- `forecast.today_remaining_kwh` and `forecast.today_available`.
+
+### Unchanged, and intentional
+
+- **Expected House Load Tomorrow remains unavailable until enough usable
+  historical model data exists.** This is deliberate and is not a defect. A
+  behavioural slot needs at least two observations before any look-back window
+  will use it, so a single prior day can never produce a forecast, and a
+  whole-day figure is only published once most of the day can actually be
+  modelled. The alternative is a fabricated prediction.
+- `model_days` is deliberately distinct from the Learning Days sensor. Learning
+  Days counts every day complete enough to learn from; `model_days` counts the
+  days actually backing a *published* forecast, and is therefore 0 while a
+  forecast is withheld.
+
+### Compatibility
+
+No configuration, storage-schema, entity-id or unique-id changes. Learned history
+is preserved; no remove and re-add is required. HACS Custom Repository users can
+update from `1.0.0-beta.1` normally.
+
 ## [1.0.0-beta.1] - 2026-08-17
 
 **First public beta.** This is the Phase 1 foundation: the integration observes,
@@ -205,6 +258,7 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.1...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.2...HEAD
+[1.0.0-beta.2]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.1...v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/Bennie-JC/ha-alpha-ems-manager/releases/tag/v1.0.0-beta.1
 [0.1.0]: https://github.com/Bennie-JC/ha-alpha-ems-manager/releases/tag/v0.1.0
