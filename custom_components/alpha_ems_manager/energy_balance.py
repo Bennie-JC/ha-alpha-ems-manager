@@ -75,6 +75,12 @@ REASON_BASE = "base_allowance"
 REASON_CONVERSION = "conversion_loss"
 REASON_METERING = "metering"
 
+#: Why a sample was skipped instead of judged. Reported so a high skip rate can
+#: be attributed to the right cause: sources that disagree about *when* they are
+#: describing, versus a single source that has stopped publishing altogether.
+SKIP_SOURCE_SKEW = "source_skew"
+SKIP_STALE_SOURCE = "stale_source"
+
 #: Mode label for a system with nothing meaningful flowing.
 MODE_IDLE = "idle"
 
@@ -89,6 +95,11 @@ class SourceCoherence:
     oldest_age_seconds: float
     #: Number of sources that contributed a timestamp.
     source_count: int
+    #: Entity that reported least recently, when the caller supplied names. This
+    #: is the single most useful field for diagnosing a high skip rate: it names
+    #: the source that is holding the comparison back instead of leaving the user
+    #: to guess which of four sources publishes too slowly.
+    oldest_entity_id: str | None = None
 
     @property
     def coherent(self) -> bool:
@@ -102,26 +113,55 @@ class SourceCoherence:
             and self.oldest_age_seconds <= BALANCE_MAX_SOURCE_AGE_SECONDS
         )
 
-    def as_dict(self) -> dict[str, float | int | bool]:
+    @property
+    def skip_reason(self) -> str | None:
+        """Return why this sample cannot be judged, or ``None`` when it can.
+
+        Age is tested first because it is the stronger statement: a source that
+        has not published for five minutes has stopped reporting, whereas skew
+        alone only means the sources are describing different instants.
+        """
+        if self.coherent:
+            return None
+        if self.oldest_age_seconds > BALANCE_MAX_SOURCE_AGE_SECONDS:
+            return SKIP_STALE_SOURCE
+        return SKIP_SOURCE_SKEW
+
+    def as_dict(self) -> dict[str, float | int | bool | str | None]:
         """Return a plain mapping for the diagnostics payload."""
         return {
             "skew_seconds": round(self.skew_seconds, 1),
             "oldest_age_seconds": round(self.oldest_age_seconds, 1),
             "source_count": self.source_count,
             "coherent": self.coherent,
+            "skip_reason": self.skip_reason,
+            "oldest_entity_id": self.oldest_entity_id,
         }
 
 
-def measure_coherence(reported_at: list[datetime], now: datetime) -> SourceCoherence:
-    """Return the timing spread of the sources that produced a reading."""
+def measure_coherence(
+    reported_at: list[datetime],
+    now: datetime,
+    entity_ids: list[str] | None = None,
+) -> SourceCoherence:
+    """Return the timing spread of the sources that produced a reading.
+
+    ``entity_ids`` is optional and, when given, is positionally parallel to
+    ``reported_at`` so the laggard can be named. It stays optional because the
+    timing arithmetic is worth testing without a state machine in the way.
+    """
     if not reported_at:
         return SourceCoherence(skew_seconds=0.0, oldest_age_seconds=0.0, source_count=0)
     newest = max(reported_at)
     oldest = min(reported_at)
+    oldest_entity_id: str | None = None
+    if entity_ids is not None and len(entity_ids) == len(reported_at):
+        oldest_entity_id = entity_ids[reported_at.index(oldest)]
     return SourceCoherence(
         skew_seconds=max(0.0, (newest - oldest).total_seconds()),
         oldest_age_seconds=max(0.0, (now - oldest).total_seconds()),
         source_count=len(reported_at),
+        oldest_entity_id=oldest_entity_id,
     )
 
 
@@ -258,6 +298,11 @@ def _rounded(value: float | None) -> float | None:
     return None if value is None else round(value, 1)
 
 
+def _tally(counts: dict[str, int], key: str) -> None:
+    """Increment ``key`` in a bounded counter mapping."""
+    counts[key] = counts.get(key, 0) + 1
+
+
 def evaluate_balance(
     flows: PowerFlows, coherence: SourceCoherence | None = None
 ) -> BalanceSample | None:
@@ -366,6 +411,44 @@ class BalanceMonitor:
     last_sample: BalanceSample | None = None
     last_coherent_sample: BalanceSample | None = None
     last_warning: str | None = None
+
+    # -- failure attribution ---------------------------------------------
+    #
+    # A pass rate alone cannot distinguish the two explanations for a handful of
+    # failures on an otherwise healthy system. A residual that appears only while
+    # the battery is converting points at the DC/AC boundary; one that appears
+    # only at low power points at a roughly constant offset between two
+    # instruments; one spread evenly across every mode points at a real
+    # configuration error. Without per-mode counts that question can only be
+    # answered by guesswork, so these record it as it happens.
+    #
+    # Mode labels come from :func:`infer_balance_mode`, so the key space is
+    # bounded by the subsets of three sources and three sinks and cannot grow
+    # with runtime. Counters only -- no per-sample history is retained.
+
+    #: Eligible passes per operating-mode label.
+    passed_by_mode: dict[str, int] = field(default_factory=dict)
+    #: Eligible failures per operating-mode label.
+    failed_by_mode: dict[str, int] = field(default_factory=dict)
+    #: Skips attributed to sources describing different instants.
+    skipped_due_to_skew: int = 0
+    #: Skips attributed to a source that had stopped publishing.
+    skipped_due_to_stale_source: int = 0
+    #: How often each entity was the least recently reported on a skipped sample.
+    stale_source_counts: dict[str, int] = field(default_factory=dict)
+    #: Largest source skew seen this session, in seconds, skipped or not.
+    worst_skew_seconds: float = 0.0
+    #: Largest absolute residual over *eligible* samples, in watts.
+    worst_residual_w: float = 0.0
+    #: Largest reported relative error over eligible samples.
+    worst_relative_error: float = 0.0
+    #: The eligible failure that overshot its allowance by the most. Kept in
+    #: preference to a plain maximum residual because the residual alone is not
+    #: comparable across modes -- 300 W is healthy at 10 kW and a fault at 300 W.
+    worst_excess_sample: BalanceSample | None = None
+    #: The most recent eligible failure, whether or not it warned.
+    last_failed_sample: BalanceSample | None = None
+
     _warned_for_current_run: bool = field(default=False, repr=False)
 
     @property
@@ -390,21 +473,46 @@ class BalanceMonitor:
         self.last_sample = sample
         outcome = sample.outcome
 
+        if sample.coherence is not None:
+            self.worst_skew_seconds = max(
+                self.worst_skew_seconds, sample.coherence.skew_seconds
+            )
+
         if outcome == OUTCOME_SKIPPED_INCOHERENT:
             self.skipped_incoherent_samples += 1
+            coherence = sample.coherence
+            if coherence is not None:
+                if coherence.skip_reason == SKIP_STALE_SOURCE:
+                    self.skipped_due_to_stale_source += 1
+                else:
+                    self.skipped_due_to_skew += 1
+                if coherence.oldest_entity_id is not None:
+                    _tally(self.stale_source_counts, coherence.oldest_entity_id)
             # A skipped sample is neither evidence of health nor of a fault, so
             # it leaves the debounce counter exactly as it was.
             return outcome
 
         self.eligible_samples += 1
         self.last_coherent_sample = sample
+        self.worst_residual_w = max(self.worst_residual_w, abs(sample.residual_w))
+        self.worst_relative_error = max(
+            self.worst_relative_error, sample.relative_error
+        )
 
         if sample.within_tolerance:
             self.passed_samples += 1
+            _tally(self.passed_by_mode, sample.mode)
             self.consecutive_failures = 0
             self._warned_for_current_run = False
         else:
             self.failed_samples += 1
+            _tally(self.failed_by_mode, sample.mode)
+            self.last_failed_sample = sample
+            if (
+                self.worst_excess_sample is None
+                or sample.excess_w > self.worst_excess_sample.excess_w
+            ):
+                self.worst_excess_sample = sample
             self.consecutive_failures += 1
             self.worst_consecutive_failures = max(
                 self.worst_consecutive_failures, self.consecutive_failures
@@ -444,6 +552,28 @@ class BalanceMonitor:
             "sustained_failure_threshold": BALANCE_SUSTAINED_FAILURES,
             "max_allowed_skew_seconds": BALANCE_MAX_SOURCE_SKEW_SECONDS,
             "max_allowed_age_seconds": BALANCE_MAX_SOURCE_AGE_SECONDS,
+            # Failure attribution. Comparing these two mappings is what turns a
+            # bare pass rate into a diagnosis: failures confined to converting
+            # modes, or to low-power modes, mean something quite different from
+            # failures spread across every mode the system enters.
+            "passed_samples_by_mode": dict(self.passed_by_mode),
+            "failed_samples_by_mode": dict(self.failed_by_mode),
+            "skipped_due_to_skew": self.skipped_due_to_skew,
+            "skipped_due_to_stale_source": self.skipped_due_to_stale_source,
+            "least_recently_reported_source_counts": dict(self.stale_source_counts),
+            "worst_skew_seconds": round(self.worst_skew_seconds, 1),
+            "worst_residual_w": round(self.worst_residual_w, 1),
+            "worst_relative_error": round(self.worst_relative_error, 4),
+            "worst_excess_sample": (
+                None
+                if self.worst_excess_sample is None
+                else self.worst_excess_sample.as_dict()
+            ),
+            "last_failed_sample": (
+                None
+                if self.last_failed_sample is None
+                else self.last_failed_sample.as_dict()
+            ),
             "tolerance_model": (
                 f"allowed_w = {BALANCE_BASE_ALLOWANCE_W:.0f}"
                 f" + {BALANCE_CONVERSION_LOSS_FRACTION} * dc_power_w"

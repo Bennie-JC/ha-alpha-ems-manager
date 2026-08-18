@@ -27,7 +27,6 @@ from .const import (
     STORAGE_VERSION,
 )
 from .coordinator import AlphaEmsCoordinator
-from .energy_balance import infer_balance_mode
 from .forecast import REASON_NOT_BUILT, DayForecast
 
 
@@ -121,6 +120,13 @@ async def async_get_config_entry_diagnostics(
     # what keeps diagnostics and the entity telling the same story.
     today_baseline = (coordinator.data or {}).get("today_baseline")
     confidence = coordinator.confidence
+    # The published learned-day count, i.e. the Learning Days sensor's state.
+    learned_days = (coordinator.data or {}).get("learning_days")
+    if learned_days is None:
+        # No successful refresh yet, so there is no published value to agree
+        # with. Fall back to the same filtered computation the coordinator uses,
+        # which keeps the field an integer rather than turning it null.
+        learned_days = len(coordinator.learned_day_dates())
 
     return {
         "integration": {
@@ -151,7 +157,15 @@ async def async_get_config_entry_diagnostics(
         "normalized_flows_now": asdict(coordinator.read_flows()),
         "daily_validation_kwh": coordinator.read_daily_house_load_kwh(),
         "learning": {
-            "learned_days": len(store.learned_days()),
+            # Taken from the value the coordinator already published, which is
+            # the same object the Learning Days sensor reads, rather than being
+            # recomputed here. Recomputing it called ``learned_days()`` without
+            # ``before``, so it counted the in-progress day from the moment its
+            # baseline coverage crossed MIN_DAY_COMPLETENESS -- around 19:15 on a
+            # clean day -- and a download taken that evening reported one more
+            # learned day than the entity showed. Reading the published value
+            # makes the two incapable of disagreeing.
+            "learned_days": learned_days,
             "retained_days": len(store.days),
             # Real quarter-hours, so a fall-back day contributes 100 and a
             # spring-forward day 92.
@@ -236,10 +250,20 @@ async def async_get_config_entry_diagnostics(
         "energy_balance": {
             **coordinator.balance.as_dict(),
             "source_entities": coordinator.balance_source_entities,
-            # The mode the identity is being evaluated in right now, lifted out
-            # of the last sample so a residual can be attributed to an operating
-            # mode without digging through the nested payload.
-            "active_balance_mode": infer_balance_mode(coordinator.read_flows()),
+            # Lifted out of the last sample, as advertised, so a residual can be
+            # attributed to an operating mode without digging through the nested
+            # payload -- and so this cannot contradict ``last_sample.mode``.
+            #
+            # It used to re-read the state machine instead. That labelled a mode
+            # for snapshots ``evaluate_balance`` had refused to judge at all: a
+            # partial snapshot returns no verdict, but ``infer_balance_mode``
+            # happily describes whichever flows were present, so the payload
+            # asserted an operating mode for a system with no balance verdict.
+            "active_balance_mode": (
+                None
+                if coordinator.last_balance is None
+                else coordinator.last_balance.mode
+            ),
             "source_time_skew_seconds": (
                 None
                 if coordinator.last_balance is None

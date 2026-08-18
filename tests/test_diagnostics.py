@@ -226,6 +226,138 @@ async def test_energy_balance_diagnostics_expose_the_robustness_counters(
     assert "incoherent samples excluded" in balance["pass_rate_basis"]
 
 
+async def test_energy_balance_diagnostics_expose_the_failure_attribution(
+    hass: HomeAssistant, setup_integration: MockConfigEntry
+) -> None:
+    """A pass rate alone cannot say *why* samples failed.
+
+    These fields are what turn "25 failures out of 265" into a diagnosis: which
+    operating modes failed, which source was holding the comparison back, and how
+    far the worst residual actually overshot its allowance.
+    """
+    payload = await async_get_config_entry_diagnostics(hass, setup_integration)
+    balance = payload["energy_balance"]
+
+    assert {
+        "passed_samples_by_mode",
+        "failed_samples_by_mode",
+        "skipped_due_to_skew",
+        "skipped_due_to_stale_source",
+        "least_recently_reported_source_counts",
+        "worst_skew_seconds",
+        "worst_residual_w",
+        "worst_relative_error",
+        "worst_excess_sample",
+        "last_failed_sample",
+        "active_balance_mode",
+    } <= set(balance)
+
+    # The two skip causes must account for the combined total exactly, or a high
+    # skip rate stays unattributable.
+    assert (
+        balance["skipped_due_to_skew"] + balance["skipped_due_to_stale_source"]
+        == balance["skipped_incoherent_samples"]
+    )
+
+
+async def test_the_reported_mode_cannot_contradict_the_last_sample(
+    hass: HomeAssistant, setup_integration: MockConfigEntry
+) -> None:
+    """``active_balance_mode`` is lifted from the sample, not re-read.
+
+    Re-reading the state machine let the payload assert an operating mode for a
+    snapshot ``evaluate_balance`` had refused to judge, so diagnostics described
+    a mode while reporting no verdict for it.
+    """
+    coordinator = setup_integration.runtime_data
+    payload = await async_get_config_entry_diagnostics(hass, setup_integration)
+    balance = payload["energy_balance"]
+
+    if coordinator.last_balance is None:
+        assert balance["active_balance_mode"] is None
+        assert balance["last_sample"] is None
+    else:
+        assert balance["active_balance_mode"] == balance["last_sample"]["mode"]
+
+
+async def test_learned_days_agrees_with_the_learning_days_sensor(
+    hass: HomeAssistant, setup_integration: MockConfigEntry
+) -> None:
+    """One question, one answer -- including on the day it changes.
+
+    Diagnostics recomputed this with ``store.learned_days()`` and no ``before``,
+    so it counted the in-progress day the moment its baseline coverage crossed
+    ``MIN_DAY_COMPLETENESS`` -- around 19:15 on a clean day. A download taken that
+    evening then reported one more learned day than the sensor showed, in the one
+    artefact a support conversation relies on.
+    """
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+
+    from custom_components.alpha_ems_manager.storage import DayRecord
+
+    from .conftest import TEST_TIMEZONE
+
+    coordinator = setup_integration.runtime_data
+    # The coordinator derives "today" from ``dt_util.now()``; deriving it the
+    # same way here keeps the test independent of the machine's real date.
+    today = dt_util.now().date()
+
+    # Two complete past days, plus a today that has already crossed the bar.
+    for offset in (2, 1):
+        day = today - timedelta(days=offset)
+        record = DayRecord(day=day, tz_key=TEST_TIMEZONE, interval_count=96)
+        record.measured = [0.2] * 96
+        coordinator.store.days[day] = record
+    today_record = DayRecord(day=today, tz_key=TEST_TIMEZONE, interval_count=96)
+    today_record.measured = [0.2] * 90 + [None] * 6  # 93.75 %
+    coordinator.store.days[today] = today_record
+
+    await coordinator.async_refresh()
+    payload = await async_get_config_entry_diagnostics(hass, setup_integration)
+    state = hass.states.get("sensor.alpha_ems_learning_days")
+
+    assert state is not None
+    assert payload["learning"]["learned_days"] == int(state.state)
+    # And the in-progress day is genuinely excluded, not merely consistent.
+    assert payload["learning"]["learned_days"] == 2
+    assert payload["learning"]["retained_days"] == 3
+
+
+async def test_learned_day_dates_also_excludes_the_in_progress_day(
+    hass: HomeAssistant, setup_integration: MockConfigEntry
+) -> None:
+    """The same defect existed in a second, unfiltered helper."""
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+
+    from custom_components.alpha_ems_manager.storage import DayRecord
+
+    from .conftest import TEST_TIMEZONE
+
+    coordinator = setup_integration.runtime_data
+    # The coordinator derives "today" from ``dt_util.now()``; deriving it the
+    # same way here keeps the test independent of the machine's real date.
+    today = dt_util.now().date()
+
+    for offset in (2, 1):
+        day = today - timedelta(days=offset)
+        record = DayRecord(day=day, tz_key=TEST_TIMEZONE, interval_count=96)
+        record.measured = [0.2] * 96
+        coordinator.store.days[day] = record
+    today_record = DayRecord(day=today, tz_key=TEST_TIMEZONE, interval_count=96)
+    today_record.measured = [0.2] * 90 + [None] * 6
+    coordinator.store.days[today] = today_record
+
+    await coordinator.async_refresh()
+    dates = coordinator.learned_day_dates()
+
+    assert today not in dates
+    assert len(dates) == 2
+
+
 async def test_the_balance_source_list_matches_the_configuration(
     hass: HomeAssistant, setup_integration: MockConfigEntry
 ) -> None:

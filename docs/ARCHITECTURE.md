@@ -246,6 +246,30 @@ highly.
 A day is *learned* at `MIN_DAY_COMPLETENESS` baseline coverage, so a day whose EV
 sensor was down keeps its measured history but does not count.
 
+The in-progress day is excluded everywhere, via `learned_days(before=today)`: a
+day can only be judged once it can no longer gain intervals. Every consumer must
+go through the value the coordinator publishes rather than recomputing it.
+Diagnostics called `learned_days()` without `before` and so counted today from the
+moment its baseline coverage crossed the bar — around 19:15 on a clean day — and a
+download taken that evening reported one more learned day than the Learning Days
+sensor showed. `coordinator.learned_day_dates()` had the same unfiltered form.
+`tests/test_diagnostics.py` now asserts the two agree.
+
+### Model history and the day rollover
+
+Only days strictly before the reference are model inputs, so `modelled_intervals`
+is **fixed for the whole civil day** and does not creep up as today fills in. A
+behavioural slot needs `MIN_OBSERVATIONS_PER_WINDOW` observations, so with two
+prior days the modelled set is their *intersection*.
+
+That has a consequence worth knowing before reading a fresh installation's
+numbers: a partial install day still pairs its slots with the following complete
+day, so a forecast can publish on rather less than a second complete day — and in
+that band it publishes with `model_days: 1`, because the newest day is not yet
+learned. `model_days: 1` alongside an available forecast is therefore honest
+reporting, not a fault. `tests/test_day_rollover.py` pins the whole transition,
+including the exact 19-interval overlap the live installation reported.
+
 ## Energy balance
 
 A quality signal only: `_sample_balance()` feeds `BalanceMonitor` and the
@@ -318,6 +342,44 @@ conventions. A merely moderate one attributes itself to measurement boundaries
 and says learning is unaffected — because telling someone to re-check a correct
 entity is worse than saying nothing.
 
+The two wordings carry **separate throttle keys**. Sharing one let the reassuring
+message rate-limit the escalated one for a full hour: a moderate residual warned,
+a passing sample re-armed `BalanceMonitor.should_warn()`, and the gross fault that
+followed inside the throttle window was discarded — permanently, because only a
+passing coherent sample re-arms the one-shot flag and a real fault never produces
+one. `_ThrottledLogger.warning()` therefore returns whether it emitted, and
+`balance.last_warning` is stamped only when it did; otherwise diagnostics reported
+a warning timestamp for a log line that was never written.
+
+### Failure attribution
+
+A pass rate cannot say *why* a minority of samples failed, and the three
+candidate explanations call for completely different action. `BalanceMonitor`
+therefore records, per session:
+
+| Field | What it distinguishes |
+|---|---|
+| `passed_samples_by_mode` / `failed_samples_by_mode` | Failures confined to converting modes (DC/AC boundary) versus low-power modes (a constant inter-instrument offset) versus all modes (a real configuration error). |
+| `skipped_due_to_skew` / `skipped_due_to_stale_source` | Sources describing different instants — normal for Modbus registers on separate poll intervals — versus a source that has stopped publishing. |
+| `least_recently_reported_source_counts` | *Which* entity holds the comparison back, so a high skip rate is actionable. |
+| `worst_excess_sample` | The largest overshoot of an allowance, not the largest residual: 300 W is healthy at 10 kW and a fault at 300 W. |
+| `worst_residual_w`, `worst_relative_error`, `worst_skew_seconds` | Peak magnitudes, including the evidence for or against the 90 s skew gate itself. |
+
+Mode labels come from `infer_balance_mode()`, so the key space is bounded by the
+subsets of three sources and three sinks and cannot grow with runtime. These are
+counters only — no per-sample history is retained, and nothing reaches an entity
+attribute.
+
+Why this matters more than a wider tolerance: the allowance collapses to a near
+absolute floor whenever nothing is converting — 46 W at 200 W of load, 58 W at
+600 W, 76 W at 1.2 kW — while reaching ~580 W when PV and a battery are both
+active. A roughly *constant* boundary offset above about 60 W therefore fails
+overnight and passes all afternoon, producing exactly the shape of a high pass
+rate punctuated by short failure runs. Widening the tolerance to absorb it would
+blind the check at every power level in order to explain one regime.
+`tests/test_balance_attribution.py` pins that arithmetic, including the ~3.5 kW
+crossover for a 150 W offset with nothing converting.
+
 ### Known open item
 
 The live system produced a sustained, coherent `supply 740 W vs demand 586 W`.
@@ -326,9 +388,10 @@ explaining it would need a ~10-13 % conversion allowance, so it was not tuned
 away. The grid source is a separate P1 meter while house load, PV and battery all
 come from the AlphaESS inverter, which makes a boundary mismatch the leading
 hypothesis — but the AlphaESS Modbus semantics are not documented here and the
-original warning recorded only the two totals. `BalanceSample.as_dict()` now
-records the full flow breakdown, the mode and the allowance so the next
-occurrence is diagnosable from diagnostics alone.
+original warning recorded only the two totals. `BalanceSample.as_dict()` records
+the full flow breakdown, the mode and the allowance, and the attribution counters
+above record which modes and which source, so the next occurrence is diagnosable
+from diagnostics alone.
 
 ## Entity contract
 

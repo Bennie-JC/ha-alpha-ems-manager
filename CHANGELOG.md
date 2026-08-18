@@ -9,6 +9,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.3] - 2026-08-18
+
+A Phase-1 bugfix beta, from an investigation of energy-balance failures observed
+during live Home Assistant testing of `1.0.0-beta.2`. **No tolerance was changed,
+no learning threshold was changed, and no forecast threshold was changed.** The
+balance failures under investigation turned out to be legitimate detections; what
+was wrong was how they were *reported*.
+
+### Fixed
+
+- **A gross-fault warning could be discarded permanently, leaving only the
+  reassuring wording for a genuinely broken configuration.** Both energy-balance
+  messages shared one throttle key. A moderate residual warned, a passing sample
+  re-armed the sustained-failure debounce, and the gross fault that followed
+  inside the one-hour throttle window was dropped — and could never be re-raised,
+  because only a passing coherent sample re-arms the one-shot flag and a real
+  fault never produces one. The user was left reading "Learning is unaffected"
+  while the log never mentioned checking source entities or sign conventions. The
+  two wordings now throttle independently.
+- **`energy_balance.last_warning` reported warnings that were never logged.** The
+  timestamp was stamped before the throttled log call, so a suppressed message
+  still advanced it. Anyone reading diagnostics then searched the log for an entry
+  that did not exist — which is exactly how the live evidence for this
+  investigation became ambiguous. `_ThrottledLogger.warning()` now reports whether
+  it emitted, and the timestamp is only stamped when it did.
+- **`learning.learned_days` in diagnostics disagreed with the Learning Days
+  sensor.** It was recomputed with `store.learned_days()` and no `before`
+  argument, so it counted the in-progress day from the moment its baseline
+  coverage crossed `MIN_DAY_COMPLETENESS` — around 19:15 on a clean day. A
+  download taken that evening reported one more learned day than the entity
+  showed. Diagnostics now reads the value the coordinator publishes, so the two
+  cannot diverge. `coordinator.learned_day_dates()` carried the same unfiltered
+  form and was corrected with it.
+- **`energy_balance.active_balance_mode` could assert an operating mode for a
+  snapshot that produced no verdict.** It re-read the state machine instead of
+  reading the last sample as its own documentation claimed, so a partial snapshot
+  — which `evaluate_balance` deliberately refuses to judge — was still given a
+  mode label. It is now lifted from the last sample and is `null` when there is
+  none.
+
+### Added
+
+- **Energy-balance failure attribution in diagnostics**, so a minority of
+  failures on an otherwise healthy system can be diagnosed from recorded data
+  instead of argument: `passed_samples_by_mode`, `failed_samples_by_mode`,
+  `skipped_due_to_skew`, `skipped_due_to_stale_source`,
+  `least_recently_reported_source_counts`, `worst_skew_seconds`,
+  `worst_residual_w`, `worst_relative_error`, `worst_excess_sample` and
+  `last_failed_sample`.
+
+  Failures confined to *converting* modes point at the inverter's DC/AC boundary;
+  failures confined to *low-power* modes point at a roughly constant offset
+  between two instruments; failures spread across every mode point at a real
+  configuration error. The three call for completely different action and were
+  previously indistinguishable.
+- Skipped samples now record **which** gate fired and **which entity** reported
+  least recently. A high incoherent-skip rate previously said only that the
+  sources disagreed about when they were describing, without naming the source
+  holding the comparison back.
+- `worst_excess_sample` retains the largest overshoot of an allowance rather than
+  the largest residual, because a residual is only meaningful against the
+  allowance it broke: 300 W is healthy at 10 kW and a fault at 300 W.
+
+### Unchanged, and intentional
+
+- **The energy-balance tolerance model is untouched.** All ten operating modes a
+  real installation enters — grid to house, grid to house and battery, PV to
+  house, PV to house and battery, PV and grid to house and battery, battery to
+  house, battery to house and grid, PV export, battery export and near-zero
+  crossings — pass with realistic residuals, so the observed failures are not the
+  model being too strict. The allowance is deliberately near-absolute at low power
+  (46 W at 200 W of load, 58 W at 600 W) and grows with conversion (~580 W when PV
+  and a battery are both active), so a roughly constant boundary offset above
+  about 60 W fails overnight and passes all afternoon. Widening it to absorb that
+  would blind the check at every power level in order to explain one regime.
+- **Energy balance still cannot reject a learning interval or a learned day.** It
+  feeds diagnostics and the confidence score and nothing else; `_ingest()`,
+  `record_interval()`, `DayRecord.is_learned` and `build_forecast()` reference it
+  nowhere. A balance failure has no effect on day qualification.
+- **`modelled_intervals` does not increase during the active day.** Only days
+  strictly before the reference are model inputs, so the figure is fixed for the
+  whole civil day. A behavioural slot needs two observations, so with two prior
+  days the modelled set is their intersection — which is why a partial install
+  evening plus one complete day yields exactly the count of that evening's slots.
+- **`model_days: 1` alongside an available forecast is honest reporting, not a
+  fault.** A partial install day pairs its slots with the following complete day,
+  so a forecast can publish before a second day is fully learned.
+- Baseline remains `max(measured - flexible, 0)`, and an interval with a
+  configured but unreadable flexible load still has no valid baseline.
+
+### Compatibility
+
+No config-entry migration, no storage-schema change, no entity-ID or unique-ID
+change. Storage schema stays at version 2 and the config-entry schema at
+version 2. Learned history, retained intervals, learning-day count, confidence
+state and every source selection are preserved across the update. The
+energy-balance attribution counters are session-scoped and deliberately not
+persisted, so they start empty after the update and after any restart.
+
 ## [1.0.0-beta.2] - 2026-08-18
 
 A Phase-1 bugfix beta, from a defect found during live Home Assistant testing of

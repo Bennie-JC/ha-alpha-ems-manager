@@ -14,7 +14,7 @@ anything.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.2` — a public beta.**
+> **Current release: `1.0.0-beta.3` — a public beta.**
 >
 > The integration is feature-complete for Phase 1 and covered by 564 automated
 > tests, but the learning and forecast model has **not** yet been validated
@@ -54,7 +54,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.2` is not offered.
+     dialog if `1.0.0-beta.3` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 

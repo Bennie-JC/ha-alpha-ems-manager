@@ -74,6 +74,12 @@ _LOGGER = logging.getLogger(__name__)
 #: delay lets sources that publish exactly on the boundary land first.
 _QUARTER_TRIGGER_SECOND = 5
 
+#: Throttle keys for the two energy-balance wordings. They are deliberately
+#: distinct: the two messages describe different situations and call for
+#: different action, so neither may rate-limit the other.
+_BALANCE_LOG_MODERATE = "energy_balance_moderate"
+_BALANCE_LOG_GROSS = "energy_balance_gross"
+
 
 @dataclass(frozen=True, slots=True)
 class SourceConfig:
@@ -143,15 +149,22 @@ class _ThrottledLogger:
         self._last: dict[str, datetime] = {}
         self._suppressed: dict[str, int] = {}
 
-    def warning(self, key: str, message: str, *args: Any) -> None:
-        """Log ``message`` unless the same ``key`` fired recently."""
+    def warning(self, key: str, message: str, *args: Any) -> bool:
+        """Log ``message`` unless the same ``key`` fired recently.
+
+        Returns whether the line was actually emitted. Callers that record a
+        user-visible "last warning" timestamp must consult it: reporting a
+        warning that the throttle swallowed makes diagnostics contradict the log
+        it is meant to explain, and sends the reader looking for an entry that
+        was never written.
+        """
         now = dt_util.utcnow()
         previous = self._last.get(key)
         if previous is not None and (now - previous) < timedelta(
             seconds=LOG_THROTTLE_SECONDS
         ):
             self._suppressed[key] = self._suppressed.get(key, 0) + 1
-            return
+            return False
         skipped = self._suppressed.pop(key, 0)
         self._last[key] = now
         if skipped:
@@ -160,6 +173,7 @@ class _ThrottledLogger:
             )
         else:
             _LOGGER.warning(message, *args)
+        return True
 
     def clear(self, key: str) -> None:
         """Note that ``key``'s condition has resolved.
@@ -525,6 +539,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         look stale.
         """
         reported_at: list[datetime] = []
+        entity_ids: list[str] = []
         for entity_id in self._balance_source_entities():
             state = self.hass.states.get(entity_id)
             if state is None:
@@ -532,7 +547,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             reported_at.append(
                 getattr(state, "last_reported", None) or state.last_updated
             )
-        return measure_coherence(reported_at, dt_util.utcnow())
+            # Carried alongside so a skipped sample can name the source holding
+            # the comparison back. Without it a high skip rate says only "the
+            # sources disagree about when", which is not actionable.
+            entity_ids.append(entity_id)
+        return measure_coherence(reported_at, dt_util.utcnow(), entity_ids)
 
     @callback
     def _sample_balance(self) -> None:
@@ -560,7 +579,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.store.balance.record(sample.within_tolerance)
 
         if sample.within_tolerance:
-            self._log.clear("energy_balance")
+            self._log.clear(_BALANCE_LOG_MODERATE)
+            self._log.clear(_BALANCE_LOG_GROSS)
             return
 
         if self.balance.should_warn():
@@ -570,7 +590,16 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # A residual only somewhat over it is far more likely to be the
             # sources sitting on different electrical boundaries, which is worth
             # reporting but is not a mistake the user made.
+            # The two wordings are throttled independently. Sharing one key let
+            # the reassuring message suppress the escalated one for a full hour:
+            # a moderate residual warned, a passing sample re-armed the debounce,
+            # and the gross fault that followed within the throttle window was
+            # dropped -- permanently, because only a passing coherent sample can
+            # re-arm the one-shot flag and a real fault never produces one. The
+            # user was left with "learning is unaffected" for a broken
+            # configuration.
             if sample.gross_fault_suspected:
+                log_key = _BALANCE_LOG_GROSS
                 message = (
                     "Sustained energy-balance mismatch over %d consecutive checks "
                     "in mode %s (supply %.0f W vs demand %.0f W, %.0f%% off; "
@@ -581,6 +610,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "source updates far more slowly than the others"
                 )
             else:
+                log_key = _BALANCE_LOG_MODERATE
                 message = (
                     "Sustained energy-balance mismatch over %d consecutive checks "
                     "in mode %s (supply %.0f W vs demand %.0f W, %.0f%% off; "
@@ -601,8 +631,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 sample.residual_w,
                 sample.allowed_residual_w,
             )
-            self.balance.last_warning = dt_util.utcnow().isoformat()
-            self._log.warning("energy_balance", message, *args)
+            # Only stamped when the line was really written, so the timestamp in
+            # diagnostics always corresponds to an entry that exists in the log.
+            if self._log.warning(log_key, message, *args):
+                self.balance.last_warning = dt_util.utcnow().isoformat()
 
     # -- derived values --------------------------------------------------
 
@@ -741,5 +773,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._ev_accumulator.open_coverage
 
     def learned_day_dates(self) -> list[date]:
-        """Return the dates that currently count as learned."""
-        return [record.day for record in self.store.learned_days()]
+        """Return the dates that currently count as learned.
+
+        Excludes the in-progress day, so this agrees with the Learning Days
+        sensor and with the confidence score. Without ``before`` it counted today
+        the moment its baseline coverage crossed ``MIN_DAY_COMPLETENESS``, which
+        is the same defect that made diagnostics disagree with the entity.
+        """
+        return [
+            record.day
+            for record in self.store.learned_days(before=dt_util.now().date())
+        ]
