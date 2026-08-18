@@ -23,6 +23,9 @@ where one has stopped reporting altogether. Such samples are *skipped*: not
 counted as a pass, not counted as a failure, and never warned about. This
 catches a dead or badly lagging source.
 
+One source is exempt from that gate, under a condition narrow enough to state
+exactly: see :func:`measure_coherence` and ``quiescent_entity_ids``.
+
 **Sustained-failure debounce** is what actually filters transients. A load step
 resolves within seconds, so it can produce at most one failing sample at the
 one-minute sampling cadence. A wrong sign convention or a mis-selected entity
@@ -100,6 +103,11 @@ class SourceCoherence:
     #: the source that is holding the comparison back instead of leaving the user
     #: to guess which of four sources publishes too slowly.
     oldest_entity_id: str | None = None
+    #: Sources deliberately left out of the timing comparison because they
+    #: contribute exactly zero to the identity. Recorded rather than silently
+    #: dropped: an exemption that does not appear in diagnostics is
+    #: indistinguishable from a source nobody noticed was missing.
+    quiescent_entity_ids: tuple[str, ...] = ()
 
     @property
     def coherent(self) -> bool:
@@ -127,7 +135,7 @@ class SourceCoherence:
             return SKIP_STALE_SOURCE
         return SKIP_SOURCE_SKEW
 
-    def as_dict(self) -> dict[str, float | int | bool | str | None]:
+    def as_dict(self) -> dict[str, object]:
         """Return a plain mapping for the diagnostics payload."""
         return {
             "skew_seconds": round(self.skew_seconds, 1),
@@ -136,6 +144,7 @@ class SourceCoherence:
             "coherent": self.coherent,
             "skip_reason": self.skip_reason,
             "oldest_entity_id": self.oldest_entity_id,
+            "quiescent_entity_ids": list(self.quiescent_entity_ids),
         }
 
 
@@ -143,15 +152,54 @@ def measure_coherence(
     reported_at: list[datetime],
     now: datetime,
     entity_ids: list[str] | None = None,
+    quiescent_entity_ids: tuple[str, ...] = (),
 ) -> SourceCoherence:
     """Return the timing spread of the sources that produced a reading.
 
     ``entity_ids`` is optional and, when given, is positionally parallel to
     ``reported_at`` so the laggard can be named. It stays optional because the
     timing arithmetic is worth testing without a state machine in the way.
+
+    ``quiescent_entity_ids`` names sources the caller has already left out of
+    ``reported_at`` because they contribute exactly zero to the identity. They
+    are recorded on the result and take no part in the arithmetic.
+
+    Why a source may be left out at all
+    -----------------------------------
+
+    The age gate answers one question: *may this source's value have changed
+    since it was last published?* For a source whose current, readable value is
+    exactly ``0``, that question cannot change the verdict, because the term it
+    contributes to the identity is exactly zero however old the publication is.
+    Nothing is fabricated by including it, and its timestamp is therefore not
+    evidence about the snapshot.
+
+    The residual risk is that the source's *true* value is no longer zero while
+    it has stopped saying so. That case is self-announcing rather than hidden:
+    substituting ``0`` for a true generation ``P`` makes ``supply`` short by
+    exactly ``P``, so the sample fails by ``P``. It can never spuriously pass.
+    Below the physical allowance the substitution is by definition not
+    diagnostic; above it, the check reports a failure. Either way the safe
+    direction is preserved.
+
+    That argument holds only for a value of *exactly* zero. A stale ``5 W``
+    injects five fabricated watts of supply, and any band drawn around zero
+    would be a threshold with no physical quantity behind it. A stale positive
+    reading is worse still: it contributes a real term that can cancel a genuine
+    fault in either direction, which is precisely the failure this check exists
+    to catch. Hence: exactly zero, or no exemption.
+
+    A source that is *unreadable* -- ``unavailable``, ``unknown``, a bad unit --
+    is not a zero. It never reaches this function, because a snapshot missing a
+    component yields no verdict at all.
     """
     if not reported_at:
-        return SourceCoherence(skew_seconds=0.0, oldest_age_seconds=0.0, source_count=0)
+        return SourceCoherence(
+            skew_seconds=0.0,
+            oldest_age_seconds=0.0,
+            source_count=0,
+            quiescent_entity_ids=quiescent_entity_ids,
+        )
     newest = max(reported_at)
     oldest = min(reported_at)
     oldest_entity_id: str | None = None
@@ -162,6 +210,7 @@ def measure_coherence(
         oldest_age_seconds=max(0.0, (now - oldest).total_seconds()),
         source_count=len(reported_at),
         oldest_entity_id=oldest_entity_id,
+        quiescent_entity_ids=quiescent_entity_ids,
     )
 
 
@@ -436,6 +485,11 @@ class BalanceMonitor:
     skipped_due_to_stale_source: int = 0
     #: How often each entity was the least recently reported on a skipped sample.
     stale_source_counts: dict[str, int] = field(default_factory=dict)
+    #: How often each entity was exempted from the timing comparison for
+    #: contributing exactly zero. Counted on every sample, coherent or not, so
+    #: the exemption is auditable from diagnostics alone -- a relaxation that
+    #: leaves no trace is one nobody can check.
+    quiescent_source_counts: dict[str, int] = field(default_factory=dict)
     #: Largest source skew seen this session, in seconds, skipped or not.
     worst_skew_seconds: float = 0.0
     #: Largest absolute residual over *eligible* samples, in watts.
@@ -477,6 +531,8 @@ class BalanceMonitor:
             self.worst_skew_seconds = max(
                 self.worst_skew_seconds, sample.coherence.skew_seconds
             )
+            for entity_id in sample.coherence.quiescent_entity_ids:
+                _tally(self.quiescent_source_counts, entity_id)
 
         if outcome == OUTCOME_SKIPPED_INCOHERENT:
             self.skipped_incoherent_samples += 1
@@ -561,6 +617,16 @@ class BalanceMonitor:
             "skipped_due_to_skew": self.skipped_due_to_skew,
             "skipped_due_to_stale_source": self.skipped_due_to_stale_source,
             "least_recently_reported_source_counts": dict(self.stale_source_counts),
+            # Sources excluded from the timing comparison for reading exactly
+            # zero, and the rule that governs the exclusion. Reported so the
+            # exemption can be audited without reading the source.
+            "quiescent_zero_source_counts": dict(self.quiescent_source_counts),
+            "quiescent_zero_rule": (
+                "a PV source reading exactly 0 W contributes exactly 0 W to the "
+                "identity, so its report age cannot change the verdict; any "
+                "non-zero or unreadable value is judged under the normal "
+                "freshness rules"
+            ),
             "worst_skew_seconds": round(self.worst_skew_seconds, 1),
             "worst_residual_w": round(self.worst_residual_w, 1),
             "worst_relative_error": round(self.worst_relative_error, 4),

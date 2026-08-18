@@ -50,6 +50,46 @@ _ENERGY_TO_KWH: dict[str, float] = {
 }
 
 
+#: Why a source reading could not be turned into a number.
+#:
+#: These exist because "the quarter was rejected" is not a diagnosis. A user
+#: whose learning has frozen needs to know whether the entity is unavailable,
+#: publishing text, or simply carrying a unit this integration cannot read --
+#: three quite different mistakes with three quite different fixes.
+
+#: The entity explicitly carries no measurement (``unavailable``/``unknown``).
+PROBLEM_STATE_UNAVAILABLE: str = "state_unavailable"
+#: The state is present but is not a finite number: text, a boolean, NaN, inf.
+PROBLEM_STATE_NOT_NUMERIC: str = "state_not_numeric"
+#: The entity reports no ``unit_of_measurement`` at all.
+PROBLEM_UNIT_MISSING: str = "unit_missing"
+#: The unit is present but is not a power unit -- typically a kWh meter picked
+#: where an instantaneous W sensor was wanted.
+PROBLEM_UNIT_NOT_POWER: str = "unit_not_power"
+
+
+def describe_power_problem(value: Any, unit: str | None) -> str | None:
+    """Return why ``value``/``unit`` is not a usable power reading, or ``None``.
+
+    Mirrors :func:`normalize_power_w` exactly: it returns ``None`` for precisely
+    the inputs that function accepts. Kept as a separate pass rather than folded
+    into the return type because the normalisation call sits on the hot sampling
+    path and is made on every state change of a fast-publishing sensor, while
+    the reason is only ever wanted once something has already gone wrong.
+    """
+    if parse_numeric(value) is None:
+        if isinstance(value, str) and value.strip().lower() in _NON_NUMERIC_STATES:
+            return PROBLEM_STATE_UNAVAILABLE
+        if value is None:
+            return PROBLEM_STATE_UNAVAILABLE
+        return PROBLEM_STATE_NOT_NUMERIC
+    if not unit:
+        return PROBLEM_UNIT_MISSING
+    if unit not in _POWER_TO_W:
+        return PROBLEM_UNIT_NOT_POWER
+    return None
+
+
 def parse_numeric(value: Any) -> float | None:
     """Return ``value`` as a finite float, or ``None`` when it is not usable.
 
@@ -171,8 +211,3 @@ class PowerFlows:
     battery_discharge_w: float | None = None
     grid_import_w: float | None = None
     grid_export_w: float | None = None
-
-    @property
-    def has_house_load(self) -> bool:
-        """Return whether the learning target is present in this snapshot."""
-        return self.house_load_w is not None

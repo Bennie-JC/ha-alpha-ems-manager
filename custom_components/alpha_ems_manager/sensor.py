@@ -119,12 +119,18 @@ def _tomorrow_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
     confidence = coordinator.confidence
     if forecast is None:
         return {}
+    # The same gate today's attributes use. Without it a withheld forecast still
+    # published the five look-back windows and a day-type decision, so a
+    # template reading the attributes saw a fully described model behind a
+    # sensor reading `unknown` -- the two entities disagreeing about the same
+    # question in opposite directions.
+    predicted = forecast.available
     return {
         "forecast_total_kwh": _round(forecast.total_kwh),
         "model_days": forecast.source_days,
         "day_type": forecast.day_type,
-        "day_type_pooled": forecast.day_type_pooled,
-        "windows_used_days": list(forecast.windows_used),
+        "day_type_pooled": forecast.day_type_pooled if predicted else None,
+        "windows_used_days": list(forecast.windows_used) if predicted else [],
         # 92 / 96 / 100 depending on the target day's daylight-saving shape.
         "intervals_tomorrow": forecast.interval_count,
         "confidence_percent": (

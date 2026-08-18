@@ -159,6 +159,13 @@ class AlphaEmsConfigFlow(ConfigFlow, domain=DOMAIN):
                 error = validate_power_entity(self.hass, ev)
                 if error:
                     errors[CONF_EV_POWER_ENTITY] = error
+                elif ev == user_input.get(CONF_HOUSE_LOAD_ENTITY):
+                    # baseline = max(measured - flexible, 0), so one entity in
+                    # both roles makes the baseline exactly zero for every
+                    # interval -- valid, complete, learned, and a confident
+                    # 0 kWh forecast. Nothing downstream can tell that apart
+                    # from a house that used no energy.
+                    errors[CONF_EV_POWER_ENTITY] = "ev_entity_same_as_house_load"
 
             # Reported inline rather than as an abort: turning the forecast off
             # is a perfectly good way forward, and an abort would throw away
@@ -448,9 +455,21 @@ class AlphaEmsOptionsFlow(OptionsFlow):
                     CONF_USE_PV_FORECAST,
                     default=bool(current(CONF_USE_PV_FORECAST, False)),
                 ): selector.BooleanSelector(),
+                # Same treatment as the Frank dropdown above, and for the same
+                # reason. A SelectSelector validates its submission against the
+                # option list, so a stored id that no longer appears -- Solcast
+                # removed, or removed and re-added under a new entry id --
+                # rejected *every* submission of this form at schema validation,
+                # before ``_validate`` could turn it into a field error. The user
+                # could not change any unrelated setting until they happened to
+                # clear this one by hand.
                 vol.Optional(
                     CONF_SOLCAST_ENTRY_ID,
-                    description={"suggested_value": current(CONF_SOLCAST_ENTRY_ID)},
+                    description={
+                        "suggested_value": _valid_default(
+                            current(CONF_SOLCAST_ENTRY_ID), solcast_options
+                        )
+                    },
                 ): selector.SelectSelector(
                     selector.SelectSelectorConfig(
                         options=solcast_options,
@@ -492,6 +511,16 @@ class AlphaEmsOptionsFlow(OptionsFlow):
         # A system declared to have PV must say where its production is read.
         if user_input.get(CONF_HAS_PV) and not user_input.get(CONF_PV_POWER_ENTITY):
             errors[CONF_PV_POWER_ENTITY] = "pv_entity_required"
+
+        # The flexible load is subtracted from measured house load, so pointing
+        # both at one entity makes ``baseline = max(m - m, 0)`` -- exactly zero
+        # for every interval of every day. Nothing downstream can detect that:
+        # the intervals are valid, the days are complete, they count as learned,
+        # and the forecast is a confident 0 kWh. It has to be refused here.
+        if user_input.get(CONF_EV_POWER_ENTITY) and user_input.get(
+            CONF_EV_POWER_ENTITY
+        ) == user_input.get(CONF_HOUSE_LOAD_ENTITY):
+            errors[CONF_EV_POWER_ENTITY] = "ev_entity_same_as_house_load"
 
         # Likewise, forecasting without a Solcast entry cannot work.
         if user_input.get(CONF_USE_PV_FORECAST) and not user_input.get(

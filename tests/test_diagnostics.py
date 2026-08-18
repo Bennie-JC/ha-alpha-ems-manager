@@ -24,6 +24,7 @@ async def test_diagnostics_report_every_documented_section(
         "sign_conventions",
         "normalized_flows_now",
         "daily_validation_kwh",
+        "daily_validation",
         "learning",
         "flexible_load",
         "forecast",

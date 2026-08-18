@@ -77,7 +77,8 @@
       "invalid_energy_entity": "Dit moet een energiesensor in Wh of kWh zijn.",
       "invalid_percentage_entity": "Dit moet een percentagesensor in % zijn.",
       "entity_not_numeric": "Die entiteit levert geen getal en kan daarom niet als meting worden gebruikt.",
-      "solcast_not_configured": "Je hebt de PV-voorspelling ingeschakeld, maar Solcast PV Forecast is niet ingesteld. Voeg die integratie eerst toe, of zet de PV-voorspelling uit."
+      "solcast_not_configured": "Je hebt de PV-voorspelling ingeschakeld, maar Solcast PV Forecast is niet ingesteld. Voeg die integratie eerst toe, of zet de PV-voorspelling uit.",
+      "ev_entity_same_as_house_load": "De sensor voor flexibele belasting moet een andere entiteit zijn dan de sensor voor huisbelasting. De basisbelasting is de gemeten belasting min de flexibele belasting, dus dezelfde entiteit twee keer kiezen zou die voor elk interval nul maken."
     },
     "abort": {
       "frank_not_configured": "Frank Quarter Prices is nog niet ingesteld. Voeg die integratie eerst toe en configureer hem, en voeg daarna Alpha EMS Manager toe.",
@@ -95,7 +96,8 @@
       "invalid_percentage_entity": "Dit moet een percentagesensor in % zijn.",
       "entity_not_numeric": "Die entiteit levert geen getal en kan daarom niet als meting worden gebruikt.",
       "pv_entity_required": "Je hebt aangegeven dat dit systeem zonnepanelen heeft, dus een PV-productiesensor is vereist.",
-      "solcast_entry_required": "Je hebt de PV-voorspelling ingeschakeld, dus een Solcast-instantie is vereist."
+      "solcast_entry_required": "Je hebt de PV-voorspelling ingeschakeld, dus een Solcast-instantie is vereist.",
+      "ev_entity_same_as_house_load": "De sensor voor flexibele belasting moet een andere entiteit zijn dan de sensor voor huisbelasting. De basisbelasting is de gemeten belasting min de flexibele belasting, dus dezelfde entiteit twee keer kiezen zou die voor elk interval nul maken."
     },
     "step": {
       "init": {

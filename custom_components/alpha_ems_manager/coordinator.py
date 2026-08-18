@@ -17,6 +17,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.const import EVENT_CORE_CONFIG_UPDATE
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.event import (
     async_track_state_change_event,
@@ -57,15 +58,27 @@ from .energy_balance import (
     evaluate_balance,
     measure_coherence,
 )
-from .forecast import DayForecast, TodayForecast, adapt_today, build_forecast
+from .forecast import (
+    DayForecast,
+    TodayForecast,
+    adapt_today,
+    build_forecast,
+    collect_forecast_inputs,
+)
 from .normalization import (
     PowerFlows,
+    describe_power_problem,
     normalize_energy_kwh,
     normalize_power_w,
     split_battery_power,
     split_grid_power,
 )
-from .quarter import QuarterAccumulator, QuarterResult, sanitize_ev_w
+from .quarter import (
+    QuarterAccumulator,
+    QuarterResult,
+    sanitize_ev_w,
+    sanitize_load_w,
+)
 from .storage import LearningStore, index_for_start_utc, utc_midnight
 
 _LOGGER = logging.getLogger(__name__)
@@ -73,6 +86,37 @@ _LOGGER = logging.getLogger(__name__)
 #: Seconds after each quarter boundary at which the bucket is closed. The small
 #: delay lets sources that publish exactly on the boundary land first.
 _QUARTER_TRIGGER_SECOND = 5
+
+#: Why a finalised quarter was not learned.
+#:
+#: A bare ``rejected_quarters`` counter was not enough to act on. Every route to
+#: a rejected quarter ends in the same place -- the interval failed to reach
+#: MIN_QUARTER_COVERAGE -- but the *causes* are unrelated to each other, and a
+#: user whose learning has stalled needs to be told which one applies. The
+#: source-level reasons below are attributed in preference to the coverage one
+#: whenever a source problem was actually seen during the interval, because
+#: "your house-load entity has no unit" is a fixable statement and "coverage was
+#: insufficient" is not.
+
+#: The configured entity does not exist in the state machine at all.
+REJECT_SOURCE_MISSING: str = "source_entity_missing"
+#: The reading parsed, but fell outside the plausible band for its quantity --
+#: a house load above MAX_PLAUSIBLE_LOAD_W, or an EV power below the negative
+#: noise floor. A glitch, not a measurement.
+REJECT_VALUE_IMPLAUSIBLE: str = "value_implausible"
+#: No source problem was seen; the interval simply was not observed for enough
+#: of its length. Normal at startup and after a restart.
+REJECT_INSUFFICIENT_COVERAGE: str = "insufficient_sample_coverage"
+#: The interval's chronological index fell outside the stored day. Only
+#: reachable when a day's recorded shape and the instant being filed disagree,
+#: which in practice means Home Assistant's timezone changed under a running
+#: history.
+REJECT_INTERVAL_OUT_OF_RANGE: str = "interval_outside_stored_day"
+
+#: Throttle key for the rejected-quarter warning. One key per distinct reason,
+#: so a newly appearing cause is never rate-limited by an older one, and each
+#: still speaks at most once per LOG_THROTTLE_SECONDS.
+_REJECTED_QUARTER_LOG = "rejected_quarter"
 
 #: Throttle keys for the two energy-balance wordings. They are deliberately
 #: distinct: the two messages describe different situations and call for
@@ -131,6 +175,11 @@ class SourceConfig:
         )
 
 
+def _tally(counts: dict[str, int], key: str) -> None:
+    """Increment ``key`` in a bounded counter mapping."""
+    counts[key] = counts.get(key, 0) + 1
+
+
 def _non_negative(value: float | None) -> float | None:
     """Return ``value`` when it is a usable non-negative power, else ``None``."""
     if value is None or value < 0:
@@ -168,9 +217,15 @@ class _ThrottledLogger:
         skipped = self._suppressed.pop(key, 0)
         self._last[key] = now
         if skipped:
-            _LOGGER.warning(
-                "%s (%d further occurrences suppressed)", message % args, skipped
-            )
+            # Formatted defensively: a caller whose message carries a literal
+            # ``%`` and no arguments would otherwise raise from inside the
+            # logging call, turning a suppressed-warning tally into an exception
+            # on the sampling path.
+            try:
+                rendered = message % args
+            except (TypeError, ValueError):
+                rendered = message
+            _LOGGER.warning("%s (%d further occurrences suppressed)", rendered, skipped)
         else:
             _LOGGER.warning(message, *args)
         return True
@@ -219,9 +274,27 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.balance = BalanceMonitor()
         self.last_finalized_quarter: datetime | None = None
         self.rejected_quarters = 0
+        #: Rejected quarters by reason. Bounded by the reason constants above,
+        #: so it cannot grow with runtime.
+        self.rejected_quarters_by_reason: dict[str, int] = {}
+        #: The most recently rejected interval and why, for diagnostics.
+        self.last_rejected_quarter: datetime | None = None
+        self.last_rejected_reason: str | None = None
         #: Intervals whose measured load was accepted but whose flexible-load
         #: reading was not, so their baseline is unusable.
         self.invalid_ev_quarters = 0
+        #: Flexible-load invalidations by reason, same key space as above.
+        self.invalid_ev_quarters_by_reason: dict[str, int] = {}
+        #: Source problems observed since the last interval was attributed.
+        #: Held across the interval rather than read at the boundary, so an
+        #: outage in the middle of a quarter is still named as its cause
+        #: instead of being reported as bare insufficient coverage.
+        self._house_problem: str | None = None
+        self._ev_problem: str | None = None
+        #: The zone both accumulators label their buckets in. Compared against
+        #: the live zone so a change can be acted on rather than silently
+        #: splitting the write path across two calendars.
+        self._tz_key = str(dt_util.get_default_time_zone())
 
     # -- lifecycle -------------------------------------------------------
 
@@ -237,6 +310,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         tears them down exactly once and never leaves a duplicate behind.
         """
         tz = dt_util.get_default_time_zone()
+        self._tz_key = str(tz)
         self._accumulator = QuarterAccumulator(tz)
         self._ev_accumulator = (
             QuarterAccumulator(tz, sanitizer=sanitize_ev_w)
@@ -274,10 +348,46 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 second=_QUARTER_TRIGGER_SECOND,
             )
         )
+        self.entry.async_on_unload(
+            self.hass.bus.async_listen(
+                EVENT_CORE_CONFIG_UPDATE, self._handle_core_config_update
+            )
+        )
 
         # Seed the accumulator so integration starts from the current reading
         # rather than from the first future state change.
         self._sample(dt_util.now())
+
+    @callback
+    def _handle_core_config_update(self, event: Event) -> None:
+        """Reload the entry when Home Assistant's timezone changes.
+
+        Both accumulators capture the zone once, at :meth:`async_start`, and
+        label every finalised bucket with the civil date and slot it implies.
+        The storage layer meanwhile stamps each day with the zone it was written
+        in. Home Assistant does not reload config entries when its timezone
+        changes, so without this the two halves of the write path ran on
+        different calendars until the next restart -- long enough to file whole
+        afternoons of energy into morning intervals of a day that still looked
+        complete.
+
+        Rebuilding is the honest response: a reload discards the in-flight
+        quarter, which cannot reach the coverage threshold anyway, and starts
+        both accumulators in the zone the user has just chosen.
+        """
+        if "time_zone" not in event.data:
+            return
+        current = str(dt_util.get_default_time_zone())
+        if current == self._tz_key:
+            return
+        _LOGGER.info(
+            "Home Assistant's timezone changed from %s to %s; reloading Alpha "
+            "EMS Manager so measurement restarts on the new calendar. Days "
+            "already learned keep the zone they were recorded in",
+            self._tz_key,
+            current,
+        )
+        self.hass.config_entries.async_schedule_reload(self.entry.entry_id)
 
     async def async_shutdown_store(self) -> None:
         """Flush pending learning data to disk."""
@@ -322,7 +432,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # generation or consumption figure is not a small-signal artefact to be
         # clamped away; it means the entity cannot be interpreted, so it is
         # treated as missing and the balance check simply returns no verdict.
-        house = _non_negative(self._read_power(self.config.house_load_entity))
+        # Sanitised with the same rule the learning path uses, so the two agree
+        # on what a usable house-load reading is. They did not: a reading above
+        # MAX_PLAUSIBLE_LOAD_W was rejected for learning but accepted here,
+        # where it inflates ``ac_power`` and therefore the allowance -- making
+        # the balance check most permissive exactly when the house-load entity
+        # is most obviously wrong.
+        house = sanitize_load_w(self._read_power(self.config.house_load_entity))
         pv = _non_negative(pv)
 
         return PowerFlows(
@@ -393,6 +509,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         state = self.hass.states.get(entity_id)
         if state is None:
+            self._house_problem = REJECT_SOURCE_MISSING
             self._log.warning(
                 "missing_house_load",
                 "House load entity %s does not exist; learning is paused",
@@ -400,10 +517,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             return None
 
-        value_w = normalize_power_w(
-            state.state, state.attributes.get("unit_of_measurement")
-        )
+        unit = state.attributes.get("unit_of_measurement")
+        value_w = normalize_power_w(state.state, unit)
         if value_w is None:
+            self._house_problem = (
+                describe_power_problem(state.state, unit) or REJECT_SOURCE_MISSING
+            )
             self._log.warning(
                 "invalid_house_load",
                 (
@@ -414,6 +533,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 entity_id,
                 state.state,
             )
+        elif sanitize_load_w(value_w) is None:
+            # Parsed and correctly united, but outside the plausible band. The
+            # accumulator will discard it too; naming it here is what stops the
+            # resulting rejection from being reported as mere thin coverage.
+            self._house_problem = REJECT_VALUE_IMPLAUSIBLE
         else:
             self._log.clear("invalid_house_load")
             self._log.clear("missing_house_load")
@@ -427,6 +551,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         state = self.hass.states.get(entity_id)
         if state is None:
+            self._ev_problem = REJECT_SOURCE_MISSING
             self._log.warning(
                 "missing_ev",
                 (
@@ -437,10 +562,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             return None
 
-        value_w = normalize_power_w(
-            state.state, state.attributes.get("unit_of_measurement")
-        )
+        unit = state.attributes.get("unit_of_measurement")
+        value_w = normalize_power_w(state.state, unit)
         if value_w is None:
+            self._ev_problem = (
+                describe_power_problem(state.state, unit) or REJECT_SOURCE_MISSING
+            )
             self._log.warning(
                 "invalid_ev",
                 (
@@ -451,6 +578,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 entity_id,
                 state.state,
             )
+        elif sanitize_ev_w(value_w) is None:
+            self._ev_problem = REJECT_VALUE_IMPLAUSIBLE
         else:
             self._log.clear("invalid_ev")
             self._log.clear("missing_ev")
@@ -480,11 +609,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         changed = False
         for result in house_results:
             if not result.accepted:
-                self.rejected_quarters += 1
+                self._record_rejected_quarter(result)
                 continue
 
             record = self.store.get_or_create(result.day, tz)
-            index = index_for_start_utc(result.day, result.start_utc, tz)
+            # Indexed in the zone the *record* was written in, not the zone that
+            # happens to be current. The two differ only after Home Assistant's
+            # timezone is changed, and then they differ by hours: an existing
+            # day keeps its original ``tz_key`` and length, so indexing it under
+            # the new zone wrote each afternoon quarter over a morning one while
+            # the day still looked complete.
+            index = index_for_start_utc(result.day, result.start_utc, record.tz)
 
             ev_kwh: float | None = None
             if ev_expected:
@@ -493,19 +628,81 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     ev_kwh = ev_result.energy_kwh
                 else:
                     self.invalid_ev_quarters += 1
+                    _tally(
+                        self.invalid_ev_quarters_by_reason,
+                        self._ev_problem or REJECT_INSUFFICIENT_COVERAGE,
+                    )
 
-            record.record_interval(
+            if not record.record_interval(
                 index,
                 measured_kwh=result.energy_kwh,
                 ev_kwh=ev_kwh,
                 ev_expected=ev_expected,
-            )
+            ):
+                # The index fell outside the day. Unreachable under a stable
+                # timezone, so reaching it means the stored day's shape and the
+                # instant being filed disagree -- which must be counted and
+                # named rather than leaving a quarter that reports itself as
+                # finalised while having stored nothing.
+                self._record_rejected_quarter(result, REJECT_INTERVAL_OUT_OF_RANGE)
+                continue
+
             self.last_finalized_quarter = result.start_utc
             self.store.last_finalized = result.start_utc.isoformat()
             changed = True
 
+        # Attribution is per interval, so the problem window is reopened once
+        # every interval in this batch has been accounted for. Clearing it any
+        # earlier would let a single bad reading explain only the first of
+        # several quarters closed together after a restart.
+        self._house_problem = None
+        self._ev_problem = None
+
         if changed:
             self.store.schedule_save()
+
+    @callback
+    def _record_rejected_quarter(
+        self, result: QuarterResult, reason: str | None = None
+    ) -> None:
+        """Count a quarter that could not be learned, and say why once.
+
+        The warning is throttled per reason rather than per occurrence. A source
+        that stays broken rejects a quarter every fifteen minutes, which is four
+        lines an hour of identical text; a source that breaks in a new way must
+        still be able to speak immediately rather than waiting behind the
+        older problem's throttle window.
+        """
+        reason = reason or self._house_problem or REJECT_INSUFFICIENT_COVERAGE
+        self.rejected_quarters += 1
+        _tally(self.rejected_quarters_by_reason, reason)
+        self.last_rejected_quarter = result.start_utc
+        self.last_rejected_reason = reason
+
+        if reason == REJECT_INSUFFICIENT_COVERAGE:
+            # Expected after a restart or a reload: the interval that was in
+            # flight cannot reach the coverage threshold and never could. Saying
+            # so every time would train the user to ignore the message.
+            _LOGGER.debug(
+                "Quarter starting %s covered only %.0f%% of its length and was "
+                "not learned",
+                result.start_utc.isoformat(),
+                result.coverage * 100,
+            )
+            return
+
+        self._log.warning(
+            f"{_REJECTED_QUARTER_LOG}:{reason}",
+            (
+                "Quarter starting %s was not learned (%s); house load source "
+                "%s covered only %.0f%% of the interval. Learning stays paused "
+                "for as long as this persists"
+            ),
+            result.start_utc.isoformat(),
+            reason,
+            self.config.house_load_entity,
+            result.coverage * 100,
+        )
 
     @property
     def balance_source_entities(self) -> list[str]:
@@ -529,6 +726,42 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return [entity_id for entity_id in candidates if entity_id]
 
     @callback
+    def _is_quiescent_zero_pv(self, entity_id: str) -> bool:
+        """Return whether ``entity_id`` is the PV source and reads exactly zero.
+
+        This is the *only* freshness exemption in the integration, and it is
+        deliberately confined to PV rather than written as a general rule about
+        zero-valued flows.
+
+        The arithmetic argument -- a term of exactly zero cannot make its own
+        timestamp matter -- is source-agnostic, and :func:`measure_coherence`
+        states it in full. What is specific to PV is the *need*. Night is a
+        predictable eight to twelve hours in which generation is genuinely zero
+        and a change-driven source has no reason to republish, so PV alone
+        accumulates a sustained skip rate: on the reference installation, 185 of
+        189 skipped samples were a PV sensor sitting at 0 W since dusk, while
+        the identity it was blocking closed to within 1 W.
+
+        Battery idle, a null grid reading and a zero house load are transient
+        states, not a nightly regime, so relaxing them would buy no measurable
+        coverage while widening the surface on which a genuinely dead source
+        could pass unnoticed. House load in particular is the learning target;
+        its silence is information, not noise.
+
+        The exemption is self-terminating. A PV sensor that starts generating
+        publishes a new, non-zero value by definition -- that is what a
+        change-driven sensor does -- so at sunrise the source is simultaneously
+        fresh and non-zero, and the normal rules resume on the same sample.
+        """
+        if entity_id != self.config.pv_power_entity or not self.config.has_pv:
+            return False
+        # Read through the same normalisation the identity uses. An
+        # ``unavailable`` or badly united PV entity yields ``None`` here, not a
+        # zero, so it is never exempted -- and it would not reach a verdict at
+        # all, because a snapshot missing a component is not judged.
+        return self._read_power(entity_id) == 0.0
+
+    @callback
     def _source_coherence(self) -> SourceCoherence:
         """Return how closely aligned in time the balance sources are.
 
@@ -537,12 +770,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         steady battery power that has read the same figure for ten minutes is
         perfectly current, but its ``last_updated`` is ten minutes old and would
         look stale.
+
+        A PV source reading exactly zero contributes no timestamp at all, so the
+        remaining sources are compared against each other rather than against a
+        sensor that has correctly stopped reporting an unchanging nothing. See
+        :meth:`_is_quiescent_zero_pv`.
         """
         reported_at: list[datetime] = []
         entity_ids: list[str] = []
+        quiescent: list[str] = []
         for entity_id in self._balance_source_entities():
             state = self.hass.states.get(entity_id)
             if state is None:
+                continue
+            if self._is_quiescent_zero_pv(entity_id):
+                quiescent.append(entity_id)
                 continue
             reported_at.append(
                 getattr(state, "last_reported", None) or state.last_updated
@@ -551,7 +793,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # the comparison back. Without it a high skip rate says only "the
             # sources disagree about when", which is not actionable.
             entity_ids.append(entity_id)
-        return measure_coherence(reported_at, dt_util.utcnow(), entity_ids)
+        return measure_coherence(
+            reported_at,
+            dt_util.utcnow(),
+            entity_ids,
+            quiescent_entity_ids=tuple(quiescent),
+        )
 
     @callback
     def _sample_balance(self) -> None:
@@ -646,8 +893,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         tomorrow = today + timedelta(days=1)
         records = list(self.store.days.values())
 
-        baseline_today = build_forecast(records, today, today, tz)
-        forecast_tomorrow = build_forecast(records, today, tomorrow, tz)
+        # Prepared once and shared. The bucketing depends only on the records
+        # and the reference day, so building it per target repeated the most
+        # expensive part of the refresh -- around 90 ms at a year of history --
+        # for no difference in result.
+        inputs = collect_forecast_inputs(records, today)
+        baseline_today = build_forecast(records, today, today, tz, inputs)
+        forecast_tomorrow = build_forecast(records, today, tomorrow, tz, inputs)
 
         today_record = self.store.days.get(today)
         if today_record is not None:

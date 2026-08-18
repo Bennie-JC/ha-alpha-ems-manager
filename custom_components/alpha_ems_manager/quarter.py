@@ -35,6 +35,7 @@ from datetime import UTC, date, datetime, timedelta, tzinfo
 
 from .const import (
     EV_NEGATIVE_NOISE_FLOOR_W,
+    MAX_CATCHUP_SECONDS,
     MAX_PLAUSIBLE_EV_W,
     MAX_PLAUSIBLE_LOAD_W,
     MAX_SAMPLE_GAP_SECONDS,
@@ -148,11 +149,6 @@ class QuarterAccumulator:
         return self._cursor is not None
 
     @property
-    def open_slot_start(self) -> datetime | None:
-        """Return the UTC start of the quarter currently being accumulated."""
-        return self._slot_start
-
-    @property
     def open_coverage(self) -> float:
         """Return the coverage accrued so far in the open quarter."""
         return min(1.0, self._valid_seconds / QUARTER_SECONDS)
@@ -177,20 +173,6 @@ class QuarterAccumulator:
         self._held_value_w = self._sanitize(value_w)
         return results
 
-    def mark_unavailable(self, moment: datetime) -> list[QuarterResult]:
-        """Record that the source stopped providing usable values."""
-        return self.add_sample(moment, None)
-
-    def poll(self, moment: datetime) -> list[QuarterResult]:
-        """Advance time without changing the held value.
-
-        Used by the quarter-boundary trigger when the source state cannot be
-        read. Does nothing before the first sample.
-        """
-        if self._cursor is None:
-            return []
-        return self._advance_to(moment.astimezone(UTC))
-
     # -- internals -------------------------------------------------------
 
     def _advance_to(self, moment: datetime) -> list[QuarterResult]:
@@ -209,6 +191,17 @@ class QuarterAccumulator:
         # the tolerated gap contributes neither energy nor coverage, no matter
         # how many quarter boundaries it spans.
         gap_seconds = (moment - self._cursor).total_seconds()
+
+        if gap_seconds > MAX_CATCHUP_SECONDS:
+            # Nothing in a gap this long is recoverable: every quarter it spans
+            # already fails the tolerated-gap test above, so walking it one
+            # bucket at a time can only manufacture rejections. A clock stepped
+            # from 1970 to the present would produce two million of them in a
+            # single synchronous loop. Restart accumulation at the new instant
+            # instead; the partially observed quarter it lands in cannot reach
+            # the coverage threshold, which is the correct outcome anyway.
+            self._begin(moment)
+            return []
         contributes = (
             self._held_value_w is not None and gap_seconds <= MAX_SAMPLE_GAP_SECONDS
         )
@@ -257,10 +250,12 @@ class QuarterAccumulator:
     def reset(self) -> None:
         """Discard all accumulation state.
 
-        Called on reload and restart. The in-flight quarter is deliberately
-        dropped rather than restored: a partially observed quarter cannot reach
-        the coverage threshold anyway, and guessing at the unobserved remainder
-        would fabricate load across downtime.
+        A reload does not call this -- it builds a fresh accumulator instead --
+        so this exists for a caller that wants to reuse an instance. Either way
+        the in-flight quarter is deliberately dropped rather than restored: a
+        partially observed quarter cannot reach the coverage threshold anyway,
+        and guessing at the unobserved remainder would fabricate load across
+        downtime.
         """
         self._slot_start = None
         self._cursor = None

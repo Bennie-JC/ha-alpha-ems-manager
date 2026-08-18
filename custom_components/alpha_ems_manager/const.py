@@ -29,6 +29,13 @@ QUARTER_SECONDS: Final = QUARTER_MINUTES * 60
 #: (``hour * 4 + minute // 15``), so the index range is 0..95 even on DST
 #: transition days. A spring-forward day simply never observes some slots and a
 #: fall-back day observes an hour of slots twice; see ``storage.DayRecord``.
+#:
+#: It is *not* a day length. ``DayRecord.interval_count`` counts real
+#: quarter-hours and is 92, 96 or 100; this constant only serves as that field's
+#: nominal default and as the ``2 * SLOTS_PER_DAY`` bound that keeps a corrupt
+#: stored length from allocating unbounded lists. Every production caller --
+#: ``get_or_create`` and ``from_dict`` -- passes a real count, and nothing may
+#: use this value where a civil day's true length is meant.
 SLOTS_PER_DAY: Final = 96
 
 # --- Quarter measurement quality ---------------------------------------------
@@ -41,6 +48,19 @@ SLOTS_PER_DAY: Final = 96
 #: coverage and contributes no energy at all, so an unavailable source can never
 #: manufacture load.
 MAX_SAMPLE_GAP_SECONDS: Final = 300
+
+#: Longest span the accumulator will walk forward in one step, in seconds.
+#:
+#: Not a measurement rule -- every quarter inside a gap this long has already
+#: failed the MAX_SAMPLE_GAP_SECONDS test and can only be rejected -- but a
+#: bound on the work done producing those rejections. A host without a
+#: real-time clock starts Home Assistant in 1970 and is stepped to the present
+#: once timesyncd reaches a server, which asked the accumulator to close two
+#: million quarter-hour buckets in a single synchronous loop: about twelve
+#: seconds of blocked event loop and several hundred megabytes of results that
+#: were all going to be discarded. Beyond a day, accumulation simply restarts
+#: at the new instant.
+MAX_CATCHUP_SECONDS: Final = 86_400
 
 #: Safety sampling interval. Guarantees the accumulator advances even when the
 #: source entity is quiet. Exactly one timer is registered per config entry.

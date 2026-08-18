@@ -131,9 +131,16 @@ def _stability(records: list[DayRecord]) -> float | None:
     A household whose daily consumption swings wildly is genuinely harder to
     forecast, and the score should say so.
     """
-    totals = [
-        record.baseline_total_kwh for record in records if record.baseline_total_kwh > 0
-    ]
+    # Every learned day counts, including one that totalled exactly zero. The
+    # earlier ``> 0`` filter was there to keep the mean off zero, but the
+    # ``mean <= 0`` guard below already does that -- and the filter bought a
+    # blind spot: a house-load source stuck at 0 W produces a full day of
+    # perfectly covered, perfectly valid, entirely zero intervals. That day is
+    # learned, lifts maturity and coverage to their limits, and drags every slot
+    # mean toward zero, while being excluded from the one component whose job is
+    # to notice that the daily totals do not agree with each other. Confidence
+    # rose as the forecast degraded.
+    totals = [record.baseline_total_kwh for record in records]
     if len(totals) < 2:
         return None
     mean = sum(totals) / len(totals)

@@ -77,7 +77,8 @@
       "invalid_energy_entity": "This must be an energy sensor measured in Wh or kWh.",
       "invalid_percentage_entity": "This must be a percentage sensor measured in %.",
       "entity_not_numeric": "That entity does not report a number, so it cannot be used as a measurement.",
-      "solcast_not_configured": "You enabled the PV forecast, but Solcast PV Forecast is not set up. Add that integration first, or turn the PV forecast off."
+      "solcast_not_configured": "You enabled the PV forecast, but Solcast PV Forecast is not set up. Add that integration first, or turn the PV forecast off.",
+      "ev_entity_same_as_house_load": "The flexible-load sensor must be a different entity from the house-load sensor. Baseline load is measured load minus flexible load, so selecting the same entity twice would make it zero for every interval."
     },
     "abort": {
       "frank_not_configured": "Frank Quarter Prices is not set up yet. Add and configure that integration first, then add Alpha EMS Manager.",
@@ -95,7 +96,8 @@
       "invalid_percentage_entity": "This must be a percentage sensor measured in %.",
       "entity_not_numeric": "That entity does not report a number, so it cannot be used as a measurement.",
       "pv_entity_required": "You marked this system as having solar panels, so a PV production sensor is required.",
-      "solcast_entry_required": "You enabled the PV forecast, so a Solcast instance is required."
+      "solcast_entry_required": "You enabled the PV forecast, so a Solcast instance is required.",
+      "ev_entity_same_as_house_load": "The flexible-load sensor must be a different entity from the house-load sensor. Baseline load is measured load minus flexible load, so selecting the same entity twice would make it zero for every interval."
     },
     "step": {
       "init": {

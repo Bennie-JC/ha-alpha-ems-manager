@@ -111,6 +111,32 @@ def expected_quarters_for(day: date, tz: Any) -> int:
     return max(1, round((end - start).total_seconds() / 900.0))
 
 
+def elapsed_quarters_for(day: date, tz: Any, now: datetime) -> int:
+    """Return how many of ``day``'s quarter-hours have fully elapsed at ``now``.
+
+    This is the denominator for any *so-far* coverage figure. A day still in
+    progress has not had the chance to record its evening, so measuring it
+    against the full civil day reports a fault where there is only a future:
+    at 06:00 a perfectly healthy installation would show 25 % coverage.
+
+    The three cases fall out of the arithmetic rather than needing a branch:
+
+    * a **past** day returns its full civil-day length, so a finalised day is
+      still judged against every interval it really had;
+    * a **future** day returns ``0``;
+    * the **current** day returns the intervals that have actually closed.
+
+    Daylight saving is handled by construction. The elapsed count is absolute
+    time since the day's UTC midnight, and the clamp is
+    :func:`expected_quarters_for`, so a spring-forward day saturates at 92 and a
+    fall-back day is allowed all 100 -- neither is a hard-coded 96, and the
+    repeated hour advances the count instead of rewinding it.
+    """
+    total = expected_quarters_for(day, tz)
+    elapsed = (now.astimezone(UTC) - utc_midnight(day, tz)).total_seconds()
+    return max(0, min(total, int(elapsed // (QUARTER_MINUTES * 60))))
+
+
 def interval_start_utc(day: date, index: int, tz: Any) -> datetime:
     """Return the absolute start of chronological interval ``index`` of ``day``."""
     return utc_midnight(day, tz) + index * _QUARTER
@@ -257,15 +283,25 @@ class DayRecord:
         measured_kwh: float | None,
         ev_kwh: float | None,
         ev_expected: bool,
-    ) -> None:
-        """Store one finalised interval by chronological index."""
+    ) -> bool:
+        """Store one finalised interval by chronological index.
+
+        Returns whether the interval was actually stored. An out-of-range index
+        is dropped, and the caller must be told: under a single stable timezone
+        the index is provably inside the day, so a rejection here means
+        something upstream is already wrong -- a record whose stored length
+        disagrees with the current zone, or a day boundary computed in a zone
+        the record was not written in. Returning nothing let that land as a
+        finalised-looking quarter that had in fact stored nothing at all.
+        """
         if not 0 <= index < self.interval_count:
-            return
+            return False
         if measured_kwh is not None:
             self.measured[index] = round(measured_kwh, _KWH_PRECISION)
         if ev_kwh is not None:
             self.ev[index] = round(ev_kwh, _KWH_PRECISION)
         self.ev_expected[index] = ev_expected
+        return True
 
     # -- serialisation ---------------------------------------------------
 
@@ -400,6 +436,20 @@ class BalanceStats:
 class _LearningStoreBackend(Store[dict[str, Any]]):
     """Store subclass that refuses to misread an incompatible older schema."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialise the backend with its migration flag cleared."""
+        super().__init__(*args, **kwargs)
+        #: Set when this store threw away a pre-v2 document, so diagnostics can
+        #: say that history was discarded by a schema migration rather than
+        #: leaving it indistinguishable from a fresh install. A user whose
+        #: learning vanished on upgrade otherwise has only a log line, which has
+        #: usually rotated away by the time they ask.
+        #:
+        #: Per instance rather than per class: two config entries load their own
+        #: documents, and a shared flag would report one entry's migration
+        #: against the other's history.
+        self.discarded_legacy_document = False
+
     async def _async_migrate_func(
         self,
         old_major_version: int,
@@ -416,6 +466,7 @@ class _LearningStoreBackend(Store[dict[str, Any]]):
         ``.storage`` is touched.
         """
         if old_major_version < 2:
+            self.discarded_legacy_document = True
             _LOGGER.warning(
                 "Discarding Alpha EMS Manager learning history written under "
                 "storage schema v%s: the v%s schema stores quarter-hour "
@@ -448,7 +499,12 @@ class LearningStore:
         self.days: dict[date, DayRecord] = {}
         self.balance = BalanceStats()
         self.last_finalized: str | None = None
+        #: Set when the document could not be read at all. While true the store
+        #: refuses to write, because an empty in-memory history must never be
+        #: allowed to overwrite a file whose only problem may have been a
+        #: momentary I/O error.
         self.corrupt = False
+        #: Set when a pre-v2 document was discarded by the migration guard.
         self.reset_by_migration = False
 
     async def async_load(self, fallback_tz_key: str) -> None:
@@ -458,15 +514,20 @@ class LearningStore:
         failing setup: losing learned days is recoverable, refusing to start is
         much less pleasant for the user.
         """
+        self._store.discarded_legacy_document = False
         try:
             raw = await self._store.async_load()
         except Exception:
             _LOGGER.warning(
-                "Learning history could not be read and is being started over; "
-                "previously learned days are lost"
+                "Learning history could not be read. Learning continues from an "
+                "empty history for this session, but nothing will be written to "
+                "disk until the problem is resolved and Home Assistant is "
+                "restarted: the existing document is left untouched in case it "
+                "is still intact and the read failure was transient"
             )
             self.corrupt = True
             return
+        self.reset_by_migration = self._store.discarded_legacy_document
 
         if not isinstance(raw, dict):
             return
@@ -505,10 +566,22 @@ class LearningStore:
         Quarters finalise every fifteen minutes, so batching writes behind a
         short delay keeps disk churn negligible without risking real data loss.
         """
+        if self.corrupt:
+            return
         self._store.async_delay_save(self.to_dict, STORE_SAVE_DELAY)
 
     async def async_save_now(self) -> None:
-        """Write immediately. Used on unload and on Home Assistant stop."""
+        """Write immediately. Used on unload and on Home Assistant stop.
+
+        Refused after a failed load. ``async_load`` degrades an unreadable
+        document to an empty history so setup can continue, which is the right
+        call for availability -- but that empty history was then written back
+        over the file on the very next unload or shutdown, turning one transient
+        read error into permanent loss of a year of learning. The document is
+        left exactly as it was found instead.
+        """
+        if self.corrupt:
+            return
         await self._store.async_save(self.to_dict())
 
     async def async_remove(self) -> None:
@@ -531,28 +604,41 @@ class LearningStore:
                 tz_key=str(tz),
                 interval_count=expected_quarters_for(day, tz),
             )
-            self.days[day] = record
+            # Pruned *before* the new day joins the history, not after. Inserting
+            # first put the new day inside the set ``prune`` clamps against, so
+            # ``reference > newest`` could never be true and the clock-excursion
+            # guard below was inert on the only path that reaches it: a single
+            # future-dated record deleted every retained day, and the debounced
+            # save then wrote the empty document to disk within the minute.
             self.prune(reference=day)
+            self.days[day] = record
         return record
 
     def prune(self, reference: date) -> int:
         """Drop days older than the retention window. Returns the count removed.
 
-        ``reference`` is clamped to just past the newest day already stored. A
-        single forward clock excursion -- a Pi that hands Home Assistant a date
-        years ahead before NTP corrects it -- would otherwise create a
-        future-dated record, prune the entire retention window against it and
-        delete every learned day. Backwards jumps are harmless, since an older
-        reference only prunes less.
+        ``reference`` is clamped to at most one day past the newest day already
+        stored. Time advances a day at a time, so a reference immediately after
+        the known history is ordinary progression, while one further ahead is
+        either a gap in which nothing was learned or a clock that is simply
+        wrong -- and neither is a reason to discard more history.
 
-        A genuine multi-day gap still prunes correctly: the clamp advances with
-        whatever the newest stored day is, so history is trimmed relative to real
-        recorded time rather than to whatever the clock momentarily claimed.
+        That distinction matters because the failure is silent and total. A Pi
+        without a real-time clock hands Home Assistant a date years ahead until
+        NTP corrects it; the first quarter to close in that window creates a
+        future-dated record, and an unclamped reference would prune the entire
+        retention window against it. Backwards jumps need no guard: an older
+        reference only ever prunes less.
+
+        A genuine multi-day gap still prunes correctly. The clamp advances with
+        the newest stored day, so once real days start being recorded again the
+        window trims relative to actual recorded time rather than to whatever
+        the clock momentarily claimed.
         """
         if self.days:
-            newest = max(self.days)
-            if reference > newest:
-                reference = newest
+            horizon = max(self.days) + timedelta(days=1)
+            if reference > horizon:
+                reference = horizon
         cutoff = reference - timedelta(days=MAX_HISTORY_DAYS - 1)
         stale = [day for day in self.days if day < cutoff]
         for day in stale:

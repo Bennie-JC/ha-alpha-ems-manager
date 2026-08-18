@@ -225,9 +225,26 @@ async def test_the_sign_convention_options_are_translated(
             assert label != option
 
 
+async def test_the_setup_failure_message_is_translated_in_both_languages(
+    hass: HomeAssistant,
+) -> None:
+    """``ConfigEntryError`` resolves through the ``exceptions`` category.
+
+    ``async_setup_entry`` raises it with ``translation_key`` when no house-load
+    source is configured, so a missing entry leaves the user with a raw key
+    instead of a sentence. The category was covered by nothing.
+    """
+    for language in ("en", "nl"):
+        payload = await bundle(hass, language, "exceptions")
+        key = f"component.{DOMAIN}.exceptions.house_load_source_missing.message"
+        message = payload.get(key)
+        assert message, f"house_load_source_missing missing in {language}"
+        assert len(message) > 20
+
+
 async def test_both_languages_expose_the_same_keys(hass: HomeAssistant) -> None:
     """Dutch and English never drift apart."""
-    for category in ("config", "options", "selector"):
+    for category in ("config", "options", "selector", "exceptions"):
         english = own_keys(await bundle(hass, "en", category))
         dutch = own_keys(await bundle(hass, "nl", category))
         assert dutch == english, f"{category} differs between en and nl"
