@@ -175,6 +175,28 @@ Writes are debounced by `STORE_SAVE_DELAY` and flushed on unload and on Home
 Assistant stop. Retention is `MAX_HISTORY_DAYS`, pruned when a new day is
 created.
 
+Two rules protect the history, and both exist because they were once broken:
+
+- **Prune before inserting.** `prune()` clamps its reference to at most one day
+  past the newest stored day, so a clock excursion cannot define "now". That
+  clamp is inert if the new day has already joined the set being clamped
+  against — which is what `get_or_create` used to do, so a single future-dated
+  record deleted the entire retention window and the debounced save wrote the
+  empty document to disk within the minute.
+- **Never write after a failed read.** `async_load` degrades an unreadable
+  document to an empty history so setup can continue; without a guard, that empty
+  history is written back over the file on the next unload or shutdown, turning
+  one transient I/O error into permanent loss. `corrupt` suspends all writes for
+  the session and is reported as `storage.writes_suspended`.
+
+A timezone change is handled by reloading the entry. Both accumulators capture
+the zone once, at `async_start`, while the storage layer stamps each day with the
+zone it was written in — and Home Assistant does not reload config entries when
+its timezone changes, so the two halves of the write path otherwise ran on
+different calendars until the next restart. Intervals are additionally indexed in
+the record's own zone rather than the live one, and `record_interval` reports an
+out-of-range index instead of dropping it silently.
+
 `_LearningStoreBackend._async_migrate_func` discards any pre-v2 document with a
 warning. There is no faithful mapping from the v1 wall-clock-slot format, and
 reading it as chronological intervals would corrupt every DST day. Only this
@@ -228,6 +250,50 @@ just do not count as days the model was built from.
 Same-day adaptation is damped (`TODAY_ADAPT_DAMPING`) and clamped
 (`TODAY_ADAPT_RATIO_MIN/MAX`), and suppressed before
 `TODAY_ADAPT_MIN_ELAPSED_SLOTS`.
+
+## Coverage semantics
+
+Four different populations answer four different questions, and conflating them
+is how a healthy installation came to report 25 % coverage at 06:00 and recover
+by itself at midnight.
+
+| Reported as | Population | Denominator |
+|---|---|---|
+| `learning.*` | every retained day | intervals that have **elapsed** (`elapsed_quarters_for`) |
+| `learning.completed_days.*` | finalised days only | their full civil length, 92/96/100 |
+| `learning.current_day.*` | the day in progress | quarters that have **closed** |
+| `confidence.*` | learned days only | their full civil length |
+
+`elapsed_quarters_for` needs no branch for the three cases: a past day returns its
+whole civil length, a future day returns zero, and the running day returns what
+has actually closed. Daylight saving falls out of the same arithmetic, because the
+count is absolute time since the day's UTC midnight clamped by
+`expected_quarters_for`.
+
+The running day is judged by nothing. It cannot be a learned day, cannot enter the
+confidence score, and cannot be an input to its own forecast until midnight
+finalises it — so measuring it against a full civil day reported the unlived
+remainder of today as missing data.
+
+## Rejection attribution
+
+Every route to a rejected quarter ends in the same place — the interval failed to
+reach `MIN_QUARTER_COVERAGE` — but the causes are unrelated, and a bare count
+could not distinguish a normal restart from an entity that had been publishing
+kWh instead of W since the day it was selected.
+
+`describe_power_problem()` classifies a reading exactly as `normalize_power_w`
+accepts it, and the coordinator adds the reasons only it can see. Counters are
+keyed by a fixed set of literals, so the mapping cannot grow with runtime:
+
+`source_entity_missing`, `state_unavailable`, `state_not_numeric`,
+`unit_missing`, `unit_not_power`, `value_implausible`,
+`interval_outside_stored_day`, `insufficient_sample_coverage`.
+
+Logging is throttled per reason, so a new kind of fault is never rate-limited by
+an older one. `insufficient_sample_coverage` logs at debug rather than warning:
+it is the expected outcome of every restart, and a message that fires every time
+teaches the user to ignore the channel.
 
 ## Confidence
 
@@ -285,6 +351,45 @@ Three layers, in the order they apply:
    advance when a value repeats and would make a steady sensor look stale).
    Too much skew, or too old, and the sample is *skipped*: excluded from the
    pass rate in both numerator and denominator.
+
+   **One source is exempt, under one condition.** A PV source whose current
+   value is *exactly* zero contributes no timestamp at all. The age gate asks
+   whether a source's value may have changed since it was last published; for a
+   term that is exactly zero, the answer cannot change the verdict, because the
+   contribution to the identity is exactly zero however old the reading is.
+
+   The residual risk is self-announcing rather than hidden. If real generation
+   `P` started while the sensor stayed silent at zero, substituting zero makes
+   `supply` short by exactly `P`, so the sample *fails* by `P`. The exemption can
+   never manufacture a pass, which is the only direction that matters.
+
+   The scope is deliberately narrow, and narrow in two separate ways:
+
+   - **Exactly zero, with no band around it.** A stale `5 W` injects five
+     fabricated watts of supply, and any tolerance drawn around zero would be a
+     threshold with no physical quantity behind it. A stale *positive* reading is
+     worse still: it contributes a real term that can cancel a genuine fault in
+     either direction, which is precisely what this check exists to catch.
+   - **PV only, not "any zero flow".** The arithmetic argument is source-
+     agnostic; the *need* is not. Night is a predictable eight to twelve hours in
+     which generation is genuinely zero and a change-driven source has no reason
+     to republish, so PV alone accumulates a sustained skip rate — 185 of 189
+     skips on the reference installation. Battery idle, a null grid reading and a
+     zero house load are transient states, not a nightly regime, so relaxing them
+     would buy no measurable coverage while widening the surface on which a
+     genuinely dead source could pass unnoticed. House load in particular is the
+     learning target; its silence is information.
+
+   An *unreadable* source is never a zero: `unavailable`, `unknown` or a bad unit
+   yields no verdict at all, so the exemption is not even consulted. The
+   exemption is self-terminating — a sensor that starts generating publishes a
+   new value by definition, so at sunrise it is simultaneously fresh and non-zero
+   — and every exemption is counted per entity in
+   `energy_balance.quiescent_zero_source_counts`, because a relaxation that
+   leaves no trace is one nobody can audit.
+
+   `tests/test_stale_zero_pv.py` pins both halves: that the exemption fires where
+   it should, and that it cannot be stretched to cover anything else.
 3. **Debounce** — `BALANCE_SUSTAINED_FAILURES` consecutive coherent failures are
    required before a warning. This, not the coherence gate, is what suppresses
    transients: a load step can fail one sample while all four timestamps look

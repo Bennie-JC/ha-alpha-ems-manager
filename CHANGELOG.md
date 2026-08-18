@@ -9,6 +9,171 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.4] - 2026-08-19
+
+The final Phase-1 hardening release. Three defects reported from live `beta.3`
+operation are fixed, and a full audit of the learning and data foundation found
+a further eleven -- including one that could destroy a year of learned history.
+**No tolerance, learning threshold or forecast threshold was changed.** Every fix
+corrects logic that was already wrong, rather than widening a limit that was
+catching something real.
+
+The storage schema stays at v2 and the config-entry schema at v2, so upgrading
+preserves learned history, source selections, entity ids and unique ids. No
+remove-and-re-add is required.
+
+### Fixed
+
+- **A PV sensor resting at 0 W overnight blocked the energy-balance check for
+  the whole night.** The AlphaESS PV template stops republishing while
+  generation is zero, so its report age reached three hours and every sample was
+  skipped as `stale_source` -- 185 of 189 skips on the reference installation,
+  while the identity being blocked closed to within 1 W. A PV source whose
+  current value is *exactly* zero now takes no part in the timing comparison,
+  because the term it contributes to the identity is exactly zero however old
+  the reading is. Nothing else is relaxed: a stale positive PV, an unreadable
+  PV, and a stale battery, grid or house-load source are all judged as before,
+  and there is deliberately no tolerance band around zero. The exemption is
+  self-terminating -- a sensor that starts generating publishes a new value by
+  definition -- and it can only ever produce a *failure* at sunrise, never a
+  spurious pass. Exemptions are counted per entity in diagnostics.
+- **Coverage counted intervals that had not happened yet.** Diagnostics divided
+  valid intervals by the full civil length of every retained day, including the
+  day in progress, so a perfectly healthy installation reported 25 % coverage at
+  06:00 and recovered by itself at midnight. Coverage is now measured against
+  intervals that have actually elapsed, with finalised days still measured
+  against their whole 92/96/100-interval length. The confidence score was never
+  affected -- it is computed over learned days only, which are by definition
+  finalised -- and it does not move.
+- **A retained day with no usable data could distort the weekday/weekend
+  split.** A day contributing zero valid baseline intervals still counted toward
+  `MIN_DAYS_FOR_DAY_TYPE`, so it could engage the day-type split on the strength
+  of contributing nothing, narrow the model to that one day type, and lower
+  `model_days` below what the same history pooled would support. Unusable days
+  now take part in no decision at all.
+- **A forecast could be withheld while reporting no reason for it.** Once two
+  days of a type existed the split engaged, but `model_days` counted only
+  *learned* days of that type -- so two partial weekend days produced
+  `model_days: 0`, an unavailable Saturday forecast, and `unavailable_reason:
+  null`, alongside a diagnostics payload claiming 96 of 96 modelled intervals.
+  It was also non-monotonic in data: deleting one of the two partial days
+  restored the forecast, so acquiring history removed one. The split now engages
+  on learned days of the type, matching what `MIN_DAYS_FOR_DAY_TYPE` has always
+  been documented to mean, and an unavailable forecast always carries a reason.
+- **A single future-dated day deleted the entire retention window.** The
+  clock-excursion guard in `prune()` clamps against the newest stored day, but
+  `get_or_create` inserted the new day *before* pruning -- so the clamp measured
+  itself against a set that already contained the future date and could never
+  fire. A host without a real-time clock, or one whose clock is stepped before
+  NTP corrects it, therefore dropped every learned day, and the debounced save
+  wrote the empty document to disk within the minute. Pruning now happens before
+  insertion, and the reference is clamped to one day past known history.
+- **A failed read could overwrite an intact learning document.** An unreadable
+  store degrades to an empty history so setup can continue, but that empty
+  history was then written straight back to disk on the next unload or shutdown,
+  turning one transient I/O error into permanent loss. Writes are suspended for
+  the session after a failed load, and diagnostics report
+  `storage.writes_suspended`.
+- **A timezone change split the write path across two calendars.** Both
+  accumulators capture the zone at setup while the storage layer creates records
+  in whatever zone is current, and Home Assistant does not reload config entries
+  when its timezone changes -- so until the next restart, quarters were filed
+  hours away from where they belonged, into days that still looked complete. The
+  entry now reloads on a timezone change, and intervals are indexed in the zone
+  their day was recorded in.
+- **A quarter could report itself as finalised while storing nothing.**
+  `record_interval` silently dropped an out-of-range index. It now reports the
+  drop, which is counted and named as `interval_outside_stored_day`.
+- **A large forward clock step blocked the event loop.** A host starting in 1970
+  and stepped to the present asked the accumulator to close roughly two million
+  quarter-hour buckets in one synchronous loop -- about twelve seconds of
+  blocked event loop and several hundred megabytes of results that were all
+  going to be rejected anyway, since every quarter in a gap that long already
+  fails the sample-gap test. Accumulation now restarts beyond a day.
+- **A house-load source stuck at exactly 0 W raised the confidence score while
+  degrading the forecast.** Such a day is fully covered and fully valid, so it
+  counted as learned and lifted both maturity and coverage, while dragging every
+  slot mean toward zero -- and `_stability`, the one component whose job is to
+  notice that daily totals disagree, filtered zero totals out. It no longer
+  does.
+- **`modelled_intervals` claimed neighbour-filled intervals had been modelled.**
+  It was overwritten with the day length on every published forecast, making it
+  a constant and hiding exactly what it was added to show. It now reports what
+  was really blended, alongside a new `filled_intervals`.
+- **Tomorrow's sensor published model metadata for a forecast it was
+  withholding.** Today's attributes were gated on availability; tomorrow's were
+  not, so a template saw all five look-back windows and a day-type decision
+  behind a sensor reading `unknown`.
+- **A stale Solcast selection made the options form reject every submission.**
+  The dropdown validates against the live entry list, so once Solcast was
+  removed -- or removed and re-added under a new id -- the stored value was no
+  longer selectable and the form failed schema validation before any field error
+  could be produced. The user could not change any unrelated setting. The Frank
+  dropdown already guarded against this; Solcast now does too.
+- **The flexible-load sensor could be set to the house-load sensor.** Since
+  `baseline = max(measured - flexible, 0)`, that makes the baseline exactly zero
+  for every interval of every day -- valid, complete, counted as learned, and a
+  confident 0 kWh forecast that nothing downstream could distinguish from a
+  house using no energy. It is refused at selection time in both flows.
+- **An implausible house-load reading widened the energy-balance allowance.**
+  The learning path rejected a reading above `MAX_PLAUSIBLE_LOAD_W`, but the
+  balance path accepted it into `ac_power`, making the check most permissive
+  exactly when the house-load entity was most obviously wrong. Both paths now
+  apply the same rule.
+
+### Added
+
+- **Rejected-quarter attribution.** Every route to a rejected quarter ends in
+  "coverage too low", so the bare count could not distinguish a normal restart
+  from an entity that had been publishing kWh instead of W since the day it was
+  selected -- and learning could stall with nothing in the log to explain it.
+  Diagnostics now carry `rejected_quarters_by_reason`, `last_rejected_quarter`
+  and `last_rejected_reason`, and the flexible load carries
+  `intervals_without_valid_data_by_reason`. Reasons distinguish a missing
+  entity, an unavailable state, a non-numeric state, a missing unit, a non-power
+  unit, an implausible value, an out-of-range interval, and genuinely thin
+  coverage. A source fault warns at most once per reason per throttle window;
+  thin coverage with a healthy source logs at debug, because a message that
+  fires after every restart teaches the user to ignore the channel.
+- **Coverage populations reported separately** -- `learning.completed_days` for
+  finalised days, `learning.current_day` for the day in progress,
+  `learning.occurred_intervals` as the shared denominator, and a
+  `coverage_basis` note -- so `learning.baseline_coverage` and
+  `confidence.coverage` can no longer be read as the same figure.
+- **A day-total cross-check in diagnostics.** `daily_validation` compares this
+  integration's integrated measurement against the vendor's own daily counter,
+  with the difference in kWh and per cent and the coverage caveat alongside. It
+  is diagnostic only and structurally incapable of being anything else: nothing
+  in the learning path reads the validation entity. It reports factual states
+  rather than a pass/fail verdict, because no defensible tolerance separates
+  "agrees" from "disagrees" between two different measurement methods.
+- **`storage.reset_by_schema_migration`**, so a discarded pre-v2 document is
+  distinguishable from a fresh install. The flag existed but was never set or
+  read, leaving only a log line that has usually rotated away by the time anyone
+  asks.
+
+### Changed
+
+- **Both forecasts share one prepared view of the history.** The observation
+  bucketing depends only on the records and the reference day, so building it
+  once per target repeated the most expensive part of every refresh -- around
+  90 ms at a year of history, twice, on the event loop every quarter of an hour,
+  and several times that on a Raspberry Pi. Results are unchanged.
+- Days older than the longest look-back window are no longer counted as model
+  inputs. `_mean` already ignored them, so reporting them overstated the history
+  behind a forecast.
+- Removed `QuarterAccumulator.mark_unavailable`, `poll` and `open_slot_start`,
+  and `PowerFlows.has_house_load`, none of which were called from anywhere.
+
+### Testing
+
+610 tests at `beta.3`, 755 at `beta.4`. Every fix above has a regression test
+that fails against `beta.3` and passes here, across
+`tests/test_stale_zero_pv.py`, `tests/test_coverage_semantics.py`,
+`tests/test_empty_day_isolation.py`, `tests/test_rejection_visibility.py`,
+`tests/test_beta4_audit_regressions.py` and
+`tests/test_midnight_finalization.py`.
+
 ## [1.0.0-beta.3] - 2026-08-18
 
 A Phase-1 bugfix beta, from an investigation of energy-balance failures observed
