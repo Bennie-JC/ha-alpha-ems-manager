@@ -483,6 +483,8 @@ class BalanceMonitor:
     skipped_due_to_skew: int = 0
     #: Skips attributed to a source that had stopped publishing.
     skipped_due_to_stale_source: int = 0
+    #: How often each entity was unreadable on a sample that got no verdict.
+    unavailable_source_counts: dict[str, int] = field(default_factory=dict)
     #: How often each entity was the least recently reported on a skipped sample.
     stale_source_counts: dict[str, int] = field(default_factory=dict)
     #: How often each entity was exempted from the timing comparison for
@@ -518,9 +520,19 @@ class BalanceMonitor:
             return None
         return self.passed_samples / self.eligible_samples
 
-    def record_unavailable(self) -> None:
-        """Record that not every source produced a reading."""
+    def record_unavailable(self, entity_ids: tuple[str, ...] = ()) -> None:
+        """Record that not every source produced a reading.
+
+        ``entity_ids`` names the sources that could not be read. A bare count
+        was a dead end: a battery entity that goes unavailable produces no log
+        line of its own -- unlike house load, which is on the learning path --
+        so ``unavailable_samples: 500`` said only that *something* was missing,
+        and the reader had to compare four source reports by hand to find out
+        which.
+        """
         self.unavailable_samples += 1
+        for entity_id in entity_ids:
+            _tally(self.unavailable_source_counts, entity_id)
 
     def record(self, sample: BalanceSample) -> str:
         """Record one evaluated sample and return its outcome."""
@@ -601,6 +613,10 @@ class BalanceMonitor:
             "failed_samples": self.failed_samples,
             "skipped_incoherent_samples": self.skipped_incoherent_samples,
             "unavailable_samples": self.unavailable_samples,
+            # Which entity was unreadable, not merely that one was. The balance
+            # check never affects learning, so a dead battery or grid source is
+            # otherwise easy to miss entirely.
+            "unavailable_source_counts": dict(self.unavailable_source_counts),
             "pass_rate": (None if self.pass_rate is None else round(self.pass_rate, 4)),
             "pass_rate_basis": "passed / eligible (incoherent samples excluded)",
             "consecutive_failures": self.consecutive_failures,

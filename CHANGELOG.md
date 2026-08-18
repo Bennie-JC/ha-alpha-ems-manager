@@ -120,6 +120,20 @@ remove-and-re-add is required.
   balance path accepted it into `ac_power`, making the check most permissive
   exactly when the house-load entity was most obviously wrong. Both paths now
   apply the same rule.
+- **A dead battery, PV or grid entity failed silently.** Those three are read
+  through `_read_power`, which logs nothing -- unlike house load, which is on
+  the learning path and reports its own problems. An unreadable one therefore
+  left the balance check with no verdict to give, forever, and the only symptom
+  was `unavailable_samples` climbing without naming which of four sources was
+  missing. Unreadable sources are now counted per entity in
+  `unavailable_source_counts` and warned about once, with the warning stating
+  plainly that learning is unaffected.
+- **`open_quarter_coverage` on the Learning Days sensor could only ever read
+  about 0.0.** Attributes are captured when the coordinator writes state, and it
+  writes at the quarter tick plus five seconds -- so the open quarter was always
+  five seconds old when the figure was taken. The number was true and useless,
+  and read as a fault. It is gone from the entity and kept in diagnostics, where
+  the payload is built on demand and the figure means something.
 
 ### Added
 
@@ -167,11 +181,12 @@ remove-and-re-add is required.
 
 ### Testing
 
-610 tests at `beta.3`, 755 at `beta.4`. Every fix above has a regression test
+610 tests at `beta.3`, 762 at `beta.4`. Every fix above has a regression test
 that fails against `beta.3` and passes here, across
 `tests/test_stale_zero_pv.py`, `tests/test_coverage_semantics.py`,
 `tests/test_empty_day_isolation.py`, `tests/test_rejection_visibility.py`,
-`tests/test_beta4_audit_regressions.py` and
+`tests/test_beta4_audit_regressions.py`,
+`tests/test_source_availability_visibility.py` and
 `tests/test_midnight_finalization.py`.
 
 ## [1.0.0-beta.3] - 2026-08-18

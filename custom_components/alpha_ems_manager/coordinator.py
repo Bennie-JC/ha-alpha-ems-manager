@@ -121,6 +121,7 @@ _REJECTED_QUARTER_LOG = "rejected_quarter"
 #: Throttle keys for the two energy-balance wordings. They are deliberately
 #: distinct: the two messages describe different situations and call for
 #: different action, so neither may rate-limit the other.
+_BALANCE_UNAVAILABLE_LOG = "energy_balance_unavailable"
 _BALANCE_LOG_MODERATE = "energy_balance_moderate"
 _BALANCE_LOG_GROSS = "energy_balance_gross"
 
@@ -726,6 +727,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return [entity_id for entity_id in candidates if entity_id]
 
     @callback
+    def _unreadable_balance_sources(self) -> tuple[str, ...]:
+        """Return the configured balance sources that currently read unusably."""
+        return tuple(
+            entity_id
+            for entity_id in self._balance_source_entities()
+            if self._read_power(entity_id) is None
+        )
+
+    @callback
     def _is_quiescent_zero_pv(self, entity_id: str) -> bool:
         """Return whether ``entity_id`` is the PV source and reads exactly zero.
 
@@ -810,7 +820,26 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         sample = evaluate_balance(self.read_flows(), self._source_coherence())
         if sample is None:
-            self.balance.record_unavailable()
+            unreadable = self._unreadable_balance_sources()
+            self.balance.record_unavailable(unreadable)
+            if unreadable:
+                # House load logs its own problems because it is on the learning
+                # path; the battery, PV and grid sources did not log anything at
+                # all, so a dead one produced a silently unjudgeable balance
+                # check and no other symptom. Throttled per source set.
+                self._log.warning(
+                    f"{_BALANCE_UNAVAILABLE_LOG}:{','.join(unreadable)}",
+                    (
+                        "Energy-balance sources %s cannot be read, so the "
+                        "balance check has no verdict to give. Learning is "
+                        "unaffected -- it does not use these sources -- but the "
+                        "data-quality component of the confidence score drops "
+                        "out until they return"
+                    ),
+                    ", ".join(unreadable),
+                )
+            else:
+                self._log.clear(_BALANCE_UNAVAILABLE_LOG)
             return
 
         self.last_balance = sample

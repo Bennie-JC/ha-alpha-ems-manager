@@ -172,7 +172,13 @@ def _days_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
         "rejected_quarters": coordinator.rejected_quarters,
         "flexible_load_configured": coordinator.ev_configured,
         "intervals_without_flexible_data": coordinator.invalid_ev_quarters,
-        "open_quarter_coverage": round(coordinator.open_quarter_coverage, 3),
+        # ``open_quarter_coverage`` deliberately absent. Attributes are captured
+        # when the coordinator writes state, and it only writes at the quarter
+        # tick plus five seconds -- by which point the open quarter is five
+        # seconds old and its coverage is always about 0.0. The number was true
+        # and useless, and reads as a fault. Diagnostics keep it, because that
+        # payload is built on demand and the figure means something there.
+        "last_rejected_reason": coordinator.last_rejected_reason,
     }
 
 
