@@ -6,7 +6,7 @@ instantaneous power sensor, sign conventions and config-entry references. The
 two share **no** keys.
 
 Before this guard existed, installing v2 over a v1 entry produced the worst
-possible outcome: setup succeeded, four healthy-looking sensors appeared, no
+possible outcome: setup succeeded, healthy-looking sensors appeared, no
 house-load listener was registered, nothing was ever learned, and nothing was
 logged. These tests make that outcome impossible.
 """
@@ -234,8 +234,8 @@ async def test_reload_creates_no_duplicate_entities(
     created = [
         item.entity_id for item in registry.entities.values() if item.platform == DOMAIN
     ]
-    assert len(created) == 4
-    assert len(set(created)) == 4
+    assert len(created) == 6
+    assert len(set(created)) == 6
     assert not [entity_id for entity_id in created if entity_id.endswith("_2")]
 
 

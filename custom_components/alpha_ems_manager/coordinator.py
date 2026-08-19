@@ -65,6 +65,8 @@ from .forecast import (
     build_forecast,
     collect_forecast_inputs,
 )
+from .forecast_recorder import ForecastRecorder, RecorderResult
+from .history_store import ForecastHistoryStore
 from .normalization import (
     PowerFlows,
     describe_power_problem,
@@ -124,6 +126,11 @@ _REJECTED_QUARTER_LOG = "rejected_quarter"
 _BALANCE_UNAVAILABLE_LOG = "energy_balance_unavailable"
 _BALANCE_LOG_MODERATE = "energy_balance_moderate"
 _BALANCE_LOG_GROSS = "energy_balance_gross"
+
+#: Throttle key for a failure inside the Phase-2 evidence layer. Throttled like
+#: everything else on this path: a persistently unwritable document would
+#: otherwise warn every fifteen minutes forever.
+_FORECAST_HISTORY_LOG = "forecast_history"
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +273,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.entry = entry
         self.config = SourceConfig.from_entry(entry)
         self.store = LearningStore(hass, entry.entry_id)
+        #: Phase-2 forecast evidence. Deliberately a separate document set from
+        #: the learning history: the two have different retention horizons, and
+        #: a schema migration that discards one must not take the other with it.
+        self.history = ForecastHistoryStore(hass, entry.entry_id)
+        self.recorder = ForecastRecorder(self.history, self.store)
+        #: Result of the most recent recording pass, for sensors and diagnostics.
+        self.last_record: RecorderResult = RecorderResult()
         self._accumulator = QuarterAccumulator(dt_util.get_default_time_zone())
         self._ev_accumulator: QuarterAccumulator | None = None
         self._log = _ThrottledLogger()
@@ -300,8 +314,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # -- lifecycle -------------------------------------------------------
 
     async def async_prepare(self) -> None:
-        """Load persisted history before entities are added."""
+        """Load persisted history before entities are added.
+
+        Both documents are read here so the first refresh already has the
+        forecast evidence in hand: without it, that refresh would look like a
+        fresh installation and re-issue snapshots that are already on disk.
+        """
         await self.store.async_load(str(dt_util.get_default_time_zone()))
+        await self.history.async_load()
 
     @callback
     def async_start(self) -> None:
@@ -391,8 +411,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.hass.config_entries.async_schedule_reload(self.entry.entry_id)
 
     async def async_shutdown_store(self) -> None:
-        """Flush pending learning data to disk."""
+        """Flush pending learning and forecast data to disk.
+
+        The forecast flush is guarded on its own so a failure there cannot stop
+        the learning history -- the irreplaceable half -- from being written.
+        """
         await self.store.async_save_now()
+        try:
+            await self.history.async_save_now()
+        except Exception:
+            _LOGGER.exception(
+                "Forecast history could not be flushed to disk. Learning "
+                "history was written normally and is unaffected"
+            )
 
     # -- source reading --------------------------------------------------
 
@@ -956,6 +987,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         learned = self.store.learned_days(before=today)
         breakdown = compute_confidence(learned, today, self.store.balance.score)
 
+        record = await self._async_record_forecast_evidence(
+            now=now,
+            today=today,
+            tz=tz,
+            baseline_today=baseline_today,
+            forecast_tomorrow=forecast_tomorrow,
+            breakdown=breakdown,
+        )
+
         return {
             "today": adapted,
             "today_baseline": baseline_today,
@@ -965,7 +1005,56 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "elapsed_intervals": elapsed,
             "measured_so_far_kwh": measured_so_far,
             "ev_so_far_kwh": ev_so_far,
+            "forecast_yesterday_error": record.yesterday,
+            "forecast_error_window": record.window,
         }
+
+    async def _async_record_forecast_evidence(
+        self,
+        *,
+        now: datetime,
+        today: date,
+        tz: Any,
+        baseline_today: DayForecast,
+        forecast_tomorrow: DayForecast,
+        breakdown: ConfidenceBreakdown,
+    ) -> RecorderResult:
+        """Persist this refresh as forecast evidence, and read the metrics back.
+
+        Wrapped so that nothing in the evidence layer can fail a refresh. The
+        four Phase-1 sensors do not depend on any of it, and taking the whole
+        integration unavailable because a forecast-history document could not be
+        written would trade the important half for the useful half.
+        """
+        try:
+            self.last_record = await self.recorder.async_record(
+                now=now,
+                today=today,
+                tz_key=str(tz),
+                tz=tz,
+                baseline_today=baseline_today,
+                tomorrow=forecast_tomorrow,
+                learned_days=breakdown.learned_days,
+                confidence_percent=breakdown.percent,
+                confidence=breakdown.as_dict(),
+                ev_power_entity=self.config.ev_power_entity,
+            )
+        except Exception:
+            self._log.warning(
+                _FORECAST_HISTORY_LOG,
+                (
+                    "Forecast-error history could not be updated this refresh. "
+                    "Load learning and both forecasts are unaffected -- nothing "
+                    "in the learning path reads this evidence -- but the "
+                    "forecast-error sensors will not advance until it recovers"
+                ),
+            )
+            _LOGGER.debug("Forecast history update failed", exc_info=True)
+            self.last_record = RecorderResult(
+                yesterday=self.last_record.yesterday,
+                window=self.last_record.window,
+            )
+        return self.last_record
 
     @staticmethod
     def _elapsed_intervals(now: datetime, today: date, tz: Any) -> int:
@@ -1052,6 +1141,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._ev_accumulator is None:
             return None
         return self._ev_accumulator.open_coverage
+
+    def today_date(self) -> date:
+        """Return the current local civil date.
+
+        Read through the same clock the refresh uses, so a consumer of the
+        public API can never end up a day away from the evidence the coordinator
+        has just recorded.
+        """
+        return dt_util.now().date()
 
     def learned_day_dates(self) -> list[date]:
         """Return the dates that currently count as learned.

@@ -31,6 +31,7 @@ async def test_diagnostics_report_every_documented_section(
         "confidence",
         "energy_balance",
         "storage",
+        "forecast_history",
         "consumed_integrations",
     }
 
@@ -404,3 +405,77 @@ async def test_a_pv_less_system_omits_pv_from_the_coherence_check(
 
     assert len(sources) == 3
     assert all("pv" not in entity for entity in sources)
+
+
+async def test_the_forecast_history_block_reports_the_evidence_layer(
+    hass: HomeAssistant, setup_integration: MockConfigEntry
+) -> None:
+    """Everything the two published sensors deliberately do not show.
+
+    The per-horizon breakdown is the part that could not exist without keeping
+    both the day-ahead and the day-of prediction for the same target.
+    """
+    from datetime import timedelta
+
+    from .forecast_helpers import (
+        NORMAL,
+        frozen,
+        history_before,
+        local,
+        refresh_at,
+        reseed,
+        seed,
+    )
+    from .synthetic import flat_day
+
+    coordinator = setup_integration.runtime_data
+    tomorrow = NORMAL + timedelta(days=1)
+    seed(coordinator, history_before(NORMAL))
+
+    # A day-ahead prediction, then a day-of one, then the day is matched.
+    await refresh_at(coordinator, local(NORMAL, 23, 50))
+    reseed(coordinator, history_before(tomorrow))
+    await refresh_at(coordinator, local(tomorrow, 0, 5))
+    reseed(
+        coordinator,
+        {**history_before(tomorrow), tomorrow: flat_day(tomorrow, 9.6)},
+    )
+    await refresh_at(coordinator, local(tomorrow + timedelta(days=1), 0, 5))
+
+    with frozen(local(tomorrow + timedelta(days=1), 9, 0)):
+        payload = await async_get_config_entry_diagnostics(hass, setup_integration)
+    block = payload["forecast_history"]
+
+    assert block["available"] is True
+    assert block["provenance"]["forecast_schema_version"] == 1
+    assert block["provenance"]["baseline_definition"] == "none"
+    # Both days resolved: NORMAL was matched when the day turned, and
+    # tomorrow when the one after it did.
+    assert block["inventory"]["lifecycle"]["validated"] == 2
+    assert block["inventory"]["lifecycle"]["unresolved"] == 0
+    assert block["inventory"]["finalization_suspended"] is False
+    assert block["issuance"]["duplicates_suppressed"] >= 0
+    assert "predicted - actual" in block["quality"]["sign_convention"]
+    # Both horizons were kept, so both can be scored separately.
+    assert set(block["quality"]["by_horizon"]) == {"0", "1"}
+    assert block["quality"]["by_horizon"]["1"]["days_compared"] == 1
+    # Two fully measured days, so 192 valid intervals and no other code.
+    assert block["matching"]["interval_status_counts"] == {"0": 192}
+    assert block["matching"]["excluded_day_flags"] == {}
+    assert block["storage"]["writes_suspended"] is False
+    assert block["storage"]["partitions"]
+
+
+async def test_the_forecast_history_block_survives_an_unreadable_index(
+    hass: HomeAssistant, setup_integration: MockConfigEntry
+) -> None:
+    """Diagnostics is the first thing asked for when storage misbehaves."""
+    coordinator = setup_integration.runtime_data
+    coordinator.history.corrupt = True
+
+    payload = await async_get_config_entry_diagnostics(hass, setup_integration)
+    block = payload["forecast_history"]
+
+    assert block["available"] is False
+    assert block["storage"]["writes_suspended"] is True
+    assert "nothing is being written" in block["note"]

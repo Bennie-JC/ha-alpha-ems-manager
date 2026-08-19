@@ -2,7 +2,8 @@
 
 This is where everything that does *not* justify an entity goes: per-source
 availability, normalised readings, sign conventions, coverage statistics, the
-confidence derivation and the energy-balance residual.
+confidence derivation, the energy-balance residual, and the whole Phase-2
+forecast-evidence layer beyond the two error figures that reached a sensor.
 
 The payload carries no credentials, tokens or account data -- this integration
 holds none, because it never talks to an external service. Nor does it dump the
@@ -13,7 +14,7 @@ the summary a support conversation actually needs is included.
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -22,6 +23,12 @@ from homeassistant.util import dt as dt_util
 from . import AlphaEmsConfigEntry
 from .const import (
     CONFIG_ENTRY_VERSION,
+    FORECAST_MAX_SNAPSHOTS_PER_TARGET,
+    FORECAST_METRIC_WINDOWS,
+    FORECAST_MODEL_VERSION,
+    FORECAST_RAW_RETENTION_DAYS,
+    FORECAST_STORAGE_VERSION,
+    FORECAST_SUMMARY_RETENTION_DAYS,
     MAX_HISTORY_DAYS,
     MIN_DAY_COMPLETENESS,
     MIN_QUARTER_COVERAGE,
@@ -30,6 +37,16 @@ from .const import (
 )
 from .coordinator import AlphaEmsCoordinator
 from .forecast import REASON_NOT_BUILT, DayForecast
+from .forecast_history import (
+    LIFECYCLE_PENDING,
+    LIFECYCLE_UNMATCHED,
+    LIFECYCLE_UNRESOLVED,
+    LIFECYCLE_VALIDATED,
+    baseline_definition,
+    lifecycle_from_summary,
+    model_params_hash,
+)
+from .metrics import compute_window, window_from_summaries
 from .storage import DayRecord, elapsed_quarters_for, expected_quarters_for
 
 
@@ -201,6 +218,180 @@ def _forecast_report(forecast: DayForecast | None) -> dict[str, Any]:
         "day_type": forecast.day_type,
         "day_type_pooled": forecast.day_type_pooled,
         "windows_used_days": list(forecast.windows_used),
+    }
+
+
+async def _forecast_history_report(
+    coordinator: AlphaEmsCoordinator, today: date
+) -> dict[str, Any]:
+    """Summarise the Phase-2 forecast evidence.
+
+    Everything the two published sensors do not show lives here: the snapshot
+    inventory, the lifecycle counts, per-horizon and per-slot error, the
+    modelled-versus-filled split, matching health and storage health.
+
+    Deep statistics are bounded to the longest window in
+    ``FORECAST_METRIC_WINDOWS``, so a diagnostics download loads at most a
+    handful of month partitions rather than a year of them.
+    """
+    history = coordinator.history
+    recorder = coordinator.recorder
+    oldest, newest = history.span
+
+    provenance = {
+        "forecast_schema_version": FORECAST_STORAGE_VERSION,
+        "model_version": FORECAST_MODEL_VERSION,
+        # Changes whenever a window, weight or threshold behind the forecast
+        # changes. Two records with different values here describe two different
+        # models and must never be pooled into one error statistic.
+        "model_params_hash": model_params_hash(),
+        "baseline_definition": baseline_definition(coordinator.config.ev_power_entity),
+        "raw_retention_days": FORECAST_RAW_RETENTION_DAYS,
+        "summary_retention_days": FORECAST_SUMMARY_RETENTION_DAYS,
+        "max_snapshots_per_target": FORECAST_MAX_SNAPSHOTS_PER_TARGET,
+    }
+
+    storage = {
+        "corrupt_on_load": history.corrupt,
+        # While true, nothing at all is written: an empty in-memory view must
+        # never be flushed over documents whose only problem may have been a
+        # transient read error.
+        "writes_suspended": history.corrupt,
+        "reset_by_schema_migration": history.reset_by_migration,
+        "partitions": history.partition_report(),
+        "pruned_days": history.pruned_days,
+        "snapshot_cap_hits": history.snapshot_cap_hits,
+    }
+
+    if history.corrupt:
+        return {
+            "available": False,
+            "note": (
+                "the forecast-history index could not be read, so no evidence "
+                "is available this session and nothing is being written; "
+                "learning and both forecasts are unaffected"
+            ),
+            "provenance": provenance,
+            "storage": storage,
+        }
+
+    lifecycle = {
+        LIFECYCLE_PENDING: 0,
+        LIFECYCLE_VALIDATED: 0,
+        LIFECYCLE_UNMATCHED: 0,
+        LIFECYCLE_UNRESOLVED: 0,
+    }
+    horizons: dict[str, int] = {}
+    for day, row in history.days.items():
+        state = lifecycle_from_summary(
+            day,
+            today,
+            finalized=row.finalized_at is not None,
+            summary=row.summary,
+        )
+        lifecycle[state] += 1
+        horizon = (row.summary or {}).get("h")
+        if horizon is not None:
+            horizons[str(horizon)] = horizons.get(str(horizon), 0) + 1
+
+    # Cheap statistics first: rebuilt from the always-loaded index rows, so
+    # these cost no disk access whatever the window.
+    rolling = {
+        f"{window}_days": window_from_summaries(
+            row.summary
+            for day, row in history.days.items()
+            if today - timedelta(days=window) <= day < today and row.summary
+        ).as_dict()
+        for window in FORECAST_METRIC_WINDOWS
+    }
+
+    deep_window = max(FORECAST_METRIC_WINDOWS)
+    start = today - timedelta(days=deep_window)
+    await history.async_ensure_days(
+        [day for day in history.days if start <= day < today]
+    )
+    detail = compute_window(recorder.scored_days(start, today))
+    by_horizon = {
+        str(horizon): compute_window(days).as_dict()
+        for horizon, days in sorted(
+            recorder.scored_days_by_horizon(start, today).items()
+        )
+    }
+
+    status_counts: dict[str, int] = {}
+    flag_counts: dict[str, int] = {}
+    for day in sorted(history.days):
+        outcome = history.outcome(day)
+        if outcome is None:
+            continue
+        for code in outcome.status:
+            status_counts[code] = status_counts.get(code, 0) + 1
+        for flag in outcome.flags:
+            flag_counts[flag] = flag_counts.get(flag, 0) + 1
+
+    return {
+        "available": True,
+        "provenance": provenance,
+        "inventory": {
+            "target_days": len(history.days),
+            "snapshots": history.snapshot_total,
+            "oldest_target": None if oldest is None else oldest.isoformat(),
+            "newest_target": None if newest is None else newest.isoformat(),
+            "snapshots_by_scored_horizon": horizons,
+            "lifecycle": lifecycle,
+            # Rises only when finalisation is suspended or a partition is
+            # unreadable; a steady non-zero value here is the thing to chase.
+            "unresolved_days": coordinator.last_record.unresolved_days,
+            "finalization_suspended": coordinator.last_record.finalization_suspended,
+            "finalization_suspended_reason": (
+                "the learning store is in its failed-read state, so every "
+                "actual would read as missing; matching is deliberately "
+                "postponed rather than recording that permanently"
+                if coordinator.last_record.finalization_suspended
+                else None
+            ),
+        },
+        "issuance": {
+            "policy": (
+                "change-triggered: a snapshot is written only when the "
+                "forecast content and provenance differ from the last one kept "
+                "for that target day"
+            ),
+            "issued_last_refresh": len(coordinator.last_record.issued),
+            "duplicates_suppressed": recorder.duplicate_issuances,
+            "finalized_last_refresh": [
+                day.isoformat() for day in coordinator.last_record.finalized
+            ],
+        },
+        "quality": {
+            "sign_convention": (
+                "error = predicted - actual; positive means the model "
+                "predicted more than was measured"
+            ),
+            "percentage_basis": (
+                "WAPE = sum(|error|) / sum(actual) over the window. No "
+                "per-interval percentage is computed: a near-zero overnight "
+                "actual makes one meaningless"
+            ),
+            "rolling": rolling,
+            f"detail_{deep_window}_days": detail.as_dict(),
+            "by_horizon": by_horizon,
+        },
+        "matching": {
+            "interval_status_counts": status_counts,
+            "status_legend": {
+                "0": "valid baseline measurement",
+                "1": "no usable measured reading",
+                "2": "measured present, flexible-load reading unusable",
+                "3": "interval had not elapsed",
+            },
+            "excluded_day_flags": flag_counts,
+            "actual_basis": (
+                "baseline = max(measured - flexible, 0), the same quantity the "
+                "model predicts; a missing actual is never read as zero"
+            ),
+        },
+        "storage": storage,
     }
 
 
@@ -499,6 +690,10 @@ async def async_get_config_entry_diagnostics(
             # install" are the same payload.
             "reset_by_schema_migration": store.reset_by_migration,
         },
+        # Phase 2. Everything the evidence layer records beyond the two
+        # published error figures: the inventory, the lifecycle counts, the
+        # per-horizon and per-slot breakdowns and the storage health.
+        "forecast_history": await _forecast_history_report(coordinator, today_date),
         "consumed_integrations": {
             "frank_entry_id": config.frank_entry_id,
             "frank_available": coordinator.frank_available,

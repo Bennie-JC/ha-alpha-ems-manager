@@ -1,10 +1,18 @@
 """Sensor platform for Alpha EMS Manager.
 
-Phase 1 exposes exactly four entities. Every other quantity the integration
-computes -- per-slot profiles, window means, balance residuals, coverage
-statistics -- is available through diagnostics instead. Ninety-six quarter
-sensors and five window averages would be technically easy and practically
-awful.
+Six entities: the four Phase-1 forecast and learning sensors, and the two
+Phase-2 forecast-error sensors. Every other quantity the integration computes --
+per-slot profiles, window means, balance residuals, coverage statistics,
+per-horizon error breakdowns, the snapshot inventory -- is available through
+diagnostics instead. Ninety-six quarter sensors and five window averages would
+be technically easy and practically awful.
+
+The two Phase-2 sensors measure error that has already happened, so unlike the
+forecast sensors they do carry a state class: a record of how wrong last week
+was belongs in long-term statistics, while a prediction does not. Neither
+carries an energy device class. The yesterday figure is signed, and labelling a
+quantity that is routinely negative as energy would offer it to the Energy
+dashboard alongside real consumption.
 
 Entity names are literal English rather than translation keys, matching the
 sibling Frank Quarter Prices integration. Home Assistant derives an entity id
@@ -35,9 +43,12 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from . import AlphaEmsConfigEntry
 from .const import (
     DOMAIN,
+    FORECAST_ERROR_WINDOW_DAYS,
     NAME,
     SENSOR_EXPECTED_LOAD_TODAY,
     SENSOR_EXPECTED_LOAD_TOMORROW,
+    SENSOR_FORECAST_ERROR_WINDOW,
+    SENSOR_FORECAST_ERROR_YESTERDAY,
     SENSOR_LEARNING_CONFIDENCE,
     SENSOR_LEARNING_DAYS,
 )
@@ -182,6 +193,90 @@ def _days_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
     }
 
 
+#: Repeated on both Phase-2 sensors, because the single most likely misreading
+#: of either number is that it compares whole days against whole days.
+_COMPARISON_BASIS: str = (
+    "baseline house load (measured minus any configured flexible load), "
+    "compared only on intervals where both a prediction and a trustworthy "
+    "measurement exist"
+)
+
+
+def _forecast_error_yesterday_value(
+    coordinator: AlphaEmsCoordinator,
+) -> float | None:
+    """Return yesterday's signed day-level forecast error in kWh.
+
+    Positive means the model predicted more than the house went on to use.
+    ``None`` whenever there is nothing honest to report: the day was never
+    matched, it carries a flag that makes the two sides incomparable, or no
+    interval of it resolved. Zero here would mean a perfect forecast, so
+    "no data" must never be allowed to render as one.
+    """
+    facts = (coordinator.data or {}).get("forecast_yesterday_error")
+    if not facts:
+        return None
+    return facts.get("signed_error_kwh")
+
+
+def _forecast_error_yesterday_attributes(
+    coordinator: AlphaEmsCoordinator,
+) -> dict[str, Any]:
+    """Return the small attribute set behind yesterday's error."""
+    facts = (coordinator.data or {}).get("forecast_yesterday_error")
+    if not facts:
+        return {"comparison_basis": _COMPARISON_BASIS, "intervals_compared": None}
+    return {
+        "absolute_error_kwh": facts.get("absolute_error_kwh"),
+        "error_percent": facts.get("error_percent"),
+        "predicted_kwh": facts.get("predicted_kwh"),
+        "actual_kwh": facts.get("actual_kwh"),
+        "mae_kwh_per_interval": facts.get("mae_kwh_per_interval"),
+        # How much of the day could actually be scored. A day with an outage
+        # compares fewer intervals, and the totals above are over those
+        # intervals only -- never a whole-day prediction against a part-day
+        # measurement.
+        "intervals_compared": facts.get("intervals_compared"),
+        "intervals_in_day": facts.get("intervals_in_day"),
+        "horizon_days": facts.get("horizon_days"),
+        "comparison_basis": _COMPARISON_BASIS,
+    }
+
+
+def _forecast_error_window_value(coordinator: AlphaEmsCoordinator) -> float | None:
+    """Return the rolling weighted absolute percentage error.
+
+    ``sum(abs(predicted - actual)) / sum(actual)`` over the window, as a
+    percentage. Deliberately not an accuracy figure: ``100 - error`` is
+    unbounded below and would read as a score rather than a measurement.
+    """
+    window = (coordinator.data or {}).get("forecast_error_window")
+    if window is None:
+        return None
+    return None if window.wape_percent is None else round(window.wape_percent, 1)
+
+
+def _forecast_error_window_attributes(
+    coordinator: AlphaEmsCoordinator,
+) -> dict[str, Any]:
+    """Return the derivation behind the rolling error figure."""
+    window = (coordinator.data or {}).get("forecast_error_window")
+    if window is None:
+        return {"window_days": FORECAST_ERROR_WINDOW_DAYS}
+    return {
+        "window_days": FORECAST_ERROR_WINDOW_DAYS,
+        "days_compared": window.days_compared,
+        "intervals_compared": window.intervals_compared,
+        "mae_kwh_per_interval": _round(window.mae_kwh, 5),
+        # Signed, so a persistent over- or under-prediction stays visible
+        # instead of being averaged away by the absolute figure above.
+        "bias_kwh_per_interval": _round(window.bias_kwh, 5),
+        "predicted_kwh": _round(window.predicted_kwh, 3),
+        "actual_kwh": _round(window.actual_kwh, 3),
+        "comparison_basis": _COMPARISON_BASIS,
+    }
+
+
 SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
     AlphaEmsSensorDescription(
         key=SENSOR_EXPECTED_LOAD_TODAY,
@@ -220,6 +315,26 @@ SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
         value_fn=_days_value,
         attributes_fn=_days_attributes,
     ),
+    AlphaEmsSensorDescription(
+        key=SENSOR_FORECAST_ERROR_YESTERDAY,
+        name="Forecast Error Yesterday",
+        icon="mdi:delta",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        # No device class: this is a signed difference, not consumption, and
+        # SensorDeviceClass.ENERGY would offer it to the Energy dashboard.
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=_forecast_error_yesterday_value,
+        attributes_fn=_forecast_error_yesterday_attributes,
+    ),
+    AlphaEmsSensorDescription(
+        key=SENSOR_FORECAST_ERROR_WINDOW,
+        name="Forecast Error 7 Days",
+        icon="mdi:chart-timeline-variant",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=_forecast_error_window_value,
+        attributes_fn=_forecast_error_window_attributes,
+    ),
 )
 
 
@@ -228,7 +343,7 @@ async def async_setup_entry(
     entry: AlphaEmsConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the four Alpha EMS sensors."""
+    """Set up the Alpha EMS sensors."""
     coordinator: AlphaEmsCoordinator = entry.runtime_data
     async_add_entities(
         AlphaEmsSensor(coordinator, description) for description in SENSORS

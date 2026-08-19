@@ -313,6 +313,117 @@ BALANCE_MAX_SOURCE_AGE_SECONDS: Final = 300.0
 #: separates the two, and it is the mechanism that stops transient warnings.
 BALANCE_SUSTAINED_FAILURES: Final = 3
 
+# --- Phase 2: forecast history ------------------------------------------------
+
+#: Forecast-history schema version. Deliberately independent of
+#: ``STORAGE_VERSION``: the learning history and the forecast evidence have
+#: different lifecycles, and a change to one must not force a migration of the
+#: other.
+FORECAST_STORAGE_VERSION: Final = 1
+FORECAST_STORAGE_MINOR_VERSION: Final = 1
+
+#: Index document: schema version, the month partitions that exist, and the
+#: small daily summary rows. Always loaded.
+FORECAST_INDEX_KEY_TEMPLATE: Final = f"{DOMAIN}.{{entry_id}}.forecast_index"
+#: One partition per calendar month of *target* days. Home Assistant's ``Store``
+#: rewrites a whole document on every save, so a single year-long file would put
+#: roughly a megabyte through the executor on every issuance. Partitioning keeps
+#: a write to about a hundred kilobytes and confines a corrupt document to one
+#: month instead of the entire history.
+FORECAST_MONTH_KEY_TEMPLATE: Final = f"{DOMAIN}.{{entry_id}}.forecast.{{month}}"
+
+#: Debounce delay for forecast-history writes, in seconds. Issuance is rare --
+#: see the fingerprint policy in ``forecast_history.py`` -- so this exists to
+#: coalesce the two targets of a single refresh rather than to batch a stream.
+FORECAST_STORE_SAVE_DELAY: Final = 10
+
+#: Days of raw quarter-level forecast evidence retained, aligned deliberately
+#: with ``MAX_HISTORY_DAYS``. Within this window a forecast record can still be
+#: correlated with the learning history that produced it; beyond it those inputs
+#: are gone, so the raw evidence could no longer answer *why* a forecast was
+#: wrong -- only that it was.
+FORECAST_RAW_RETENTION_DAYS: Final = MAX_HISTORY_DAYS
+
+#: Days of daily summary rows retained. Around 200 bytes each, so a decade costs
+#: well under a megabyte; the bound exists so the document cannot grow without
+#: limit on an installation that runs for years.
+FORECAST_SUMMARY_RETENTION_DAYS: Final = 3650
+
+#: Hard ceiling on immutable snapshots kept for one target day.
+#:
+#: Issuance is change-triggered, and the Phase-1 model produces at most two
+#: distinct forecasts per target (day-ahead and day-of), so this is never
+#: reached in normal operation. It bounds the damage if a future input starts
+#: oscillating: without it, a source flapping every quarter would write 96
+#: records a day. A breach is logged rather than silently truncating, because a
+#: silent cap reads as full coverage when it is not.
+FORECAST_MAX_SNAPSHOTS_PER_TARGET: Final = 32
+
+#: Decimal places used for persisted energies and for the fingerprint input.
+#: Matches the learning store's precision -- 0.1 Wh -- so a rounding difference
+#: can never make two identical forecasts fingerprint differently.
+FORECAST_KWH_PRECISION: Final = 4
+
+#: Version of the forecasting model itself, bumped whenever a change alters the
+#: numbers ``build_forecast`` produces. Recorded on every snapshot so a later
+#: phase cannot pool error statistics across two incompatible model generations
+#: and read the discontinuity as a behavioural change in the household.
+FORECAST_MODEL_VERSION: Final = 1
+
+#: Rolling window, in days, behind the published forecast-error sensor.
+FORECAST_ERROR_WINDOW_DAYS: Final = 7
+
+#: Windows reported in diagnostics. Bounded at 90 days so a diagnostics download
+#: loads at most four month partitions.
+FORECAST_METRIC_WINDOWS: Final = (7, 30, 90)
+
+#: Fewest compared intervals before a rolling metric is published at all.
+#: Roughly two full days. Below it the figure is dominated by whichever few
+#: intervals happened to resolve, and publishing it would invite a user to read
+#: a fresh installation's noise as forecast quality.
+FORECAST_MIN_INTERVALS_FOR_METRIC: Final = 192
+
+#: Per-interval outcome status codes. A fixed, bounded key space: an interval is
+#: described by exactly one of these, and the set cannot grow at runtime.
+#:
+#: The distinction between the three failure codes is the point. "No usable
+#: actual" is not one situation: a quarter that never reached coverage, a
+#: quarter whose flexible-load reading was unusable, and a quarter that never
+#: happened call for completely different readings of the same missing number.
+STATUS_VALID: Final = "0"
+#: No usable measured reading: the quarter never reached ``MIN_QUARTER_COVERAGE``,
+#: or Home Assistant was not running for it.
+STATUS_MEASURED_MISSING: Final = "1"
+#: Measured energy exists, but a configured flexible load had no usable reading,
+#: so the baseline for that interval is not defined. The measured ground truth
+#: is intact; only the quantity the forecast predicts is missing.
+STATUS_FLEXIBLE_MISSING: Final = "2"
+#: The interval had not elapsed when the day was finalised. Unreachable in
+#: normal operation -- only days already in the past are finalised -- so this
+#: exists for a clock stepped backwards across a finalisation.
+STATUS_NOT_ELAPSED: Final = "3"
+
+#: Reasons a finalised target day is excluded from every derived metric. The
+#: record is still kept: the prediction and the actual are both true facts, and
+#: only their *comparability* is in doubt.
+#:
+#: A day carrying any of these must never enter an error statistic, because each
+#: one means the two sides of the comparison are describing different things.
+FLAG_NO_RECORD: Final = "no_record"
+FLAG_SHAPE_MISMATCH: Final = "shape_mismatch"
+FLAG_TIMEZONE_CHANGED: Final = "timezone_changed"
+FLAG_DEFINITION_CHANGED: Final = "definition_changed"
+
+#: Behavioural slot bands used to report where in the day the error sits.
+#: Quarter-hour resolution is too fine to read as a table and too noisy to act
+#: on; four bands are enough to see a pattern and few enough to publish.
+FORECAST_SLOT_BANDS: Final = (
+    ("night", 0, 24),  # 00:00-05:59
+    ("morning", 24, 48),  # 06:00-11:59
+    ("afternoon", 48, 72),  # 12:00-17:59
+    ("evening", 72, 96),  # 18:00-23:59
+)
+
 # --- Configuration keys -------------------------------------------------------
 
 CONF_NAME: Final = "name"
@@ -373,6 +484,11 @@ SENSOR_EXPECTED_LOAD_TODAY: Final = "expected_house_load_today"
 SENSOR_EXPECTED_LOAD_TOMORROW: Final = "expected_house_load_tomorrow"
 SENSOR_LEARNING_CONFIDENCE: Final = "learning_confidence"
 SENSOR_LEARNING_DAYS: Final = "learning_days"
+
+# Phase 2. Both are measurements of past error rather than predictions, so both
+# carry a state class -- unlike the two forecast sensors above.
+SENSOR_FORECAST_ERROR_YESTERDAY: Final = "forecast_error_yesterday"
+SENSOR_FORECAST_ERROR_WINDOW: Final = "forecast_error_7d"
 
 # --- Logging ------------------------------------------------------------------
 

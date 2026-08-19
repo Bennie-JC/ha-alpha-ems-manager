@@ -32,6 +32,8 @@ SENSORS = (
     "sensor.alpha_ems_expected_house_load_tomorrow",
     "sensor.alpha_ems_learning_confidence",
     "sensor.alpha_ems_learning_days",
+    "sensor.alpha_ems_forecast_error_yesterday",
+    "sensor.alpha_ems_forecast_error_7_days",
 )
 
 
@@ -61,7 +63,7 @@ async def setup_at(
 async def test_setup_loads_and_creates_the_sensors(
     hass: HomeAssistant, setup_integration: MockConfigEntry
 ) -> None:
-    """A configured entry loads and publishes its four sensors."""
+    """A configured entry loads and publishes its sensors."""
     assert setup_integration.state is ConfigEntryState.LOADED
     for entity_id in SENSORS:
         assert hass.states.get(entity_id) is not None
@@ -80,7 +82,7 @@ async def test_unload_removes_the_entities(
         assert state is None or state.state == "unavailable"
 
 
-async def test_reload_keeps_exactly_four_entities(
+async def test_reload_keeps_exactly_the_documented_entities(
     hass: HomeAssistant, setup_integration: MockConfigEntry
 ) -> None:
     """Reloading repeatedly never produces ``_2`` duplicates."""
@@ -293,6 +295,7 @@ async def test_two_instances_coexist_without_sharing_state(
 
     assert first.runtime_data is not second.runtime_data
     assert first.runtime_data.store is not second.runtime_data.store
+    assert first.runtime_data.history is not second.runtime_data.history
     assert first.runtime_data.store.days[START.date()].measured[40] == pytest.approx(
         0.5, rel=1e-2
     )
@@ -306,5 +309,6 @@ async def test_two_instances_coexist_without_sharing_state(
         for entity in registry.entities.values()
         if entity.platform == DOMAIN
     ]
-    assert len(ours) == 8
-    assert len(set(ours)) == 8
+    # Two entries, six entities each, no id shared between them.
+    assert len(ours) == 12
+    assert len(set(ours)) == 12

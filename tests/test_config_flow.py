@@ -644,5 +644,5 @@ async def test_reload_after_options_creates_no_duplicate_entities(
         for entity in registry.entities.values()
         if entity.platform == DOMAIN
     ]
-    assert len(ours) == 4
+    assert len(ours) == 6
     assert not [entity_id for entity_id in ours if entity_id.endswith("_2")]

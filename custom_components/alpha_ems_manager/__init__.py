@@ -21,6 +21,7 @@ from .const import (
     PLATFORMS,
 )
 from .coordinator import AlphaEmsCoordinator, SourceConfig
+from .history_store import ForecastHistoryStore
 from .storage import LearningStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -118,14 +119,23 @@ async def async_unload_entry(hass: HomeAssistant, entry: AlphaEmsConfigEntry) ->
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: AlphaEmsConfigEntry) -> None:
-    """Delete the learning history belonging to a removed entry.
+    """Delete the stored history belonging to a removed entry.
 
-    The store key is scoped to the entry id, so without this every removed entry
-    leaves a document behind in ``.storage`` that nothing can ever reach again --
-    up to a year of quarter-hour history per orphan. A removal is an explicit
-    instruction to forget this instance, so the history goes with it.
+    Every store key is scoped to the entry id, so without this each removed
+    entry leaves documents behind in ``.storage`` that nothing can ever reach
+    again -- up to a year of quarter-hour history plus a year of forecast
+    evidence per orphan. A removal is an explicit instruction to forget this
+    instance, so all of it goes.
+
+    The forecast history is partitioned by month, so it must be loaded before it
+    is removed: the index is what names the partitions, and without reading it
+    first every month file but the current one would survive.
     """
     await LearningStore(hass, entry.entry_id).async_remove()
+
+    history = ForecastHistoryStore(hass, entry.entry_id)
+    await history.async_load()
+    await history.async_remove()
 
 
 async def async_reload_entry(hass: HomeAssistant, entry: AlphaEmsConfigEntry) -> None:
