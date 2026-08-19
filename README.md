@@ -7,16 +7,16 @@
 A Home Assistant custom integration that learns how much electricity your
 household **actually** uses, and forecasts what it will use today and tomorrow.
 
-This is **Phase 1**. It observes, learns and predicts. It does not control
-anything.
+This is **Phase 2**. It observes, learns, predicts, and now keeps a record of
+how wrong its predictions turned out to be. It still does not control anything.
 
 ---
 
 ## Project status
 
-> **Current release: `1.0.0-beta.4` — a public beta.**
+> **Current release: `1.0.0-beta.5` — a public beta.**
 >
-> The integration is feature-complete for Phase 1 and covered by 564 automated
+> The integration is feature-complete for Phase 2 and covered by 961 automated
 > tests, but the learning and forecast model has **not** yet been validated
 > across enough real-world complete days to be called stable. Treat it as
 > something to run and observe, not yet as something to depend on.
@@ -54,7 +54,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.4` is not offered.
+     dialog if `1.0.0-beta.5` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -92,6 +92,31 @@ see the note under [Configuration](#configuration).
   overlapping look-back windows, with separate weekday and weekend behaviour.
 - Adapts today's remaining forecast to what has actually been measured so far.
 - Reports how mature and trustworthy the learned model currently is.
+- **Records every forecast it issues, and matches it against what the house
+  really did.** Each prediction is kept exactly as it stood when it was made,
+  together with the model state behind it; once the day is over, the measured
+  baseline is matched to it quarter by quarter and the error becomes visible.
+
+### Forecast-error history (new in Phase 2)
+
+The point is not the two new sensors. It is that the evidence behind them is
+kept, so that a later phase can eventually work out *why* a forecast was wrong
+rather than only that it was.
+
+- A prediction is recorded when it **changes**, not on every refresh. Under the
+  current model that means two records per day for each target: one made the day
+  before, one made on the day itself.
+- Each record keeps the per-quarter prediction, which intervals were modelled
+  and which were extrapolated from a neighbour, the number of learned days
+  behind it, the weekday/weekend decision, the confidence at the time, and the
+  version of the model that produced it.
+- When the day is over, the measured **baseline** — the same quantity the model
+  predicts — is matched to it interval by interval. A quarter that was never
+  measured stays missing; it is never counted as zero consumption.
+- Raw quarter-level evidence is kept for **365 days**, matching the learning
+  history it can be correlated with. Small daily summaries are kept far longer.
+
+None of this changes the forecast. Nothing in the learning path reads it.
 
 ## What it does **not** do yet
 
@@ -102,6 +127,8 @@ see the note under [Configuration](#configuration).
   baseline; it never starts, stops or plans charging.
 - ❌ No Solcast-driven optimisation. The PV forecast source is validated and
   reported in diagnostics, but it does not influence the load model.
+- ❌ No self-correction. Phase 2 *records* forecast error; it does not feed it
+  back into the model. Nothing adjusts itself in response to being wrong.
 - ❌ No API calls of its own — see [No external polling](#no-external-polling).
 
 ---
@@ -329,7 +356,7 @@ accuracy percentage is claimed, because none has been measured yet.
 
 ## Entities
 
-Exactly four. Everything else lives in diagnostics.
+Exactly six. Everything else lives in diagnostics.
 
 | Entity | Unit | Meaning |
 |---|---|---|
@@ -337,11 +364,30 @@ Exactly four. Everything else lives in diagnostics.
 | `sensor.alpha_ems_expected_house_load_tomorrow` | kWh | Predicted **baseline** consumption tomorrow |
 | `sensor.alpha_ems_learning_confidence` | % | How mature and trustworthy the model is |
 | `sensor.alpha_ems_learning_days` | — | Calendar days with sufficient valid baseline data |
+| `sensor.alpha_ems_forecast_error_yesterday` | kWh | Yesterday's forecast minus what was measured |
+| `sensor.alpha_ems_forecast_error_7_days` | % | Rolling forecast error over the last 7 days |
 
 Neither forecast sensor declares a `state_class`. They carry `device_class:
 energy` so the UI formats them properly, but a *prediction* must not become a
 long-term statistic or appear on the Energy dashboard next to measured
 consumption.
+
+The two error sensors are the other way round. They measure something that has
+already happened, so they *do* carry a state class — but no `device_class`,
+because a signed difference is not consumption and must not be offered to the
+Energy dashboard.
+
+**Reading the error sensors.** `forecast_error_yesterday` is signed: **positive
+means the forecast was higher than reality**. `forecast_error_7_days` is
+`sum(|error|) / sum(actual)` over the window — so "8 %" means the model was off
+by eight per cent of the energy it was predicting. It is deliberately *not* an
+accuracy score: there is no `100 − error` figure anywhere, because that number
+goes negative on a bad week and invites comparison with unrelated systems.
+
+Both read `unknown` until there is something honest to report, and stay
+`unknown` rather than showing `0` — zero is the value of a *perfect* forecast,
+not of a missing one. Expect the first value the morning after your first
+complete day, and the rolling figure after roughly two.
 
 Attributes are small scalars only. **No per-interval profile is ever exposed** —
 the recorder writes every attribute on every state change.
@@ -361,6 +407,23 @@ the recorder writes every attribute on every state change.
 - **Schema version 2.** A version 1 document (the fixed 96-slot development
   format) is discarded on load with a warning rather than misread; it cannot
   represent a fall-back day. No other Home Assistant storage is touched.
+
+### Forecast history
+
+Kept separately from the learning history, on its own schema version, so that a
+problem with one cannot damage the other.
+
+- A small always-loaded index, plus one document per calendar month of predicted
+  days. Home Assistant rewrites a whole document on every save, so a single
+  year-long file would be a megabyte through the disk on each write — and one
+  corrupt byte would cost the lot.
+- Roughly **3.5 kB per day**, so about **1.3 MB** at the 365-day steady state.
+- Raw per-quarter evidence is pruned at 365 days; the reduced daily summaries
+  behind the rolling figure are kept for years at about 200 bytes a day.
+- If a document cannot be read, nothing is written for the rest of the session
+  and the file is left exactly as found. If the *learning* history cannot be
+  read, no day is matched at all, rather than permanently recording that every
+  measurement was missing.
 
 ---
 
@@ -461,6 +524,13 @@ conventions, measured **and** baseline coverage, flexible-load status, learned
 and retained interval counts, the full confidence derivation, forecast totals,
 the last energy-balance residual, storage schema version, and Frank/Solcast
 availability. No credentials — the integration holds none — and no history dump.
+
+The `forecast_history` block carries everything the two error sensors do not:
+how many predictions are stored and for which days, how many are still waiting
+to be matched, forecast error broken down by look-ahead, by time of day and by
+whether an interval was modelled or extrapolated, the model version and
+parameter fingerprint behind each record, and the health of every storage
+partition.
 
 ---
 

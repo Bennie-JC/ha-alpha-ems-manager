@@ -10,9 +10,15 @@ undo.
 
 ## Scope
 
-Phase 1 is **observation only**. It measures household consumption, learns a
-baseline demand profile and forecasts it. It issues no commands to the battery,
-makes no charge, discharge or trading decisions, and schedules nothing.
+Phases 1 and 2 are **observation only**. Phase 1 measures household consumption,
+learns a baseline demand profile and forecasts it. Phase 2 records each forecast
+and matches it against what actually happened. Neither issues a command to the
+battery, makes a charge, discharge or trading decision, or schedules anything.
+
+Phase 2 adds no feedback loop. It *records* forecast error; nothing reads that
+error back into the model. Adaptive correction belongs to a much later phase, and
+keeping the boundary sharp is what makes the recorded evidence trustworthy: the
+history is a measurement of the model, not a product of it.
 
 The previous 0.1.0 release contained an advisory battery and trading layer —
 `recommendation`, `reserve_satisfied`, a trade engine, a reserve model, a PV
@@ -47,6 +53,11 @@ generic `ConfigEntry` typing and coordinator `config_entry` support. Keep
 | `forecast.py` | The multi-window statistical model and same-day adaptation. Pure. |
 | `confidence.py` | The confidence score and its component breakdown. Pure. |
 | `energy_balance.py` | Optional sanity check on the flow identity. Pure. |
+| `forecast_history.py` | Phase 2 record model: immutable snapshots, day outcomes, fingerprinting, matching rules. Home-Assistant-free. |
+| `history_store.py` | Partitioned, versioned persistence for forecast evidence. |
+| `metrics.py` | All derived forecast-error statistics. Pure, and persists nothing. |
+| `forecast_recorder.py` | Orchestration: issue, match, prune, read back. |
+| `api.py` | The frozen read-only interface later phases consume. |
 | `validation.py` | Entity validation used by the config and options flows. |
 | `coordinator.py` | Runtime orchestration: listeners, timers, both accumulators, ingest, derived values. |
 | `config_flow.py` | Five-step config flow and a single-page options flow. |
@@ -498,16 +509,257 @@ the full flow breakdown, the mode and the allowance, and the attribution counter
 above record which modes and which source, so the next occurrence is diagnosable
 from diagnostics alone.
 
+## Phase 2: the forecast evidence layer
+
+Phase 1 produced a forecast and threw it away the moment a newer one replaced
+it. Phase 2 keeps it, together with what the house went on to do, so the question
+*was it right, and why not* has an answer later.
+
+### The property everything rests on
+
+`build_forecast()` is a pure function of `(records, reference, target, tz)`. The
+in-progress day is excluded from its own forecast — `collect_forecast_inputs()`
+keeps only `0 < age <= horizon` — and the only writer that touches a *past* day
+mid-run is the midnight close of the previous day's last quarter.
+
+**So between one midnight and the next, the forecast cannot change.** Ninety-six
+refreshes rebuild the same arrays from an unchanged input set.
+
+`tests/test_forecast_issuance.py::test_the_forecast_is_constant_within_a_civil_day`
+pins this. If it ever fails, the issuance policy needs redesigning rather than
+patching: it would mean the model is moving in a way nothing is recording.
+
+### Issuance policy
+
+Change-triggered, deduplicated by a content fingerprint. A snapshot is written
+when — and only when — the forecast's content and provenance differ from the last
+one kept for that target day.
+
+```
+fingerprint = sha256(target day, tz, look-ahead, interval count,
+                     available + reason, predicted array, fill mask,
+                     model_days, usable_days, day type, pooled, windows,
+                     modelled/filled counts,
+                     model version, model parameter hash, baseline definition)
+```
+
+Deliberately **excluded**: the issuance instant, the confidence percentage and
+the energy-balance score. Balance is resampled every sixty seconds, so including
+it would write a snapshot per refresh and defeat the entire policy. Those fields
+are recorded *on* the snapshot; they simply do not decide whether one is written.
+
+Deliberately **included**, and the one exception to "content only": the
+look-ahead. A prediction made a day ahead and one made on the day are different
+observations even when they carry identical numbers, because the question they
+answer differs. Excluding it collapsed the two into one record whenever the model
+happened not to move — common on a settled household — and left the day-of side
+of any look-ahead comparison systematically empty of exactly the days the model
+found easy. It costs nothing in churn: look-ahead is constant for a whole civil
+day.
+
+Under the Phase-1 model this yields exactly **two records per target day**: H-1
+issued while the target was "tomorrow", and H-0 issued on the day itself, after
+the model gained a learned day.
+
+Consequences that fall out for free: a reload, a restart, the first refresh after
+setup and duplicate coordinator callbacks all recompute the same fingerprint and
+write nothing. Duplicate protection is structural, not defensive.
+
+`FORECAST_MAX_SNAPSHOTS_PER_TARGET` caps a runaway future input at 32 per day and
+**logs when it bites** — a silent cap reads as full coverage when it is not.
+
+### What is recorded, and what is refused
+
+A withheld forecast **is** recorded, with its `unavailable_reason` and no array.
+Without that, an installation whose first month published nothing would later
+look like a model that was never wrong.
+
+The snapshot is never the *adapted* Today figure. Same-day adaptation blends
+measured energy into the remainder of the day, so that total is a hybrid of
+prediction and reality and is not a like-for-like prediction of anything. The
+unadapted baseline forecast is what gets stored and scored.
+
+Arrays are copied, not referenced. `DayForecast` is a mutable dataclass rebuilt
+every refresh; holding a reference would make "immutable snapshot" a comment
+rather than a property.
+
+### Matching
+
+At the first refresh of a new civil day, every unmatched past day is matched.
+The ordering already works: `_handle_quarter_boundary` samples **synchronously**,
+closing 23:45 into yesterday's record, before scheduling the refresh.
+
+The actual is `DayRecord.baseline_at(index)` — `max(measured - flexible, 0)`,
+`None` when either half is untrustworthy. That is deliberately the same quantity
+the model predicts; scoring a baseline forecast against raw measured load would
+charge the model for energy an EV drew.
+
+Per-interval status codes are a fixed, bounded key space:
+
+| Code | Meaning |
+|---|---|
+| `0` | valid baseline measurement |
+| `1` | no usable measured reading |
+| `2` | measured present, flexible-load reading unusable |
+| `3` | interval had not elapsed (clock stepped backwards) |
+
+`1` and `2` are kept apart because they call for different action — check the
+house-load sensor, or check the charger — and collapsing them would throw away
+the only clue.
+
+A day is **kept but never scored** when its two sides are not comparable:
+`no_record`, `shape_mismatch`, `timezone_changed`, `definition_changed`. The
+prediction and the measurement are both true facts; only their comparability is
+void. Index-matching two different day shapes would line an 18:00 prediction up
+against a 17:00 measurement and look entirely plausible doing it.
+
+`definition_changed` is judged from the evidence rather than the configuration:
+the record's own `ev_expected` flags say what was expected of each interval, so a
+flexible load switched on at noon is caught even though the configuration looks
+consistent by the time the day is finalised.
+
+### Lifecycle
+
+Derived, never stored. The only state committed to disk is `finalized_at`.
+
+```
+pending      -> has a prediction, and the day has not finished
+unresolved   -> the day has finished and it is still unmatched
+validated    -> matched, comparable, and something survives to compare
+unmatched    -> matched, but nothing comparable came out of it
+```
+
+A stored state field would be a second source of truth, and the first time the
+two disagreed it would be the stored one that got believed — a record labelled
+`validated` whose actual is null. Both callers go through `lifecycle_state()`, so
+a diagnostics count and a scored day cannot tell different stories.
+
+### The suspension rule — do not remove this
+
+**Nothing is matched while `LearningStore.corrupt` is true.**
+
+That store degrades an unreadable document to an empty history so setup can
+continue, which is right for availability — but then `baseline_at` returns `None`
+for every interval of every day. Matching against it would write immutable
+records stating that every measurement was missing, for days whose data is very
+probably intact on disk.
+
+This is the beta.4 write-after-failed-read defect one layer up, and worse: the
+learning document survives that failure, while these records are final by design.
+
+Nothing is lost by waiting. Matching is a pure recomputation from persisted data,
+so the days stay unmatched and resolve on the next refresh after a successful
+read. `tests/test_forecast_matching.py` pins both halves.
+
+### Persistence
+
+Separate documents from the learning history, on their own schema version, so
+neither can damage the other — and the learning document is already discarded
+outright by its own migration guard.
+
+```
+alpha_ems_manager.<entry_id>.forecast_index        # always loaded, small
+alpha_ems_manager.<entry_id>.forecast.<YYYY-MM>    # one per month of target days
+```
+
+The index carries one lightweight row per target day: interval count, the
+fingerprints already kept, `finalized_at`, and the reduced summary facts. Because
+the fingerprints live there, **the hot path performs no disk access at all** —
+a refresh reproducing the previous forecast is two string comparisons.
+`test_an_unchanged_refresh_touches_no_storage_at_all` enforces that by making
+`Store.async_load` raise.
+
+Month partitioning exists because `Store` rewrites a whole document on every
+save: a year-long file would be about a megabyte through the executor on each
+write, and one corrupt byte would cost the lot. Writes are atomic — forecast
+evidence cannot be regenerated the way a lost quarter can.
+
+Both learning-store safety rules are reproduced: **never write after a failed
+read** (per document, so a corrupt month costs one month), and **clamp the prune
+reference** to at most one day past the newest stored target.
+
+### Retention
+
+| Class | Kept | Why |
+|---|---|---|
+| Raw per-quarter arrays | 365 days | Exactly `MAX_HISTORY_DAYS`, so a record can always be correlated with the learning history that produced it. Past that the inputs are gone and the arrays could no longer explain *why* a forecast was wrong. |
+| Reduced daily summaries | 3650 days | About 200 bytes. Sufficient statistics — summed absolute error, summed actual, compared count — so MAE, bias and WAPE can be rebuilt for any window. |
+
+An **unfinalised** day is never pruned: dropping its prediction would leave a
+record nothing can ever answer.
+
+Roughly 3.5 kB/day, so about 1.3 MB at the 365-day steady state.
+
+### Metrics
+
+Nothing derived is persisted. Predictions and actuals are the facts; every
+statistic is recomputed. A stored `mae` field would freeze one definition into
+the history and would eventually disagree with the data beside it.
+
+Sign convention, fixed once: `error = predicted - actual`. **Positive means the
+model over-predicted.**
+
+Published: MAE, mean signed error, and WAPE = `sum(|error|) / sum(actual)` over
+the window. RMSE and the breakdowns are diagnostics only.
+
+**Never computed:** a per-interval percentage error. Quarter-hour baseline load is
+routinely a few hundredths of a kilowatt-hour at four in the morning, so MAPE
+divides by something arbitrarily close to zero and one interval swamps any
+average it enters. It is not stabilised with a floor — a floor is a threshold
+with no physical quantity behind it — it is simply not computed. Likewise there
+is no `100 - error` accuracy figure: it is unbounded below and invites comparison
+with unrelated systems.
+
+A day-level percentage *is* safe, because the denominator is a whole day of
+demand, and it returns `None` when that day measured nothing.
+
+Day-level comparison uses the **intersection** of intervals valid in the actual
+and predicted in the snapshot. Comparing a whole-day prediction against a partly
+observed day reports the unmeasured hours as a forecast that came in high, which
+is a systematic bias manufactured out of a sensor outage.
+
+### Context, and keeping it from becoming a dumping ground
+
+Provenance travels in namespaced, versioned blocks declared by a
+`ContextProvider`: a key, a version and an exact field set. Anything undeclared
+raises. Phase 2 registers exactly one provider, `load_model`. A later phase adds
+its own key without touching it, and unknown blocks read from disk are
+**preserved verbatim** so a downgrade is not destructive.
+
+`model_params_hash()` fingerprints the constants that shape a forecast. Without
+it, one future tuning change would silently split the historical error series in
+two and a later phase would read the discontinuity as the household changing its
+habits.
+
+### The Phase-3 boundary
+
+`api.py` is the only module a later phase may import. `forecast_history`,
+`history_store`, `forecast_recorder` and `metrics` are implementation — if Phase 3
+reads a partition dictionary directly, the storage layout can never change again
+without breaking battery logic. `tests/test_api_boundary.py` enforces this
+statically over the real source files, the same way
+`tests/test_no_external_polling.py` enforces the network boundary.
+
 ## Entity contract
 
-Exactly four sensors, unique IDs `{entry_id}_{key}`, all on one service device
-named from the entry title. Names are literal English with **no**
-`translation_key`: Home Assistant derives the entity ID from the translated name,
-so a translation key would give a Dutch user Dutch entity IDs. This matches the
-sibling Frank Quarter Prices integration.
+Exactly six sensors — four from Phase 1, two from Phase 2 — unique IDs
+`{entry_id}_{key}`, all on one service device named from the entry title. Names
+are literal English with **no** `translation_key`: Home Assistant derives the
+entity ID from the translated name, so a translation key would give a Dutch user
+Dutch entity IDs. This matches the sibling Frank Quarter Prices integration, and
+it is why the two new sensors carry no translation entries either.
 
 Neither forecast sensor sets `state_class` — a prediction must not become a
 long-term statistic.
+
+The two Phase-2 error sensors invert both halves of that rule, deliberately. They
+**do** set `state_class`, because they measure error that has already happened
+and a record of it belongs in long-term statistics. They set **no**
+`device_class`: `forecast_error_yesterday` is a signed difference, and an energy
+class would offer it to the Energy dashboard beside real consumption.
+
+Both read `unknown` rather than `0` when there is nothing to report. Zero is the
+value of a perfect forecast.
 
 Attributes are small scalars only. Never expose a per-interval profile; the
 recorder writes every attribute on every state change.
@@ -524,8 +776,17 @@ enforces this both statically and at runtime.
 ## Future phases
 
 Optimisation, reserve calculation and any battery control belong on top of this
-foundation, not inside it. Things Phase 1 deliberately keeps possible without
-implementing: battery minimum SOC and usable capacity, charge/discharge power
-limits, grid import/export limits, efficiency and degradation modelling,
+foundation, not inside it. Things Phases 1 and 2 deliberately keep possible
+without implementing: battery minimum SOC and usable capacity, charge/discharge
+power limits, grid import/export limits, efficiency and degradation modelling,
 reason/status outputs, and EV scheduling using the flexible-load series already
 being recorded.
+
+Phase 3 should consume `api.py` and nothing deeper. `ForecastUncertainty` exists
+so a reserve can be sized from measured forecast error rather than a guessed
+margin — note that its fields are `None` when there is no evidence, and `None`
+means "no evidence", never "no error".
+
+An adaptive phase should read the stored evidence through the same boundary, and
+should check `model_version` and `model_params_hash` before pooling records: two
+different values there describe two different models.
