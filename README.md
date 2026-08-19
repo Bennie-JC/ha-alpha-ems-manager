@@ -14,9 +14,9 @@ how wrong its predictions turned out to be. It still does not control anything.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.5` — a public beta.**
+> **Current release: `1.0.0-beta.6` — a public beta.**
 >
-> The integration is feature-complete for Phase 2 and covered by 961 automated
+> The integration is feature-complete for Phase 2 and covered by 1026 automated
 > tests, but the learning and forecast model has **not** yet been validated
 > across enough real-world complete days to be called stable. Treat it as
 > something to run and observe, not yet as something to depend on.
@@ -54,7 +54,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.5` is not offered.
+     dialog if `1.0.0-beta.6` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -115,6 +115,15 @@ rather than only that it was.
   measured stays missing; it is never counted as zero consumption.
 - Raw quarter-level evidence is kept for **365 days**, matching the learning
   history it can be correlated with. Small daily summaries are kept far longer.
+- A day whose two sides are not comparable is **kept but never scored** — the
+  clearest case being a flexible-load source selected or removed part-way through
+  a day, which makes the morning's baseline and the afternoon's two different
+  quantities. A day that merely has *gaps* is still scored, on the intervals it
+  has. Diagnostics reports every excluded day together with the facts that
+  excluded it.
+- `Forecast Error Yesterday` appears as soon as one prior day has been scored.
+  `Forecast Error 7 Days` waits for about two full days of compared intervals
+  before publishing a rate, and reports its sample size honestly while it waits.
 
 None of this changes the forecast. Nothing in the learning path reads it.
 
@@ -618,12 +627,21 @@ Beyond the Phase-1 scope listed at the top, these are the current honest caveats
   than being assumed to be zero, so an idle-unavailable charger invalidates most
   of the day. Prefer a sensor that reports a numeric `0`, or leave the EV field
   empty.
-- **One unexplained energy-balance residual.** On the maintainer's own system a
-  sustained, coherent residual of roughly 154 W on 740 W of supply remains under
-  investigation. It is reported as a moderate measurement-boundary effect rather
-  than a configuration error, and it **cannot** affect learning — the balance
-  check is a quality signal and can never reject an interval. It does slightly
-  depress the reported confidence score.
+- **A recurring energy-balance residual at low power.** On the maintainer's own
+  system a sustained, coherent residual — roughly 154 W on 740 W of supply, and
+  again 155 W on 661 W — is reported from time to time and then clears on its own
+  (the recorded pass rate is around 99 %). The grid figure comes from a separate
+  P1 meter while house load, PV and battery all come from the inverter, so a
+  roughly constant offset between two instruments on different electrical
+  boundaries is the leading explanation: negligible on a busy afternoon, a large
+  fraction of a quiet one. The residual's sign is the direction unmeasured
+  conversion loss would take, not the direction a sign error would.
+
+  No threshold has been widened to silence it: doing so would blind the check at
+  every power level to explain one regime, and hiding a wiring or sign error is
+  worse than the warning. It **cannot** affect learning — the check is a quality
+  signal and can never reject an interval — and it cannot affect forecast-error
+  scoring either. It does slightly depress the reported confidence score.
 - **Solcast is validated but unused by the model.** The PV forecast source is
   checked and reported in diagnostics; it does not yet influence the load model.
 - **No in-place upgrade from 0.1.0.** The configuration models share no keys.

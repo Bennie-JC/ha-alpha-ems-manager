@@ -9,6 +9,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.6] - 2026-08-20
+
+Closes Phase 2. `beta.5` shipped the forecast evidence layer; its first real
+midnight rollover exposed four defects in it, and this release fixes all four,
+repairs the record the first one damaged, and proves the whole scoring pipeline
+end to end at exact values instead of at tolerances.
+
+Nothing about the forecast itself changes. No threshold, tolerance, weighting or
+learning rule was touched, and the four Phase-1 sensors publish identical
+numbers. The config-entry schema stays at v2 and the learning-history schema at
+v2, so learned days, source selections, entity IDs and unique IDs all survive.
+The forecast-history schema stays at major v1 — its *minor* version moves from 1
+to 2 for one added optional field — so every prediction and every matched actual
+`beta.5` wrote is read back unchanged. No remove-and-re-add, and no battery is
+controlled.
+
+### Fixed
+
+- **A missing quarter was read as the meaning of "baseline" changing, and it
+  excluded the whole day from every statistic — permanently.** This is why the
+  19 August rollover advanced the learning side correctly while
+  `Forecast Error Yesterday` stayed `unknown`: the day was matched, then flagged
+  `definition_changed`, and a flagged day is never scored.
+
+  The flag is meant to catch a real change of quantity — a flexible-load source
+  selected or removed part-way through a day, which makes the morning's baseline
+  and the afternoon's two different things that no single prediction can be
+  scored against. It was judged from the per-interval flexible-load expectation
+  recorded on the day. But that expectation is only written for quarters that
+  were actually *accepted*: a quarter that never reached coverage, or that fell
+  inside a Home Assistant restart, is never recorded at all and keeps the "no
+  flexible load" default it was padded with. On any installation with a charger
+  configured, one such quarter therefore looked exactly like the charger being
+  switched on mid-day — and a restart is guaranteed to produce one, including the
+  restart that installs an update.
+
+  A gap is a gap. The per-interval status codes already describe it precisely,
+  and it says nothing whatever about what "baseline" meant. The judgement is now
+  made over the intervals that were actually observed, so a day with a data gap
+  is scored on the intervals it has, while a genuine mid-day change of
+  configuration is still excluded. A day with no observation at all now makes no
+  claim either way: it has no comparable interval regardless, and asserting a
+  definition change on top of that invents the one reason a maintainer would go
+  and investigate.
+
+- **A corrected matching rule now reaches the days already matched.** Matching
+  only ever looked at days that had never been matched, so the day the defect
+  above damaged would have carried its wrong verdict for as long as the record
+  survived. Matching is a pure recomputation from a stored prediction and a
+  retained learning record, so a day whose match predates the current rules is
+  re-derived — while both of those inputs are still on disk, and never
+  otherwise. The predictions themselves are never touched: they are the
+  evidence, and only the reading of them is restated. On upgrade this repairs
+  19 August in place rather than merely sparing the days after it.
+
+- **A host whose clock ran years ahead deleted every stored prediction array.**
+  Retention is measured against a reference clamped to one day past the newest
+  recorded day, precisely so a Pi without a real-time clock cannot define "now"
+  and take the history with it. The clamp was inert: forecasts were recorded
+  before retention ran, so the bogus future day was already inside the set the
+  clamp measures against. One refresh under a five-year excursion reduced the
+  entire history to daily summaries. The same ordering defect was found and fixed
+  in the learning history in `beta.4`; the test that was supposed to cover it
+  here exercised the retention function directly and so never touched the path a
+  refresh actually takes.
+
+- **`Forecast Error 7 Days` published energy it had not measured.** Until the
+  window holds about two full days, the error *rate* is withheld — below that it
+  is whichever handful of intervals happened to resolve, and a new
+  installation's noise would read as forecast quality. But the two energy totals
+  were being dropped to zero along with it, so the sensor advertised
+  `predicted_kwh: 0.0` and `actual_kwh: 0.0` beside an `intervals_compared` of
+  ninety-six: a claim that the house consumed nothing, from the one sensor whose
+  entire purpose is to refuse that substitution. The sample size and both
+  energies are facts about the window and are now always reported; only the rate
+  waits. A window with genuinely nothing in it reports no energy at all rather
+  than zero.
+
+- **Non-finite numbers are refused wherever a document is read.** Nothing this
+  integration writes can produce a `NaN` or an infinity, but a hand-edited or
+  externally damaged file can, and one would travel through every mean, total and
+  forecast into a sensor state — comparing false against every guard that might
+  have caught it. Measured energies, predictions, matched actuals and summary
+  rows now all reject them as missing data. One damaged summary row no longer
+  voids the sound rows beside it.
+
+### Changed
+
+- **Diagnostics explains an excluded day instead of counting it.** A flag count
+  says a day was dropped, not why. Each excluded day is now reported with the
+  facts that excluded it — its interval count, how much of it carried a valid
+  measurement, the timezone its record was written in, its flexible-load total,
+  and the baseline definition, shape and timezone of each prediction made for it.
+  The list is newest-first and capped; the counts beside it stay complete.
+- **Diagnostics and the two sensors can no longer appear to disagree.** The
+  rolling statistics in a download are deliberately ungated — a maintainer wants
+  the figure whatever its sample size — which meant a payload could show a WAPE
+  of 25 % next to an entity reading `unknown` with nothing explaining which was
+  wrong. Neither was. The payload now also carries what the entities actually
+  publish and the threshold that separates the two.
+- **The matching rules carry their own version,** separate from the model
+  version, recorded on every daily summary. Two comparisons produced under
+  different rules must never be pooled into one error series, and a later phase
+  reading the history has to be able to tell.
+
+### Notes for anyone upgrading
+
+- `Forecast Error Yesterday` becomes a real number as soon as one prior day has
+  been validated. `Forecast Error 7 Days` waits for about two full days of
+  compared intervals, by design, and reports its sample size honestly while it
+  waits.
+- On the first refresh after the update, a day excluded by the old rule is
+  re-matched if its prediction and its learning record are both still retained.
+  Diagnostics reports it under `matching.restated_last_refresh`. A day that
+  *stays* excluded was excluded correctly.
+- Tests: 964 → 1026. Every new regression test was demonstrated to fail against
+  the `beta.5` behaviour before the fix and to pass after it.
+
 ## [1.0.0-beta.5] - 2026-08-19
 
 The first Phase-2 release: **Load Forecasting & Forecast-Error Logging**.
@@ -660,7 +778,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.5...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.6...HEAD
+[1.0.0-beta.6]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.5...v1.0.0-beta.6
 [1.0.0-beta.5]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.4...v1.0.0-beta.5
 [1.0.0-beta.4]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.3...v1.0.0-beta.4
 [1.0.0-beta.3]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.2...v1.0.0-beta.3
