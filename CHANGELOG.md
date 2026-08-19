@@ -9,6 +9,129 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.5] - 2026-08-19
+
+The first Phase-2 release: **Load Forecasting & Forecast-Error Logging**.
+
+Phase 1 learned what the house uses and predicted what it will use. Until now
+those predictions vanished the moment a newer one replaced them, so the obvious
+question -- *was it right?* -- had no answer anywhere. This release keeps the
+evidence.
+
+Nothing about the forecast itself changes. No threshold, tolerance, weighting or
+learning rule was touched, and the numbers the four existing sensors publish are
+identical to `beta.4`. The storage schema stays at v2 and the config-entry schema
+at v2, so upgrading preserves learned history, source selections, entity ids and
+unique ids. No remove-and-re-add is required, and no battery is controlled.
+
+### Added
+
+- **Immutable forecast records.** Every forecast the model issues is kept
+  exactly as it stood at the moment it was made -- the per-quarter prediction,
+  which intervals were genuinely modelled and which were extrapolated from a
+  neighbour, how many learned days stood behind it, the weekday/weekend
+  decision, the confidence at the time, and the version and parameter
+  fingerprint of the model that produced it. A record is never overwritten by a
+  later one: a prediction that turned out to be wrong is evidence, not a mistake
+  to be tidied away.
+- **Records are written when the forecast changes, not on every refresh.** The
+  Phase-1 model is a pure function of history that cannot change between one
+  midnight and the next, so a per-refresh policy would have written ninety-six
+  identical copies a day. A content fingerprint reduces that to the two
+  predictions that genuinely differ: the one made the day before, and the one
+  made on the day itself. Volatile context -- the issuance time, the confidence
+  percentage, the energy-balance score -- is recorded on the record but excluded
+  from the fingerprint, because the balance score is resampled every minute and
+  would otherwise defeat the whole policy. Withheld forecasts are recorded too,
+  with the reason: a model that never spoke must not later look like a model
+  that was never wrong.
+- **Matching against what actually happened.** Once a day can no longer gain
+  intervals, the measured **baseline** -- household load minus any configured
+  flexible load, the same quantity the model predicts -- is matched to the
+  prediction interval by interval. Comparing against raw measured load instead
+  would charge the model for energy an EV drew, which is precisely the load the
+  baseline exists to exclude. A quarter that was never measured stays missing;
+  it is never read as zero consumption, and a day is only ever scored on the
+  intervals where a prediction and a trustworthy measurement both exist.
+- **Two new sensors, and only two.** `Forecast Error Yesterday` in kWh, signed
+  so that positive means the model predicted more than the house used; and
+  `Forecast Error 7 Days` as a rolling weighted percentage,
+  `sum(|error|) / sum(actual)`. Both read `unknown` until there is something
+  honest to report, and neither is an "accuracy" score -- `100 - error` goes
+  negative on a bad week and invites comparison with unrelated systems. The
+  integration now publishes six entities. Everything else -- the record
+  inventory, error broken down by look-ahead, by time of day and by
+  modelled-versus-extrapolated interval, the matching health and the storage
+  health -- is diagnostics only.
+- **Per-interval fill provenance on the forecast.** `filled_intervals` said how
+  many intervals were extrapolated from a neighbour but never which, and the
+  filling step overwrites the values in place, so the information was destroyed
+  at the moment it was created. A per-interval mask now travels with the
+  forecast. It changes no predicted value; it exists because comparing error on
+  modelled versus extrapolated intervals cannot be reconstructed after the fact
+  and would otherwise have to be recovered by running a second copy of the model
+  elsewhere.
+- **A separate, partitioned, versioned store for the evidence.** A small
+  always-loaded index plus one document per calendar month of predicted days.
+  Home Assistant rewrites a whole document on every save, so a single year-long
+  file would put roughly a megabyte through the disk on each write and would
+  lose the entire history to one corrupt byte. Writes are atomic, and the common
+  case -- a refresh reproducing the forecast it produced fifteen minutes ago --
+  performs no disk access at all. Around 3.5 kB per day, so about 1.3 MB at the
+  365-day steady state.
+- **Retention aligned with the learning history.** Raw quarter-level evidence is
+  kept for 365 days, the same window as the learning data it can be correlated
+  with; past that point the inputs behind a forecast are gone, so the raw arrays
+  could no longer explain *why* it was wrong. Reduced daily summaries -- about
+  200 bytes each, and enough to rebuild the rolling figures -- are kept for
+  years.
+- **A stable interface for later phases.** `api.py` exposes the current
+  forecast, any historical prediction as it was issued, and measured forecast
+  uncertainty, as frozen and copied structures. Nothing outside it may reach
+  into the storage internals, and a test enforces that statically over the real
+  source files.
+
+### Fixed
+
+- **A day-ahead and a day-of prediction could collapse into one record.** The
+  fingerprint covered content but not look-ahead, so on a settled household --
+  where the model often says the same thing on both days -- only one record
+  survived. That left the day-of side of any look-ahead comparison
+  systematically empty of exactly the days the model found easy. Look-ahead is
+  now part of the fingerprint. It costs nothing in churn, because it is constant
+  for a whole civil day.
+
+### Safety
+
+- **Matching is suspended while the learning history cannot be read.** An
+  unreadable learning document degrades to an empty history so that setup can
+  continue, which is right for availability -- but every interval then reads as
+  missing. Matching against that would write immutable records permanently
+  asserting that nothing was measured, for days whose measurements are almost
+  certainly intact on disk. This is the `beta.4` write-after-failed-read defect
+  one layer up, and worse, because these records are final by design. Nothing is
+  lost by waiting: matching is a pure recomputation from persisted data, so the
+  days simply resolve after a restart that reads the history successfully.
+- **Nothing in the evidence layer can fail a refresh.** Learning and both
+  forecasts do not read any of it, so a storage failure degrades the evidence
+  and leaves the four Phase-1 sensors alone.
+- **The clock-excursion and failed-read rules are reproduced, not re-learned.**
+  Pruning clamps its reference against known history, so a host without a
+  real-time clock cannot define "now" and delete the retention window behind it;
+  and a store that could not be read refuses to write for the rest of the
+  session.
+- **Days whose two sides are not comparable are kept but never scored.** A
+  changed timezone, a changed day length, a flexible-load source added or
+  removed, or a day with no record at all: the prediction and the measurement
+  are both true facts, and only their comparability is void. Index-matching two
+  different day shapes would line an 18:00 prediction up against a 17:00
+  measurement and look entirely plausible doing it.
+
+### Changed
+
+- The entity contract now documents **six** sensors rather than four. Existing
+  entity ids and unique ids are unchanged.
+
 ## [1.0.0-beta.4] - 2026-08-19
 
 The final Phase-1 hardening release. Three defects reported from live `beta.3`
@@ -537,7 +660,10 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.2...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.5...HEAD
+[1.0.0-beta.5]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.4...v1.0.0-beta.5
+[1.0.0-beta.4]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.3...v1.0.0-beta.4
+[1.0.0-beta.3]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.2...v1.0.0-beta.3
 [1.0.0-beta.2]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.1...v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/Bennie-JC/ha-alpha-ems-manager/releases/tag/v1.0.0-beta.1
 [0.1.0]: https://github.com/Bennie-JC/ha-alpha-ems-manager/releases/tag/v0.1.0
