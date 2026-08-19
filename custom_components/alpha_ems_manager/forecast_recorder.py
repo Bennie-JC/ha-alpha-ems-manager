@@ -1,10 +1,13 @@
 """Orchestration for the Phase-2 forecast evidence layer.
 
 One entry point, :meth:`ForecastRecorder.async_record`, called once per
-coordinator refresh after the forecasts have been built. It issues snapshots
-that are actually new, matches finished days against what the house really did,
-prunes what has aged out, and returns the small set of figures the two Phase-2
-sensors publish.
+coordinator refresh after the forecasts have been built. It prunes what has aged
+out, issues snapshots that are actually new, matches finished days against what
+the house really did, re-derives any match left behind by a superseded rule, and
+returns the small set of figures the two Phase-2 sensors publish.
+
+Pruning goes first, and that ordering is load-bearing rather than tidy: see the
+comment in :meth:`async_record`.
 
 It never raises into the refresh. A forecast-history failure must degrade the
 evidence layer, not take the four Phase-1 sensors down with it: learning and
@@ -26,6 +29,10 @@ final by design.
 Nothing is lost by waiting. Matching is a pure recomputation from persisted
 data, so the days simply stay unfinalised and resolve on the next refresh after
 a restart that reads the history successfully.
+
+Restatement -- re-deriving an already-written match after a matching *rule* is
+corrected -- obeys the same suspension for the same reason, and is bounded
+further still. :meth:`ForecastRecorder._async_restate` states each bound.
 """
 
 from __future__ import annotations
@@ -37,6 +44,7 @@ from typing import Any
 
 from .const import (
     FORECAST_ERROR_WINDOW_DAYS,
+    FORECAST_MATCHER_VERSION,
     FORECAST_MIN_INTERVALS_FOR_METRIC,
 )
 from .forecast import DayForecast
@@ -52,6 +60,7 @@ from .metrics import (
     WindowSummary,
     best_snapshot,
     day_error_from_summary,
+    matcher_version,
     score_day,
     summary_row,
     window_from_summaries,
@@ -60,7 +69,9 @@ from .storage import LearningStore, expected_quarters_for
 
 _LOGGER = logging.getLogger(__name__)
 
-#: Most unfinalised days resolved in one refresh.
+#: Most days matched, or re-matched, in one refresh. The two share the budget:
+#: an update that both corrects a rule and comes back from a long outage must
+#: still not put a hundred partition loads on the event loop at once.
 #:
 #: A Home Assistant that has been off for months comes back with a long backlog,
 #: and each day loads a partition and rebuilds an outcome. Bounding the batch
@@ -78,6 +89,10 @@ class RecorderResult:
     issued: tuple[ForecastSnapshot, ...] = ()
     #: Target days matched against reality this pass. Normally zero or one.
     finalized: tuple[date, ...] = ()
+    #: Days whose existing match was re-derived under corrected matching rules.
+    #: Non-empty only for the few refreshes after an update that changes
+    #: ``FORECAST_MATCHER_VERSION``.
+    restated: tuple[date, ...] = ()
     #: Day-level error facts for the previous civil day, or ``None``.
     yesterday: dict[str, Any] | None = None
     #: Rolling statistics over the published window.
@@ -125,6 +140,19 @@ class ForecastRecorder:
         day_changed = self._last_day != today
         self._last_day = today
 
+        # Pruned *before* this pass issues anything, and the order is the whole
+        # point. ``async_prune`` clamps its reference to one day past the newest
+        # target already recorded, so a host whose clock is years ahead cannot
+        # define "now" and take the retention window with it. Issuing first put
+        # the bogus future target *inside* the set the clamp measures against,
+        # which made the clamp inert on the only path that reaches it: one
+        # refresh under a five-year clock excursion dropped every retained
+        # prediction array in the history. Exactly the beta.4 ``get_or_create``
+        # defect, one store along.
+        if day_changed:
+            await self.store.async_prune(today)
+            await self.store.async_drop_empty_months()
+
         issued = await self._async_issue(
             now=now,
             today=today,
@@ -138,18 +166,19 @@ class ForecastRecorder:
 
         suspended = self.learning.corrupt
         finalized: tuple[date, ...] = ()
+        restated: tuple[date, ...] = ()
         if not suspended:
             finalized = await self._async_finalize(now=now, today=today, tz=tz)
-
-        if day_changed:
-            await self.store.async_prune(today)
-            await self.store.async_drop_empty_months()
+            restated = await self._async_restate(
+                now=now, today=today, tz=tz, budget=len(finalized)
+            )
 
         self.store.schedule_save()
 
         return RecorderResult(
             issued=issued,
             finalized=finalized,
+            restated=restated,
             yesterday=self.yesterday_error(today),
             window=self.window_summary(today),
             finalization_suspended=suspended,
@@ -231,6 +260,80 @@ class ForecastRecorder:
                 resolved.append(day)
         return tuple(resolved)
 
+    async def _async_restate(
+        self, *, now: datetime, today: date, tz: Any, budget: int
+    ) -> tuple[date, ...]:
+        """Re-derive matches written under a superseded set of matching rules.
+
+        A matching rule that turns out to be wrong is not only wrong going
+        forward. The days already matched under it carry its verdict, and
+        nothing would ever revisit them: finalisation only looks at days that
+        were never matched at all. On a dataset that accrues one irreplaceable
+        day at a time, that leaves a permanent scar for every rule ever
+        corrected -- and the first correction, in v1.0.0-beta.6, excluded whole
+        days for having a single missing quarter.
+
+        So this is safe to do, and only because of how narrowly it is bounded.
+        Every input is still on disk, and re-deriving is the same pure function
+        over the same two arguments:
+
+        * the **snapshots are never touched**. They are the evidence; only the
+          *match* -- a derived reading of them -- is restated.
+        * the day must still have retained snapshots. Past the raw-retention
+          horizon the arrays are gone and only the summary remains, and a
+          re-derivation there would replace a real comparison with an empty one.
+        * the day must still have a **learning record**. Once that has been
+          pruned, ``build_outcome`` would honestly return "no record" -- and
+          writing that over a sound match would destroy the very evidence this
+          exists to preserve. So a day whose record has aged out keeps the
+          verdict it already has.
+        * it runs under the same suspension and the same per-refresh budget as
+          finalisation, so an update never lands as one long blocking sweep.
+        """
+        remaining = _MAX_FINALIZATIONS_PER_REFRESH - budget
+        if remaining <= 0:
+            return ()
+
+        stale = self._restatable_days(today)
+        if not stale:
+            return ()
+
+        batch = stale[:remaining]
+        _LOGGER.debug(
+            "Re-deriving %d of %d forecast matches under matching rules v%d",
+            len(batch),
+            len(stale),
+            FORECAST_MATCHER_VERSION,
+        )
+        await self.store.async_ensure_days(batch)
+        restated: list[date] = []
+        for day in batch:
+            # Checked only now the partition is loaded: a day whose snapshots
+            # turn out to be absent -- an unreadable month, a torn write -- must
+            # keep the match it has rather than be re-derived against nothing.
+            if not self.store.snapshots(day):
+                continue
+            if self._finalize_day(day, now=now, tz=tz):
+                restated.append(day)
+        return tuple(restated)
+
+    def _restatable_days(self, today: date) -> list[date]:
+        """Return matched days whose verdict predates the current rules.
+
+        Answered from the always-loaded index and the learning history already
+        in memory, so it costs no disk access -- and once every row carries the
+        current version it finds nothing and costs nothing at all.
+        """
+        return sorted(
+            day
+            for day, row in self.store.days.items()
+            if day < today
+            and row.finalized_at is not None
+            and not row.raw_pruned
+            and matcher_version(row.summary) < FORECAST_MATCHER_VERSION
+            and day in self.learning.days
+        )
+
     def _finalize_day(self, day: date, *, now: datetime, tz: Any) -> bool:
         """Build and persist one day's outcome. Returns whether it was written."""
         if not self.store.writable(day):
@@ -291,12 +394,20 @@ class ForecastRecorder:
         ]
         summary = window_from_summaries(row for row in rows if row is not None)
         if summary.intervals_compared < FORECAST_MIN_INTERVALS_FOR_METRIC:
-            # Below roughly two full days the figure is whichever handful of
-            # intervals happened to resolve, and publishing it would invite a
-            # fresh installation's noise to be read as forecast quality.
+            # Below roughly two full days the *derived* figures are whichever
+            # handful of intervals happened to resolve, and publishing them
+            # would invite a fresh installation's noise to be read as forecast
+            # quality. The sample size and the two energy totals are facts about
+            # the window rather than judgements of the model, so they are
+            # reported: dropping them let the sensor publish
+            # ``predicted_kwh: 0.0`` and ``actual_kwh: 0.0`` beside an
+            # ``intervals_compared`` of ninety-six, which is a claim that the
+            # house consumed nothing.
             return WindowSummary(
                 days_compared=summary.days_compared,
                 intervals_compared=summary.intervals_compared,
+                predicted_kwh=summary.predicted_kwh,
+                actual_kwh=summary.actual_kwh,
             )
         return summary
 

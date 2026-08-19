@@ -59,11 +59,20 @@ def flat_day(
     per_interval = daily_kwh / count
 
     for index in range(count):
-        has_measured = index < measured_count
+        if index >= measured_count:
+            # Faithful to the coordinator, which files a quarter only once it is
+            # *accepted*: an interval that never reached coverage, or that fell
+            # inside a restart, is never handed to ``record_interval`` at all and
+            # so keeps the padded defaults -- including ``ev_expected=False``.
+            # Filing it here instead wrote a flexible-load expectation onto an
+            # interval that was never observed, which is precisely the state a
+            # live installation can never be in, and it hid the beta.5
+            # definition-change false positive from every test in this suite.
+            continue
         has_ev = ev_expected and index < ev_count
         record.record_interval(
             index,
-            measured_kwh=per_interval if has_measured else None,
+            measured_kwh=per_interval,
             ev_kwh=(ev_kwh_per_interval or 0.0) if has_ev else None,
             ev_expected=ev_expected,
         )

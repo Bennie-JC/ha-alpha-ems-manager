@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .const import FORECAST_SLOT_BANDS
+from .const import FORECAST_MATCHER_VERSION, FORECAST_SLOT_BANDS
 from .forecast_history import DayOutcome, ForecastSnapshot
 from .storage import local_slot_for_index
 
@@ -155,8 +155,13 @@ class WindowMetrics:
     #: Root mean squared error. Reported for diagnostics only: it weights the
     #: few large misses that matter for sizing far more heavily than MAE does.
     rmse_kwh: float | None = None
-    predicted_kwh: float = 0.0
-    actual_kwh: float = 0.0
+    #: Summed predicted and measured energy over the compared intervals.
+    #: ``None`` -- not zero -- when nothing was compared: a week in which
+    #: nothing could be scored did not measure zero kilowatt-hours, and a
+    #: fabricated zero beside a ``days_compared`` of nought is the one reading
+    #: this project refuses to publish.
+    predicted_kwh: float | None = None
+    actual_kwh: float | None = None
     #: MAE restricted to intervals blended from their own behavioural slot.
     mae_modelled_kwh: float | None = None
     #: MAE restricted to intervals extrapolated from a neighbour.
@@ -253,8 +258,8 @@ def compute_window(
             100.0 * sum(absolute) / actual_total if actual_total > 0 else None
         ),
         rmse_kwh=None if mean_squared is None else math.sqrt(mean_squared),
-        predicted_kwh=predicted_total,
-        actual_kwh=actual_total,
+        predicted_kwh=predicted_total if errors else None,
+        actual_kwh=actual_total if errors else None,
         mae_modelled_kwh=_mean(modelled),
         mae_filled_kwh=_mean(filled),
         intervals_modelled=len(modelled),
@@ -334,7 +339,12 @@ def summary_row(
     hundred and fifty bytes a day for a decade instead of a kilobyte.
     """
     if scored is None:
-        return {"n": interval_count, "c": 0, "fg": list(flags)}
+        return {
+            "n": interval_count,
+            "c": 0,
+            "fg": list(flags),
+            "mr": FORECAST_MATCHER_VERSION,
+        }
 
     filled = [
         abs(predicted - actual)
@@ -356,7 +366,21 @@ def summary_row(
         "fn": len(filled),
         "fe": round(sum(filled), 4),
         "fg": list(flags),
+        # Which generation of the matching rules produced this row. Read by the
+        # recorder to find days still carrying a verdict from a superseded rule.
+        "mr": FORECAST_MATCHER_VERSION,
     }
+
+
+def matcher_version(summary: dict[str, object] | None) -> int:
+    """Return the matching-rule generation a summary row was written under.
+
+    A row without the field predates the field, which is generation 1.
+    """
+    value = (summary or {}).get("mr")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 1
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,8 +397,13 @@ class WindowSummary:
     mae_kwh: float | None = None
     bias_kwh: float | None = None
     wape_percent: float | None = None
-    predicted_kwh: float = 0.0
-    actual_kwh: float = 0.0
+    #: Summed predicted and measured energy over the compared intervals, or
+    #: ``None`` when there is nothing to sum. These are *facts about the window*
+    #: rather than metric definitions, so they are reported even where the
+    #: derived figures are withheld for want of a large enough sample -- but
+    #: never as a zero standing in for "no comparison happened".
+    predicted_kwh: float | None = None
+    actual_kwh: float | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Return a plain mapping for the diagnostics payload."""
@@ -390,10 +419,17 @@ class WindowSummary:
 
 
 def _number(value: object) -> float | None:
-    """Return a stored figure as a float, or ``None`` when it is not one."""
+    """Return a stored figure as a float, or ``None`` when it is not one.
+
+    Non-finite values are refused as well. A summary row holding ``NaN`` would
+    otherwise turn every window it entered into ``NaN`` -- including the rows
+    beside it, since the totals are summed -- and a single damaged row would
+    silently void a whole week of otherwise sound statistics.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def window_from_summaries(rows: Iterable[dict[str, object]]) -> WindowSummary:

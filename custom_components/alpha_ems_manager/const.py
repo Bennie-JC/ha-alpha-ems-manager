@@ -320,7 +320,16 @@ BALANCE_SUSTAINED_FAILURES: Final = 3
 #: different lifecycles, and a change to one must not force a migration of the
 #: other.
 FORECAST_STORAGE_VERSION: Final = 1
-FORECAST_STORAGE_MINOR_VERSION: Final = 1
+#: Minor version, bumped for a *backward-compatible* addition to the layout.
+#: The major version is what decides whether a document can be read at all, so a
+#: minor bump reads every earlier document unchanged and simply writes the newer
+#: one back. History is never migrated and never discarded by one.
+#:
+#: * **1.1** -- v1.0.0-beta.5. The original layout.
+#: * **1.2** -- v1.0.0-beta.6. Summary rows gained ``mr``, the matching-rule
+#:   generation that produced them. A row without it is generation 1, which is
+#:   exactly what every beta.5 row is.
+FORECAST_STORAGE_MINOR_VERSION: Final = 2
 
 #: Index document: schema version, the month partitions that exist, and the
 #: small daily summary rows. Always loaded.
@@ -369,6 +378,25 @@ FORECAST_KWH_PRECISION: Final = 4
 #: phase cannot pool error statistics across two incompatible model generations
 #: and read the discontinuity as a behavioural change in the household.
 FORECAST_MODEL_VERSION: Final = 1
+
+#: Version of the *matching* rules -- how a stored prediction is paired with
+#: what the house actually did, and which days are judged incomparable.
+#:
+#: Distinct from ``FORECAST_MODEL_VERSION``, which versions the numbers the
+#: forecast contains. This versions the numbers the *comparison* contains, and
+#: it exists so a correction to a matching rule reaches the days already
+#: matched under the old one. Matching is a pure recomputation from the stored
+#: snapshot and the retained learning record, so re-deriving an outcome is
+#: idempotent and loses nothing -- while leaving it alone would keep a verdict
+#: the current release knows to be wrong, permanently, in the one dataset this
+#: project cannot regenerate.
+#:
+#: * **1** -- v1.0.0-beta.5. Judged the baseline definition from every entry of
+#:   ``DayRecord.ev_expected``, including the padded entries of intervals that
+#:   were never recorded, so on an installation with a flexible load a single
+#:   missing quarter excluded the whole day as ``definition_changed``.
+#: * **2** -- v1.0.0-beta.6. Judges it from the observed intervals only.
+FORECAST_MATCHER_VERSION: Final = 2
 
 #: Rolling window, in days, behind the published forecast-error sensor.
 FORECAST_ERROR_WINDOW_DAYS: Final = 7

@@ -23,8 +23,10 @@ from homeassistant.util import dt as dt_util
 from . import AlphaEmsConfigEntry
 from .const import (
     CONFIG_ENTRY_VERSION,
+    FORECAST_MATCHER_VERSION,
     FORECAST_MAX_SNAPSHOTS_PER_TARGET,
     FORECAST_METRIC_WINDOWS,
+    FORECAST_MIN_INTERVALS_FOR_METRIC,
     FORECAST_MODEL_VERSION,
     FORECAST_RAW_RETENTION_DAYS,
     FORECAST_STORAGE_VERSION,
@@ -221,6 +223,13 @@ def _forecast_report(forecast: DayForecast | None) -> dict[str, Any]:
     }
 
 
+#: Flagged days described individually in the diagnostics payload, newest
+#: first. The flag *counts* beside them are always complete; this bounds only
+#: the per-day detail, so a long-running installation cannot turn a diagnostics
+#: download into a full history dump.
+_MAX_EXCLUDED_DAYS_REPORTED = 10
+
+
 async def _forecast_history_report(
     coordinator: AlphaEmsCoordinator, today: date
 ) -> dict[str, Any]:
@@ -245,6 +254,11 @@ async def _forecast_history_report(
         # changes. Two records with different values here describe two different
         # models and must never be pooled into one error statistic.
         "model_params_hash": model_params_hash(),
+        # Versions the *comparison* rather than the forecast: which prediction a
+        # day is scored against, and which days are judged incomparable. A row
+        # written under an older value is re-derived while its snapshot and its
+        # learning record are both still retained.
+        "matcher_version": FORECAST_MATCHER_VERSION,
         "baseline_definition": baseline_definition(coordinator.config.ev_power_entity),
         "raw_retention_days": FORECAST_RAW_RETENTION_DAYS,
         "summary_retention_days": FORECAST_SUMMARY_RETENTION_DAYS,
@@ -320,7 +334,9 @@ async def _forecast_history_report(
 
     status_counts: dict[str, int] = {}
     flag_counts: dict[str, int] = {}
-    for day in sorted(history.days):
+    excluded: list[dict[str, Any]] = []
+    excluded_total = 0
+    for day in sorted(history.days, reverse=True):
         outcome = history.outcome(day)
         if outcome is None:
             continue
@@ -328,6 +344,40 @@ async def _forecast_history_report(
             status_counts[code] = status_counts.get(code, 0) + 1
         for flag in outcome.flags:
             flag_counts[flag] = flag_counts.get(flag, 0) + 1
+        if not outcome.flags:
+            continue
+        excluded_total += 1
+        if len(excluded) >= _MAX_EXCLUDED_DAYS_REPORTED:
+            continue
+        # A flag on its own says a day was excluded, not why. The facts that
+        # decide each flag are all in the record already, so reporting them
+        # beside it is the difference between "definition_changed: 1" and a
+        # diagnosable day.
+        excluded.append(
+            {
+                "target_day": day.isoformat(),
+                "flags": list(outcome.flags),
+                "intervals_in_day": outcome.interval_count,
+                "intervals_with_valid_actual": len(outcome.valid_indices()),
+                "record_timezone": outcome.tz_key,
+                # Non-null exactly when some observed interval expected a
+                # flexible load, which is what the day's own baseline
+                # definition is judged from.
+                "flexible_total_kwh": outcome.flexible_total_kwh,
+                "snapshot_baseline_definitions": sorted(
+                    {
+                        snapshot.baseline_definition
+                        for snapshot in history.snapshots(day)
+                    }
+                ),
+                "snapshot_interval_counts": sorted(
+                    {snapshot.interval_count for snapshot in history.snapshots(day)}
+                ),
+                "snapshot_timezones": sorted(
+                    {snapshot.tz_key for snapshot in history.snapshots(day)}
+                ),
+            }
+        )
 
     return {
         "available": True,
@@ -376,6 +426,23 @@ async def _forecast_history_report(
             "rolling": rolling,
             f"detail_{deep_window}_days": detail.as_dict(),
             "by_horizon": by_horizon,
+            # The two published sensors, reported beside the figures they are
+            # derived from. ``rolling`` is deliberately ungated -- a maintainer
+            # wants the statistic whatever its sample size -- so without this a
+            # download showed a WAPE of 25 % next to an entity reading
+            # ``unknown``, with nothing in the payload explaining which of the
+            # two was wrong. Neither was.
+            "published": {
+                "minimum_intervals_for_metric": FORECAST_MIN_INTERVALS_FOR_METRIC,
+                "gate": (
+                    "the rolling sensor withholds its rate, and only its rate, "
+                    "until the window holds at least that many compared "
+                    "intervals; the sample size and the two energy totals are "
+                    "reported throughout"
+                ),
+                "forecast_error_yesterday": coordinator.last_record.yesterday,
+                "forecast_error_window": coordinator.last_record.window.as_dict(),
+            },
         },
         "matching": {
             "interval_status_counts": status_counts,
@@ -386,6 +453,14 @@ async def _forecast_history_report(
                 "3": "interval had not elapsed",
             },
             "excluded_day_flags": flag_counts,
+            # Newest first, and capped so a diagnostics download cannot grow
+            # with the history. The counts above are complete either way.
+            "excluded_days": excluded,
+            "excluded_days_reported": len(excluded),
+            "excluded_days_total": excluded_total,
+            "restated_last_refresh": [
+                day.isoformat() for day in coordinator.last_record.restated
+            ],
             "actual_basis": (
                 "baseline = max(measured - flexible, 0), the same quantity the "
                 "model predicts; a missing actual is never read as zero"

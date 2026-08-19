@@ -49,6 +49,7 @@ the baseline for that interval without discarding the measured ground truth.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -378,12 +379,23 @@ def _numeric_list(raw: Any, count: int) -> list[float | None]:
     """Return ``count`` optional floats, dropping anything non-numeric.
 
     A corrupted entry becomes ``None`` -- missing data -- rather than zero.
+
+    ``NaN`` and the infinities are dropped too. Nothing this integration writes
+    can produce one, but a hand-edited or externally damaged document can, and
+    Python's ``json`` accepts the literals. One would propagate straight through
+    every mean, total and forecast into a sensor state, poisoning arithmetic that
+    has no other way to notice: unlike a wrong number, ``NaN`` compares false
+    against every threshold, so even the completeness guards would wave it past.
     """
     values: list[float | None] = [None] * count
     if not isinstance(raw, list):
         return values
     for index, value in enumerate(raw[:count]):
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        ):
             values[index] = float(value)
     return values
 

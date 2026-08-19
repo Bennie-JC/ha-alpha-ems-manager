@@ -509,6 +509,38 @@ the full flow breakdown, the mode and the allowance, and the attribution counter
 above record which modes and which source, so the next occurrence is diagnosable
 from diagnostics alone.
 
+**Second occurrence, 2026-08-20, and it behaved exactly as designed.** Mode
+`pv+grid->house+battery`, `supply 661 W`, `demand 506 W`, residual `+155 W`
+against an allowance of `95 W`. The allowance reconstructs exactly from the
+model — `40 + 0.03 x 661 + 0.05 x 703 = 95 W` for `703 W` of gross DC flow — and
+the reported `23 %` is `155 / max(661, 506, 250)`, so the arithmetic and the
+attribution are both sound. The **sign** is the informative part: `supply -
+demand` is *positive*, meaning measured input exceeds accounted output, which is
+what an unmeasured conversion loss and an inverter's own auxiliary draw look
+like. A negative residual in that mode would be the suspicious one, because it
+would mean energy arriving from nowhere.
+
+`155 W` at `703 W` DC is more loss than a conversion stage alone explains, and
+that is consistent with the leading hypothesis rather than against it: two
+instruments on different electrical boundaries differ by a roughly *constant*
+offset, which is a negligible fraction of a busy afternoon and a large fraction
+of a quiet one. The check then cleared by itself — 374 of 378 eligible samples
+passed, a 98.9 % rate with `consecutive_failures` back to zero — which is the
+debounce doing its job rather than a fault going away.
+
+No threshold was changed. Widening the base allowance to cover a `155 W` offset
+would blind the check at every power level in order to explain one regime, and it
+would hide the wiring or sign error the check exists to catch.
+
+**Nothing in Phase 2 depends on this result.** The balance score reaches exactly
+one thing — the confidence component — and confidence is recorded *on* a snapshot
+as provenance, excluded from the fingerprint, and read by no scoring, matching,
+retention or storage decision. A balance failure therefore cannot invalidate,
+alter or suppress a forecast comparison.
+`tests/test_forecast_scoring_proof.py` pins that twice: once by scoring an
+identical day with a 0 % pass rate and comparing every figure, and once
+statically, by asserting that no scoring module imports the balance check at all.
+
 ## Phase 2: the forecast evidence layer
 
 Phase 1 produced a forecast and threw it away the moment a newer one replaced
@@ -618,6 +650,62 @@ the record's own `ev_expected` flags say what was expected of each interval, so 
 flexible load switched on at noon is caught even though the configuration looks
 consistent by the time the day is finalised.
 
+**Only observed intervals have an opinion, and that distinction is load-bearing.**
+`ev_expected` is written by `record_interval()`, which the coordinator calls once
+per *accepted* quarter — so an interval that never reached coverage, or that fell
+inside a restart, keeps the `False` its list was padded with. Reading those
+padded entries as "no flexible load was configured then" is what made a single
+missing quarter on a day *with* a charger look like the definition changing at
+that quarter: `any(expected) and not all(expected)` was true and the whole day
+was excluded from every statistic, permanently. That was the beta.5 defect that
+left 19 August 2026 unscored on the live system after the upgrade restart.
+
+A gap is a gap. The status codes above describe it exactly, and it says nothing
+about what "baseline" meant. So the judgement is made over the intervals with a
+measurement, and a day with no observation at all makes no claim either way — it
+has no comparable interval regardless, and adding a reason that was never
+established is the reason a maintainer would go and investigate.
+
+| Situation | Verdict |
+|---|---|
+| Charger configured all day, quarters missing to a restart | comparable — scored on the observed intervals |
+| Charger selected at noon | `definition_changed` |
+| Charger removed between issuance and the day being measured | `definition_changed` |
+| No charger at all, quarters missing | comparable |
+| Nothing observed at all | no flag; `unmatched` for want of a comparison |
+| Entry reloaded, options unchanged | comparable |
+| Model version or parameter hash changed | comparable — recorded on the snapshot, never a matching flag |
+
+### Restating a match
+
+`FORECAST_MATCHER_VERSION` versions the *matching* rules, separately from
+`FORECAST_MODEL_VERSION`, which versions the numbers a forecast contains. Every
+summary row records the generation that produced it; a row without the field is
+generation 1, which is exactly what every beta.5 row is.
+
+A matching rule that turns out to be wrong is not only wrong going forward. The
+days already matched carry its verdict and nothing revisits them, because
+finalisation only looks at days that were never matched at all. On a dataset that
+accrues one irreplaceable day at a time that leaves a permanent scar for every
+rule ever corrected, so a day whose row predates the current generation is
+**re-derived**. Snapshots are never touched — they are the evidence; only the
+match, a derived reading of them, is restated.
+
+It is safe only because of how narrowly it is bounded. Re-derivation needs:
+
+- retained snapshots — past the raw-retention horizon there is no prediction left
+  to re-derive against, and a re-derivation there would replace a real comparison
+  with an empty one;
+- a **retained learning record** — without it `build_outcome()` would honestly
+  return `no_record`, and writing that over a sound match would destroy the
+  evidence the sweep exists to preserve;
+- the same suspension rule and the same per-refresh budget as finalisation.
+
+Once every row carries the current generation the sweep finds nothing and costs
+nothing: it reads the always-loaded index and the learning history already in
+memory. `tests/test_beta6_audit_regressions.py` pins each bound, including that
+the sweep runs once and does not rewrite the document afterwards.
+
 ### Lifecycle
 
 Derived, never stored. The only state committed to disk is `finalized_at`.
@@ -678,6 +766,26 @@ Both learning-store safety rules are reproduced: **never write after a failed
 read** (per document, so a corrupt month costs one month), and **clamp the prune
 reference** to at most one day past the newest stored target.
 
+The clamp only works if pruning runs **before** issuance, and in beta.5 it did
+not. Issuing first put the bogus future target inside the very set the clamp
+measures against, so one refresh under a host whose clock was years ahead — a Pi
+without a real-time clock, before NTP corrects it — dropped every retained
+prediction array in the history. This is the beta.4 `get_or_create()` ordering
+defect one store along, and the store-level test that was meant to cover it
+called `async_prune()` directly and so never exercised the real path.
+
+Order per refresh, and it matters in this order:
+
+```
+prune (day change only) -> issue -> finalise -> restate -> schedule save
+```
+
+The clamp costs one day of lag when the newest stored target is far behind the
+reference: that first pass declines to expire anything, and the next day-change
+prunes correctly against recorded time. That is the intended behaviour — a
+reference far ahead of the recorded history is indistinguishable from a wrong
+clock until real days start arriving.
+
 ### Retention
 
 | Class | Kept | Why |
@@ -712,6 +820,33 @@ with unrelated systems.
 
 A day-level percentage *is* safe, because the denominator is a whole day of
 demand, and it returns `None` when that day measured nothing.
+
+`FORECAST_MIN_INTERVALS_FOR_METRIC` (192 — roughly two full days) is a
+**minimum-sample rule on the rate, and only on the rate**. Below it, MAE, bias
+and WAPE are withheld, because the figure would be whichever handful of intervals
+happened to resolve and a fresh installation's noise would be read as forecast
+quality. The sample size and the two summed energies are *facts about the window*
+rather than judgements of the model, so they are reported throughout. beta.5
+dropped them to their `0.0` dataclass defaults instead, which had the rolling
+sensor advertising `predicted_kwh: 0.0` and `actual_kwh: 0.0` beside an
+`intervals_compared` of ninety-six — a claim that the house consumed nothing,
+published by the one sensor whose whole purpose is to refuse that substitution.
+`None` now means no comparison, at every layer.
+
+`Forecast Error Yesterday` has no such threshold: one validated prior day is one
+real comparison, and it is published as soon as there is one.
+
+Diagnostics reports the rolling statistics **ungated** — a maintainer wants the
+figure whatever its sample size — so it also carries what the entities actually
+publish, under `quality.published`, together with the threshold that separates
+the two. Without that a download showed a WAPE of 25 % next to an entity reading
+`unknown`, with nothing in the payload saying which was wrong. Neither was.
+
+Every loader refuses non-finite numbers. Nothing this integration writes can
+produce a `NaN`, but a hand-edited or externally damaged document can and
+Python's `json` accepts the literals — and `NaN` compares false against every
+threshold, so the completeness guards would wave it straight through into a
+sensor state.
 
 Day-level comparison uses the **intersection** of intervals valid in the actual
 and predicted in the snapshot. Comparing a whole-day prediction against a partly

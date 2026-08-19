@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
@@ -136,6 +137,21 @@ def _digest(payload: Any) -> str:
 def _round_kwh(value: float | None) -> float | None:
     """Round a stored energy, preserving ``None``."""
     return None if value is None else round(value, FORECAST_KWH_PRECISION)
+
+
+def _finite(value: Any) -> float | None:
+    """Return a loaded number as a float, or ``None`` when it is not usable.
+
+    Booleans are excluded because ``True`` is an ``int``, and ``NaN`` and the
+    infinities are excluded because a damaged or hand-edited document can carry
+    them and Python's ``json`` accepts the literals. A non-finite prediction or
+    actual would travel through every metric into a sensor state while comparing
+    false against every guard that might have caught it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _mask_to_text(mask: list[bool]) -> str:
@@ -320,12 +336,7 @@ class ForecastSnapshot:
             values = raw.get("p")
             if not isinstance(values, list):
                 return None
-            predicted = tuple(
-                float(value)
-                if isinstance(value, (int, float)) and not isinstance(value, bool)
-                else None
-                for value in values[:count]
-            )
+            predicted = tuple(_finite(value) for value in values[:count])
             predicted = predicted + (None,) * max(0, count - len(predicted))
             filled = tuple(_mask_from_text(raw.get("f"), count))
 
@@ -559,12 +570,7 @@ class DayOutcome:
         values = raw.get("a")
         actual: tuple[float | None, ...] = ()
         if isinstance(values, list):
-            actual = tuple(
-                float(value)
-                if isinstance(value, (int, float)) and not isinstance(value, bool)
-                else None
-                for value in values[:count]
-            )
+            actual = tuple(_finite(value) for value in values[:count])
         actual = actual + (None,) * max(0, count - len(actual))
 
         status = raw.get("s")
@@ -591,11 +597,7 @@ class DayOutcome:
             interval_count=count,
             actual=actual,
             status=status,
-            flexible_total_kwh=(
-                float(ev)
-                if isinstance(ev, (int, float)) and not isinstance(ev, bool)
-                else None
-            ),
+            flexible_total_kwh=_finite(ev),
             flags=tuple(str(flag) for flag in flags) if isinstance(flags, list) else (),
         )
 
@@ -692,11 +694,33 @@ def _definition_changed(record: DayRecord, snapshots: list[ForecastSnapshot]) ->
     interval, so a flexible load switched on at noon shows up here even though
     the configuration looks perfectly consistent by the time the day is
     finalised.
+
+    **Only intervals the integration actually observed have an opinion.**
+    ``ev_expected`` is written by ``DayRecord.record_interval``, and the
+    coordinator calls that exactly once per *accepted* quarter -- so an interval
+    that never reached coverage, or that fell in a Home Assistant restart, keeps
+    the ``False`` its list was padded with. Reading those padded entries as
+    "no flexible load was configured then" is what made a single missing quarter
+    on a day *with* a charger look like the definition changing at that quarter:
+    ``any(expected) and not all(expected)`` was true, the whole day was excluded
+    from every statistic, and the exclusion was permanent.
+
+    That is a data *gap*, which the per-interval status codes already describe
+    exactly, and it says nothing at all about what "baseline" meant. So the
+    judgement is made over the observed intervals only, and a day with no
+    observations at all makes no claim: it has no comparable interval either
+    way, and inventing a definition change on top of that would be an invention.
     """
-    expected = record.ev_expected[: record.interval_count]
-    if any(expected) and not all(expected):
+    observed = [
+        record.ev_expected[index]
+        for index in range(record.interval_count)
+        if record.measured[index] is not None
+    ]
+    if not observed:
+        return False
+    if any(observed) and not all(observed):
         return True
-    day_configured = any(expected)
+    day_configured = any(observed)
     return any(snapshot.ev_configured != day_configured for snapshot in snapshots)
 
 
