@@ -104,6 +104,23 @@ class DayForecast:
     #: neighbour instead. Published so a day that is mostly extrapolated cannot
     #: look identical to one that was fully observed.
     filled_intervals: int = 0
+    #: Per-interval fill provenance, chronological and always ``interval_count``
+    #: long. ``True`` means the value at that index was copied from a
+    #: neighbouring interval by :func:`_fill_unknown_intervals` rather than
+    #: blended from observations of its own behavioural slot.
+    #:
+    #: The count above cannot answer *which* intervals were extrapolated, and
+    #: :func:`_fill_unknown_intervals` overwrites the values in place, so
+    #: without this the provenance is destroyed at the moment of filling and
+    #: cannot be reconstructed afterwards from the published forecast. A later
+    #: phase comparing forecast error on modelled versus extrapolated intervals
+    #: needs it, and needs it recorded at issuance.
+    #:
+    #: On a published forecast ``sum(filled) == filled_intervals``. On a
+    #: withheld one the two deliberately differ: ``filled_intervals`` counts the
+    #: intervals that *would* have needed filling, while the mask stays all
+    #: ``False`` because the fill step never ran.
+    filled: list[bool] = field(default_factory=list)
     #: Why nothing is published, or ``None`` when the forecast is available.
     #: Diagnostics only -- this bug was found on a live system where the
     #: withholding was correct but impossible to explain from the outside.
@@ -281,6 +298,7 @@ def build_forecast(
         day_type=day_type,
         interval_count=interval_count,
         intervals=[None] * interval_count,
+        filled=[False] * interval_count,
     )
 
     # A retained day with no valid baseline interval anywhere -- a house-load
@@ -443,6 +461,10 @@ def _fill_unknown_intervals(forecast: DayForecast) -> None:
             continue
         nearest = min(known_indices, key=lambda known: abs(known - index))
         forecast.intervals[index] = forecast.intervals[nearest]
+        # The values themselves become indistinguishable from modelled ones the
+        # instant they are written -- that is the point of filling -- so the
+        # mask is the only surviving record that this index was extrapolated.
+        forecast.filled[index] = True
 
 
 def adapt_today(
