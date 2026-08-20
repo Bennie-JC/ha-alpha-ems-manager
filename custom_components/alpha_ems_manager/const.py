@@ -1098,8 +1098,26 @@ PV_ELECTRICAL_CORRESPONDENCE_UNKNOWN: Final = "unknown"
 #: a forecast of zero.
 PV_UNAVAILABLE_NOT_CONFIGURED: Final = "pv_forecast_not_enabled"
 PV_UNAVAILABLE_NO_SOLCAST_ENTRY: Final = "solcast_entry_not_selected"
-PV_UNAVAILABLE_ENTRY_NOT_LOADED: Final = "solcast_entry_not_loaded"
+#: The stored entry id names no config entry that exists. Provable, unlike the
+#: entry *state* check this replaces.
+#:
+#: beta.9 asked whether the Solcast config entry was in state ``LOADED`` and
+#: refused to read the source when it was not. That produced a live false
+#: negative on every Home Assistant restart: Solcast registers its actions at
+#: component level, so both appear registered while its config entry is still
+#: setting up -- and Alpha EMS takes its first refresh during its own setup,
+#: which can win that race. The result was a capability snapshot reporting both
+#: actions present and the entry "not loaded", held until the next quarter-hour
+#: boundary.
+#:
+#: The state was never needed. Calling a registered action is safe by
+#: definition, and a failure is already caught and reported as
+#: ``PV_UNAVAILABLE_SERVICE_FAILED``. So capability is now established from facts
+#: that can be demonstrated: an entry is selected, that entry exists, and the
+#: actions are registered.
+PV_UNAVAILABLE_ENTRY_NOT_FOUND: Final = "solcast_entry_not_found"
 PV_UNAVAILABLE_SERVICE_MISSING: Final = "solcast_query_service_missing"
+PV_UNAVAILABLE_DIAGNOSTIC_MISSING: Final = "solcast_diagnostic_service_missing"
 PV_UNAVAILABLE_SERVICE_FAILED: Final = "solcast_query_failed"
 PV_UNAVAILABLE_NO_SITES_DISCOVERED: Final = "no_solcast_sites_discovered"
 PV_UNAVAILABLE_EMPTY_SELECTION: Final = "no_solcast_site_selected"
@@ -1110,8 +1128,9 @@ PV_UNAVAILABLE_PERIOD_REFUSED: Final = "source_period_not_a_multiple_of_fifteen"
 PV_UNAVAILABLE_REASONS: Final = (
     PV_UNAVAILABLE_NOT_CONFIGURED,
     PV_UNAVAILABLE_NO_SOLCAST_ENTRY,
-    PV_UNAVAILABLE_ENTRY_NOT_LOADED,
+    PV_UNAVAILABLE_ENTRY_NOT_FOUND,
     PV_UNAVAILABLE_SERVICE_MISSING,
+    PV_UNAVAILABLE_DIAGNOSTIC_MISSING,
     PV_UNAVAILABLE_SERVICE_FAILED,
     PV_UNAVAILABLE_NO_SITES_DISCOVERED,
     PV_UNAVAILABLE_EMPTY_SELECTION,

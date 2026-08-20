@@ -731,8 +731,15 @@ async def test_case_g_a_restart_before_midnight_keeps_the_prediction(
         assert await hass.config_entries.async_reload(setup_integration.entry_id)
         await hass.async_block_till_done()
     restarted = setup_integration.runtime_data
+    # The load-bearing assertion: nothing new was issued, so the prediction
+    # already on disk is the one that stands.
     assert restarted.last_record.issued == ()
-    assert restarted.recorder.duplicate_issuances == 2
+    # Two refreshes now happen on a reload rather than one -- the setup refresh
+    # and the one beta.10 added once Home Assistant reports itself started, which
+    # exists so a value read before the sources had published cannot stand for a
+    # quarter of an hour. Each refresh recognises today and tomorrow as already
+    # issued, so the duplicate tally is two per refresh rather than two in total.
+    assert restarted.recorder.duplicate_issuances == 4
 
     await restarted.history.async_ensure_days([DAY_ONE])
     reloaded = restarted.history.snapshots(DAY_ONE)

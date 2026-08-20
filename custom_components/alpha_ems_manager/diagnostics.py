@@ -53,6 +53,7 @@ from .plan import plan_as_dict
 from .policy import DEFAULT_POLICY, SHIPPED_POLICIES
 from .pv_forecast import PvForecast, pv_error_metrics
 from .solcast_source import SolcastFacts
+from .solcast_source import discover as discover_solcast
 from .storage import DayRecord, elapsed_quarters_for, expected_quarters_for
 
 
@@ -936,7 +937,13 @@ async def async_get_config_entry_diagnostics(
         "control": coordinator.control_report,
         "pv": {
             "enabled": config.use_pv_forecast,
-            "capability": coordinator.pv_capability.as_dict(),
+            # Probed **now**, not read from the last refresh. The two are not the
+            # same thing, and printing a stale capability beside live source
+            # readings is what made the beta.9 defect look like a contradiction:
+            # the block said the source was unusable while the field below it
+            # said it was available, because they described different instants.
+            "capability": discover_solcast(hass, config.solcast_entry_id).as_dict(),
+            "capability_at_last_refresh": coordinator.pv_capability.as_dict(),
             "source": (
                 None if coordinator.pv_facts is None else coordinator.pv_facts.as_dict()
             ),
@@ -974,6 +981,13 @@ async def async_get_config_entry_diagnostics(
                     "caused by this integration"
                 ),
             },
+            # When the forecast blocks above were computed. Everything in them is
+            # a snapshot from that instant; the capability above is not.
+            "last_refresh_at": (
+                None
+                if coordinator.last_refresh_at is None
+                else coordinator.last_refresh_at.isoformat()
+            ),
             "daylight_note": (
                 "the daylight window is advisory: it never modifies a forecast "
                 "value and sits on no safety path. generation forecast outside it "

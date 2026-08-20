@@ -45,11 +45,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 
 from .const import (
-    PV_UNAVAILABLE_ENTRY_NOT_LOADED,
+    PV_UNAVAILABLE_DIAGNOSTIC_MISSING,
+    PV_UNAVAILABLE_ENTRY_NOT_FOUND,
     PV_UNAVAILABLE_NO_SOLCAST_ENTRY,
     PV_UNAVAILABLE_SERVICE_MISSING,
     SOLCAST_DOMAIN,
@@ -79,42 +79,84 @@ _SITE_FIELDS = (
 
 @dataclass(frozen=True, slots=True)
 class SolcastCapability:
-    """What of the Solcast boundary was found, named even when absent."""
+    """What of the Solcast boundary was found, named even when absent.
+
+    Every field here is a fact that can be demonstrated. There is deliberately
+    **no config-entry state check**, and that is the beta.10 correction.
+
+    beta.9 required the Solcast config entry to be in state ``LOADED``. That
+    produced a live false negative on every Home Assistant restart. Solcast
+    registers its actions at component level, so both are visible while its
+    config entry is still setting up -- and Alpha EMS takes its first refresh
+    during its own setup, which can win that race. The captured snapshot then
+    reported both actions present *and* the entry not loaded, which is precisely
+    the combination the live installation showed, and it stood until the next
+    quarter-hour boundary.
+
+    The state was never load-bearing. Calling a registered action is safe by
+    definition, and a failure is caught and reported as a failed call rather than
+    guessed at in advance. What matters is that an entry is selected, that it
+    exists, and that the actions are there to call.
+    """
 
     entry_selected: bool = False
-    entry_loaded: bool = False
+    #: The selected id names a config entry that exists. Provable, and unlike the
+    #: former state check it cannot be true one moment and false the next while
+    #: the integration is perfectly usable.
+    entry_found: bool = False
     query_service: bool = False
     diagnostic_service: bool = False
 
     @property
     def usable(self) -> bool:
         """Return whether a forecast can be requested at all."""
-        return self.entry_selected and self.entry_loaded and self.query_service
+        return self.entry_selected and self.entry_found and self.query_service
+
+    @property
+    def discoverable(self) -> bool:
+        """Return whether the site list can be read.
+
+        Separate from :attr:`usable`, because an installation with a stored
+        selection can still fetch a forecast without re-reading the site list.
+        """
+        return self.usable and self.diagnostic_service
 
     @property
     def unavailable_reason(self) -> str | None:
-        """Return why the boundary is unusable, most specific cause first."""
+        """Return why the boundary is unusable, most specific cause first.
+
+        Every branch names something that was actually checked. There is no
+        "not loaded" any more, because that state could not be proven from
+        anything the source reliably exposes.
+        """
         if not self.entry_selected:
             return PV_UNAVAILABLE_NO_SOLCAST_ENTRY
-        if not self.entry_loaded:
-            return PV_UNAVAILABLE_ENTRY_NOT_LOADED
+        if not self.entry_found:
+            return PV_UNAVAILABLE_ENTRY_NOT_FOUND
         if not self.query_service:
             return PV_UNAVAILABLE_SERVICE_MISSING
+        if not self.diagnostic_service:
+            return PV_UNAVAILABLE_DIAGNOSTIC_MISSING
         return None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the diagnostics form, naming what was looked for."""
         return {
             "entry_selected": self.entry_selected,
-            "entry_loaded": self.entry_loaded,
+            "entry_found": self.entry_found,
             "query_forecast_data": self.query_service,
             "diagnostic": self.diagnostic_service,
             "usable": self.usable,
+            "discoverable": self.discoverable,
             "unavailable_reason": self.unavailable_reason,
             "basis": (
                 "two read-only actions, both response-only and both served from "
                 "the Solcast integration's own cache; neither consumes the "
-                "account's API allowance"
+                "account's API allowance. capability is established from the "
+                "entry existing and the actions being registered, never from the "
+                "entry's setup state -- that state is not needed to call a "
+                "registered action, and requiring it produced a false negative "
+                "on every restart"
             ),
         }
 
@@ -128,11 +170,9 @@ def discover(hass: HomeAssistant, entry_id: str | None) -> SolcastCapability:
     if not entry_id:
         return SolcastCapability()
 
-    entry = hass.config_entries.async_get_entry(entry_id)
-    loaded = entry is not None and entry.state is ConfigEntryState.LOADED
     return SolcastCapability(
         entry_selected=True,
-        entry_loaded=loaded,
+        entry_found=hass.config_entries.async_get_entry(entry_id) is not None,
         query_service=hass.services.has_service(
             SOLCAST_DOMAIN, SOLCAST_SERVICE_QUERY_FORECAST
         ),

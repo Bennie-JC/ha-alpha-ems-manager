@@ -30,6 +30,7 @@ from homeassistant.helpers.event import (
     async_track_time_change,
     async_track_time_interval,
 )
+from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.sun import get_astral_event_date
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -78,7 +79,6 @@ from .const import (
     DEFAULT_CONTROL_HORIZON_MINUTES,
     DEFAULT_GRID_POWER_SIGN,
     DOMAIN_FRANK,
-    DOMAIN_SOLCAST,
     INHIBIT_NO_DECISION,
     INHIBIT_NO_PLAN,
     INHIBIT_PLAN_UNAVAILABLE,
@@ -552,6 +552,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: per-site entity, which would multiply entities for information that is
         #: read once and then acted on by nobody.
         self.pv_capability: SolcastCapability = SolcastCapability()
+        #: Whether the one-time site-membership write has already been scheduled
+        #: this session. Without it a refresh that overlaps the pending write
+        #: would schedule a second one.
+        self._pv_selection_write_scheduled = False
+        #: When the last refresh ran. Everything in the published data is a
+        #: snapshot from this instant, and saying so is what stops a reader
+        #: comparing it against a live figure and concluding the two contradict.
+        self.last_refresh_at: datetime | None = None
         self.pv_facts: SolcastFacts | None = None
         #: The most recent forecast per target day. Rebuilt every refresh.
         self.pv_forecasts: dict[date, PvForecast] = {}
@@ -587,6 +595,24 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             QuarterAccumulator(tz, sanitizer=sanitize_pv_w)
             if self.config.has_pv and self.config.pv_power_entity
             else None
+        )
+
+        # Home Assistant has not necessarily finished starting when this entry is
+        # set up, and the first refresh happens during that setup. Anything read
+        # then is provisional: the AlphaESS Modbus sensors may not have published
+        # a value yet, and an integration this one consumes may still be loading
+        # its own config entry. Because refreshes are driven by the quarter-hour
+        # tick rather than an interval, a provisional reading would otherwise
+        # stand for up to fifteen minutes -- which is exactly the beta.9 defect,
+        # where a Solcast entry still setting up left the PV layer unusable and a
+        # battery state of charge that had not yet published left the plan
+        # reporting a missing input, both of them beside live values in
+        # diagnostics that plainly contradicted them.
+        #
+        # ``async_at_started`` fires immediately when Home Assistant is already
+        # running, so a reload behaves the same way as a cold boot.
+        self.entry.async_on_unload(
+            async_at_started(self.hass, self._handle_hass_started)
         )
 
         watched = [
@@ -760,6 +786,25 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _handle_source_change(self, event: Event) -> None:
         """Integrate on every published change of the house-load entity."""
         self._sample(dt_util.now())
+
+    @callback
+    def _handle_hass_started(self, _hass: HomeAssistant) -> None:
+        """Replace the setup-time snapshot once everything else is up.
+
+        A refresh rather than a partial re-read, because every layer took its
+        provisional values from the same instant: the sources, the consumed
+        integrations and the derived plan. Re-running one of them would leave the
+        others stale and the payload internally inconsistent, which is what made
+        the beta.9 symptom so confusing to read.
+
+        ``async_refresh`` rather than ``async_request_refresh``, deliberately.
+        The requesting form is debounced, so a startup refresh and a user action
+        arriving within the cooldown collapse into one -- and the survivor can be
+        the one taken *before* the user acted, leaving their change unreflected
+        until the next quarter-hour tick. This fires once at startup and is not
+        something to rate-limit against.
+        """
+        self.hass.async_create_task(self.async_refresh())
 
     @callback
     def _handle_safety_sample(self, now: datetime) -> None:
@@ -1367,6 +1412,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Recompute forecasts and confidence from the learned history."""
         now = dt_util.now()
+        self.last_refresh_at = now
         tz = dt_util.get_default_time_zone()
         today = now.date()
         tomorrow = today + timedelta(days=1)
@@ -1877,6 +1923,29 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 PV_UNAVAILABLE_NO_SITES_DISCOVERED,
             )
 
+        # Scheduled rather than written inline. Writing the options fires this
+        # entry's own update listener, which reloads the entry -- and doing that
+        # from inside a running refresh tears down the coordinator halfway
+        # through the very refresh that had just resolved the answer. The task
+        # runs once the refresh has finished, so the reload is clean.
+        #
+        # The resolved set is returned and used immediately, so this refresh
+        # already produces a PV-aware plan rather than waiting for the reload.
+        if not self._pv_selection_write_scheduled:
+            self._pv_selection_write_scheduled = True
+            self.hass.async_create_task(self._async_store_site_selection(discovered))
+        return discovered, PV_SELECTION_ORIGIN_AUTO, None
+
+    async def _async_store_site_selection(self, discovered: tuple[str, ...]) -> None:
+        """Persist the resolved site membership exactly once.
+
+        Re-checked before writing: a refresh may have overlapped with the user
+        answering the question themselves in the options form, and their answer
+        must win over a default resolved from discovery.
+        """
+        self.config = SourceConfig.from_entry(self.entry)
+        if self.config.solcast_selection_stored:
+            return
         self.hass.config_entries.async_update_entry(
             self.entry,
             options={
@@ -1884,13 +1953,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 CONF_SELECTED_SOLCAST_SITE_IDS: list(discovered),
             },
         )
-        self.config = SourceConfig.from_entry(self.entry)
         _LOGGER.info(
-            "Solcast site membership resolved to %s on first discovery and stored; "
-            "a site added later will be reported as available but not selected",
+            "Solcast site membership resolved to %s on first discovery and "
+            "stored; a site added later will be reported as available but not "
+            "selected",
             ", ".join(discovered),
         )
-        return discovered, PV_SELECTION_ORIGIN_AUTO, None
 
     def _pv_provenance(
         self,
@@ -2370,10 +2438,22 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @property
     def solcast_available(self) -> bool:
-        """Return whether the configured Solcast entry is loaded."""
+        """Return whether the Solcast source can actually be read right now.
+
+        Delegates to the same capability probe the PV layer uses, so the two can
+        never disagree. They did in beta.9, and the disagreement is what made the
+        defect so hard to read: this property asked whether the config entry was
+        in state ``LOADED`` and answered *yes* at download time, while the PV
+        block carried a snapshot from a refresh where the entry had not finished
+        setting up and answered *no*. Two definitions and two instants, printed
+        side by side as though they described the same thing.
+
+        One definition now, and it is the one that matters: can the two read-only
+        actions be called.
+        """
         if not self.config.use_pv_forecast:
             return False
-        return self._entry_loaded(DOMAIN_SOLCAST, self.config.solcast_entry_id)
+        return discover_solcast(self.hass, self.config.solcast_entry_id).usable
 
     # -- accessors used by sensors and diagnostics ------------------------
 
