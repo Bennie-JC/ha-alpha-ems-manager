@@ -17,9 +17,9 @@ battery.** The final step is unreachable, not merely switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.8` — a public beta.**
+> **Current release: `1.0.0-beta.9` — a public beta.**
 >
-> The integration is feature-complete for Phase 4 and covered by 1545 automated
+> The integration is feature-complete for Phase 5 and covered by 1844 automated
 > tests, but the learning and forecast model has **not** yet been validated
 > across enough real-world complete days to be called stable. Treat it as
 > something to run and observe, not yet as something to depend on.
@@ -59,7 +59,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.8` is not offered.
+     dialog if `1.0.0-beta.9` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -204,6 +204,61 @@ before your inverter returned to normal by itself) and an export safety margin.
 Alpha EMS uses the AlphaESS package's own helpers and its own tested write
 sequence. It never writes a Modbus register directly.
 
+### Solar forecast (new in Phase 5)
+
+Alpha EMS was completely blind to the sun until now. It read your PV sensor for
+the energy-balance check and nothing else, which had a visible consequence: on a
+sunny afternoon it would recommend discharging the battery to cover a load the
+panels were already covering.
+
+Phase 5 fixes that by reading a forecast from the **Solcast PV Forecast**
+integration you already have, and netting expected production against predicted
+load *before* the battery is asked for anything. When the sun covers the house,
+the recommendation is to hold — not because a new rule was added, but because the
+existing one is now shown the right number.
+
+Nothing is polled. Alpha EMS calls two read-only Solcast actions, both of which
+serve that integration's own cache and **consume none of your API allowance**.
+The mutating ones — update, force-update, clear-data, set-options, dampening,
+hard-limit — appear nowhere in the source, and a test proves it.
+
+**One new setting: which sites are yours.** A Solcast account can hold rooftop
+sites that have nothing to do with this system — a second property, someone
+else's array — and folding those into your plan would be silently wrong. So
+**Options → Sources** now lists your Solcast sites by name and asks you to tick
+the ones that feed this AlphaESS system. On an upgrade every site found is
+selected for you and written down once; a site you add to Solcast later is
+reported as available but is *not* added to your plan without you saying so.
+
+You are never asked which site connects to which inverter, or which is AC- or
+DC-coupled. That is not something most people can answer reliably, and a guessed
+answer recorded as fact would be worse than the honest "unknown" that is stored
+instead.
+
+**Measured production is now recorded too**, per quarter-hour, so the forecast can
+be checked against what the panels actually did. Both sides are kept raw:
+nothing adjusts the forecast in response to being wrong, and a bad day cannot
+change the next one. Every interval is labelled with why it could or could not be
+compared — no forecast, no reading, night, one site quiet, not yet elapsed — which
+is what a later phase would need in order to learn from it honestly.
+
+**The projected state of charge is now realistic**, where your inverter's own
+state says it is storing surplus. If **Excess Export** is on it is not, because
+that feature deliberately sends production to the grid instead — so the projection
+says so and reports itself as a lower bound rather than quietly overstating your
+battery.
+
+**And the export safety check is now measured rather than reconstructed.** Beta.8
+compared a proposed discharge against your house load alone, which was
+under-protective whenever the panels were already covering that load: on this
+installation, real samples with 3.1 kW of PV against 2.0 kW of load passed a check
+that should have refused, because the site was already exporting a kilowatt before
+the battery was asked to add to it. The absorbing capacity is now taken from the
+meter — `import − export + battery discharge` — which is the instrument that
+defines export. It needs no PV term at all, so no daylight rule and no assumption
+about how your arrays are wired, and it accounts for loads your house-load sensor
+cannot see.
+
 ## What it does **not** do yet
 
 - ❌ No automatic battery control. It never writes to your inverter.
@@ -211,18 +266,22 @@ sequence. It never writes a Modbus register directly.
 - ❌ No energy arbitrage or price-based trading.
 - ❌ No EV charge scheduling. Phase 1 only *separates* EV consumption from the
   baseline; it never starts, stops or plans charging.
-- ❌ No Solcast-driven optimisation. The PV forecast source is validated and
-  reported in diagnostics, but it does not influence the load model.
+- ❌ No Solcast-driven *optimisation*. The forecast reduces what the battery is
+  asked to supply and makes the projection realistic, but nothing schedules,
+  trades or charges on the strength of it. It also never changes the learned
+  household load, which is defined to be independent of production.
 - ❌ No self-correction. Phase 2 *records* forecast error; it does not feed it
   back into the model. Nothing adjusts itself in response to being wrong.
 - ❌ **No battery control, still.** Phase 4 builds the entire control path --
   translation, safety checks, the exact command -- and cannot execute it. No
   service call reaches your inverter, and that is enforced by a build-time
   constant rather than by a setting.
-- ❌ No PV-aware battery planning. The simulation has no solar production term
-  until Phase 5, so it answers "what if there were no sun" — see
-  [Known limitations](#known-limitations).
-- ❌ No price-aware or economic battery planning, and no automatic charging.
+- ❌ No price-aware or economic battery planning, and no automatic charging. No
+  cheap-hour buying, no reserve sized for tomorrow's weather, no overnight
+  carry-over, no arbitrage. Expected production is an input to the plan, never a
+  reason to buy or sell.
+- ❌ No self-learning PV correction. Forecast and actual are both recorded raw;
+  nothing is adjusted in response to error.
 - ❌ No stopping or continuing a dispatch. Nothing in the AlphaESS control
   surface records *who* started one, so Alpha EMS cannot prove a running dispatch
   is its own -- and it will never modify or cancel one it cannot prove it
@@ -754,21 +813,38 @@ Beyond the Phase-1 scope listed at the top, these are the current honest caveats
   worse than the warning. It **cannot** affect learning — the check is a quality
   signal and can never reject an interval — and it cannot affect forecast-error
   scoring either. It does slightly depress the reported confidence score.
-- **The battery simulation cannot see your solar.** Production forecasting is
-  Phase 5, so the simulation answers a deliberately narrow question: given the
-  predicted household load and *no other generation*, what happens to the
-  battery. On a sunny day the real state of charge will be higher than the
-  projection in diagnostics, and the simulated grid import will be well above
-  what you actually import. That is why the projected state of charge is **not**
-  published as an entity. `Usable Battery Energy` and `Battery Recommendation` are
-  unaffected — neither depends on production.
+- **The simulation can see your solar now, but only as well as Solcast can.**
+  Where a forecast covers an interval, production is netted against predicted load
+  and surplus is modelled as stored — so the projection is realistic rather than
+  the "what if there were no sun" answer beta.8 gave. Three caveats remain, and
+  diagnostics states which applies. Without a forecast an interval is still
+  PV-blind. With **Excess Export** on, your inverter deliberately sends surplus to
+  the grid instead of the battery, so the projection is reported as a *lower*
+  bound. And forecast and measured production sit on different electrical
+  boundaries — your PV figure sums DC strings and an AC meter, and Solcast does
+  not state its own — so a persistent difference between them is a property of the
+  installation rather than forecast error. That is recorded, never corrected.
+  The projected state of charge is still not published as an entity.
 - **`Usable Battery Energy` is an upper bound.** It applies a single round-trip
   efficiency figure, which flatters a real inverter at low power, and it does not
   model the inverter's own standby draw. Both make the number slightly optimistic.
   Neither is guessed at, because doing so would mean inventing figures for your
   hardware.
-- **Solcast is validated but unused by the model.** The PV forecast source is
-  checked and reported in diagnostics; it does not yet influence the load model.
+- **Which Solcast site is on which inverter is unknown.** Solcast divides a roof
+  by orientation and AlphaESS divides it by electrical coupling, so having the
+  same number of each proves nothing. You declare which sites are *yours*, and
+  that is all that is asked; the correspondence is recorded as unknown rather than
+  guessed. It is not needed for planning, and it would matter only to a later
+  phase trying to attribute a difference between forecast and actual.
+- **Clipping looks like forecast error, and is flagged rather than corrected.** If
+  your array can out-produce your inverter's AC limit, the forecast will exceed
+  the measured figure on the best days by design. Where the limit is readable, the
+  day is flagged; where it is not, the check is switched off rather than guessing a
+  ceiling.
+- **Solcast's own settings can change what "raw" means.** If you enable its
+  auto-dampening or actuals blending, the series Alpha EMS reads has already been
+  adjusted by something else. Both are recorded in diagnostics, and both were off
+  on the installation this was built against.
 - **No in-place upgrade from 0.1.0.** The configuration models share no keys.
 - **Single house-load source.** Multi-phase or multi-meter summing is not
   supported; provide one already-summed power sensor.

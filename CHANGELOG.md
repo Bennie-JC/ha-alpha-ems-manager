@@ -9,6 +9,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.9] - 2026-08-20
+
+**Phase 5: Solcast PV Forecast Integration.** Alpha EMS was completely blind to
+the sun. It read your PV sensor for the energy-balance check and nothing else,
+which had a visible consequence: on a sunny afternoon it recommended discharging
+the battery to cover a load the panels were already covering.
+
+It now reads a forecast from the Solcast integration you already have and nets
+expected production against predicted load *before* the battery is asked for
+anything. No new policy and no new objective: the existing rule is simply shown
+the right number.
+
+**Nothing is polled, and no API allowance is consumed.** Two read-only Solcast
+actions, both served from that integration's own cache. Every mutating one appears
+nowhere in the source, and a test proves it.
+
+**Execution is still unavailable.** Phase 4's barrier is untouched: no command
+reaches your inverter, `active` still cannot execute, and an active-mode refresh
+with a forecast in hand still makes exactly zero service calls.
+
+### Added
+
+- **A PV forecast on the existing quarter-hour identity.** Half-hourly source
+  periods are split piecewise-constant, so the quarters sum to exactly the period
+  energy and no intra-period shape is invented. The period length is *measured*
+  from consecutive timestamps rather than assumed — every row this project has
+  seen was thirty minutes, which is precisely why assuming it would be untestable.
+  Daylight saving needs no special case, because mapping is by instant: the
+  repeated autumn hour produces two distinct intervals and the spring gap has no
+  rows.
+- **One new setting: which Solcast sites are yours.** A Solcast account can hold
+  sites that have nothing to do with this system, and folding those into your plan
+  would be silently wrong. **Options → Sources** now lists your sites by name and
+  asks you to tick the ones that feed this AlphaESS system. On upgrade every site
+  found is selected and written down once; a site added later is reported as
+  available but never joins your plan on its own. Stable identifiers are stored,
+  so renaming a site changes nothing.
+
+  You are never asked which site is AC- or DC-coupled, or which feeds the hybrid.
+  Most people cannot answer that reliably, and a guessed answer recorded as fact
+  would be worse than the honest unknown stored instead.
+- **Measured production, recorded per quarter-hour**, on the same machinery as
+  house load and subject to the same coverage rule. A missing interval is missing,
+  never zero.
+- **Forecast-versus-actual evidence**, with both sides kept raw. Every interval
+  carries a code saying why it could or could not be compared — no forecast, no
+  reading, night, one declared site quiet, not yet elapsed — because a single
+  residual that folds those together is not evidence of anything.
+- **Tenth and ninetieth percentile bands at interval resolution.** They cost
+  nothing to fetch and cannot be recovered once a day has passed.
+- **A `pv` diagnostics section**, and a `pv_aware` attribute on `Battery
+  Recommendation` — the one fact needed to read the recommendation that cannot
+  live in prose, because prose cannot be automated against.
+
+### Fixed
+
+- **The export safety check was under-protective, and live data caught it.** It
+  compared a proposed discharge against your house load alone, which is wrong
+  whenever the panels are already covering that load. Three real shadow-mode
+  samples show it: at 15:33 the house drew 2071 W against 3132 W of PV, so the
+  site was exporting a kilowatt and the absorbing capacity was the 22 W of import
+  actually recorded — and the check read 2071 W and passed.
+
+  Capacity is now measured where export is defined: `grid import − grid export +
+  battery discharge`. A forced discharge first displaces import and only spills
+  onto the grid once import reaches zero, so that expression is the bound, derived
+  rather than tuned. Subtracting PV from house load would also have caught all
+  three, but the meter needs no PV term at all — no assumption about how your
+  arrays are wired, no exposure to the vendor's filter on the PV signal, and no
+  daylight rule for a sensor that legitimately reads zero all night. It also
+  bounds loads your house-load sensor cannot see, which on this installation is
+  about 1.4 kW.
+
+  The check still refuses whole commands and still never scales one. Two
+  conditions were *added* rather than replaced — an unreadable meter and a stale
+  one both refuse — so it is strictly tighter than before.
+- **PV finally has the sanitisers the other sources always had.** It had a bare
+  non-negative check and no plausibility ceiling, so a spike to a million watts
+  was accepted and inflated the energy-balance allowance — making the check most
+  permissive exactly when the entity was most obviously wrong — while half a watt
+  of noise below zero was thrown away as unreadable. Both are now the right way
+  round.
+- **Stale interface wording.** The PV source is no longer described as "recorded
+  for the energy-balance check only", and the forecast option no longer says it
+  merely validates that the source is reachable.
+
+### Changed
+
+- **The projected state of charge is realistic where your inverter is storing
+  surplus, and says so where it is not.** With **Excess Export** on, that feature
+  deliberately sends production to the grid rather than the battery — so the
+  projection reports itself as a lower bound instead of overstating your battery.
+  The same applies while Peak Shaving is on or a dispatch is running. The PV-blind
+  disclaimer was made conditional rather than deleted: it exists because a visibly
+  wrong figure costs more trust than it buys, and a partly covered horizon is
+  still partly wrong.
+- **Storage: learning history 2.2 → 2.3, forecast history 1.2 → 1.3.** Both minor.
+  Every earlier document is read unchanged and simply written back in the newer
+  form; nothing migrates and nothing is discarded. The config entry stays at
+  version 2, so no reinstall is needed and no history is lost.
+
+### Not in this release
+
+No prices, no cheap-hour buying, no reserve sized for tomorrow's weather, no
+overnight carry-over, no arbitrage, and no self-learning correction of any kind.
+Expected production is an input to the plan, never a reason to buy or sell. A
+forecast that turned out badly cannot change the next one — asserted both
+behaviourally and structurally.
+
+### Verification
+
+Tests 1545 → 1844, including sixteen new mutations that break a Phase-5 invariant
+and prove a test notices. Writing them found three real defects, each fixed here:
+a hole in the source series silently stretched every row across the gap and
+fabricated generation; the selection origin reported a user decision on the very
+refresh that had resolved it automatically; and an unreadable Excess Export
+boolean was indistinguishable from one switched off, which is the unsafe direction
+for the surplus question. A fourth was caught by an existing test the moment the
+device read was added — it could take down a whole refresh.
+
+Phases 1 to 4 are asserted unchanged rather than assumed: the whole integration is
+driven twice at the same instant, once with a forecast and once without, and every
+Phase-1 and Phase-2 figure is compared along with the stored baselines themselves.
+`test_pv_independence.py` and `test_stale_zero_pv.py` pass unmodified.
+
 ## [1.0.0-beta.8] - 2026-08-20
 
 **Phase 4: AlphaESS Actions & Control.** The integration now builds the complete
@@ -980,7 +1105,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.8...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.9...HEAD
+[1.0.0-beta.9]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.8...v1.0.0-beta.9
 [1.0.0-beta.8]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.7...v1.0.0-beta.8
 [1.0.0-beta.7]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.6...v1.0.0-beta.7
 [1.0.0-beta.6]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.5...v1.0.0-beta.6

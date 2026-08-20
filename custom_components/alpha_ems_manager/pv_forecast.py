@@ -1288,8 +1288,14 @@ def pv_error_metrics(
             "flags": list(outcome.flags),
         }
 
-    predicted = [snapshot.predicted[index] or 0.0 for index in indices]
-    measured = [outcome.actual[index] or 0.0 for index in indices]
+    # ``scored_indices`` only contains intervals where both sides were present, so
+    # neither lookup can be ``None`` here. Asserted rather than defaulted with
+    # ``or 0.0``: that idiom is indistinguishable from silently reading a missing
+    # value as zero, which is the one thing this whole layer exists to avoid.
+    predicted = [snapshot.predicted[index] for index in indices]
+    measured = [outcome.actual[index] for index in indices]
+    assert all(value is not None for value in predicted)
+    assert all(value is not None for value in measured)
     total_predicted = sum(predicted)
     total_measured = sum(measured)
     absolute = sum(abs(p - m) for p, m in zip(predicted, measured, strict=True))

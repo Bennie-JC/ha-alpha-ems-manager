@@ -72,6 +72,13 @@ The pure modules carry the interesting logic deliberately: they can be tested
 against synthetic timelines without a Home Assistant instance, which is why the
 DST and forecast tests are fast and exhaustive.
 
+### Phase-5 modules
+
+| Module | Role |
+|---|---|
+| `pv_forecast.py` | the production model, the mapping, both fingerprints, provenance and the evidence pair. Pure |
+| `solcast_source.py` | the read-only source boundary. Fetches values and decides nothing |
+
 ### Phase-3 modules
 
 | Module | Role |
@@ -1488,6 +1495,299 @@ control entities and nothing else, and a Phase-3 fault does not take the control
 layer down with it. Both directions are tested.
 
 
+## Phase 5: the PV forecast
+
+Alpha EMS was blind to the sun. It read the PV entity for the energy-balance check
+and nothing else, which had a visible consequence rather than a theoretical one:
+on a sunny afternoon the recommendation was to discharge the battery to cover a
+load the panels were already covering, and the export gate agreed to it.
+
+### Modules
+
+| Module | Pure? | Role |
+|---|---|---|
+| `pv_forecast.py` | yes | the model, the thirty-to-fifteen-minute mapping, both fingerprints, provenance, the snapshot/outcome evidence pair and the scoring |
+| `solcast_source.py` | no | capability discovery, site discovery, the two read-only calls, response parsing |
+
+### Energy is the primitive, and the unit is read once
+
+The source publishes **average power in kilowatts** per period. Conversion happens
+once, at the boundary, and everything downstream is kilowatt-hours per
+chronological quarter-hour — the same unit and the same index as
+`LoadForecast.intervals`. That identity *is* the compatibility contract later
+phases depend on: any consumer that handles one handles the other with no
+alignment code.
+
+Reading that figure as interval energy is the single most plausible mistake
+available, and on a thirty-minute source it doubles every number. It has its own
+mutation test, as does reading the offset-aware timestamp as UTC — which moves the
+whole day, two hours on this installation, from index 48 to index 56.
+
+### Piecewise-constant, and the period is measured
+
+A period covering two quarters gives each quarter the same average power, so the
+two sum to exactly the period's energy. A curve between periods would invent
+intra-period shape the source never published, and would not conserve energy.
+
+The period length is measured from consecutive timestamps. Every row this project
+has seen was thirty minutes, which is exactly why assuming it would be untestable:
+a resolution change would silently halve or double every stored series.
+
+Two subtleties that cost real defects while being written:
+
+* **A row covers its own period and never more than the gap to the next row.**
+  Rows cannot overlap. Without the second half of that rule, a hole in the series
+  made the measured gap sixty minutes and every row was then stretched across an
+  hour — fabricating generation for precisely the intervals the source had
+  declined to describe.
+* **Two rows an hour apart cannot be told from a half-hourly series with one row
+  missing.** There is no way to know from the response, so the measured period is
+  *reported* rather than guessed at. Reporting it is the whole reason it is
+  measured.
+
+DST needs no special case, because mapping is by instant: the repeated autumn hour
+yields two distinct chronological indices sharing one wall-clock slot, and the
+spring gap simply has no rows.
+
+### Missing is missing
+
+`None` means no forecast for that interval, and it is never zero. Zero is a
+forecast of no generation — true after dark and a fault at noon — and collapsing
+the two makes the whole evidence layer meaningless.
+
+### Site membership is declared, never inferred
+
+A Solcast account can hold sites that have nothing to do with the AlphaESS system
+a config entry manages. Consuming the aggregate unconditionally folds those into
+the plan, and no amount of provenance recovers a number that was already wrong
+when it was summed. So Phase 5 adds exactly one configuration key,
+`selected_solcast_site_ids`, and asks exactly one question: which sites belong
+here.
+
+The user is **never** asked to classify a site as AC- or DC-coupled, hybrid-side
+or grid-inverter-side. Solcast partitions a roof by *orientation* and AlphaESS
+partitions it by *electrical coupling*, so equal site counts prove nothing — and
+that correspondence is not reliably knowable to a user. It is recorded as
+`electrical_correspondence: unknown`, and a structural test proves no
+configuration key and no translated string asks about it.
+
+Three states are kept distinct because they are three different facts:
+
+| Stored | Meaning |
+|---|---|
+| nothing | resolve to every discovered site and **write that down once** |
+| a set | use it exactly; a site the source no longer offers stays in it, reported as missing |
+| an empty set | a named unavailability. Falling back to everything would overrule a decision |
+
+Persisting the default is the load-bearing part. Resolving "all of them" afresh
+every refresh would mean a site added to Solcast next year silently joining this
+installation's plan, which is the failure the option exists to prevent.
+
+Two fingerprints, and **neither contains the display name**: `selected_sites_identity`
+over the identifier set, and `selected_sites_model` over
+`(resource_id, capacity, capacity_dc, azimuth, tilt, loss_factor)` plus the
+source's own exclusions. A rename is the same roof; a re-tilt is not. `loss_factor`
+is in the model key because it scales every figure the source returns — an earlier
+draft omitted it, so a site rescaled from 0.9 to 0.85 would have looked identical.
+
+### Aggregate and subset
+
+All sites selected uses the source's own aggregate in one request. A strict subset
+queries each declared site and sums them per interval, with P10, P50 and P90 summed
+independently — none derived from another. Neither path costs API allowance, which
+is what makes the subset path usable at all on an account with ten calls a day.
+
+A declared site missing an interval never contributes a zero. The sum of what
+reported is kept, tagged `partial_sites` with the contributing count, and excluded
+from scoring. It is a known *under*-estimate — the benign direction, because
+understated production raises net demand while export protection comes from the
+meter.
+
+**Percentile sums are not calibrated percentiles.** Adding each site's
+tenth-percentile outcome assumes every site has its bad day simultaneously, which
+bounds the aggregate *more* conservatively than the true joint tenth percentile.
+Safe to compute, but a reserve calculation that treated it as a calibrated band
+would size against a scenario far rarer than one day in ten. Hence
+`percentile_aggregation`, which is `comonotonic_sum` for our sums and
+`source_aggregate` where the source did its own and we do not know its convention.
+
+### The read-only boundary
+
+Two actions, `query_forecast_data` and `diagnostic`. Both response-only, both
+served from the source integration's cache, neither consuming allowance. The
+service-caller guard was widened from one module to two — deliberately, and with
+three companions that together say more than the single-caller rule did:
+
+1. Every call site names its domain and action **statically**, resolved through
+   the constants. This is the mirror image of the Phase-4 adapter, whose single
+   call site passes variables from a planned command; between them neither module
+   can reach an arbitrary domain, and they fail closed in opposite directions.
+2. **No function takes a domain or an action as an argument**, which is what stops
+   a helpful `_call(domain, service, data)` appearing later and becoming the
+   escape hatch.
+3. Every mutating Solcast action is named once in `const` and proven to appear
+   nowhere else.
+
+API keys are dropped at the boundary: only named fields are read out of the
+response at all, so "no key material is exposed" is a property of the code rather
+than a promise. A test asserts it against a response that carries one.
+
+### The plan sees net demand
+
+Production is netted against load in AC energy **before** anything is converted,
+and floored — so at most one of net demand and surplus is non-zero and the
+single-direction-per-interval invariant is preserved structurally. Netting after
+conversion destroys energy invisibly, for the same reason `BatteryRequest` refuses
+a signed power.
+
+The seam is one property. `IntervalDemand.power_kw` derives from net demand, and
+`ReserveGuardPolicy` already asks for the discharge that covers the demand it is
+shown — so when the sun covers the house it asks for nothing, entirely by its
+existing rule. **No policy gained an objective**, and with no forecast the value is
+the raw baseline exactly as before.
+
+### Surplus absorption is ambient, conditional, and cannot become a command
+
+The inverter storing surplus is environment, not intent. Three properties keep it
+that way:
+
+* it applies **only** where the policy asked for nothing, so no interval carries
+  both a requested direction and an ambient one;
+* it goes through `battery.apply_request`, so the power limit, the headroom and
+  the one-way efficiency apply once, where they are implemented;
+* `ControlIntent` derives from the *policy's* action, and a structural test
+  asserts the control layer cannot even name a trajectory.
+
+**It is not unconditional physics, and the approved design was wrong about that.**
+The vendor control surface says so in its own notes: with **Excess Export** on, PV
+below the inverter's AC limit is directed to house load and feed-in and the battery
+is charged with *zero*. Peak Shaving arms its own dispatch, and the dispatch
+vocabulary contains modes that forbid charging. What does *not* gate it is the
+charging/discharging settings helper, whose four options cover grid charging and
+timed discharge only — which is why baseline self-consumption is real in the
+default configuration.
+
+So it is predicated on observable state, and the distinction that matters is
+between a helper that is **absent** and one that is **unreadable**:
+
+| Observed | Absorption |
+|---|---|
+| a feature is on, or a dispatch is running | not modelled |
+| a feature exists and cannot be read | not modelled — it could be suppressing it invisibly |
+| the features do not exist here | **modelled** — nothing can be suppressing them |
+
+Reading absence as ignorance would leave every installation without the vendor
+package permanently pessimistic about its own battery, which is wrong rather than
+cautious. When absorption is not modelled the surplus becomes simulated export,
+which projects a *lower* state of charge and never claims stored energy the
+inverter is sending to the grid.
+
+Neither feature boolean is in `REQUIRED_ENTITIES`, so neither appears in
+`missing` or `unavailable` — which originally made an unreadable Excess Export
+indistinguishable from one switched off, the unsafe direction. `DeviceCapability`
+now carries both raw states the way it already carried the failsafe state.
+
+This reads the inverter's state in **every** control mode, including `off`.
+Reading is not controlling: `off` still means no writes and no attempted control,
+and the off-mode report says so explicitly rather than leaving the old claim to
+become untrue.
+
+### The export gate is measured, not reconstructed
+
+Beta.8 compared a proposed discharge against house load alone, which is
+under-protective whenever production already covers that load. Three live
+shadow-mode samples show it — at 15:33, 2071 W of house load against 3132 W of PV,
+so the site was exporting a kilowatt and the absorbing capacity was the 22 W of
+import recorded, while the gate read 2071 W and passed.
+
+    capacity = max(0, grid_import - grid_export + battery_discharge)
+
+A forced discharge first displaces import and only spills onto the grid once
+import reaches zero, so that expression is the bound — derived, not tuned.
+Subtracting PV from house load would also have caught all three, but the meter
+needs no PV term at all: no answer to the mixed DC/AC boundary question, no
+exposure to the vendor's low-pass filter on the PV signal, and no daylight rule
+for a sensor that legitimately reads zero all night. It also bounds loads no
+house-load sensor sees — about 1.4 kW on this installation.
+
+Two conditions were **added** rather than replaced: an unreadable meter and a
+stale one both refuse. So the gate is strictly tighter than before, 25 conditions
+to 27, and it still refuses whole commands and still never scales one.
+
+### Evidence, and the correction that is not computed
+
+Snapshots and outcomes live in the **existing** forecast-history partitions under
+PV-namespaced keys (`pvs`, `pvo`, and `pvfp` in the index row). A third
+partitioned store would have duplicated seven hundred lines of partitioning,
+atomic writes, write ordering, corruption suspension and the month sweep — and
+Phase 3 rejected exactly that reasoning for plan storage. The counter-argument,
+different failure blast radii, is weaker here: load and PV evidence for the same
+day are analysed together, and the load snapshots already share a partition with
+their own outcomes.
+
+Issuance is change-triggered by content fingerprint, which folds in provenance
+identity — so a forecast carrying the same numbers after the declared set changed
+is still a different issuance. The source updates a handful of times a day at
+best, so this bounds growth naturally rather than by a tuned cap.
+
+Scoring **classifies and computes nothing**. Eight per-interval codes rather than
+one residual, because a figure that folds "the forecast was wrong", "the sensor
+was down", "it was night", "no forecast was ever obtained" and "one declared site
+went quiet" into one number is not evidence of anything. A PV-blind interval is
+never scored: comparing a forecast that was never obtained against a real reading
+manufactures error out of an outage, which is the mistake the load-side scoring
+already refuses for a partly observed day.
+
+Metrics are derived from the two stored sides on demand — a stored statistic is a
+second source of truth, and the first time it disagreed it is the stored one that
+would be believed. The **signed** error is kept beside the absolute one, because
+the sign is the whole diagnostic: a structural conversion difference or clipping
+biases one way and forecast noise does not.
+
+No correction exists, and it is unreachable rather than merely absent.
+`score_pv_day` never receives a forecast and the snapshot it does receive is
+frozen; `build_forecast` cannot name an outcome, a metric or an actual series.
+
+### Boundaries recorded rather than solved
+
+| Fact | Status |
+|---|---|
+| the measured figure sums DC strings and an AC meter | declared, `actual_pv_boundary` |
+| the source does not state its own boundary | declared, `forecast_boundary: unspecified` |
+| which site feeds which subsystem | `unknown`, never guessed and never asked |
+| clipping | flagged where the AC limit is readable, suppressed where it is not, corrected never |
+| the source's own dampening and actuals blending | recorded; either turning on means "raw" is no longer raw |
+
+On a big day the forecast exceeds the actual **by design**, because an inverter
+cannot pass more than its limit however bright it is. A later phase must not learn
+a correction for physics.
+
+### Daylight is advisory
+
+`get_astral_event_date` rather than the `sun` entity, which exposes only the
+*next* events and so cannot describe tomorrow. It never modifies a value and sits
+on no safety path. What it buys is the best available detector for a whole class of
+timezone and offset bugs — generation forecast in the dark — caught on an
+installation rather than only in a test. When the window cannot be determined the
+detector is suppressed rather than a window invented.
+
+### The three disclaimer branches
+
+The PV-blind note was pinned by a test on purpose, and the honest response to the
+limitation changing is to change the words rather than delete them: a projection
+published without its limitation costs more trust than it buys.
+
+| Condition | What it says |
+|---|---|
+| no forecast | PV-blind, as before, verbatim |
+| forecast and absorption modelled | PV-aware, with the covered-interval count |
+| forecast and absorption suppressed | PV-aware, and a **lower bound** |
+
+`Battery Recommendation` gains one attribute, `pv_aware`, taking it from eight to
+nine. "Eight" was a convention rather than a rule, and this is the one fact needed
+to read the recommendation that cannot live in the prose beside it, because prose
+cannot be automated against.
+
 ## Entity contract
 
 Exactly nine sensors — four from Phase 1, two from Phase 2, three from Phase 3 — unique IDs
@@ -1524,7 +1824,7 @@ enforces this both statically and at runtime.
 
 ## Future phases
 
-Things Phases 1 to 4 deliberately keep possible without implementing: grid
+Things Phases 1 to 5 deliberately keep possible without implementing: grid
 import/export limits, degradation modelling, and EV scheduling using the
 flexible-load series already being recorded.
 
@@ -1532,9 +1832,9 @@ What each next phase needs, and where it plugs in:
 
 | Phase | Needs | Seam |
 |---|---|---|
-| **5** Solcast PV | production joins the simulation | the stepper takes a *sequence of demands*, never the forecast — production is a second series. Makes `Projected Battery SoC` publishable, and is where asymmetric efficiency belongs |
+| ~~**5** Solcast PV~~ | *shipped in beta.9* | production is a second series on the same index; the stepper still takes a sequence of demands. Asymmetric efficiency remains available and unused |
 | **6** Frank prices | a price series joins | prices are a *policy* input; what-if already compares trajectories, so this adds a cost function over them |
-| **7** Dynamic reserve | raise the floor, never the user's setting | `dynamic_reserve` beside `static_reserve`, computing `max(configured, dynamic)` **inside** the factory. `interval_margin_kwh` is already reported |
+| **7** Dynamic reserve | raise the floor, never the user's setting | `dynamic_reserve` beside `static_reserve`, computing `max(configured, dynamic)` **inside** the factory. `interval_margin_kwh` is already reported, and the P10/P90 series is now recorded per interval — but read `percentile_aggregation` first: a per-site sum is not a calibrated band |
 | **8** Economic optimisation | replace the objective, keep the simulator | the policy interface; `HoldPolicy` is already the counterfactual to price against, and the soft reserve is what makes “dip but never below the floor” expressible |
 | **9** Adaptive feedback | provenance and joins | recorded state of charge joins the Phase-2 snapshot by chronological index and target day; plans are recomputable; `policy_version` prevents pooling generations; separate efficiency fields let them be learned |
 | **10** Multi-day | a longer horizon | the simulator is horizon-agnostic and already walks today plus tomorrow |
@@ -1562,6 +1862,35 @@ down rather than switching off a setting somebody chose.
 low-pass-filtered PV figure while the balance check reads the raw one, so a third
 term joins the two-meter difference during PV transients. Diagnostics-only, like
 the rest.
+
+### Known open items — Phase 5
+
+**Which selected site feeds which AlphaESS subsystem is unknown.** Solcast divides
+a roof by orientation and AlphaESS divides it by electrical coupling, so equal
+counts prove nothing. Membership is declared by the user and that is all that is
+asked; the correspondence is recorded as unknown. Do not solve it by asking the
+user, and do not solve it by inferring from capacities — the raw per-site
+capacities are stored, so a later phase that finds a sound derivation can classify
+retroactively.
+
+**The per-site query path is implemented against the documented contract rather
+than against an observed response.** The aggregate path is verified live; the
+subset path is exercised only against a fake. Every snapshot records `query_mode`,
+so a future disagreement between the two is attributable rather than mysterious.
+Confirming it needs one read: per-site queries over a window already fetched as an
+aggregate, comparing the sums. If the percentile bands do not agree,
+`percentile_aggregation` stops being a formality.
+
+**Forecast and measured production sit on different electrical boundaries** — DC
+strings plus an AC meter on one side, an unstated boundary on the other. A
+persistent difference between them is a conversion property of the installation.
+Recorded, never corrected.
+
+**The source can correct its own output in two ways**, dampening and actuals
+blending, and both were off on the installation this was built against. Either
+turning on means the series Alpha EMS reads is no longer raw, and a later adaptive
+phase would then be learning on top of somebody else's learning. Both are in
+provenance for exactly that reason.
 
 `ForecastUncertainty` exists so a reserve can be sized from measured forecast
 error rather than a guessed margin — note that its fields are `None` when there is
