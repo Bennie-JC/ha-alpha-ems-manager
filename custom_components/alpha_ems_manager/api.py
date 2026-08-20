@@ -26,8 +26,10 @@ that belongs to Phase 3 and later.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -123,7 +125,14 @@ class ForecastUncertainty:
     #: ``sum(|error|) / sum(actual)`` over the window, as a percentage.
     wape_percent: float | None
     #: MAE per behavioural slot band: night, morning, afternoon, evening.
-    mae_by_band: dict[str, float | None]
+    #:
+    #: A read-only mapping, not a ``dict``. This class is frozen, so the
+    #: *reference* could never be swapped -- but a plain dict's contents remained
+    #: editable through it, which quietly contradicted the promise at the top of
+    #: this module that everything returned here is frozen and copied. A consumer
+    #: could have mutated a band average in place and handed the altered object
+    #: on. ``MappingProxyType`` costs nothing and makes the docstring true.
+    mae_by_band: Mapping[str, float | None]
     #: MAE split by whether the interval was modelled or neighbour-filled.
     mae_modelled_kwh: float | None
     mae_filled_kwh: float | None
@@ -158,13 +167,28 @@ class ForecastUncertainty:
         return self.mae_kwh
 
 
-def _as_forecast(
+def load_forecast_from(
     forecast: Any,
     *,
     tz_key: str,
-    confidence_percent: float | None,
+    confidence_percent: float | None = None,
 ) -> LoadForecast:
-    """Convert an internal ``DayForecast`` into the public shape."""
+    """Convert a live ``DayForecast`` into the public, frozen shape.
+
+    Public because the decision layer needs it. ``current_forecast`` reads the
+    forecasts off the *last* published coordinator data, which is one refresh
+    stale for anything running inside the refresh that produces them -- and
+    planning against yesterday's arrays would be a subtle, permanent bug.
+
+    So the coordinator hands the forecasts it has just built straight through
+    here. What that buys, beyond freshness, is immutability: ``DayForecast`` is a
+    mutable dataclass rebuilt every refresh, and a plan holding a reference to
+    one would have its inputs rewritten underneath it. This copies the arrays,
+    exactly as ``build_snapshot`` does for the same reason.
+
+    It converts and nothing else. No decision, no reserve, no schedule -- the
+    contract this module is held to by ``test_api_boundary.py`` is unchanged.
+    """
     return LoadForecast(
         day=forecast.day,
         tz_key=tz_key,
@@ -205,7 +229,9 @@ def current_forecast(
 
     for forecast in (baseline, tomorrow):
         if forecast.day == target:
-            return _as_forecast(forecast, tz_key=tz_key, confidence_percent=percent)
+            return load_forecast_from(
+                forecast, tz_key=tz_key, confidence_percent=percent
+            )
     return None
 
 
@@ -275,7 +301,7 @@ async def async_uncertainty(
             mae_kwh=None,
             bias_kwh=None,
             wape_percent=None,
-            mae_by_band=empty_bands,
+            mae_by_band=MappingProxyType(empty_bands),
             mae_modelled_kwh=None,
             mae_filled_kwh=None,
         )
@@ -294,7 +320,7 @@ async def async_uncertainty(
         mae_kwh=metrics.mae_kwh,
         bias_kwh=metrics.bias_kwh,
         wape_percent=metrics.wape_percent,
-        mae_by_band=dict(metrics.mae_by_band) or empty_bands,
+        mae_by_band=MappingProxyType(dict(metrics.mae_by_band) or empty_bands),
         mae_modelled_kwh=metrics.mae_modelled_kwh,
         mae_filled_kwh=metrics.mae_filled_kwh,
     )

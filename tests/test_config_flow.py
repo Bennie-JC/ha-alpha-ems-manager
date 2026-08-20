@@ -17,8 +17,13 @@ from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.alpha_ems_manager.const import (
+    CONF_BATTERY_CAPACITY_KWH,
+    CONF_BATTERY_MAX_CHARGE_KW,
+    CONF_BATTERY_MAX_DISCHARGE_KW,
+    CONF_BATTERY_MIN_SOC_PERCENT,
     CONF_BATTERY_POWER_ENTITY,
     CONF_BATTERY_POWER_SIGN,
+    CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_SOC_ENTITY,
     CONF_DAILY_HOUSE_LOAD_ENTITY,
     CONF_EV_POWER_ENTITY,
@@ -31,7 +36,9 @@ from custom_components.alpha_ems_manager.const import (
     CONF_PV_POWER_ENTITY,
     CONF_SOLCAST_ENTRY_ID,
     CONF_USE_PV_FORECAST,
+    DEFAULT_BATTERY_MIN_SOC_PERCENT,
     DEFAULT_BATTERY_POWER_SIGN,
+    DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     DEFAULT_GRID_POWER_SIGN,
     DOMAIN,
     SIGN_BATTERY_POSITIVE_IS_CHARGE,
@@ -64,14 +71,33 @@ def user_step(**overrides: Any) -> dict[str, Any]:
     }
 
 
+#: A plausible 10 kWh battery with a 5 kW inverter, used wherever a test needs
+#: the Phase-3 planning figures to be present and does not care what they are.
+BATTERY_PLANNING = {
+    CONF_BATTERY_CAPACITY_KWH: 10.0,
+    CONF_BATTERY_MIN_SOC_PERCENT: DEFAULT_BATTERY_MIN_SOC_PERCENT,
+    CONF_BATTERY_MAX_CHARGE_KW: 5.0,
+    CONF_BATTERY_MAX_DISCHARGE_KW: 5.0,
+    CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT: (
+        DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT
+    ),
+}
+
+
 def battery_step(**overrides: Any) -> dict[str, Any]:
-    """Return a valid battery-step payload."""
+    """Return a valid battery-step payload, sources and planning figures alike."""
     return {
         CONF_BATTERY_SOC_ENTITY: BATTERY_SOC,
         CONF_BATTERY_POWER_ENTITY: BATTERY_POWER,
         CONF_BATTERY_POWER_SIGN: DEFAULT_BATTERY_POWER_SIGN,
+        **BATTERY_PLANNING,
         **overrides,
     }
+
+
+def battery_options_payload(**overrides: Any) -> dict[str, Any]:
+    """Return a valid submission for the battery-planning options page."""
+    return {**BATTERY_PLANNING, **overrides}
 
 
 def grid_step(**overrides: Any) -> dict[str, Any]:
@@ -93,6 +119,25 @@ async def start(hass: HomeAssistant) -> dict[str, Any]:
 async def submit(hass: HomeAssistant, flow_id: str, payload: dict) -> dict[str, Any]:
     """Submit one step."""
     return await hass.config_entries.flow.async_configure(flow_id, payload)
+
+
+async def open_options(
+    hass: HomeAssistant, entry_id: str, page: str = "sources"
+) -> dict[str, Any]:
+    """Open one page of the options flow.
+
+    The options flow is a menu since Phase 3 added the battery-planning figures:
+    thirteen source selections and five hardware numbers are edited on different
+    occasions, and appending the numbers to the existing form would have buried
+    them. Every options test goes through here so the navigation lives in one
+    place.
+    """
+    result = await hass.config_entries.options.async_init(entry_id)
+    if result["type"] is FlowResultType.MENU:
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {"next_step_id": page}
+        )
+    return result
 
 
 # -- happy paths -------------------------------------------------------------
@@ -484,10 +529,10 @@ async def test_the_options_form_renders(
     frank_config_entry: MockConfigEntry,
 ) -> None:
     """Every changeable source appears on one page."""
-    result = await hass.config_entries.options.async_init(setup_integration.entry_id)
+    result = await open_options(hass, setup_integration.entry_id)
 
     assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "init"
+    assert result["step_id"] == "sources"
     keys = {str(marker) for marker in result["data_schema"].schema}
     # Every source listed in the README as changeable, plus the Solcast slot,
     # which is always rendered but only required when the forecast is enabled.
@@ -506,7 +551,7 @@ async def test_changing_a_source_is_saved_and_reloads(
     replacement = "sensor.new_house_load"
     set_sensor(hass, replacement, 1500, "W", "power")
 
-    result = await hass.config_entries.options.async_init(setup_integration.entry_id)
+    result = await open_options(hass, setup_integration.entry_id)
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         options_payload(
@@ -536,7 +581,7 @@ async def test_unrelated_options_are_preserved(
     )
     await hass.async_block_till_done()
 
-    result = await hass.config_entries.options.async_init(setup_integration.entry_id)
+    result = await open_options(hass, setup_integration.entry_id)
     await hass.config_entries.options.async_configure(
         result["flow_id"],
         options_payload(
@@ -559,7 +604,7 @@ async def test_options_reject_an_incompatible_entity(
     frank_config_entry: MockConfigEntry,
 ) -> None:
     """The options form validates as strictly as the config flow."""
-    result = await hass.config_entries.options.async_init(setup_integration.entry_id)
+    result = await open_options(hass, setup_integration.entry_id)
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         options_payload(
@@ -580,7 +625,7 @@ async def test_declaring_pv_without_a_pv_entity_is_rejected(
     payload = options_payload(frank_config_entry.entry_id, **{CONF_HAS_PV: True})
     payload.pop(CONF_PV_POWER_ENTITY)
 
-    result = await hass.config_entries.options.async_init(setup_integration.entry_id)
+    result = await open_options(hass, setup_integration.entry_id)
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], payload
     )
@@ -594,7 +639,7 @@ async def test_enabling_the_forecast_without_solcast_is_rejected(
     frank_config_entry: MockConfigEntry,
 ) -> None:
     """The same consistency rule applies to the PV forecast."""
-    result = await hass.config_entries.options.async_init(setup_integration.entry_id)
+    result = await open_options(hass, setup_integration.entry_id)
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         options_payload(frank_config_entry.entry_id, **{CONF_USE_PV_FORECAST: True}),
@@ -612,7 +657,7 @@ async def test_clearing_the_optional_validation_sensor_removes_it(
     payload = options_payload(frank_config_entry.entry_id)
     payload.pop(CONF_DAILY_HOUSE_LOAD_ENTITY)
 
-    result = await hass.config_entries.options.async_init(setup_integration.entry_id)
+    result = await open_options(hass, setup_integration.entry_id)
     await hass.config_entries.options.async_configure(result["flow_id"], payload)
     await hass.async_block_till_done()
 
@@ -628,7 +673,7 @@ async def test_reload_after_options_creates_no_duplicate_entities(
     frank_config_entry: MockConfigEntry,
 ) -> None:
     """Changing an option must not leave ``_2`` entities behind."""
-    result = await hass.config_entries.options.async_init(setup_integration.entry_id)
+    result = await open_options(hass, setup_integration.entry_id)
     await hass.config_entries.options.async_configure(
         result["flow_id"],
         options_payload(
@@ -644,5 +689,5 @@ async def test_reload_after_options_creates_no_duplicate_entities(
         for entity in registry.entities.values()
         if entity.platform == DOMAIN
     ]
-    assert len(ours) == 6
+    assert len(ours) == 9
     assert not [entity_id for entity_id in ours if entity_id.endswith("_2")]

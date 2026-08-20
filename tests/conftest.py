@@ -23,8 +23,13 @@ from pytest_homeassistant_custom_component.common import (
 )
 
 from custom_components.alpha_ems_manager.const import (
+    CONF_BATTERY_CAPACITY_KWH,
+    CONF_BATTERY_MAX_CHARGE_KW,
+    CONF_BATTERY_MAX_DISCHARGE_KW,
+    CONF_BATTERY_MIN_SOC_PERCENT,
     CONF_BATTERY_POWER_ENTITY,
     CONF_BATTERY_POWER_SIGN,
+    CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_SOC_ENTITY,
     CONF_DAILY_HOUSE_LOAD_ENTITY,
     CONF_FRANK_ENTRY_ID,
@@ -36,7 +41,9 @@ from custom_components.alpha_ems_manager.const import (
     CONF_PV_POWER_ENTITY,
     CONF_USE_PV_FORECAST,
     CONFIG_ENTRY_VERSION,
+    DEFAULT_BATTERY_MIN_SOC_PERCENT,
     DEFAULT_BATTERY_POWER_SIGN,
+    DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     DEFAULT_GRID_POWER_SIGN,
     DOMAIN,
     DOMAIN_FRANK,
@@ -143,6 +150,17 @@ def config_data(frank_config_entry: MockConfigEntry) -> dict[str, object]:
         CONF_BATTERY_SOC_ENTITY: BATTERY_SOC,
         CONF_BATTERY_POWER_ENTITY: BATTERY_POWER,
         CONF_BATTERY_POWER_SIGN: DEFAULT_BATTERY_POWER_SIGN,
+        # Phase-3 planning figures, as the config flow requires them of a new
+        # installation: a 10 kWh pack behind a 5 kW inverter. An installation
+        # upgrading from an earlier release has none of these, which is what
+        # ``test_beta6_upgrade.py`` builds explicitly.
+        CONF_BATTERY_CAPACITY_KWH: 10.0,
+        CONF_BATTERY_MIN_SOC_PERCENT: DEFAULT_BATTERY_MIN_SOC_PERCENT,
+        CONF_BATTERY_MAX_CHARGE_KW: 5.0,
+        CONF_BATTERY_MAX_DISCHARGE_KW: 5.0,
+        CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT: (
+            DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT
+        ),
         CONF_HAS_PV: True,
         CONF_PV_POWER_ENTITY: PV_POWER,
         CONF_GRID_POWER_ENTITY: GRID_POWER,

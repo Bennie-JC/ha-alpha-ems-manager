@@ -12,6 +12,7 @@ registry, so this integration adds no API traffic of its own.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -27,10 +28,17 @@ from homeassistant.helpers.event import (
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
+from .api import load_forecast_from
+from .battery import sanitize_soc_percent
 from .confidence import ConfidenceBreakdown, compute_confidence
 from .const import (
+    CONF_BATTERY_CAPACITY_KWH,
+    CONF_BATTERY_MAX_CHARGE_KW,
+    CONF_BATTERY_MAX_DISCHARGE_KW,
+    CONF_BATTERY_MIN_SOC_PERCENT,
     CONF_BATTERY_POWER_ENTITY,
     CONF_BATTERY_POWER_SIGN,
+    CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_SOC_ENTITY,
     CONF_DAILY_HOUSE_LOAD_ENTITY,
     CONF_EV_POWER_ENTITY,
@@ -42,7 +50,9 @@ from .const import (
     CONF_PV_POWER_ENTITY,
     CONF_SOLCAST_ENTRY_ID,
     CONF_USE_PV_FORECAST,
+    DEFAULT_BATTERY_MIN_SOC_PERCENT,
     DEFAULT_BATTERY_POWER_SIGN,
+    DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     DEFAULT_GRID_POWER_SIGN,
     DOMAIN_FRANK,
     DOMAIN_SOLCAST,
@@ -71,10 +81,12 @@ from .normalization import (
     PowerFlows,
     describe_power_problem,
     normalize_energy_kwh,
+    normalize_percentage,
     normalize_power_w,
     split_battery_power,
     split_grid_power,
 )
+from .plan import BatteryPlan, build_plan
 from .quarter import (
     QuarterAccumulator,
     QuarterResult,
@@ -131,6 +143,36 @@ _BALANCE_LOG_GROSS = "energy_balance_gross"
 #: everything else on this path: a persistently unwritable document would
 #: otherwise warn every fifteen minutes forever.
 _FORECAST_HISTORY_LOG = "forecast_history"
+#: Throttle key for a battery-planning failure. Separate from the forecast one so
+#: a fault in one layer cannot silence the other.
+_BATTERY_PLAN_LOG = "battery_plan"
+
+
+def _optional_number(raw: Any) -> float | None:
+    """Return a stored numeric option as a float, or ``None``.
+
+    A config entry is JSON, so a number written by the options form comes back
+    as an ``int`` or a ``float`` -- but a hand-edited entry, or one carried over
+    from a future release, can hold anything. Anything unusable becomes ``None``,
+    which the battery layer reports as a missing field rather than substituting a
+    value for. Booleans are excluded because ``True`` is an ``int``.
+
+    Not ``normalization.parse_numeric``, which owns this question elsewhere,
+    because that reads a *sensor state* -- it parses strings and knows about
+    ``unavailable``. This reads a stored configuration value, where a string is a
+    damaged document rather than a number to be recovered. The small overlap is
+    deliberate: the two have different inputs and different correct answers.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    number = float(raw)
+    return number if math.isfinite(number) else None
+
+
+def _number(raw: Any, default: float) -> float:
+    """Return a stored numeric option, falling back to a documented default."""
+    value = _optional_number(raw)
+    return default if value is None else value
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +194,19 @@ class SourceConfig:
     frank_entry_id: str | None
     use_pv_forecast: bool
     solcast_entry_id: str | None
+    #: Phase-3 battery planning facts. ``None`` where the user has not supplied
+    #: one: capacity and the two power limits have no default, because a
+    #: capacity cannot be derived from a percentage sensor and a power limit
+    #: cannot be inferred from a capacity without assuming a C-rate. Absent
+    #: means the battery layer declines to decide and says which field is
+    #: missing -- it never means a guessed value.
+    battery_capacity_kwh: float | None
+    battery_max_charge_kw: float | None
+    battery_max_discharge_kw: float | None
+    #: These two do have defaults, which are choices rather than measurements of
+    #: this particular battery. See ``const.py``.
+    battery_min_soc_percent: float
+    battery_round_trip_efficiency_percent: float
 
     @classmethod
     def from_entry(cls, entry: ConfigEntry) -> SourceConfig:
@@ -180,6 +235,19 @@ class SourceConfig:
             frank_entry_id=value(CONF_FRANK_ENTRY_ID),
             use_pv_forecast=bool(value(CONF_USE_PV_FORECAST, False)),
             solcast_entry_id=value(CONF_SOLCAST_ENTRY_ID),
+            battery_capacity_kwh=_optional_number(value(CONF_BATTERY_CAPACITY_KWH)),
+            battery_max_charge_kw=_optional_number(value(CONF_BATTERY_MAX_CHARGE_KW)),
+            battery_max_discharge_kw=_optional_number(
+                value(CONF_BATTERY_MAX_DISCHARGE_KW)
+            ),
+            battery_min_soc_percent=_number(
+                value(CONF_BATTERY_MIN_SOC_PERCENT),
+                DEFAULT_BATTERY_MIN_SOC_PERCENT,
+            ),
+            battery_round_trip_efficiency_percent=_number(
+                value(CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT),
+                DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+            ),
         )
 
 
@@ -576,6 +644,52 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return value_w
 
     @callback
+    def _canonical_battery_power_w(self) -> float | None:
+        """Return battery power positive-for-charging, or ``None``.
+
+        Normalised through :func:`normalization.split_battery_power` first, so the
+        user's own sign convention is resolved away exactly once and this figure
+        can be read without knowing it -- the rule ``PowerFlows`` exists to
+        enforce. Reporting the raw sensor value instead would put a number in
+        diagnostics whose meaning depended on a setting elsewhere in the same
+        payload, which is the confusion this whole convention was built to end.
+
+        Positive for charging, matching the plan's own published convention.
+        """
+        charge, discharge = split_battery_power(
+            self._read_power(self.config.battery_power_entity),
+            self.config.battery_power_sign,
+        )
+        if charge is None or discharge is None:
+            return None
+        return charge - discharge
+
+    def _read_soc_percent(self) -> float | None:
+        """Return the battery state of charge in percent, or ``None``.
+
+        The first place in the project that reads this entity as a *value*: until
+        Phase 3 it was validated when selected and reported in diagnostics, and
+        nothing consumed it.
+
+        Routed through :func:`normalization.normalize_percentage`, which insists
+        the unit actually says percent. A house-load sensor selected by mistake
+        would otherwise arrive as a 2000 % battery. Then through
+        :func:`battery.sanitize_soc_percent`, which clamps a narrow noise band at
+        either end and refuses anything further out -- a reading of -20 % would
+        otherwise compute a charge headroom larger than the pack itself.
+        """
+        entity_id = self.config.battery_soc_entity
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return None
+        return sanitize_soc_percent(
+            normalize_percentage(
+                state.state, state.attributes.get("unit_of_measurement")
+            )
+        )
+
     def _read_ev_power_w(self) -> float | None:
         """Return the current flexible-load reading in watts, or ``None``."""
         entity_id = self.config.ev_power_entity
@@ -633,6 +747,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         tz = dt_util.get_default_time_zone()
         ev_expected = self._ev_accumulator is not None
+        # A state of charge is a level, not a flow, so it is sampled at the
+        # boundary rather than integrated across the interval. Read once here,
+        # and attached only to the interval that has *just* closed: when several
+        # quarters close together after a restart, the state of charge two hours
+        # ago is genuinely unknown, and repeating today's reading across them
+        # would be inventing history.
+        soc_percent = self._read_soc_percent()
+        latest_start = max(
+            (result.start_utc for result in house_results if result.accepted),
+            default=None,
+        )
         # The two accumulators are advanced together, so equal-length result
         # lists are the normal case; pairing by start instant keeps the mapping
         # correct even if one of them was created later.
@@ -670,6 +795,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 measured_kwh=result.energy_kwh,
                 ev_kwh=ev_kwh,
                 ev_expected=ev_expected,
+                soc_percent=soc_percent if result.start_utc == latest_start else None,
             ):
                 # The index fell outside the day. Unreachable under a stable
                 # timezone, so reaching it means the stored day's shape and the
@@ -996,6 +1122,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             breakdown=breakdown,
         )
 
+        plan = self._build_battery_plan(
+            today=today,
+            elapsed=elapsed,
+            baseline_today=baseline_today,
+            tomorrow=forecast_tomorrow,
+            tz_key=str(tz),
+        )
+
         return {
             "today": adapted,
             "today_baseline": baseline_today,
@@ -1007,7 +1141,61 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "ev_so_far_kwh": ev_so_far,
             "forecast_yesterday_error": record.yesterday,
             "forecast_error_window": record.window,
+            "battery_plan": plan,
         }
+
+    def _build_battery_plan(
+        self,
+        *,
+        today: date,
+        elapsed: int,
+        baseline_today: DayForecast,
+        tomorrow: DayForecast,
+        tz_key: str,
+    ) -> BatteryPlan | None:
+        """Build this refresh's battery plan, or ``None`` if it could not be.
+
+        Wrapped for the same reason the forecast-evidence step is: Phase 3 is
+        additive, the six Phase-1 and Phase-2 sensors do not read any of it, and
+        taking the whole integration unavailable because a battery calculation
+        raised would trade the important half for the newest half. A ``None``
+        here degrades exactly three entities and nothing else.
+
+        The forecasts are converted to the public ``LoadForecast`` shape by the
+        same helper ``api.current_forecast`` uses, so the decision layer sees
+        precisely what a later phase would see through the boundary -- the
+        *unadapted* baseline, never the Today entity's hybrid of prediction and
+        measurement.
+        """
+        try:
+            return build_plan(
+                soc_percent=self._read_soc_percent(),
+                capacity_kwh=self.config.battery_capacity_kwh,
+                max_charge_kw=self.config.battery_max_charge_kw,
+                max_discharge_kw=self.config.battery_max_discharge_kw,
+                round_trip_efficiency_percent=(
+                    self.config.battery_round_trip_efficiency_percent
+                ),
+                configured_min_soc_percent=self.config.battery_min_soc_percent,
+                today_forecast=load_forecast_from(baseline_today, tz_key=tz_key),
+                tomorrow_forecast=load_forecast_from(tomorrow, tz_key=tz_key),
+                elapsed_intervals=elapsed,
+                today=today,
+                battery_power_w=self._canonical_battery_power_w(),
+            )
+        except Exception:
+            self._log.warning(
+                _BATTERY_PLAN_LOG,
+                (
+                    "The battery decision layer could not be evaluated this "
+                    "refresh. Learning, both forecasts and the forecast-error "
+                    "sensors are unaffected -- nothing in those paths reads the "
+                    "battery plan -- but the three battery entities will read "
+                    "unknown until it recovers"
+                ),
+            )
+            _LOGGER.debug("Battery plan build failed", exc_info=True)
+            return None
 
     async def _async_record_forecast_evidence(
         self,
@@ -1110,6 +1298,25 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def open_quarter_coverage(self) -> float:
         """Return coverage accrued in the quarter currently being measured."""
         return self._accumulator.open_coverage
+
+    @property
+    def battery_plan(self) -> BatteryPlan | None:
+        """Return the current battery plan, or ``None`` when there is none."""
+        return (self.data or {}).get("battery_plan")
+
+    @property
+    def current_soc_percent(self) -> float | None:
+        """Return the sanitised battery state of charge, for diagnostics."""
+        return self._read_soc_percent()
+
+    @property
+    def battery_planning_configured(self) -> bool:
+        """Return whether every Phase-3 hardware fact has been supplied."""
+        return None not in (
+            self.config.battery_capacity_kwh,
+            self.config.battery_max_charge_kw,
+            self.config.battery_max_discharge_kw,
+        )
 
     @property
     def ev_configured(self) -> bool:

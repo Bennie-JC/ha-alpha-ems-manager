@@ -10,10 +10,13 @@ undo.
 
 ## Scope
 
-Phases 1 and 2 are **observation only**. Phase 1 measures household consumption,
-learns a baseline demand profile and forecasts it. Phase 2 records each forecast
-and matches it against what actually happened. Neither issues a command to the
-battery, makes a charge, discharge or trading decision, or schedules anything.
+Phases 1, 2 and 3 are **observation only**. Phase 1 measures household
+consumption, learns a baseline demand profile and forecasts it. Phase 2 records
+each forecast and matches it against what actually happened. Phase 3 decides what
+the battery *should* do and simulates the consequence. **None of them issues a
+command to the battery, schedules anything, or calls a service.** Phase 3's
+recommendation is published so it can be watched for weeks before Phase 4 is
+allowed to act on it; nothing executes it.
 
 Phase 2 adds no feedback loop. It *records* forecast error; nothing reads that
 error back into the model. Adaptive correction belongs to a much later phase, and
@@ -68,6 +71,15 @@ generic `ConfigEntry` typing and coordinator `config_entry` support. Keep
 The pure modules carry the interesting logic deliberately: they can be tested
 against synthetic timelines without a Home Assistant instance, which is why the
 DST and forecast tests are fast and exhaustive.
+
+### Phase-3 modules
+
+| Module | Role |
+|---|---|
+| `battery.py` | physical model, limits, and the single clamp. Pure |
+| `simulation.py` | interval stepper and reduced trajectory. Pure |
+| `policy.py` | objectives. Pure, and enforces nothing |
+| `plan.py` | one refresh's decision, and the only Phase-3 consumer of `api` |
 
 ## Source selection
 
@@ -875,9 +887,344 @@ without breaking battery logic. `tests/test_api_boundary.py` enforces this
 statically over the real source files, the same way
 `tests/test_no_external_polling.py` enforces the network boundary.
 
+Phase 3 respects it: `plan.py` is the only Phase-3 module that imports `api`, and
+none of the four imports a private module. It also does **not** publish its plan
+here. `api.py` reports what was predicted and how that prediction performed;
+adding a decision to it would mean deleting the grep guard that keeps it
+descriptive, and Phase 3 needs no public surface because nothing may consume it
+yet. **When Phase 4 needs one it should get its own module.**
+
+`load_forecast_from` was added to this surface because `current_forecast` reads
+the *last published* coordinator data, which is one refresh stale for anything
+running inside the refresh that produces it. It converts and copies; it decides
+nothing.
+
+
+## Phase 3: battery decision and simulation
+
+Phase 3 answers one question: *given what is legitimately known now, what should
+the battery do, what constrains it, and what would happen next.* It controls
+nothing, and that is enforced rather than intended —
+`tests/test_phase_three_boundaries.py` reads the real sources and asserts no
+Phase-3 module imports a network client or calls a service.
+
+Four pure modules, none of which imports Home Assistant, so every rule can be
+tested against synthetic state exactly as `forecast_history` and `metrics` are:
+
+| Module | Responsibility |
+|---|---|
+| `battery.py` | the physical model, and **the one place a limit is enforced** |
+| `simulation.py` | walking intervals forward; decides nothing |
+| `policy.py` | what the battery *should* do; enforces nothing |
+| `plan.py` | one refresh's decision and the evidence behind it |
+
+### The electrical boundary — the expensive decision
+
+`energy_kwh`, `soc_percent` and `capacity_kwh` are **DC-side**: the state of the
+pack. Charge and discharge power, the grid residual and every household energy
+are **AC-side**.
+
+**Efficiency is applied exactly once, when energy crosses that boundary, and
+never in state-of-charge arithmetic.**
+
+This is the most expensive thing here to get wrong. It is baked into a value the
+user typed *and* into what gets stored, it is the frame every other quantity is
+defined against, and a self-consistent model with the boundary flipped passes
+every round-trip test that can be written while carrying a few per cent of
+systematic bias — comfortably inside the noise of an integer-percent
+state-of-charge sensor. So it is in the field labels (“Usable battery capacity
+(DC)”, “Maximum charge power (AC)”), in diagnostics, and in one bit-exact test:
+
+> 10 kWh of AC energy at 90 % round trip raises stored DC energy by exactly
+> `9.486832980505138` kWh, and discharging all of it returns exactly `9.0` kWh AC.
+
+One configured round-trip percentage is split symmetrically,
+`eta_c = eta_d = sqrt(eta_rt)` — the only split that reproduces the measured round
+trip while staying agnostic between directions, and no user knows the halves
+separately. The resulting 5.13 % per crossing agrees with
+`BALANCE_CONVERSION_LOSS_FRACTION` (0.05) to within 0.13 %, which is an
+independent check on the default. The model nonetheless stores
+`charge_efficiency` and `discharge_efficiency` as **two** fields, because
+photovoltaic charging never crosses the AC boundary at all — Phase 5 needs
+asymmetry, and Phase 9 may want to learn them.
+
+#### Two known optimistic biases — do not present these figures as exact
+
+Both push the same way, so `Usable Battery Energy` is an **upper bound**:
+
+1. A constant efficiency flatters a real inverter at low power. The balance
+   tolerance model above documents ~20 % conversion loss in that regime, where
+   this assumes 5.13 %.
+2. Inverter auxiliary draw is not modelled at all — roughly 0.0125 kWh per
+   interval, about the size of the modelled loss on an overnight discharge.
+
+Neither is modelled, because both would mean inventing a third and fourth
+unverifiable hardware property. They are documented, reported in diagnostics, and
+are the first Phase-5/9 candidates. A 20 % floor dwarfs both in practice.
+
+### Two floors, and why they are not one
+
+| Concept | Phase 3 | Enforced by | May be crossed? |
+|---|---|---|---|
+| `configured_min_soc_percent` | the user's setting | **the clamp** | never |
+| `effective_min_soc_percent` | equal to it | the **policy** | Phase 8 only, never below configured |
+
+Numerically identical today, so the user-visible promise holds exactly. Kept apart
+because Phase 7 will raise the effective reserve dynamically and Phase 8 must be
+able to say “a price spike justifies dipping into the reserve, but never below the
+floor the user set”. Merging two names later is free; splitting a persisted one is
+not.
+
+`BatteryReserve` is built only through a factory, so the `max()` that protects the
+user's floor lives inside `static_reserve` rather than at a call site — Phase 7
+adds `dynamic_reserve` beside it and cannot forget. The clamp reads only the
+configured floor; the policy reads only the effective one; both halves are
+asserted structurally.
+
+### A request carries a mode, not a sign
+
+Two defects in the first draft of this model made that non-negotiable, and both
+were reproduced numerically before the design was accepted:
+
+* **A negative requested power created energy.** `min(-1.0, max_discharge)`
+  returns `-1.0`, the non-negativity guards sat on the available energy rather
+  than the request, and −0.25 kWh AC became **+0.2635 kWh DC** — an effective
+  efficiency of 1.054. A negative is exactly what arrives if a caller passes a
+  raw battery-power sensor.
+* **Charging and discharging in one interval destroyed energy invisibly.** Two
+  independently firing rules asking 4 kW each leave the grid residual *exactly*
+  equal to the load — identical to doing nothing — while stored energy falls by
+  `1/eta − eta` = 0.10541 kWh. Over ninety-six intervals that is **10.1 kWh, an
+  entire pack**, with a perfectly balanced grid trace. Phase 1 *assumed* this
+  away; Phase 3 enforces it.
+
+`BatteryRequest` therefore carries a mode and a non-negative magnitude, making
+both unrepresentable rather than checked. Signed power exists only where
+`Planned Battery Power` is published — and that sign is the plan's own, unrelated
+to the configured `battery_power_sign`, which describes the user's sensor and is
+resolved away long before.
+
+### The single clamp
+
+`battery.apply_request` is the only thing that reduces a request. No policy,
+simulator, entity or coordinator may re-implement a limit: a second copy is a
+second thing to keep in step, and the first time the two disagreed it would be
+the copy that got believed.
+
+* the **power** limit is applied in AC terms — the side the nameplate and the
+  grid residual are denominated in;
+* the **energy** limit is applied in DC terms — the state of charge is the pack's
+  physical state and the available window is a window in it;
+* the conversion back to AC happens *after* the energy clamp, so the two
+  conversions are exact inverses and an allowed power fed back reproduces itself.
+
+Clamping the AC energy instead would be arithmetically equivalent — measured
+across 200 000 magnitudes the two differ by at most 9e-16 kWh and neither ever
+exceeds the available energy. `_clamp_energy` is a **backstop**, measured to be
+one: neutralised and swept over 7840 combinations with 200 repeated applications
+each, it never fired. It is kept because it is two comparisons and it turns an
+invariant that happens to hold into one that cannot stop holding.
+
+`tests/test_phase_three_boundaries.py` enforces the single clamp structurally, by
+looking for the limit names inside a comparison or a `min`/`max` call rather than
+anywhere in the file — reporting a limit is not enforcing one.
+
+### Interval duration is derived, never passed
+
+Every quarter-hour is fifteen minutes. Daylight saving changes how many a civil
+day *contains* — 92, 96, 100 — never how long one lasts. `INTERVAL_HOURS` is
+derived from `QUARTER_MINUTES` and there is no parameter, because accepting one
+invites `1.0`, `900` or, worst, `0.91666` “for the short DST hour”.
+
+That is also why the trajectory starts at the **next** whole interval: every
+interval it walks is a whole one, so the partial interval in progress never needs
+a different duration. The *recommendation* is separate — it is for the interval
+now in progress and needs no trajectory.
+
+The horizon runs to the end of tomorrow, because Phase 2 already publishes
+tomorrow's forecast. That costs nothing and exercises the multi-day path Phase 10
+needs from the first release.
+
+### PV blindness — a battery-only counterfactual
+
+There is **no photovoltaic term**. Predicting production is Phase 5, and inventing
+one here would be the fabrication this project exists to avoid. Two consequences
+have to be stated wherever the figures appear:
+
+* for a household with solar, **simulated grid import substantially exceeds
+  reality** — the real array is covering load the model cannot see;
+* a whole-day state-of-charge projection is wrong on any sunny afternoon.
+
+Which is why **`Projected Battery SoC` is diagnostics-only**, carries an explicit
+PV-blind note, and is not an entity. A visibly wrong entity costs more trust than
+it buys. Phase 5 makes it publishable.
+
+Read as a conditional — “given the predicted baseline load and no other
+generation, where does the battery end up and when does the floor bite” — this is
+not a defect but the definition, and it is exactly what Phase 7 needs to size a
+reserve.
+
+### The grid residual is unsigned
+
+```
+net             = load_ac + charge_ac − discharge_ac     # local only
+grid_import_kwh = max(0, net)
+grid_export_kwh = max(0, −net)
+```
+
+Shaped like `split_grid_power`. A signed field would reintroduce the reasoning
+`PowerFlows` was built to end, and grid sign is the one thing this project has a
+*tested* opinion about — it is a user-facing option precisely because it is the
+field's most common error. Import and export are also priced differently, so any
+cost layer must split them anyway.
+
+No grid limit is modelled. Adding one later makes the clamp a **fixed-point
+problem**, because a grid clamp constrains the battery request which changes the
+residual.
+
+### Policy, and why nothing charges
+
+An objective is a pure callable of `(state, demand)` with an identity and a
+version. Two ship: `HoldPolicy` (the reference trajectory the what-if measures
+against, and what Phase 8 will price) and `ReserveGuardPolicy`.
+
+**No Phase-3 policy asks to charge.** Every reason to would need information this
+phase does not have — surplus production is Phase 5, a cheap half-hour Phase 6, a
+storm Phase 7, an arbitrage spread Phase 8 — and the inverter already absorbs
+photovoltaic surplus by itself. The charge path exists, is clamped and is
+simulated so those phases have somewhere to land and so what-if works, and a test
+asserts over the real `SHIPPED_POLICIES` that none of them emits one.
+
+`ReserveGuardPolicy` is **not an optimisation**, and describing it as one would be
+a lie: with no forecast of production and no prices, “reduce grid import”
+collapses to “discharge to cover load”, which the inverter already does. What it
+adds is the reserve boundary made explicit and computable — where the floor bites,
+how much is genuinely available above it, and a decision path that provably cannot
+cross it. `policy_version` travels on every decision so a later, genuinely
+optimising policy is never pooled with this one.
+
+`ForecastUncertainty.interval_margin_kwh` is deliberately **not** consumed: widening
+a plan by measured error is reserve sizing, which is Phase 7. It is reported in
+diagnostics so Phase 7 has it to hand.
+
+### Deciding, and declining to decide
+
+Two failures are kept apart:
+
+* a **missing hardware fact** — no state of charge, capacity, power limit, or an
+  impossible efficiency — means there is nothing to reason with:
+  `ACTION_NO_DECISION`, and the recommendation entity reads `unknown`;
+* a **missing forecast** means the battery is known and the load is not, so
+  holding is a real answer: `ACTION_HOLD` with the reason
+  `forecast_unavailable`, and the trajectory is withheld.
+
+`Usable Battery Energy` survives the second case, which is why it was chosen over
+a projected state of charge: it needs no forecast, so a young installation still
+gets the number the minimum-SoC setting controls.
+
+`NO_DECISION` is made safe by an invariant rather than by hope — it always carries
+zero allowed energy, so it is behaviourally identical to a hold and semantically
+distinct. That invariant was found to be **untested** by deliberately breaking it,
+which is why the test exists.
+
+### Configuration
+
+Five keys, in a second Options page behind a menu. Sources and hardware figures
+are edited on different occasions, and appending five numbers to a form that
+already had thirteen would have buried them. Keys stay **flat**: sections would
+deliver nested values, which the effective-configuration rule, the
+unknown-key-preservation rule and the cleared-optional rule all read flat.
+
+| Key | Default | Boundary |
+|---|---|---|
+| `battery_capacity_kwh` | **none** | DC |
+| `battery_min_soc_percent` | 20 | — |
+| `battery_max_charge_kw` | **none** | AC |
+| `battery_max_discharge_kw` | **none** | AC |
+| `battery_round_trip_efficiency_percent` | 90 | AC→AC |
+
+Capacity and the two power limits have **no default**, because nothing can derive
+them — a percentage sensor says nothing about how many kilowatt-hours a percent is
+worth, and a power limit cannot be inferred from a capacity without assuming a
+C-rate. Absent means Phase 3 declines and names the missing field. Required in the
+config flow, so a new installation is complete; optional in Options, so an
+installation upgrading from beta.6 can fill them in when it has the figures.
+
+`max_soc_percent` stays an internal constant at 100: nothing in Phase 3 charges,
+so a user-facing ceiling would be an untested field. The charge clamp is written
+and tested against it so Phase 5 can promote it without touching the clamp.
+
+Validation adds one rule, and it is a real one rather than a narrowing of the
+range: `min_soc < max_soc`, so a floor leaves some usable energy. **0 % is legal**
+— it means no EMS reserve, and the inverter's own floor still protects the cells.
+The efficiency range starts at 50 % to catch `0.90` typed where `90` belongs.
+
+**No config-entry version bump.** Additive keys with defaults supplied at read
+time need no migration.
+
+### Measured state of charge
+
+One additive optional array on `DayRecord`, `s`, following `e`/`x` exactly:
+sampled at each interval boundary, omitted from the document when empty, and read
+as “no samples” on every earlier document. `STORAGE_MINOR_VERSION` 2.1 → 2.2; the
+major version does not move, so nothing migrates.
+
+Sampled rather than integrated, because a state of charge is a *level*: it does
+not pass through `QuarterAccumulator`. When several quarters close together after
+a restart, **only the one that just ended takes the sample** — where the battery
+was two hours ago is genuinely unknown, and writing the current reading across a
+backlog would be inventing history.
+
+It is recorded for one reason: a plan is a pure function of the stored forecast,
+the stored configuration and the state of charge at the time, so any plan can be
+*recomputed* — but where the battery actually was cannot be recovered from
+anything. Every day without it is a day the physical model can never be checked
+against reality. That is also why Phase 3 persists **no plan documents** and adds
+no storage layer of its own.
+
+**The invariant, and it has its own file.** Adding, removing or corrupting
+state-of-charge samples must not move `completeness`, `is_learned`, `baseline_at`,
+the forecast, the confidence score, Learning Days, or any Phase-2 figure. It is
+additive evidence for a later phase, never a learning input.
+`tests/test_soc_persistence.py` holds that down, including a day whose battery
+reported happily all day while the house-load sensor was down — which must still
+not count as learned.
+
+### Entities
+
+Three, taking the integration to nine.
+
+| Entity | State | Classes |
+|---|---|---|
+| **Battery Recommendation** | `hold` / `charge` / `discharge`; `unknown` for no decision | `device_class: enum`, no state class |
+| **Planned Battery Power** | signed kW, positive = charge, **interval average** | kW, measurement, **no** device class |
+| **Usable Battery Energy** | kWh above the reserve, an **upper bound** | kWh, `energy_storage`, measurement |
+
+`Planned Battery Power` is an *average*, not an inverter setpoint: in the last
+partial interval before the floor a real device delivers full power for part of it
+and nothing after. Naming it for what it is avoids Phase 4 reading it as a
+setpoint and under-delivering. No device class, for the same reason
+`Forecast Error Yesterday` has none — a signed quantity must not be offered to the
+Energy dashboard.
+
+Attributes are capped at eight flat values with no mappings, against a closed
+allow-list. Everything else — the reduced trajectory, the per-band split, the
+binding-constraint tally, the what-if comparison, the projection — is
+diagnostics-only. A ninety-six-interval array would breach the sixteen-entry
+ceiling every diagnostics list is held to, and would be written to the recorder on
+every state change.
+
+### Failure isolation
+
+Phase 3 is additive, so a fault in it costs only Phase 3. `_build_battery_plan`
+is wrapped exactly as `_async_record_forecast_evidence` is: an exception degrades
+three entities to `unknown`, names itself in diagnostics, and leaves learning,
+both forecasts and both forecast-error sensors untouched. Tested in both
+directions — a corrupt forecast history does not take the battery down either.
+
 ## Entity contract
 
-Exactly six sensors — four from Phase 1, two from Phase 2 — unique IDs
+Exactly nine sensors — four from Phase 1, two from Phase 2, three from Phase 3 — unique IDs
 `{entry_id}_{key}`, all on one service device named from the entry title. Names
 are literal English with **no** `translation_key`: Home Assistant derives the
 entity ID from the translated name, so a translation key would give a Dutch user
@@ -885,7 +1232,8 @@ Dutch entity IDs. This matches the sibling Frank Quarter Prices integration, and
 it is why the two new sensors carry no translation entries either.
 
 Neither forecast sensor sets `state_class` — a prediction must not become a
-long-term statistic.
+long-term statistic. Nor does `Battery Recommendation`: a device class of `enum`
+permits none, and a long-term statistic over a category means nothing.
 
 The two Phase-2 error sensors invert both halves of that rule, deliberately. They
 **do** set `state_class`, because they measure error that has already happened
@@ -910,17 +1258,26 @@ enforces this both statically and at runtime.
 
 ## Future phases
 
-Optimisation, reserve calculation and any battery control belong on top of this
-foundation, not inside it. Things Phases 1 and 2 deliberately keep possible
-without implementing: battery minimum SOC and usable capacity, charge/discharge
-power limits, grid import/export limits, efficiency and degradation modelling,
-reason/status outputs, and EV scheduling using the flexible-load series already
-being recorded.
+Battery *control* belongs on top of this foundation, not inside it. Things Phases
+1 to 3 deliberately keep possible without implementing: grid import/export
+limits, degradation modelling, and EV scheduling using the flexible-load series
+already being recorded.
 
-Phase 3 should consume `api.py` and nothing deeper. `ForecastUncertainty` exists
-so a reserve can be sized from measured forecast error rather than a guessed
-margin — note that its fields are `None` when there is no evidence, and `None`
-means "no evidence", never "no error".
+What each next phase needs, and where it plugs in:
+
+| Phase | Needs | Seam |
+|---|---|---|
+| **4** Control | a safe executable recommendation | `allowed_energy_ac_kwh` on a frozen record obtainable only from the clamp. **Give it its own boundary module** so `api.py` stays decision-free |
+| **5** Solcast PV | production joins the simulation | the stepper takes a *sequence of demands*, never the forecast — production is a second series. Makes `Projected Battery SoC` publishable, and is where asymmetric efficiency belongs |
+| **6** Frank prices | a price series joins | prices are a *policy* input; what-if already compares trajectories, so this adds a cost function over them |
+| **7** Dynamic reserve | raise the floor, never the user's setting | `dynamic_reserve` beside `static_reserve`, computing `max(configured, dynamic)` **inside** the factory. `interval_margin_kwh` is already reported |
+| **8** Economic optimisation | replace the objective, keep the simulator | the policy interface; `HoldPolicy` is already the counterfactual to price against, and the soft reserve is what makes “dip but never below the floor” expressible |
+| **9** Adaptive feedback | provenance and joins | recorded state of charge joins the Phase-2 snapshot by chronological index and target day; plans are recomputable; `policy_version` prevents pooling generations; separate efficiency fields let them be learned |
+| **10** Multi-day | a longer horizon | the simulator is horizon-agnostic and already walks today plus tomorrow |
+
+`ForecastUncertainty` exists so a reserve can be sized from measured forecast
+error rather than a guessed margin — note that its fields are `None` when there is
+no evidence, and `None` means "no evidence", never "no error".
 
 An adaptive phase should read the stored evidence through the same boundary, and
 should check `model_version` and `model_params_hash` before pooling records: two

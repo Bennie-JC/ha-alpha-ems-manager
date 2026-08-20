@@ -32,6 +32,7 @@ async def test_diagnostics_report_every_documented_section(
         "energy_balance",
         "storage",
         "forecast_history",
+        "battery_plan",
         "consumed_integrations",
     }
 

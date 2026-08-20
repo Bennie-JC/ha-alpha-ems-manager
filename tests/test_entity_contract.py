@@ -74,11 +74,37 @@ CONTRACT: dict[str, dict[str, object]] = {
         "state_class": "measurement",
         "icon": "mdi:chart-timeline-variant",
     },
+    # Phase 3. The recommendation is an enum, so it carries a device class and
+    # deliberately no state class; the other two are measurements of a plan.
+    "sensor.alpha_ems_battery_recommendation": {
+        "unique_id_suffix": "battery_recommendation",
+        "name": "Alpha EMS Battery Recommendation",
+        "unit": None,
+        "device_class": "enum",
+        "state_class": None,
+        "icon": "mdi:battery-heart-variant",
+    },
+    "sensor.alpha_ems_planned_battery_power": {
+        "unique_id_suffix": "battery_planned_power",
+        "name": "Alpha EMS Planned Battery Power",
+        "unit": "kW",
+        "device_class": None,
+        "state_class": "measurement",
+        "icon": "mdi:transmission-tower",
+    },
+    "sensor.alpha_ems_usable_battery_energy": {
+        "unique_id_suffix": "battery_usable_energy",
+        "name": "Alpha EMS Usable Battery Energy",
+        "unit": "kWh",
+        "device_class": "energy_storage",
+        "state_class": "measurement",
+        "icon": "mdi:battery-charging-medium",
+    },
 }
 
 
 def test_no_entity_is_missing_or_extra(hass: HomeAssistant) -> None:
-    """Exactly the six documented entities exist."""
+    """Exactly the nine documented entities exist."""
     registry = er.async_get(hass)
     created = {
         entity.entity_id
@@ -86,7 +112,27 @@ def test_no_entity_is_missing_or_extra(hass: HomeAssistant) -> None:
         if entity.platform == DOMAIN
     }
     assert created == set(CONTRACT)
-    assert len(created) == len(CONTRACT) == 6
+    assert len(created) == len(CONTRACT) == 9
+
+
+#: The entity surface, phase by phase. Named rather than counted, so a new
+#: entity cannot be waved through by adjusting a single number -- and so it is
+#: visible which phase each one belongs to.
+PHASE_ONE_ENTITIES = {
+    "sensor.alpha_ems_expected_house_load_today",
+    "sensor.alpha_ems_expected_house_load_tomorrow",
+    "sensor.alpha_ems_learning_confidence",
+    "sensor.alpha_ems_learning_days",
+}
+PHASE_TWO_ENTITIES = {
+    "sensor.alpha_ems_forecast_error_yesterday",
+    "sensor.alpha_ems_forecast_error_7_days",
+}
+PHASE_THREE_ENTITIES = {
+    "sensor.alpha_ems_battery_recommendation",
+    "sensor.alpha_ems_planned_battery_power",
+    "sensor.alpha_ems_usable_battery_energy",
+}
 
 
 def test_phase_two_added_exactly_two_entities(hass: HomeAssistant) -> None:
@@ -94,22 +140,54 @@ def test_phase_two_added_exactly_two_entities(hass: HomeAssistant) -> None:
 
     Everything else it records -- the snapshot inventory, per-horizon and
     per-slot error breakdowns, modelled-versus-filled performance, storage
-    health, lifecycle counts -- is diagnostics-only by design. Naming the four
-    Phase-1 entities explicitly means a future entity cannot be waved through by
-    adjusting a single number.
+    health, lifecycle counts -- is diagnostics-only by design.
     """
-    phase_one = {
-        "sensor.alpha_ems_expected_house_load_today",
-        "sensor.alpha_ems_expected_house_load_tomorrow",
-        "sensor.alpha_ems_learning_confidence",
-        "sensor.alpha_ems_learning_days",
-    }
-    phase_two = set(CONTRACT) - phase_one
+    assert set(CONTRACT) - PHASE_ONE_ENTITIES - PHASE_THREE_ENTITIES == (
+        PHASE_TWO_ENTITIES
+    )
 
-    assert phase_two == {
-        "sensor.alpha_ems_forecast_error_yesterday",
-        "sensor.alpha_ems_forecast_error_7_days",
+
+def test_phase_three_added_exactly_three_entities(hass: HomeAssistant) -> None:
+    """The decision layer is worth three rows, and no more.
+
+    The simulated trajectory, the per-band split, the binding-constraint tally,
+    the what-if comparison and the PV-blind projected state of charge are all
+    diagnostics-only. A ninety-six-interval plan has no place in an attribute,
+    and a projection the simulator cannot honestly make has no place in an
+    entity.
+    """
+    assert set(CONTRACT) - PHASE_ONE_ENTITIES - PHASE_TWO_ENTITIES == (
+        PHASE_THREE_ENTITIES
+    )
+    assert len(PHASE_THREE_ENTITIES) == 3
+
+
+def test_the_phase_one_and_two_entities_are_untouched_by_phase_three(
+    hass: HomeAssistant,
+) -> None:
+    """Phase 3 is additive. The six existing rows keep their exact contract.
+
+    Asserted against the literal table rather than against ``CONTRACT``, so
+    editing the table to accommodate a Phase-3 change cannot silently relax a
+    Phase-1 or Phase-2 entity at the same time.
+    """
+    existing = {
+        "sensor.alpha_ems_expected_house_load_today": ("kWh", "energy", None),
+        "sensor.alpha_ems_expected_house_load_tomorrow": ("kWh", "energy", None),
+        "sensor.alpha_ems_learning_confidence": ("%", None, "measurement"),
+        "sensor.alpha_ems_learning_days": (None, None, "measurement"),
+        "sensor.alpha_ems_forecast_error_yesterday": ("kWh", None, "measurement"),
+        "sensor.alpha_ems_forecast_error_7_days": ("%", None, "measurement"),
     }
+    registry = er.async_get(hass)
+    for entity_id, (unit, device_class, state_class) in existing.items():
+        entry = registry.async_get(entity_id)
+        assert entry is not None, entity_id
+        assert entry.unit_of_measurement == unit, entity_id
+        assert entry.original_device_class == device_class, entity_id
+        state = hass.states.get(entity_id)
+        assert state is not None, entity_id
+        assert state.attributes.get("state_class") == state_class, entity_id
 
 
 def test_the_forecast_error_sensors_are_measurements_not_predictions(

@@ -389,23 +389,43 @@ async def test_the_options_flow_aborts_when_the_price_source_is_gone(
     rejected the form on submit -- so the user could not change *any* setting,
     including repointing an unrelated sensor. The only escape was deleting the
     entry, which loses all learned history.
+
+    Since Phase 3 the options flow is a menu, so the abort surfaces on the
+    sources page rather than on opening. That makes the lockout strictly smaller,
+    which this test now also proves: the battery-planning page still works with
+    no price source at all, so a user is never locked out of everything.
     """
+    from .test_config_flow import open_options
+
     await hass.config_entries.async_remove(frank_config_entry.entry_id)
     await hass.async_block_till_done()
 
-    result = await hass.config_entries.options.async_init(setup_integration.entry_id)
+    result = await open_options(hass, setup_integration.entry_id, "sources")
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "frank_not_configured"
+
+    # ... and the other page is unaffected, which the old single-page form could
+    # not have offered.
+    battery = await open_options(hass, setup_integration.entry_id, "battery")
+    assert battery["type"] is FlowResultType.FORM
+    assert battery["step_id"] == "battery"
 
 
 async def test_the_options_flow_still_opens_normally(
     hass: HomeAssistant, setup_integration: MockConfigEntry
 ) -> None:
     """The abort must not trigger when the price source is present."""
-    result = await hass.config_entries.options.async_init(setup_integration.entry_id)
+    from .test_config_flow import open_options
 
-    assert result["type"] is FlowResultType.FORM
+    menu = await hass.config_entries.options.async_init(setup_integration.entry_id)
+    assert menu["type"] is FlowResultType.MENU
+    assert set(menu["menu_options"]) == {"sources", "battery"}
+
+    for page in ("sources", "battery"):
+        result = await open_options(hass, setup_integration.entry_id, page)
+        assert result["type"] is FlowResultType.FORM, page
+        assert result["step_id"] == page
 
 
 # -- removing an entry must not orphan its history ---------------------------

@@ -24,16 +24,26 @@
       },
       "battery": {
         "title": "Accu",
-        "description": "Kies de accusensoren en bevestig hoe jouw systeem laden rapporteert.",
+        "description": "Kies de accusensoren, bevestig hoe je systeem laden rapporteert en vul de grenzen van de accu zelf in. Die grenzen dienen alleen om te berekenen wat de accu zou kunnen doen; Alpha EMS stuurt de accu nooit aan.",
         "data": {
           "battery_soc_entity": "Laadtoestand accu",
           "battery_power_entity": "Accuvermogen",
-          "battery_power_sign": "Tekenconventie accuvermogen"
+          "battery_power_sign": "Tekenconventie accuvermogen",
+          "battery_capacity_kwh": "Bruikbare accucapaciteit (DC)",
+          "battery_min_soc_percent": "Minimale laadtoestand",
+          "battery_max_charge_kw": "Maximaal laadvermogen (AC)",
+          "battery_max_discharge_kw": "Maximaal ontlaadvermogen (AC)",
+          "battery_round_trip_efficiency_percent": "Rendement heen en terug"
         },
         "data_description": {
           "battery_soc_entity": "Een percentagesensor, bijvoorbeeld AlphaESS SoC Battery.",
           "battery_power_entity": "Momentaan accuvermogen in W of kW.",
-          "battery_power_sign": "Kijk op een moment dat de accu laadt. AlphaESS rapporteert tijdens laden een negatieve waarde; dat is hier de standaard."
+          "battery_power_sign": "Kijk op een moment dat de accu laadt. AlphaESS rapporteert tijdens laden een negatieve waarde; dat is hier de standaard.",
+          "battery_capacity_kwh": "De bruikbare energie van de accu zelf, aan de DC-zijde, in kWh. Neem de bruikbare waarde uit het datablad van je accu en niet de uitkomst van een laad- of ontlaadtest: die is aan de AC-zijde gemeten en een paar procent lager. Dit is nergens uit een percentagesensor af te leiden en heeft daarom geen standaardwaarde. Laat het leeg en de accuplanning blijft onbeschikbaar in plaats van te gaan gokken.",
+          "battery_min_soc_percent": "De laagste laadtoestand die de planning ooit gebruikt. Het is een harde ondergrens: geen enkel advies en geen enkele simulatie gaat eronder. 0 % is toegestaan en betekent geen eigen reserve; dan geldt alleen de ondergrens van je omvormer zelf.",
+          "battery_max_charge_kw": "Het maximale laadvermogen van de accu, gemeten aan de AC-zijde, in kW. Meestal het vermogen van de omvormer. Geen standaardwaarde, om dezelfde reden als bij de capaciteit.",
+          "battery_max_discharge_kw": "Het maximale ontlaadvermogen van de accu, gemeten aan de AC-zijde, in kW. Meestal het vermogen van de omvormer.",
+          "battery_round_trip_efficiency_percent": "Hoeveel van de ingestopte energie er weer uit komt, AC naar AC, in procenten. Rond 90 % is gebruikelijk voor een thuisaccu. Vul 90 in, niet 0,9."
         }
       },
       "solar": {
@@ -78,7 +88,8 @@
       "invalid_percentage_entity": "Dit moet een percentagesensor in % zijn.",
       "entity_not_numeric": "Die entiteit levert geen getal en kan daarom niet als meting worden gebruikt.",
       "solcast_not_configured": "Je hebt de PV-voorspelling ingeschakeld, maar Solcast PV Forecast is niet ingesteld. Voeg die integratie eerst toe, of zet de PV-voorspelling uit.",
-      "ev_entity_same_as_house_load": "De sensor voor flexibele belasting moet een andere entiteit zijn dan de sensor voor huisbelasting. De basisbelasting is de gemeten belasting min de flexibele belasting, dus dezelfde entiteit twee keer kiezen zou die voor elk interval nul maken."
+      "ev_entity_same_as_house_load": "De sensor voor flexibele belasting moet een andere entiteit zijn dan de sensor voor huisbelasting. De basisbelasting is de gemeten belasting min de flexibele belasting, dus dezelfde entiteit twee keer kiezen zou die voor elk interval nul maken.",
+      "min_soc_not_below_max": "De minimale laadtoestand moet nog bruikbare energie overlaten en dus onder 100 % liggen."
     },
     "abort": {
       "frank_not_configured": "Frank Quarter Prices is nog niet ingesteld. Voeg die integratie eerst toe en configureer hem, en voeg daarna Alpha EMS Manager toe.",
@@ -97,12 +108,21 @@
       "entity_not_numeric": "Die entiteit levert geen getal en kan daarom niet als meting worden gebruikt.",
       "pv_entity_required": "Je hebt aangegeven dat dit systeem zonnepanelen heeft, dus een PV-productiesensor is vereist.",
       "solcast_entry_required": "Je hebt de PV-voorspelling ingeschakeld, dus een Solcast-instantie is vereist.",
-      "ev_entity_same_as_house_load": "De sensor voor flexibele belasting moet een andere entiteit zijn dan de sensor voor huisbelasting. De basisbelasting is de gemeten belasting min de flexibele belasting, dus dezelfde entiteit twee keer kiezen zou die voor elk interval nul maken."
+      "ev_entity_same_as_house_load": "De sensor voor flexibele belasting moet een andere entiteit zijn dan de sensor voor huisbelasting. De basisbelasting is de gemeten belasting min de flexibele belasting, dus dezelfde entiteit twee keer kiezen zou die voor elk interval nul maken.",
+      "min_soc_not_below_max": "De minimale laadtoestand moet nog bruikbare energie overlaten en dus onder 100 % liggen."
     },
     "step": {
       "init": {
         "title": "Instellingen Alpha EMS Manager",
-        "description": "Het wijzigen van een bron herlaadt de integratie. De geleerde historie blijft behouden.",
+        "description": "Kies wat je wilt wijzigen. De geleerde geschiedenis en het prognosebewijs blijven in beide gevallen bewaard.",
+        "menu_options": {
+          "sources": "Bronnen",
+          "battery": "Accuplanning"
+        }
+      },
+      "sources": {
+        "title": "Bronnen",
+        "description": "Het wijzigen van een bron herlaadt de integratie. De geleerde geschiedenis blijft bewaard.",
         "data": {
           "house_load_entity": "Huisverbruik vermogen",
           "daily_house_load_entity": "Dagelijks huisverbruik (validatie, optioneel)",
@@ -132,6 +152,24 @@
           "use_pv_forecast": "Vereist een geconfigureerde Solcast PV Forecast-integratie.",
           "solcast_entry_id": "Vereist wanneer de PV-voorspelling is ingeschakeld.",
           "ev_power_entity": "Optionele flexibele belasting. Het geleerde verbruik sluit het laden van de auto uit wanneer dit is ingesteld."
+        }
+      },
+      "battery": {
+        "title": "Accuplanning",
+        "description": "De grenzen van de accu zelf, gebruikt om te berekenen wat hij zou kunnen doen. Alpha EMS stuurt de accu nooit aan. Laat je de capaciteit of een vermogensgrens leeg, dan blijft de accuplanning onbeschikbaar in plaats van te gaan gokken; de geleerde geschiedenis en het prognosebewijs blijven onaangetast.",
+        "data": {
+          "battery_capacity_kwh": "Bruikbare accucapaciteit (DC)",
+          "battery_min_soc_percent": "Minimale laadtoestand",
+          "battery_max_charge_kw": "Maximaal laadvermogen (AC)",
+          "battery_max_discharge_kw": "Maximaal ontlaadvermogen (AC)",
+          "battery_round_trip_efficiency_percent": "Rendement heen en terug"
+        },
+        "data_description": {
+          "battery_capacity_kwh": "De bruikbare energie van de accu zelf, aan de DC-zijde, in kWh. Neem de bruikbare waarde uit het datablad van je accu en niet de uitkomst van een laad- of ontlaadtest: die is aan de AC-zijde gemeten en een paar procent lager. Dit is nergens uit een percentagesensor af te leiden en heeft daarom geen standaardwaarde. Laat het leeg en de accuplanning blijft onbeschikbaar in plaats van te gaan gokken.",
+          "battery_min_soc_percent": "De laagste laadtoestand die de planning ooit gebruikt. Het is een harde ondergrens: geen enkel advies en geen enkele simulatie gaat eronder. 0 % is toegestaan en betekent geen eigen reserve; dan geldt alleen de ondergrens van je omvormer zelf.",
+          "battery_max_charge_kw": "Het maximale laadvermogen van de accu, gemeten aan de AC-zijde, in kW. Meestal het vermogen van de omvormer. Geen standaardwaarde, om dezelfde reden als bij de capaciteit.",
+          "battery_max_discharge_kw": "Het maximale ontlaadvermogen van de accu, gemeten aan de AC-zijde, in kW. Meestal het vermogen van de omvormer.",
+          "battery_round_trip_efficiency_percent": "Hoeveel van de ingestopte energie er weer uit komt, AC naar AC, in procenten. Rond 90 % is gebruikelijk voor een thuisaccu. Vul 90 in, niet 0,9."
         }
       }
     }

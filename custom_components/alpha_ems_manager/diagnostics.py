@@ -49,6 +49,8 @@ from .forecast_history import (
     model_params_hash,
 )
 from .metrics import compute_window, window_from_summaries
+from .plan import plan_as_dict
+from .policy import DEFAULT_POLICY, SHIPPED_POLICIES
 from .storage import DayRecord, elapsed_quarters_for, expected_quarters_for
 
 
@@ -470,6 +472,57 @@ async def _forecast_history_report(
     }
 
 
+def _battery_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any]:
+    """Summarise the Phase-3 decision layer.
+
+    Everything the three published entities do not show: the input state, both
+    floors and where the effective one came from, the derived usable window, the
+    reduced trajectory, the per-band split, which limit bound where, the hold
+    comparison and the PV-blind projection.
+
+    Bounded by construction. ``plan_as_dict`` publishes no per-interval array and
+    caps its one list of binding intervals, because every list anywhere in this
+    payload is held to sixteen entries -- a ninety-six-interval trajectory would
+    turn a support download into a history dump.
+    """
+    plan = coordinator.battery_plan
+    configured = coordinator.battery_planning_configured
+    if plan is None:
+        return {
+            "available": False,
+            # Two quite different absences, told apart. A missing hardware fact
+            # is the user's to fill in; a failed evaluation is a fault.
+            "note": (
+                "no battery plan was produced this refresh: the decision layer "
+                "either raised and was isolated, or the coordinator has not "
+                "refreshed yet. Learning, both forecasts and the forecast-error "
+                "sensors are unaffected"
+                if configured
+                else "battery planning is not configured; enter the capacity and "
+                "the two power limits under Options to enable it"
+            ),
+            "hardware_configured": configured,
+            "controls_nothing": (
+                "Phase 3 is observation only and issues no command to the battery"
+            ),
+        }
+
+    payload = plan_as_dict(plan, tz)
+    payload["hardware_configured"] = configured
+    payload["policy_catalogue"] = {
+        "shipped": [policy.identity for policy in SHIPPED_POLICIES],
+        "default": DEFAULT_POLICY.identity,
+        "charging_rule": (
+            "no policy shipped in this phase ever asks to charge: every reason "
+            "to would need photovoltaic, price or dynamic-reserve information "
+            "that belongs to a later phase. The charge path exists, is clamped "
+            "and is simulated, so what-if comparison and later phases have "
+            "somewhere to land"
+        ),
+    }
+    return payload
+
+
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: AlphaEmsConfigEntry
 ) -> dict[str, Any]:
@@ -769,6 +822,10 @@ async def async_get_config_entry_diagnostics(
         # published error figures: the inventory, the lifecycle counts, the
         # per-horizon and per-slot breakdowns and the storage health.
         "forecast_history": await _forecast_history_report(coordinator, today_date),
+        # Phase 3. The decision and simulation layer: what it read, what it
+        # concluded, which limit bound it, and what would have happened. Nothing
+        # here is ever executed.
+        "battery_plan": _battery_report(coordinator, tz),
         "consumed_integrations": {
             "frank_entry_id": config.frank_entry_id,
             "frank_available": coordinator.frank_available,

@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 from datetime import timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.core import HomeAssistant
@@ -98,8 +99,25 @@ def test_no_unexpected_module_reaches_into_the_evidence_layer(path: Path) -> Non
 
 
 def test_the_public_interface_exposes_only_what_it_promises() -> None:
-    """A frozen surface, so a later phase can be written against it."""
-    public = {name for name in vars(api) if not name.startswith("_")}
+    """A frozen surface, so a later phase can be written against it.
+
+    Compared as an *exact* set, over the names this module actually defines
+    rather than over everything reachable through it. The previous form asserted
+    a subset, which meant it could not fail: a new public name -- or a decision
+    accidentally exposed here -- would have passed a test whose name says it
+    would not. Imported symbols are excluded because they are reachable as
+    attributes of any module and say nothing about the contract.
+    """
+    tree = ast.parse((COMPONENT_DIR / "api.py").read_text(encoding="utf-8"))
+    imported = {
+        (alias.asname or alias.name).split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    }
+    defined = {
+        name for name in vars(api) if not name.startswith("_") and name not in imported
+    }
     expected = {
         "API_VERSION",
         "LoadForecast",
@@ -107,9 +125,91 @@ def test_the_public_interface_exposes_only_what_it_promises() -> None:
         "current_forecast",
         "async_issued_forecast",
         "async_uncertainty",
+        # Phase 3 needs the live forecast, not the one refresh-stale copy sitting
+        # on ``coordinator.data``. Converts and copies; decides nothing.
+        "load_forecast_from",
     }
 
-    assert expected <= public
+    assert defined == expected
+
+
+def test_the_band_mapping_is_declared_as_read_only() -> None:
+    """Annotated ``Mapping``, not ``dict``, so the intent is in the signature.
+
+    The promise at the top of the module is that everything *returned here* is
+    frozen and copied. ``mae_by_band`` was a plain ``dict`` on a frozen
+    dataclass, so the reference could not be swapped but a caller could edit a
+    band average in place and hand the altered object on. The annotation states
+    the contract; the test below proves the accessor honours it.
+    """
+    import typing
+
+    hints = typing.get_type_hints(api.ForecastUncertainty)
+
+    assert typing.get_origin(hints["mae_by_band"]) is not dict
+    assert "Mapping" in str(hints["mae_by_band"])
+
+
+async def test_every_returned_mapping_is_read_only(
+    hass: HomeAssistant, setup_integration: MockConfigEntry
+) -> None:
+    """Through the real accessor, which is what the promise actually covers."""
+    coordinator = setup_integration.runtime_data
+    seed(coordinator, history_before(NORMAL))
+    await refresh_at(coordinator, local(NORMAL, 12, 5))
+
+    with frozen(local(NORMAL, 12, 6)):
+        uncertainty = await api.async_uncertainty(coordinator)
+
+    with pytest.raises(TypeError):
+        uncertainty.mae_by_band["night"] = 99.0  # type: ignore[index]
+
+
+def test_an_out_of_range_interval_index_is_never_silently_accepted() -> None:
+    """``index_for_start_utc`` is unclamped on purpose, so every caller guards.
+
+    Clamping inside the helper would be worse than leaving it: an index outside
+    the day means the stored day's shape and the instant being filed disagree,
+    and beta.4 added ``REJECT_INTERVAL_OUT_OF_RANGE`` precisely so that is
+    counted and named rather than absorbed. Silently folding it to the nearest
+    valid index would restore the defect that fix removed.
+
+    So the guarantee lives at the call sites, and this is what holds it there.
+    """
+    from custom_components.alpha_ems_manager.storage import (
+        DayRecord,
+        index_for_start_utc,
+        utc_midnight,
+    )
+
+    tz = ZoneInfo("Europe/Amsterdam")
+    before = utc_midnight(NORMAL, tz) - timedelta(minutes=15)
+    assert index_for_start_utc(NORMAL, before, tz) == -1
+
+    record = DayRecord(day=NORMAL, tz_key="Europe/Amsterdam", interval_count=96)
+    for index in (-1, 96, 500):
+        assert (
+            record.record_interval(
+                index, measured_kwh=1.0, ev_kwh=None, ev_expected=False
+            )
+            is False
+        )
+    assert record.measured_valid_count == 0
+    assert record.soc_sample_count == 0
+
+    users = {
+        path.stem
+        for path in COMPONENT_DIR.glob("*.py")
+        if "index_for_start_utc" in path.read_text(encoding="utf-8")
+        and path.stem != "storage"
+    }
+    assert users == {"coordinator"}
+    coordinator_source = (COMPONENT_DIR / "coordinator.py").read_text(encoding="utf-8")
+    assert "REJECT_INTERVAL_OUT_OF_RANGE" in coordinator_source
+    assert "if not record.record_interval(" in coordinator_source
+    for name in ("battery", "simulation", "policy", "plan"):
+        source = (COMPONENT_DIR / f"{name}.py").read_text(encoding="utf-8")
+        assert "index_for_start_utc" not in source, name
 
 
 def test_the_public_types_are_immutable() -> None:

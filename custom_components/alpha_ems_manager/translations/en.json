@@ -24,16 +24,26 @@
       },
       "battery": {
         "title": "Battery",
-        "description": "Select the battery sensors and confirm how your system reports charging.",
+        "description": "Select the battery sensors, confirm how your system reports charging, and enter the battery's own limits. The limits are used only to work out what the battery could do; Alpha EMS never sends a command to it.",
         "data": {
           "battery_soc_entity": "Battery state of charge",
           "battery_power_entity": "Battery power",
-          "battery_power_sign": "Battery power sign convention"
+          "battery_power_sign": "Battery power sign convention",
+          "battery_capacity_kwh": "Usable battery capacity (DC)",
+          "battery_min_soc_percent": "Minimum state of charge",
+          "battery_max_charge_kw": "Maximum charge power (AC)",
+          "battery_max_discharge_kw": "Maximum discharge power (AC)",
+          "battery_round_trip_efficiency_percent": "Round-trip efficiency"
         },
         "data_description": {
           "battery_soc_entity": "A percentage sensor, for example AlphaESS SoC Battery.",
           "battery_power_entity": "Instantaneous battery power in W or kW.",
-          "battery_power_sign": "Check a moment when the battery is charging. AlphaESS reports a negative value while charging, which is the default here."
+          "battery_power_sign": "Check a moment when the battery is charging. AlphaESS reports a negative value while charging, which is the default here.",
+          "battery_capacity_kwh": "The usable energy of the pack itself, on the DC side, in kWh. Take the usable figure from your battery's data sheet rather than a charge or discharge test result, which is measured on the AC side and is a few per cent smaller. Nothing can work this out from a percentage sensor, so it has no default: leave it empty and the battery planning stays unavailable rather than guessing.",
+          "battery_min_soc_percent": "The lowest state of charge the planning will ever use. It is a hard floor: no recommendation and no simulation crosses it. 0 % is allowed and means no reserve of its own, in which case only your inverter's own floor applies.",
+          "battery_max_charge_kw": "The most the battery can be charged at, measured on the AC side, in kW. Usually the inverter's rating. No default, for the same reason as capacity.",
+          "battery_max_discharge_kw": "The most the battery can be discharged at, measured on the AC side, in kW. Usually the inverter's rating.",
+          "battery_round_trip_efficiency_percent": "How much of the energy put in comes back out again, AC to AC, as a percentage. Around 90 % is typical for a home battery. Enter 90, not 0.9."
         }
       },
       "solar": {
@@ -78,7 +88,8 @@
       "invalid_percentage_entity": "This must be a percentage sensor measured in %.",
       "entity_not_numeric": "That entity does not report a number, so it cannot be used as a measurement.",
       "solcast_not_configured": "You enabled the PV forecast, but Solcast PV Forecast is not set up. Add that integration first, or turn the PV forecast off.",
-      "ev_entity_same_as_house_load": "The flexible-load sensor must be a different entity from the house-load sensor. Baseline load is measured load minus flexible load, so selecting the same entity twice would make it zero for every interval."
+      "ev_entity_same_as_house_load": "The flexible-load sensor must be a different entity from the house-load sensor. Baseline load is measured load minus flexible load, so selecting the same entity twice would make it zero for every interval.",
+      "min_soc_not_below_max": "The minimum state of charge must leave some usable energy, so it has to be below 100 %."
     },
     "abort": {
       "frank_not_configured": "Frank Quarter Prices is not set up yet. Add and configure that integration first, then add Alpha EMS Manager.",
@@ -97,11 +108,20 @@
       "entity_not_numeric": "That entity does not report a number, so it cannot be used as a measurement.",
       "pv_entity_required": "You marked this system as having solar panels, so a PV production sensor is required.",
       "solcast_entry_required": "You enabled the PV forecast, so a Solcast instance is required.",
-      "ev_entity_same_as_house_load": "The flexible-load sensor must be a different entity from the house-load sensor. Baseline load is measured load minus flexible load, so selecting the same entity twice would make it zero for every interval."
+      "ev_entity_same_as_house_load": "The flexible-load sensor must be a different entity from the house-load sensor. Baseline load is measured load minus flexible load, so selecting the same entity twice would make it zero for every interval.",
+      "min_soc_not_below_max": "The minimum state of charge must leave some usable energy, so it has to be below 100 %."
     },
     "step": {
       "init": {
         "title": "Alpha EMS Manager settings",
+        "description": "Choose what to change. Learned history and forecast evidence are kept either way.",
+        "menu_options": {
+          "sources": "Sources",
+          "battery": "Battery planning"
+        }
+      },
+      "sources": {
+        "title": "Sources",
         "description": "Changing a source reloads the integration. Learned history is kept.",
         "data": {
           "house_load_entity": "House load power",
@@ -132,6 +152,24 @@
           "use_pv_forecast": "Requires a configured Solcast PV Forecast integration.",
           "solcast_entry_id": "Required when the PV forecast is enabled.",
           "ev_power_entity": "Optional flexible load. Learned demand excludes EV charging when this is set."
+        }
+      },
+      "battery": {
+        "title": "Battery planning",
+        "description": "The battery's own limits, used to work out what it could do. Alpha EMS never sends a command to the battery. Leaving the capacity or a power limit empty keeps the battery planning unavailable rather than guessing; learned history and forecast evidence are untouched either way.",
+        "data": {
+          "battery_capacity_kwh": "Usable battery capacity (DC)",
+          "battery_min_soc_percent": "Minimum state of charge",
+          "battery_max_charge_kw": "Maximum charge power (AC)",
+          "battery_max_discharge_kw": "Maximum discharge power (AC)",
+          "battery_round_trip_efficiency_percent": "Round-trip efficiency"
+        },
+        "data_description": {
+          "battery_capacity_kwh": "The usable energy of the pack itself, on the DC side, in kWh. Take the usable figure from your battery's data sheet rather than a charge or discharge test result, which is measured on the AC side and is a few per cent smaller. Nothing can work this out from a percentage sensor, so it has no default: leave it empty and the battery planning stays unavailable rather than guessing.",
+          "battery_min_soc_percent": "The lowest state of charge the planning will ever use. It is a hard floor: no recommendation and no simulation crosses it. 0 % is allowed and means no reserve of its own, in which case only your inverter's own floor applies.",
+          "battery_max_charge_kw": "The most the battery can be charged at, measured on the AC side, in kW. Usually the inverter's rating. No default, for the same reason as capacity.",
+          "battery_max_discharge_kw": "The most the battery can be discharged at, measured on the AC side, in kW. Usually the inverter's rating.",
+          "battery_round_trip_efficiency_percent": "How much of the energy put in comes back out again, AC to AC, as a percentage. Around 90 % is typical for a home battery. Enter 90, not 0.9."
         }
       }
     }

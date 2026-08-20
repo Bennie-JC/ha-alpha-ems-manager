@@ -19,6 +19,7 @@ Two selection styles are used deliberately:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import voluptuous as vol
@@ -33,9 +34,15 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import selector
 
 from .const import (
+    BATTERY_MAX_SOC_PERCENT,
     BATTERY_SIGN_OPTIONS,
+    CONF_BATTERY_CAPACITY_KWH,
+    CONF_BATTERY_MAX_CHARGE_KW,
+    CONF_BATTERY_MAX_DISCHARGE_KW,
+    CONF_BATTERY_MIN_SOC_PERCENT,
     CONF_BATTERY_POWER_ENTITY,
     CONF_BATTERY_POWER_SIGN,
+    CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_SOC_ENTITY,
     CONF_DAILY_HOUSE_LOAD_ENTITY,
     CONF_EV_POWER_ENTITY,
@@ -49,13 +56,21 @@ from .const import (
     CONF_SOLCAST_ENTRY_ID,
     CONF_USE_PV_FORECAST,
     CONFIG_ENTRY_VERSION,
+    DEFAULT_BATTERY_MIN_SOC_PERCENT,
     DEFAULT_BATTERY_POWER_SIGN,
+    DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     DEFAULT_GRID_POWER_SIGN,
     DEFAULT_INSTANCE_NAME,
     DOMAIN,
     DOMAIN_FRANK,
     DOMAIN_SOLCAST,
     GRID_SIGN_OPTIONS,
+    MAX_BATTERY_CAPACITY_KWH,
+    MAX_BATTERY_POWER_KW,
+    MAX_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+    MIN_BATTERY_CAPACITY_KWH,
+    MIN_BATTERY_POWER_KW,
+    MIN_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
 )
 from .validation import (
     validate_energy_entity,
@@ -82,6 +97,164 @@ _ENERGY_SELECTOR = selector.EntitySelector(
 _BATTERY_SELECTOR = selector.EntitySelector(
     selector.EntitySelectorConfig(domain=Platform.SENSOR)
 )
+
+
+#: The project's first numeric selectors.
+#:
+#: ``BOX`` rather than ``SLIDER`` for every one of them: these are datasheet
+#: figures a user reads off their hardware, not preferences to be dragged, and a
+#: slider cannot express 10.1 kWh legibly. Each carries its unit, so the
+#: electrical boundary in the label is reinforced by the box itself.
+#:
+#: The bounds duplicate the model's own validation on purpose. The selector stops
+#: an implausible value being typed; ``build_limits`` stops one that arrives any
+#: other way -- a hand-edited entry, or a key carried over from a future release.
+#: A single guard at either layer alone would be a guard with a hole in it.
+def _number_selector(
+    *,
+    minimum: float,
+    maximum: float,
+    step: float,
+    unit: str,
+) -> selector.NumberSelector:
+    """Return a bounded numeric box carrying its unit."""
+    return selector.NumberSelector(
+        selector.NumberSelectorConfig(
+            min=minimum,
+            max=maximum,
+            step=step,
+            unit_of_measurement=unit,
+            mode=selector.NumberSelectorMode.BOX,
+        )
+    )
+
+
+_CAPACITY_SELECTOR = _number_selector(
+    minimum=MIN_BATTERY_CAPACITY_KWH,
+    maximum=MAX_BATTERY_CAPACITY_KWH,
+    step=0.1,
+    unit="kWh",
+)
+_BATTERY_POWER_SELECTOR = _number_selector(
+    minimum=MIN_BATTERY_POWER_KW,
+    maximum=MAX_BATTERY_POWER_KW,
+    step=0.1,
+    unit="kW",
+)
+#: Zero is deliberately allowed: it means "no EMS reserve", and the inverter's
+#: own floor still protects the cells. Refusing it would be an arbitrary
+#: restriction, so the one genuine rule -- that a floor below the ceiling leaves
+#: something usable -- is validated instead. See ``_validate_battery``.
+_MIN_SOC_SELECTOR = _number_selector(
+    minimum=0.0, maximum=BATTERY_MAX_SOC_PERCENT, step=1.0, unit="%"
+)
+#: The floor of fifty is not cosmetic. It is what catches a user entering ``0.90``
+#: where ``90`` belongs, which would otherwise model a plausible-looking battery
+#: that loses ninety per cent of everything put into it.
+_EFFICIENCY_SELECTOR = _number_selector(
+    minimum=MIN_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+    maximum=MAX_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+    step=1.0,
+    unit="%",
+)
+
+#: The Phase-3 hardware facts that have no default, in form order.
+#:
+#: Nothing can derive them: a percentage sensor says nothing about how many
+#: kilowatt-hours a percent is worth, and a power limit cannot be inferred from a
+#: capacity without assuming a C-rate. Absent means the battery layer declines to
+#: decide and names the missing field -- never a guessed value.
+BATTERY_HARDWARE_KEYS = (
+    CONF_BATTERY_CAPACITY_KWH,
+    CONF_BATTERY_MAX_CHARGE_KW,
+    CONF_BATTERY_MAX_DISCHARGE_KW,
+)
+
+
+def _battery_planning_schema(
+    current: Callable[[str, Any], Any] | None = None,
+) -> vol.Schema:
+    """Return the battery-planning fields.
+
+    ``current`` is supplied by the options flow, and its presence is what makes
+    the three hardware fields optional there. In the config flow they are
+    required, because a new installation is walked through the form and can be
+    complete from the start; in the options flow an installation upgrading from
+    an earlier release has none of them, and forcing all three to be entered
+    before a minimum state of charge could be changed would be a worse form than
+    one that lets a user fill them in when they have the figures to hand.
+    """
+    if current is None:
+        return vol.Schema(
+            {
+                vol.Required(CONF_BATTERY_CAPACITY_KWH): _CAPACITY_SELECTOR,
+                vol.Required(
+                    CONF_BATTERY_MIN_SOC_PERCENT,
+                    default=DEFAULT_BATTERY_MIN_SOC_PERCENT,
+                ): _MIN_SOC_SELECTOR,
+                vol.Required(CONF_BATTERY_MAX_CHARGE_KW): _BATTERY_POWER_SELECTOR,
+                vol.Required(CONF_BATTERY_MAX_DISCHARGE_KW): _BATTERY_POWER_SELECTOR,
+                vol.Required(
+                    CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+                    default=DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+                ): _EFFICIENCY_SELECTOR,
+            }
+        )
+    return vol.Schema(
+        {
+            vol.Optional(
+                CONF_BATTERY_CAPACITY_KWH,
+                description={
+                    "suggested_value": current(CONF_BATTERY_CAPACITY_KWH, None)
+                },
+            ): _CAPACITY_SELECTOR,
+            vol.Required(
+                CONF_BATTERY_MIN_SOC_PERCENT,
+                default=current(
+                    CONF_BATTERY_MIN_SOC_PERCENT, DEFAULT_BATTERY_MIN_SOC_PERCENT
+                ),
+            ): _MIN_SOC_SELECTOR,
+            vol.Optional(
+                CONF_BATTERY_MAX_CHARGE_KW,
+                description={
+                    "suggested_value": current(CONF_BATTERY_MAX_CHARGE_KW, None)
+                },
+            ): _BATTERY_POWER_SELECTOR,
+            vol.Optional(
+                CONF_BATTERY_MAX_DISCHARGE_KW,
+                description={
+                    "suggested_value": current(CONF_BATTERY_MAX_DISCHARGE_KW, None)
+                },
+            ): _BATTERY_POWER_SELECTOR,
+            vol.Required(
+                CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+                default=current(
+                    CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+                    DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+                ),
+            ): _EFFICIENCY_SELECTOR,
+        }
+    )
+
+
+def _validate_battery(user_input: dict[str, Any]) -> dict[str, str]:
+    """Return errors for the battery-planning fields.
+
+    One rule, and it is a real one rather than an arbitrary narrowing of the
+    range: a minimum state of charge at or above the ceiling leaves no usable
+    energy at all, so the battery could never be planned with. Expressed against
+    the ceiling rather than against the literal 100 so that it keeps working
+    unchanged when a later phase makes the ceiling configurable.
+    """
+    errors: dict[str, str] = {}
+    minimum = user_input.get(CONF_BATTERY_MIN_SOC_PERCENT)
+    if (
+        isinstance(minimum, (int, float))
+        and not isinstance(minimum, bool)
+        and minimum >= BATTERY_MAX_SOC_PERCENT
+    ):
+        errors[CONF_BATTERY_MIN_SOC_PERCENT] = "min_soc_not_below_max"
+    return errors
 
 
 def _sign_selector(options: tuple[str, ...], key: str) -> selector.SelectSelector:
@@ -204,7 +377,14 @@ class AlphaEmsConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_battery(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Collect the battery sources and their sign convention."""
+        """Collect the battery sources, sign convention and planning limits.
+
+        The planning figures live here rather than in a step of their own so a
+        new installation reaches the end of the flow with a battery that can
+        actually be planned with. They are required for that reason -- and
+        because the integration already insists on a state-of-charge and a power
+        sensor, so it already assumes a battery exists.
+        """
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -219,6 +399,8 @@ class AlphaEmsConfigFlow(ConfigFlow, domain=DOMAIN):
             if error:
                 errors[CONF_BATTERY_POWER_ENTITY] = error
 
+            errors.update(_validate_battery(user_input))
+
             if not errors:
                 self._data.update(user_input)
                 if self._data.get(CONF_HAS_PV):
@@ -232,6 +414,7 @@ class AlphaEmsConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Required(
                     CONF_BATTERY_POWER_SIGN, default=DEFAULT_BATTERY_POWER_SIGN
                 ): _sign_selector(BATTERY_SIGN_OPTIONS, "battery_power_sign"),
+                **_battery_planning_schema().schema,
             }
         )
         return self.async_show_form(
@@ -346,12 +529,64 @@ class AlphaEmsConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class AlphaEmsOptionsFlow(OptionsFlow):
-    """Lets every source selection be changed without re-adding the entry."""
+    """Lets every selection be changed without re-adding the entry.
+
+    Two pages behind a menu rather than one long form. The source selections and
+    the battery-planning figures are edited on different occasions and by
+    different reasoning -- one is "which sensor", the other is "what hardware" --
+    and appending five numeric fields to a form that already had thirteen would
+    have buried them at the bottom.
+
+    The stored keys stay **flat**. Collapsible sections were the other candidate
+    and would have delivered nested values, which the effective-configuration
+    rule, the unknown-key preservation rule and the cleared-optional rule all
+    read flat. A second step costs one extra click and changes no storage.
+    """
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Show and validate the full set of changeable options."""
+        """Offer the two groups of options."""
+        return self.async_show_menu(step_id="init", menu_options=["sources", "battery"])
+
+    async def async_step_battery(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show and validate the battery-planning figures.
+
+        Saving here must never disturb anything else. The merge starts from the
+        existing options for that reason, and the three hardware fields are
+        cleared to an explicit ``None`` when the user empties them -- deleting the
+        key would not clear them, because the effective configuration falls back
+        to the original entry data.
+        """
+        entry = self.config_entry
+        errors: dict[str, str] = {}
+
+        def current(key: str, default: Any = None) -> Any:
+            return entry.options.get(key, entry.data.get(key, default))
+
+        if user_input is not None:
+            errors = _validate_battery(user_input)
+            if not errors:
+                merged = {**entry.options, **user_input}
+                for optional in BATTERY_HARDWARE_KEYS:
+                    if optional not in user_input:
+                        merged[optional] = None
+                return self.async_create_entry(title="", data=merged)
+
+        return self.async_show_form(
+            step_id="battery",
+            data_schema=self.add_suggested_values_to_schema(
+                _battery_planning_schema(current), user_input
+            ),
+            errors=errors,
+        )
+
+    async def async_step_sources(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show and validate the full set of changeable source selections."""
         entry = self.config_entry
         errors: dict[str, str] = {}
 
@@ -480,7 +715,7 @@ class AlphaEmsOptionsFlow(OptionsFlow):
         )
 
         return self.async_show_form(
-            step_id="init",
+            step_id="sources",
             data_schema=self.add_suggested_values_to_schema(schema, user_input),
             errors=errors,
         )

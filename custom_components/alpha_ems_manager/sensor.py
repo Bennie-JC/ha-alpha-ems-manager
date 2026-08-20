@@ -1,11 +1,16 @@
 """Sensor platform for Alpha EMS Manager.
 
-Six entities: the four Phase-1 forecast and learning sensors, and the two
-Phase-2 forecast-error sensors. Every other quantity the integration computes --
-per-slot profiles, window means, balance residuals, coverage statistics,
-per-horizon error breakdowns, the snapshot inventory -- is available through
-diagnostics instead. Ninety-six quarter sensors and five window averages would
-be technically easy and practically awful.
+Nine entities: the four Phase-1 forecast and learning sensors, the two Phase-2
+forecast-error sensors, and the three Phase-3 battery ones. Every other quantity
+the integration computes -- per-slot profiles, window means, balance residuals,
+coverage statistics, per-horizon error breakdowns, the snapshot inventory, the
+simulated battery trajectory -- is available through diagnostics instead.
+Ninety-six quarter sensors and five window averages would be technically easy and
+practically awful.
+
+The three Phase-3 sensors describe a plan that is never executed. Nothing in this
+integration issues a command to a battery; the recommendation is published so it
+can be watched for weeks before anything is allowed to act on it.
 
 The two Phase-2 sensors measure error that has already happened, so unlike the
 forecast sensors they do carry a state class: a record of how wrong last week
@@ -34,7 +39,7 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import PERCENTAGE, UnitOfEnergy
+from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfPower
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -42,9 +47,16 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import AlphaEmsConfigEntry
 from .const import (
+    BATTERY_ACTION_OPTIONS,
+    BATTERY_KW_PRECISION,
+    BATTERY_KWH_PRECISION,
+    BATTERY_SOC_PRECISION,
     DOMAIN,
     FORECAST_ERROR_WINDOW_DAYS,
     NAME,
+    SENSOR_BATTERY_PLANNED_POWER,
+    SENSOR_BATTERY_RECOMMENDATION,
+    SENSOR_BATTERY_USABLE_ENERGY,
     SENSOR_EXPECTED_LOAD_TODAY,
     SENSOR_EXPECTED_LOAD_TOMORROW,
     SENSOR_FORECAST_ERROR_WINDOW,
@@ -53,13 +65,14 @@ from .const import (
     SENSOR_LEARNING_DAYS,
 )
 from .coordinator import AlphaEmsCoordinator
+from .plan import BatteryPlan
 
 
 @dataclass(frozen=True, kw_only=True)
 class AlphaEmsSensorDescription(SensorEntityDescription):
     """Describes one Alpha EMS sensor and how to derive it."""
 
-    value_fn: Callable[[AlphaEmsCoordinator], float | int | None]
+    value_fn: Callable[[AlphaEmsCoordinator], float | int | str | None]
     attributes_fn: Callable[[AlphaEmsCoordinator], dict[str, Any]] | None = None
 
 
@@ -277,6 +290,166 @@ def _forecast_error_window_attributes(
     }
 
 
+# -- Phase 3: the battery decision -------------------------------------------
+
+#: Repeated on all three battery sensors, because the single most likely
+#: misreading of any of them is that something acts on it.
+_SHADOW_BASIS: str = (
+    "advisory only: Phase 3 issues no command to the battery and nothing "
+    "executes this plan"
+)
+
+
+def _plan(coordinator: AlphaEmsCoordinator) -> BatteryPlan | None:
+    """Return this refresh's battery plan, or ``None``."""
+    return (coordinator.data or {}).get("battery_plan")
+
+
+def _recommendation_value(coordinator: AlphaEmsCoordinator) -> str | None:
+    """Return the recommended action, or ``None`` when none could be reached.
+
+    ``None`` -- which Home Assistant renders as ``unknown`` -- is deliberate for
+    the no-decision case. Internally that case is ``ACTION_NO_DECISION`` and is
+    kept distinct from a deliberate hold, because "hold because that is best" and
+    "hold because a hardware fact is missing" are different facts and a later
+    phase needs them apart. Publishing it as a fourth state would make ``unknown``
+    mean two things at once, and every other sensor here already uses ``unknown``
+    for "nothing honest to report".
+    """
+    plan = _plan(coordinator)
+    if plan is None or not plan.decision.decided:
+        return None
+    return plan.decision.action
+
+
+def _recommendation_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return why the recommendation is what it is.
+
+    The reason survives a non-decision: an entity reading ``unknown`` with no
+    explanation is the thing a maintainer cannot act on.
+    """
+    plan = _plan(coordinator)
+    if plan is None:
+        return {"reason": None, "basis": _SHADOW_BASIS}
+    decision = plan.decision
+    state = plan.state
+    return {
+        "reason": decision.reason,
+        "planned_power_kw": (
+            _round(decision.published_power_kw, BATTERY_KW_PRECISION)
+            if decision.decided
+            else None
+        ),
+        "usable_energy_kwh": _round(plan.usable_energy_kwh, BATTERY_KWH_PRECISION),
+        "battery_soc_percent": (
+            None if state is None else _round(state.soc_percent, BATTERY_SOC_PRECISION)
+        ),
+        # Both floors, always. The configured one is what the user set and what
+        # the simulator refuses to cross; the effective one is what the policy
+        # aims at. They are equal in this phase, and publishing both is what lets
+        # a user see immediately if anything has raised their floor.
+        "configured_min_soc_percent": plan.reserve.configured_min_soc_percent,
+        "effective_min_soc_percent": plan.reserve.effective_min_soc_percent,
+        "constraints": list(decision.constraints),
+        "basis": _SHADOW_BASIS,
+    }
+
+
+def _planned_power_value(coordinator: AlphaEmsCoordinator) -> float | None:
+    """Return the planned battery power in kW, positive for charging.
+
+    The only signed battery power in Phase 3, and signed only here. Internally a
+    request carries a direction and a non-negative magnitude, which is what makes
+    a negative discharge -- which would *add* energy -- unrepresentable.
+
+    This sign convention is the plan's own. It has nothing to do with the
+    configured ``battery_power_sign``, which describes how the user's own sensor
+    reports and is resolved away long before this point.
+    """
+    plan = _plan(coordinator)
+    if plan is None or not plan.decision.decided:
+        return None
+    return _round(plan.decision.published_power_kw, BATTERY_KW_PRECISION)
+
+
+def _planned_power_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return what was asked for and what the limits allowed."""
+    plan = _plan(coordinator)
+    if plan is None:
+        return {"basis": _PLANNED_POWER_BASIS, "sign_convention": _SIGN_CONVENTION}
+    decision = plan.decision
+    return {
+        "requested_mode": decision.request.mode,
+        "requested_power_kw": _round(decision.request.power_kw, BATTERY_KW_PRECISION),
+        "allowed_energy_kwh": (
+            _round(decision.allowed_energy_ac_kwh, BATTERY_KWH_PRECISION)
+            if decision.decided
+            else None
+        ),
+        "limiting_constraints": list(decision.constraints),
+        "policy": decision.policy,
+        "policy_version": decision.policy_version,
+        "sign_convention": _SIGN_CONVENTION,
+        "basis": _PLANNED_POWER_BASIS,
+    }
+
+
+def _usable_energy_value(coordinator: AlphaEmsCoordinator) -> float | None:
+    """Return the AC energy available above the reserve, in kWh.
+
+    Needs no forecast, so this survives a young installation where the forecast
+    is still withheld -- which is why it is published and a projected state of
+    charge is not.
+    """
+    plan = _plan(coordinator)
+    if plan is None:
+        return None
+    return _round(plan.usable_energy_kwh, BATTERY_KWH_PRECISION)
+
+
+def _usable_energy_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return the derivation behind the usable figure."""
+    plan = _plan(coordinator)
+    if plan is None:
+        return {"basis": _USABLE_ENERGY_BASIS}
+    state = plan.state
+    return {
+        "battery_soc_percent": (
+            None if state is None else _round(state.soc_percent, BATTERY_SOC_PRECISION)
+        ),
+        "capacity_kwh": plan.inputs.capacity_kwh,
+        "stored_energy_kwh": (
+            None if state is None else _round(state.energy_kwh, BATTERY_KWH_PRECISION)
+        ),
+        "configured_min_soc_percent": plan.reserve.configured_min_soc_percent,
+        "effective_min_soc_percent": plan.reserve.effective_min_soc_percent,
+        "reserve_source": plan.reserve.source,
+        # ``None`` without a forecast rather than taking the entity with it.
+        "coverage_hours": _round(plan.coverage_hours, 2),
+        "basis": _USABLE_ENERGY_BASIS,
+    }
+
+
+_SIGN_CONVENTION: str = (
+    "positive is energy into the battery; this is the plan's own convention and "
+    "is unrelated to the configured battery power sign, which describes the "
+    "source sensor only"
+)
+
+_PLANNED_POWER_BASIS: str = (
+    "interval-average AC power over the quarter-hour, after every hardware "
+    "limit; not an instantaneous inverter setpoint. Advisory only: nothing "
+    "executes it"
+)
+
+_USABLE_ENERGY_BASIS: str = (
+    "AC energy deliverable above the reserve, one conversion below the stored "
+    "DC energy. An upper bound: a single efficiency figure flatters a real "
+    "inverter at low power and inverter auxiliary draw is not modelled. "
+    "Advisory only: nothing executes this plan"
+)
+
+
 SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
     AlphaEmsSensorDescription(
         key=SENSOR_EXPECTED_LOAD_TODAY,
@@ -335,6 +508,44 @@ SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
         value_fn=_forecast_error_window_value,
         attributes_fn=_forecast_error_window_attributes,
     ),
+    AlphaEmsSensorDescription(
+        key=SENSOR_BATTERY_RECOMMENDATION,
+        name="Battery Recommendation",
+        icon="mdi:battery-heart-variant",
+        # An enum, so Home Assistant renders and records it as one rather than as
+        # free text. No state class: a device class of ENUM permits none, and a
+        # long-term statistic over a categorical value would mean nothing anyway.
+        device_class=SensorDeviceClass.ENUM,
+        options=list(BATTERY_ACTION_OPTIONS),
+        value_fn=_recommendation_value,
+        attributes_fn=_recommendation_attributes,
+    ),
+    AlphaEmsSensorDescription(
+        key=SENSOR_BATTERY_PLANNED_POWER,
+        name="Planned Battery Power",
+        icon="mdi:transmission-tower",
+        native_unit_of_measurement=UnitOfPower.KILO_WATT,
+        # No device class, for the same reason ``Forecast Error Yesterday`` has
+        # none: this is a signed quantity, and SensorDeviceClass.POWER would
+        # invite it into dashboards that assume a physical measurement rather
+        # than an intention.
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=_planned_power_value,
+        attributes_fn=_planned_power_attributes,
+    ),
+    AlphaEmsSensorDescription(
+        key=SENSOR_BATTERY_USABLE_ENERGY,
+        name="Usable Battery Energy",
+        icon="mdi:battery-charging-medium",
+        # Stored energy, which is exactly what ENERGY_STORAGE describes -- and
+        # deliberately not ENERGY, which would offer a reserve figure to the
+        # Energy dashboard as though it were consumption.
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=_usable_energy_value,
+        attributes_fn=_usable_energy_attributes,
+    ),
 )
 
 
@@ -376,7 +587,7 @@ class AlphaEmsSensor(CoordinatorEntity[AlphaEmsCoordinator], SensorEntity):
         )
 
     @property
-    def native_value(self) -> float | int | None:
+    def native_value(self) -> float | int | str | None:
         """Return the current sensor value."""
         return self.entity_description.value_fn(self.coordinator)
 

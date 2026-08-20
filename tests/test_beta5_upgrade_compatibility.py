@@ -224,6 +224,11 @@ async def test_a_beta5_installation_keeps_every_entity_and_unique_id(
             f"{entry_id}_forecast_error_yesterday"
         ),
         "sensor.alpha_ems_forecast_error_7_days": f"{entry_id}_forecast_error_7d",
+        "sensor.alpha_ems_battery_recommendation": (
+            f"{entry_id}_battery_recommendation"
+        ),
+        "sensor.alpha_ems_planned_battery_power": f"{entry_id}_battery_planned_power",
+        "sensor.alpha_ems_usable_battery_energy": (f"{entry_id}_battery_usable_energy"),
     }
 
 

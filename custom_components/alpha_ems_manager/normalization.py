@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.const import (
+    PERCENTAGE,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
     UnitOfEnergy,
@@ -141,6 +142,21 @@ def normalize_energy_kwh(value: Any, unit: str | None) -> float | None:
     if factor is None:
         return None
     return number * factor
+
+
+def normalize_percentage(value: Any, unit: str | None) -> float | None:
+    """Convert a source percentage reading to a plain number, or ``None``.
+
+    The unit must actually say percent. A power or energy sensor selected by
+    mistake would otherwise be read as a state of charge, and a house-load
+    sensor reporting 2000 W would arrive as a 2000 % battery -- refused here
+    rather than clamped to something plausible, for the same reason
+    :func:`normalize_power_w` refuses an unrecognised unit instead of guessing an
+    unscaled value.
+    """
+    if unit != PERCENTAGE:
+        return None
+    return parse_numeric(value)
 
 
 def is_power_unit(unit: str | None) -> bool:

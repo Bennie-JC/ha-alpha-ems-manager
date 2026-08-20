@@ -77,6 +77,10 @@ _LOGGER = logging.getLogger(__name__)
 #: Rounding applied to stored energies. Four decimals of a kWh is 0.1 Wh, well
 #: below the noise floor of any household power sensor.
 _KWH_PRECISION = 4
+#: Decimal places for a stored state of charge. The source reports whole
+#: percent, so one decimal is already generous; four would advertise a precision
+#: the sensor does not have.
+_SOC_PRECISION = 1
 
 _QUARTER = timedelta(minutes=QUARTER_MINUTES)
 
@@ -177,6 +181,27 @@ class DayRecord:
     ev: list[float | None] = field(default_factory=list)
     #: Whether a flexible-load source was configured for that interval.
     ev_expected: list[bool] = field(default_factory=list)
+    #: Battery state of charge in percent at the **end** of each interval, or
+    #: ``None`` where there was no usable reading.
+    #:
+    #: Additive evidence, and evidence only. Nothing in the learning or forecast
+    #: path reads it: it does not affect ``baseline_at``, ``completeness``,
+    #: ``is_learned``, the forecast, the confidence score or any Phase-2 figure,
+    #: and ``test_soc_persistence.py`` pins every one of those. A day with no
+    #: state-of-charge data is exactly as learnable as it was before this field
+    #: existed.
+    #:
+    #: It is recorded because it is the one physical observation a battery plan
+    #: depends on that cannot be reconstructed from anything else. A prediction
+    #: can be recomputed from the stored forecast and the stored configuration;
+    #: where the battery actually was at 03:15 last Tuesday cannot. Every day
+    #: without it is a day the physical model can never be checked against.
+    #:
+    #: Sampled rather than integrated, because a state of charge is a level and
+    #: not a flow: it does not pass through ``QuarterAccumulator``. When several
+    #: quarters close together after a restart, only the one that just ended
+    #: takes the sample -- the others genuinely are not known.
+    soc: list[float | None] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Size the parallel lists to the day's real interval count."""
@@ -190,6 +215,7 @@ class DayRecord:
             ("measured", None),
             ("ev", None),
             ("ev_expected", False),
+            ("soc", None),
         ):
             values = list(getattr(self, name))
             if len(values) < count:
@@ -226,6 +252,17 @@ class DayRecord:
         if self.ev_expected[index] and flexible is None:
             return None
         return max(measured - (flexible or 0.0), 0.0)
+
+    def soc_at(self, index: int) -> float | None:
+        """Return the recorded state of charge at the end of one interval."""
+        if not 0 <= index < self.interval_count:
+            return None
+        return self.soc[index]
+
+    @property
+    def soc_sample_count(self) -> int:
+        """Return how many intervals carry a state-of-charge sample."""
+        return sum(1 for value in self.soc if value is not None)
 
     @property
     def measured_valid_count(self) -> int:
@@ -284,6 +321,7 @@ class DayRecord:
         measured_kwh: float | None,
         ev_kwh: float | None,
         ev_expected: bool,
+        soc_percent: float | None = None,
     ) -> bool:
         """Store one finalised interval by chronological index.
 
@@ -302,6 +340,8 @@ class DayRecord:
         if ev_kwh is not None:
             self.ev[index] = round(ev_kwh, _KWH_PRECISION)
         self.ev_expected[index] = ev_expected
+        if soc_percent is not None:
+            self.soc[index] = round(soc_percent, _SOC_PRECISION)
         return True
 
     # -- serialisation ---------------------------------------------------
@@ -320,6 +360,11 @@ class DayRecord:
         if any(self.ev_expected):
             payload["e"] = self.ev
             payload["x"] = [1 if flag else 0 for flag in self.ev_expected]
+        if any(value is not None for value in self.soc):
+            # Omitted entirely on an installation that has never produced a
+            # usable reading, exactly as the flexible-load arrays are, so the
+            # document does not grow for a user this evidence cannot help.
+            payload["s"] = self.soc
         return payload
 
     @classmethod
@@ -365,6 +410,11 @@ class DayRecord:
         record = cls(day=day, tz_key=tz_key, interval_count=count)
         record.measured = _numeric_list(measured_raw, count)
         record.ev = _numeric_list(raw.get("e"), count)
+        # Absent on every document written before this field existed, and on any
+        # installation with no usable reading. ``_numeric_list`` already refuses
+        # a non-finite or non-numeric entry, so a damaged array degrades to
+        # missing samples rather than to plausible-looking numbers.
+        record.soc = _numeric_list(raw.get("s"), count)
         flags_raw = raw.get("x")
         if isinstance(flags_raw, list):
             record.ev_expected = [bool(flag) for flag in flags_raw[:count]] + [

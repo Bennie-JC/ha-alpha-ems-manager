@@ -438,7 +438,9 @@ async def test_a_stale_solcast_selection_does_not_block_every_submission(
 
     # The form must still render, and its Solcast default must not be the id
     # that is no longer selectable.
-    result = await hass.config_entries.options.async_init(mock_config_entry.entry_id)
+    from .test_config_flow import open_options
+
+    result = await open_options(hass, mock_config_entry.entry_id)
     assert result["type"].value == "form"
 
     schema_keys = {str(key): key for key in result["data_schema"].schema}
@@ -459,9 +461,9 @@ async def test_the_flexible_load_may_not_be_the_house_load_entity(
     0 kWh. Nothing downstream can tell that apart from a house that used no
     energy, so it has to be refused at selection time.
     """
-    from .test_config_flow import options_payload
+    from .test_config_flow import open_options, options_payload
 
-    result = await hass.config_entries.options.async_init(setup_integration.entry_id)
+    result = await open_options(hass, setup_integration.entry_id)
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         options_payload(

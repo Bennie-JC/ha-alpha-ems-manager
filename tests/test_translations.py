@@ -37,27 +37,50 @@ EXPECTED_CONFIG_FIELDS: dict[str, list[str]] = {
         "battery_soc_entity",
         "battery_power_entity",
         "battery_power_sign",
+        # Phase 3. Required in the config flow so a new installation ends up with
+        # a battery that can actually be planned with.
+        "battery_capacity_kwh",
+        "battery_min_soc_percent",
+        "battery_max_charge_kw",
+        "battery_max_discharge_kw",
+        "battery_round_trip_efficiency_percent",
     ],
     "solar": ["pv_power_entity"],
     "grid": ["grid_power_entity", "grid_power_sign"],
     "sources": ["frank_entry_id", "solcast_entry_id"],
 }
 
-EXPECTED_OPTIONS_FIELDS = [
-    "house_load_entity",
-    "daily_house_load_entity",
-    "ev_power_entity",
-    "battery_soc_entity",
-    "battery_power_entity",
-    "battery_power_sign",
-    "has_pv",
-    "pv_power_entity",
-    "grid_power_entity",
-    "grid_power_sign",
-    "frank_entry_id",
-    "use_pv_forecast",
-    "solcast_entry_id",
-]
+#: The options flow is a menu of two pages. Both are checked, in order.
+EXPECTED_OPTIONS_MENU = ("sources", "battery")
+
+EXPECTED_OPTIONS_FIELDS: dict[str, list[str]] = {
+    "sources": [
+        "house_load_entity",
+        "daily_house_load_entity",
+        "ev_power_entity",
+        "battery_soc_entity",
+        "battery_power_entity",
+        "battery_power_sign",
+        "has_pv",
+        "pv_power_entity",
+        "grid_power_entity",
+        "grid_power_sign",
+        "frank_entry_id",
+        "use_pv_forecast",
+        "solcast_entry_id",
+    ],
+    "battery": [
+        # Optional here, unlike in the config flow: an installation upgrading
+        # from an earlier release has none of the three hardware figures, and
+        # forcing all three before a minimum state of charge could be changed
+        # would be a worse form than one that lets them be filled in later.
+        "battery_capacity_kwh",
+        "battery_min_soc_percent",
+        "battery_max_charge_kw",
+        "battery_max_discharge_kw",
+        "battery_round_trip_efficiency_percent",
+    ],
+}
 
 CONFIG_ERRORS = (
     "entity_not_found",
@@ -65,6 +88,7 @@ CONFIG_ERRORS = (
     "invalid_energy_entity",
     "invalid_percentage_entity",
     "entity_not_numeric",
+    "min_soc_not_below_max",
     "solcast_not_configured",
 )
 
@@ -130,14 +154,32 @@ async def test_the_config_steps_render_the_documented_fields(
     assert steps == EXPECTED_CONFIG_FIELDS
 
 
+async def rendered_options_pages(
+    hass: HomeAssistant, entry_id: str
+) -> dict[str, list[str]]:
+    """Walk both options pages and record the fields each renders."""
+    pages: dict[str, list[str]] = {}
+    for page in EXPECTED_OPTIONS_MENU:
+        result = await hass.config_entries.options.async_init(entry_id)
+        assert result["type"] is FlowResultType.MENU, result
+        assert set(result["menu_options"]) == set(EXPECTED_OPTIONS_MENU)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {"next_step_id": page}
+        )
+        assert result["type"] is FlowResultType.FORM, result
+        pages[result["step_id"]] = [
+            str(marker) for marker in result["data_schema"].schema
+        ]
+    return pages
+
+
 async def test_the_options_form_renders_the_documented_fields(
     hass: HomeAssistant, setup_integration: MockConfigEntry
 ) -> None:
-    """The options form matches the documented field list, in order."""
-    result = await hass.config_entries.options.async_init(setup_integration.entry_id)
-    keys = [str(marker) for marker in result["data_schema"].schema]
+    """Both options pages match the documented field lists, in order."""
+    pages = await rendered_options_pages(hass, setup_integration.entry_id)
 
-    assert keys == EXPECTED_OPTIONS_FIELDS
+    assert pages == EXPECTED_OPTIONS_FIELDS
 
 
 @pytest.mark.parametrize("language", LANGUAGES)
@@ -167,16 +209,24 @@ async def test_every_options_field_has_a_label_and_a_description(
 ) -> None:
     """The options form is translated as completely as the config flow."""
     payload = await bundle(hass, language, "options")
-    prefix = f"component.{DOMAIN}.options.step.init"
 
-    assert f"{prefix}.title" in payload
-    for field in EXPECTED_OPTIONS_FIELDS:
-        label = payload.get(f"{prefix}.data.{field}")
-        assert label, f"{field} has no label in {language}"
-        assert label != field
+    menu_prefix = f"component.{DOMAIN}.options.step.init"
+    assert f"{menu_prefix}.title" in payload
+    for page in EXPECTED_OPTIONS_MENU:
+        entry = payload.get(f"{menu_prefix}.menu_options.{page}")
+        assert entry, f"menu option {page} has no label in {language}"
+        assert entry != page
 
-        description = payload.get(f"{prefix}.data_description.{field}")
-        assert description, f"{field} has no description in {language}"
+    for step, fields in EXPECTED_OPTIONS_FIELDS.items():
+        prefix = f"component.{DOMAIN}.options.step.{step}"
+        assert f"{prefix}.title" in payload, f"{step} has no title in {language}"
+        for field in fields:
+            label = payload.get(f"{prefix}.data.{field}")
+            assert label, f"{step}.{field} has no label in {language}"
+            assert label != field
+
+            description = payload.get(f"{prefix}.data_description.{field}")
+            assert description, f"{step}.{field} has no description in {language}"
 
 
 @pytest.mark.parametrize("language", LANGUAGES)

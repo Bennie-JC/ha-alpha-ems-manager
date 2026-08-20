@@ -116,7 +116,16 @@ EV_NEGATIVE_NOISE_FLOOR_W: Final = -10.0
 #: it was replaced before any real history accumulated. v1 documents are
 #: discarded with a warning rather than misread -- see ``LearningStore``.
 STORAGE_VERSION: Final = 2
-STORAGE_MINOR_VERSION: Final = 1
+#: Minor version, bumped for a *backward-compatible* addition to the layout. The
+#: major version is what decides whether a document can be read at all, so a
+#: minor bump reads every earlier document unchanged and simply writes the newer
+#: one back. History is never migrated and never discarded by one.
+#:
+#: * **2.1** -- up to v1.0.0-beta.6.
+#: * **2.2** -- v1.0.0-beta.7. Day records gained an optional per-interval
+#:   battery state-of-charge array. Absent on every earlier document, and read as
+#:   "no samples" rather than as zeros.
+STORAGE_MINOR_VERSION: Final = 2
 STORAGE_KEY_TEMPLATE: Final = f"{DOMAIN}.{{entry_id}}.learning"
 
 #: Config-entry schema version. v1 was the previous integration's source model,
@@ -479,6 +488,33 @@ CONF_FRANK_ENTRY_ID: Final = "frank_entry_id"
 CONF_USE_PV_FORECAST: Final = "use_pv_forecast"
 CONF_SOLCAST_ENTRY_ID: Final = "solcast_entry_id"
 
+# Phase 3: battery planning. The first *numeric* configuration keys in the
+# project -- every key above selects an entity, a sign convention or a boolean.
+#
+# They carry a unit suffix, which the entity keys do not need. Internal constants
+# already do this (``MAX_PLAUSIBLE_LOAD_W``, ``TODAY_ADAPT_MIN_BASELINE_KWH``,
+# ``BALANCE_CONVERSION_LOSS_FRACTION``) and a numeric key without one is
+# ambiguous in the worst possible place: ``battery_min_soc`` could mean 20 or
+# 0.2, and this value is a hard safety floor.
+#
+# Nothing here can be derived from the sensors already configured. A percentage
+# state of charge says nothing about how many kilowatt-hours a percent is worth,
+# and a power limit cannot be inferred from a capacity without assuming a C-rate
+# -- which would be inventing a hardware property and would silently produce a
+# plan the inverter cannot execute.
+
+#: Usable capacity, **DC side**. See ``battery.py`` for why the boundary matters.
+CONF_BATTERY_CAPACITY_KWH: Final = "battery_capacity_kwh"
+#: The user's hard floor. Never crossed by the simulator; see ``BatteryReserve``.
+CONF_BATTERY_MIN_SOC_PERCENT: Final = "battery_min_soc_percent"
+#: Maximum charge and discharge power, **AC side**.
+CONF_BATTERY_MAX_CHARGE_KW: Final = "battery_max_charge_kw"
+CONF_BATTERY_MAX_DISCHARGE_KW: Final = "battery_max_discharge_kw"
+#: Round-trip efficiency, **AC to AC**, as a percentage.
+CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT: Final = (
+    "battery_round_trip_efficiency_percent"
+)
+
 # --- Sign conventions ---------------------------------------------------------
 
 #: Battery power sign options. The AlphaESS test system reports a *negative*
@@ -500,6 +536,150 @@ GRID_SIGN_OPTIONS: Final = (
 )
 DEFAULT_GRID_POWER_SIGN: Final = SIGN_GRID_POSITIVE_IS_IMPORT
 
+# --- Phase 3: battery planning ------------------------------------------------
+
+#: Default hard floor, in percent of capacity.
+#:
+#: Conservative for a value the decision engine treats as inviolable, and
+#: comfortably above the ~10 % on-grid discharge floor common on vendor
+#: inverters, so the EMS constraint binds before the hardware's own does. A user
+#: lowering it is then an explicit choice rather than an inherited accident.
+#:
+#: Zero is a legal setting: it means "no EMS reserve", and the inverter's own
+#: floor still protects the cells. Refusing it would be an arbitrary restriction
+#: of exactly the kind this project does not make.
+DEFAULT_BATTERY_MIN_SOC_PERCENT: Final = 20.0
+
+#: Default round-trip efficiency, AC to AC, in percent.
+#:
+#: Corroborated independently: the symmetric split this implies is
+#: ``1 - sqrt(0.90) = 5.13 %`` per boundary crossing, against
+#: ``BALANCE_CONVERSION_LOSS_FRACTION = 0.05`` above, which was derived from
+#: inverter conversion loss for the energy-balance tolerance model. The two
+#: agree to 0.13 %. Stated here so a future tuning of either cannot silently
+#: separate them.
+DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT: Final = 90.0
+
+#: Upper limit on the configurable state of charge, in percent.
+#:
+#: Not configurable in Phase 3: no Phase-3 policy charges, so a user-facing
+#: ceiling would be a field nothing exercised. The charge clamp is written and
+#: unit-tested against this constant so Phase 5 can promote it to an option
+#: without touching the clamp.
+BATTERY_MAX_SOC_PERCENT: Final = 100.0
+
+#: Accepted range for a configured capacity, in kWh. The ceiling exists for the
+#: same reason ``MAX_PLAUSIBLE_LOAD_W`` does: a mistyped value must be refused
+#: rather than producing a confidently wrong plan.
+MIN_BATTERY_CAPACITY_KWH: Final = 0.1
+MAX_BATTERY_CAPACITY_KWH: Final = 200.0
+
+#: Accepted range for a configured charge or discharge power limit, in kW.
+MIN_BATTERY_POWER_KW: Final = 0.1
+MAX_BATTERY_POWER_KW: Final = 50.0
+
+#: Accepted range for round-trip efficiency, in percent. The floor is not
+#: cosmetic: it catches a user entering ``0.90`` where ``90`` belongs, which
+#: would otherwise model a plausible-looking 90 %-loss battery.
+MIN_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT: Final = 50.0
+MAX_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT: Final = 100.0
+
+#: How far outside 0..100 a state-of-charge reading may sit and still be clamped
+#: back rather than refused. Sensor noise around either end is real; anything
+#: further out is not a number, it is an unreadable source. The same reasoning as
+#: ``EV_NEGATIVE_NOISE_FLOOR_W``, and deliberately narrow for the same reason.
+SOC_NOISE_BAND_PERCENT: Final = 1.0
+
+#: Version of the Phase-3 decision policy. Recorded on every decision so a later
+#: phase cannot pool decisions made under different objectives into one series --
+#: the same role ``FORECAST_MODEL_VERSION`` plays for predictions.
+BATTERY_POLICY_VERSION: Final = 1
+
+# --- Phase 3: reserve provenance ----------------------------------------------
+
+#: Where an effective minimum state of charge came from. Phase 3 only ever
+#: produces the first; Phase 7 adds the second.
+RESERVE_CONFIGURED: Final = "configured"
+RESERVE_DYNAMIC: Final = "dynamic"
+
+# --- Phase 3: battery actions -------------------------------------------------
+
+#: What the decision layer recommends. ``NO_DECISION`` is deliberately distinct
+#: from ``HOLD``: "hold because that is best" and "hold because I know nothing"
+#: are different facts, and a later phase needs them apart. It is made safe by
+#: an invariant rather than by hope -- ``NO_DECISION`` always carries zero
+#: allowed energy, so it is behaviourally identical to ``HOLD``.
+ACTION_HOLD: Final = "hold"
+ACTION_CHARGE: Final = "charge"
+ACTION_DISCHARGE: Final = "discharge"
+ACTION_NO_DECISION: Final = "no_decision"
+
+#: The three states the published recommendation entity can take. ``NO_DECISION``
+#: is *not* among them: it renders as ``unknown``, the same way an unresolved
+#: forecast error does.
+BATTERY_ACTION_OPTIONS: Final = (ACTION_HOLD, ACTION_CHARGE, ACTION_DISCHARGE)
+
+# --- Phase 3: request modes ---------------------------------------------------
+
+#: The direction of a battery request. Direction and magnitude are separate so a
+#: signed power cannot exist internally: a negative "discharge" would otherwise
+#: *add* energy to the pack, and a simultaneous charge and discharge would
+#: destroy energy while leaving the grid residual untouched.
+MODE_IDLE: Final = "idle"
+MODE_CHARGE: Final = "charge"
+MODE_DISCHARGE: Final = "discharge"
+
+# --- Phase 3: decision reasons ------------------------------------------------
+
+#: Why the decision layer said what it said. A bounded vocabulary, like the
+#: ``FLAG_*``, ``STATUS_*`` and ``REJECT_*`` key spaces: an open string would
+#: become unqueryable within two releases.
+REASON_AT_RESERVE: Final = "at_reserve"
+REASON_BELOW_RESERVE: Final = "below_reserve"
+REASON_COVER_FORECAST_LOAD: Final = "forecast_load_and_available_energy"
+REASON_NO_FLEXIBILITY: Final = "no_flexibility_available"
+REASON_MISSING_SOC: Final = "missing_soc"
+REASON_MISSING_CAPACITY: Final = "missing_capacity"
+REASON_MISSING_POWER_LIMITS: Final = "missing_power_limits"
+REASON_INVALID_EFFICIENCY: Final = "invalid_efficiency"
+REASON_FORECAST_UNAVAILABLE: Final = "forecast_unavailable"
+REASON_POLICY_HOLD: Final = "policy_hold"
+
+# --- Phase 3: constraint names ------------------------------------------------
+
+#: Which limit bound a request. Reported per interval and tallied per
+#: trajectory; a bounded key space, so the tally cannot grow with runtime.
+CONSTRAINT_MIN_SOC: Final = "min_soc"
+CONSTRAINT_MAX_SOC: Final = "max_soc"
+CONSTRAINT_MAX_CHARGE_POWER: Final = "max_charge_power"
+CONSTRAINT_MAX_DISCHARGE_POWER: Final = "max_discharge_power"
+
+BATTERY_CONSTRAINTS: Final = (
+    CONSTRAINT_MIN_SOC,
+    CONSTRAINT_MAX_SOC,
+    CONSTRAINT_MAX_CHARGE_POWER,
+    CONSTRAINT_MAX_DISCHARGE_POWER,
+)
+
+#: Decimal places for persisted and reported battery energies.
+#:
+#: Two, not four. An integer-percent state-of-charge sensor on a 10 kWh pack
+#: quantises the starting energy to 0.1 kWh, so the seed carries about +/-0.05 kWh
+#: of unavoidable error -- five hundred times any accumulated arithmetic drift.
+#: Reporting four decimals would advertise 0.1 Wh resolution on a quantity known
+#: to 50 Wh.
+BATTERY_KWH_PRECISION: Final = 2
+#: Decimal places for a reported state of charge. The source is integer percent.
+BATTERY_SOC_PRECISION: Final = 1
+#: Decimal places for a reported planned power.
+BATTERY_KW_PRECISION: Final = 3
+
+#: Binding intervals described individually in diagnostics, newest first. The
+#: tallies beside them are always complete; this bounds only the per-interval
+#: detail, and it must stay at or below the sixteen-entry ceiling every
+#: diagnostics list is held to.
+MAX_BINDING_INTERVALS_REPORTED: Final = 16
+
 # --- Consumed integration domains ---------------------------------------------
 
 #: Domains Alpha EMS Manager *reads entities from*. It never talks to their APIs.
@@ -517,6 +697,13 @@ SENSOR_LEARNING_DAYS: Final = "learning_days"
 # carry a state class -- unlike the two forecast sensors above.
 SENSOR_FORECAST_ERROR_YESTERDAY: Final = "forecast_error_yesterday"
 SENSOR_FORECAST_ERROR_WINDOW: Final = "forecast_error_7d"
+
+# Phase 3. Three, and only three: everything else the decision layer computes --
+# the reduced trajectory, the per-band split, the binding-constraint tally, the
+# what-if comparison and the PV-blind projection -- is diagnostics-only.
+SENSOR_BATTERY_RECOMMENDATION: Final = "battery_recommendation"
+SENSOR_BATTERY_PLANNED_POWER: Final = "battery_planned_power"
+SENSOR_BATTERY_USABLE_ENERGY: Final = "battery_usable_energy"
 
 # --- Logging ------------------------------------------------------------------
 
