@@ -1,7 +1,9 @@
 """Constants for the Alpha EMS Manager integration.
 
-Phase 1 scope: data fusion, household-load learning and forecasting.
-No battery control, no arbitrage, no optimisation.
+Data fusion, household-load learning, forecasting, a battery decision, and the
+control pipeline that would carry it out. No arbitrage and no optimisation -- and
+no execution either: ``CONTROL_EXECUTION_AVAILABLE`` is what makes the last of
+those a fact rather than an intention.
 """
 
 from __future__ import annotations
@@ -15,7 +17,10 @@ NAME: Final = "Alpha EMS Manager"
 # default yields entity ids such as ``sensor.alpha_ems_expected_house_load_today``.
 DEFAULT_INSTANCE_NAME: Final = "Alpha EMS"
 
-PLATFORMS: Final = ["sensor"]
+# ``select`` joins ``sensor`` in Phase 4. It is the integration's first
+# writable entity, and it writes only to this integration's own runtime
+# state -- never to a battery.
+PLATFORMS: Final = ["sensor", "select"]
 
 # --- Learning resolution ------------------------------------------------------
 
@@ -680,6 +685,266 @@ BATTERY_KW_PRECISION: Final = 3
 #: diagnostics list is held to.
 MAX_BINDING_INTERVALS_REPORTED: Final = 16
 
+# --- Phase 4: the execution barrier -------------------------------------------
+
+#: Whether real execution is permitted to leave this release at all.
+#:
+#: The release barrier, and the reason ``async_execute`` is unreachable rather
+#: than merely disabled. The whole active path is built, imported and tested,
+#: and this constant is the single thing standing between it and the inverter.
+#:
+#: Flipping it is **not** sufficient to enable real control. Two prerequisites
+#: are unresolved, and both are recorded here so they cannot be forgotten:
+#:
+#: 1. **Provenance.** Nothing in the control surface records who armed a
+#:    dispatch, so Alpha EMS cannot prove it created one. Without that proof a
+#:    stop or a continuation could act on a dispatch a person started by hand.
+#: 2. **Continuation.** Because any active dispatch is therefore treated as
+#:    foreign, a dispatch Alpha EMS itself armed would inhibit it at the next
+#:    refresh -- so no multi-interval command is expressible yet.
+CONTROL_EXECUTION_AVAILABLE: Final = False
+
+# --- Phase 4: control modes ---------------------------------------------------
+
+#: What the user asks the control layer to do.
+#:
+#: ``off`` does nothing at all. ``shadow`` runs the complete real pipeline --
+#: the same intent translation, the same safety gate and the same command
+#: planner the active path uses -- and writes nothing, so its diagnostics answer
+#: "would this have been safe, and what exactly would it have sent". ``active``
+#: adds only the final authorization step.
+CONTROL_MODE_OFF: Final = "off"
+CONTROL_MODE_SHADOW: Final = "shadow"
+CONTROL_MODE_ACTIVE: Final = "active"
+
+CONTROL_MODE_OPTIONS: Final = (
+    CONTROL_MODE_OFF,
+    CONTROL_MODE_SHADOW,
+    CONTROL_MODE_ACTIVE,
+)
+
+#: What the control pipeline actually did this refresh.
+#:
+#: ``inhibited`` and ``eligible`` are deliberately distinct: the first says the
+#: safety gate refused, the second says it did not and only the execution
+#: barrier stopped the write. Watching the second is the entire point of shadow
+#: mode. ``idle`` means the gate passed and there was nothing to send, which is
+#: what a hold is. No state describes a completed write, because this release
+#: cannot perform one; a later phase adds that option when it can.
+CONTROL_STATE_OFF: Final = "off"
+CONTROL_STATE_INHIBITED: Final = "inhibited"
+CONTROL_STATE_ELIGIBLE: Final = "eligible"
+CONTROL_STATE_IDLE: Final = "idle"
+
+CONTROL_STATE_OPTIONS: Final = (
+    CONTROL_STATE_OFF,
+    CONTROL_STATE_INHIBITED,
+    CONTROL_STATE_ELIGIBLE,
+    CONTROL_STATE_IDLE,
+)
+
+# --- Phase 4: configuration keys ----------------------------------------------
+
+#: How long a command tells the device to hold, in minutes.
+#:
+#: A dead-man margin, **not** a delivery window. The plan is rebuilt once per
+#: quarter-hour and each rebuild supersedes the last, so in normal operation
+#: this never expires; it exists so a stopped Alpha EMS cannot leave a dispatch
+#: running indefinitely. It must therefore exceed the planning cadence, which is
+#: why the accepted range starts above it rather than at the device minimum.
+CONF_CONTROL_HORIZON_MINUTES: Final = "control_horizon_minutes"
+#: How far below the live house load a discharge command must stay, in percent.
+CONF_CONTROL_EXPORT_MARGIN_PERCENT: Final = "control_export_margin_percent"
+#: Whether the user has enabled real execution.
+#:
+#: Read but deliberately absent from the options form in this release: with
+#: ``CONTROL_EXECUTION_AVAILABLE`` false it cannot change behaviour, and an
+#: option that does nothing is worse than no option. The key exists so the
+#: plumbing is exercised by tests today.
+CONF_CONTROL_EXECUTION_ENABLED: Final = "control_execution_enabled"
+
+DEFAULT_CONTROL_HORIZON_MINUTES: Final = 20
+DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT: Final = 10
+DEFAULT_CONTROL_EXECUTION_ENABLED: Final = False
+
+#: Accepted range for the dead-man margin, in minutes. The floor is one planning
+#: cadence plus one device step: a shorter command would lapse before the next
+#: refresh could renew it, leaving the battery unmanaged for most of every
+#: interval.
+MIN_CONTROL_HORIZON_MINUTES: Final = QUARTER_MINUTES + 5
+MAX_CONTROL_HORIZON_MINUTES: Final = 60
+
+#: Accepted range for the export margin, in percent.
+MIN_CONTROL_EXPORT_MARGIN_PERCENT: Final = 0
+MAX_CONTROL_EXPORT_MARGIN_PERCENT: Final = 50
+
+# --- Phase 4: the device contract ---------------------------------------------
+#
+# Read off the control surface rather than assumed. Every figure here is a
+# property of the helpers Alpha EMS writes, so each is a quantisation a command
+# must respect -- and every one of them resolves *downwards*, so a command can
+# only ever deliver less energy than the decision layer allowed.
+
+#: Resolution of the power helper, in kW.
+CONTROL_POWER_STEP_KW: Final = 0.1
+#: Upper bound of the power helper, in kW.
+CONTROL_MAX_POWER_KW: Final = 20.0
+
+#: Window, in watts, inside which the control surface reads a battery as having
+#: reached its cutoff and tears the dispatch down after ten seconds.
+#:
+#: Not a figure Alpha EMS chose. A command whose *actual* battery power lands
+#: inside this band is indistinguishable from a finished one, so the smallest
+#: command worth issuing has to sit clear of it.
+CONTROL_HOLD_MONITOR_WINDOW_W: Final = 50.0
+
+#: Smallest power Alpha EMS will command, in kW.
+#:
+#: Two helper steps, which is four times the teardown window above. One step
+#: would be only twice it, and a dispatch tracks the commanded power rather than
+#: matching it exactly, so a single-step command could sit inside the band while
+#: behaving perfectly correctly. Below this the command is refused rather than
+#: rounded up: the undelivered energy is at most one step over one interval, and
+#: the inverter's own behaviour already covers it.
+CONTROL_MIN_POWER_KW: Final = 2 * CONTROL_POWER_STEP_KW
+
+#: Resolution and accepted range of the duration helper, in minutes.
+CONTROL_DURATION_STEP_MINUTES: Final = 5
+CONTROL_MIN_DURATION_MINUTES: Final = 5
+CONTROL_MAX_DURATION_MINUTES: Final = 480
+
+#: Accepted range of the cutoff state-of-charge helper, in percent.
+CONTROL_CUTOFF_MIN_PERCENT: Final = 4
+CONTROL_CUTOFF_MAX_PERCENT: Final = 100
+
+#: Percent represented by one bit of the device's cutoff register.
+#:
+#: The control surface converts percent to register bits by truncation, so a
+#: requested cutoff always lands at or slightly *below* the figure asked for --
+#: the direction that would permit a marginally deeper discharge. One extra
+#: percent is added to compensate, which is provably sufficient because the
+#: worst-case truncation loss is smaller than one percent.
+CONTROL_CUTOFF_PERCENT_PER_BIT: Final = 0.392
+
+#: Decimal places a commanded power is reported and written with.
+CONTROL_POWER_DECIMALS: Final = 1
+
+#: Recent control events described individually in diagnostics, newest first.
+#: Held to the same sixteen-entry ceiling as every other diagnostics list.
+MAX_CONTROL_EVENTS_REPORTED: Final = 16
+
+#: Minimum gap between two commands that start or increase battery movement.
+#:
+#: One planning interval, because the plan is rebuilt once per interval and
+#: anything faster would throttle a decision that has not changed. A command
+#: that *reduces* movement is exempt, since reducing can only reduce risk.
+CONTROL_COOLDOWN_SECONDS: Final = QUARTER_SECONDS
+
+# --- Phase 4: why control was inhibited ---------------------------------------
+#
+# A bounded vocabulary, like every other reason space here. Each names one
+# condition, and exactly one is ever reported: the first that failed.
+
+#: A helper or read-back the adapter needs is not in the state machine.
+INHIBIT_MISSING_CONTROL_ENTITY: Final = "missing_control_entity"
+#: It exists, but is unavailable or unknown.
+INHIBIT_CONTROL_ENTITY_UNAVAILABLE: Final = "control_entity_unavailable"
+#: The control surface's own restart and communication-loss reset is absent or
+#: switched off. Without it an interrupted sequence could outlive Alpha EMS.
+INHIBIT_NO_FAILSAFE_AUTOMATION: Final = "no_failsafe_automation"
+#: Another feature of the control surface is driving the battery. Alpha EMS
+#: stands down rather than switching a user's feature off behind their back.
+INHIBIT_EXCESS_EXPORT_ACTIVE: Final = "excess_export_active"
+INHIBIT_PEAK_SHAVING_ACTIVE: Final = "peak_shaving_active"
+#: A dispatch is running. Alpha EMS cannot prove it created it, so it belongs to
+#: someone else and is neither modified nor cancelled.
+INHIBIT_DISPATCH_ACTIVE: Final = "dispatch_active"
+#: The battery hardware facts are incomplete.
+INHIBIT_BATTERY_NOT_CONFIGURED: Final = "battery_not_configured"
+#: No plan, an unusable plan, or a plan that reached no decision.
+INHIBIT_NO_PLAN: Final = "no_plan"
+INHIBIT_PLAN_UNAVAILABLE: Final = "plan_unavailable"
+INHIBIT_NO_DECISION: Final = "no_decision"
+#: The plan describes a different interval, a different day, or is too old.
+INHIBIT_STALE_PLAN_INTERVAL: Final = "stale_plan_interval"
+INHIBIT_STALE_PLAN_DAY: Final = "stale_plan_day"
+INHIBIT_STALE_PLAN_AGE: Final = "stale_plan_age"
+#: A reading Phase 4 depends on is unusable, or too old to act on.
+INHIBIT_SOC_UNUSABLE: Final = "soc_unusable"
+INHIBIT_SOC_STALE: Final = "soc_stale"
+INHIBIT_BATTERY_POWER_UNUSABLE: Final = "battery_power_unusable"
+INHIBIT_BATTERY_POWER_STALE: Final = "battery_power_stale"
+INHIBIT_HOUSE_LOAD_UNUSABLE: Final = "house_load_unusable"
+INHIBIT_HOUSE_LOAD_STALE: Final = "house_load_stale"
+#: A discharge was recommended with nothing available above the floor.
+INHIBIT_AT_OR_BELOW_FLOOR: Final = "at_or_below_floor"
+#: The command does not fit the device contract.
+INHIBIT_POWER_BELOW_DEVICE_MINIMUM: Final = "power_below_device_minimum"
+INHIBIT_POWER_ABOVE_DEVICE_MAXIMUM: Final = "power_above_device_maximum"
+INHIBIT_CUTOFF_OUT_OF_RANGE: Final = "cutoff_out_of_range"
+INHIBIT_DURATION_OUT_OF_RANGE: Final = "duration_out_of_range"
+#: The commanded discharge would push energy onto the grid. The gate refuses the
+#: whole command; it never reduces it to fit, because a gate that scales a
+#: request has made a decision of its own.
+INHIBIT_WOULD_EXPORT: Final = "would_export"
+
+CONTROL_INHIBIT_REASONS: Final = (
+    INHIBIT_MISSING_CONTROL_ENTITY,
+    INHIBIT_CONTROL_ENTITY_UNAVAILABLE,
+    INHIBIT_NO_FAILSAFE_AUTOMATION,
+    INHIBIT_EXCESS_EXPORT_ACTIVE,
+    INHIBIT_PEAK_SHAVING_ACTIVE,
+    INHIBIT_DISPATCH_ACTIVE,
+    INHIBIT_BATTERY_NOT_CONFIGURED,
+    INHIBIT_NO_PLAN,
+    INHIBIT_PLAN_UNAVAILABLE,
+    INHIBIT_NO_DECISION,
+    INHIBIT_STALE_PLAN_INTERVAL,
+    INHIBIT_STALE_PLAN_DAY,
+    INHIBIT_STALE_PLAN_AGE,
+    INHIBIT_SOC_UNUSABLE,
+    INHIBIT_SOC_STALE,
+    INHIBIT_BATTERY_POWER_UNUSABLE,
+    INHIBIT_BATTERY_POWER_STALE,
+    INHIBIT_HOUSE_LOAD_UNUSABLE,
+    INHIBIT_HOUSE_LOAD_STALE,
+    INHIBIT_AT_OR_BELOW_FLOOR,
+    INHIBIT_POWER_BELOW_DEVICE_MINIMUM,
+    INHIBIT_POWER_ABOVE_DEVICE_MAXIMUM,
+    INHIBIT_CUTOFF_OUT_OF_RANGE,
+    INHIBIT_DURATION_OUT_OF_RANGE,
+    INHIBIT_WOULD_EXPORT,
+)
+
+# --- Phase 4: why execution was not authorized --------------------------------
+#
+# Separate from the inhibit vocabulary above, and separate on purpose: a hazard
+# and a permission are different facts. The safety gate answers the first and
+# knows nothing about the control mode; this answers the second and knows
+# nothing about hazards beyond whether the gate passed.
+
+#: The safety gate refused. Carries the gate's own reason alongside.
+REFUSE_UNSAFE: Final = "unsafe"
+#: The user has not selected active control.
+REFUSE_MODE_NOT_ACTIVE: Final = "mode_not_active"
+#: Active is selected, but execution has not been enabled.
+REFUSE_EXECUTION_NOT_ENABLED: Final = "execution_not_enabled"
+#: This release cannot execute at all. See ``CONTROL_EXECUTION_AVAILABLE``.
+REFUSE_EXECUTION_UNAVAILABLE: Final = "execution_unavailable"
+#: A previous command is too recent for this one to start or increase it.
+REFUSE_COOLDOWN: Final = "cooldown"
+#: There was nothing to send.
+REFUSE_NO_COMMANDS: Final = "no_commands"
+
+CONTROL_REFUSAL_REASONS: Final = (
+    REFUSE_UNSAFE,
+    REFUSE_MODE_NOT_ACTIVE,
+    REFUSE_EXECUTION_NOT_ENABLED,
+    REFUSE_EXECUTION_UNAVAILABLE,
+    REFUSE_COOLDOWN,
+    REFUSE_NO_COMMANDS,
+)
+
 # --- Consumed integration domains ---------------------------------------------
 
 #: Domains Alpha EMS Manager *reads entities from*. It never talks to their APIs.
@@ -697,6 +962,14 @@ SENSOR_LEARNING_DAYS: Final = "learning_days"
 # carry a state class -- unlike the two forecast sensors above.
 SENSOR_FORECAST_ERROR_YESTERDAY: Final = "forecast_error_yesterday"
 SENSOR_FORECAST_ERROR_WINDOW: Final = "forecast_error_7d"
+
+# Phase 4. Two, and only two: one control the user sets, and one state that
+# says what the control pipeline did and why. Every command, capability check,
+# gate condition, residual and read-back value stays in attributes and
+# diagnostics -- a gate with twenty-five inhibit reasons must not become
+# twenty-five entities.
+SELECT_CONTROL_MODE: Final = "control_mode"
+SENSOR_CONTROL_STATE: Final = "control_state"
 
 # Phase 3. Three, and only three: everything else the decision layer computes --
 # the reduced trajectory, the per-band split, the binding-constraint tally, the

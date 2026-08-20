@@ -293,7 +293,7 @@ async def test_every_entity_id_and_unique_id_survives(
         assert ours[entity_id].startswith(f"{upgraded.entry_id}_")
     for entity_id in BATTERY_ENTITIES:
         assert entity_id in ours, entity_id
-    assert len(ours) == 9
+    assert len(ours) == 11
     assert not any("_2" in entity_id for entity_id in ours)
 
 

@@ -117,7 +117,8 @@
         "description": "Choose what to change. Learned history and forecast evidence are kept either way.",
         "menu_options": {
           "sources": "Sources",
-          "battery": "Battery planning"
+          "battery": "Battery planning",
+          "control": "Control"
         }
       },
       "sources": {
@@ -170,6 +171,18 @@
           "battery_max_charge_kw": "The most the battery can be charged at, measured on the AC side, in kW. Usually the inverter's rating. No default, for the same reason as capacity.",
           "battery_max_discharge_kw": "The most the battery can be discharged at, measured on the AC side, in kW. Usually the inverter's rating.",
           "battery_round_trip_efficiency_percent": "How much of the energy put in comes back out again, AC to AC, as a percentage. Around 90 % is typical for a home battery. Enter 90, not 0.9."
+        }
+      },
+      "control": {
+        "title": "Control",
+        "description": "How Alpha EMS should behave if it is ever allowed to act on its own recommendation. This release cannot send a command to your inverter at all: the control pipeline is built and checked end to end, and the final step that would write to the battery is unavailable. Set the Control Mode entity to Shadow to watch what it would have done.",
+        "data": {
+          "control_horizon_minutes": "Command duration",
+          "control_export_margin_percent": "Export safety margin"
+        },
+        "data_description": {
+          "control_horizon_minutes": "How long a command would tell the inverter to hold, in minutes. This is a safety timeout rather than a delivery time: the plan is rebuilt every fifteen minutes and each command replaces the last, so it only matters if Alpha EMS stops running -- then the inverter returns to normal by itself once this expires. It has to be longer than fifteen minutes or a command would lapse before the next one arrived.",
+          "control_export_margin_percent": "How far below your current house load a discharge command must stay, in percent. A forced discharge sets the battery's rate, so anything the house cannot use goes out to the grid -- and the inverter's own feed-in limit does not apply to it. If a command would exceed this, the whole command is refused rather than made smaller."
         }
       }
     }

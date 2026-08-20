@@ -87,6 +87,23 @@ SKIP_STALE_SOURCE = "stale_source"
 #: Mode label for a system with nothing meaningful flowing.
 MODE_IDLE = "idle"
 
+#: Upper edges of the AC-power bands failures are attributed to, in watts.
+#:
+#: Bounded, like the mode labels, so the tallies cannot grow with runtime. The
+#: point is not the bands themselves but what comparing them reveals: a residual
+#: caused by a fixed offset between two instruments shrinks as a share of the
+#: allowance when power rises, while one caused by a mis-selected or mis-signed
+#: source grows with it. A pass rate cannot tell those apart. This can.
+BALANCE_POWER_BAND_EDGES_W: tuple[float, ...] = (500.0, 2000.0, 5000.0)
+
+#: How many recent eligible samples the windowed failure count looks back over.
+#:
+#: The consecutive-failure counter that drives the warning has a known blind
+#: spot: a fault that alternates with a pass never reaches three in a row, so it
+#: never warns, while still halving the pass rate. This is the statistic that
+#: would see it. Reporting only -- it changes no verdict and raises no warning.
+BALANCE_FAILURE_WINDOW = 20
+
 
 @dataclass(frozen=True, slots=True)
 class SourceCoherence:
@@ -347,6 +364,16 @@ def _rounded(value: float | None) -> float | None:
     return None if value is None else round(value, 1)
 
 
+def power_band(ac_power_w: float) -> str:
+    """Return the bounded band label an AC power figure falls in."""
+    lower = 0.0
+    for edge in BALANCE_POWER_BAND_EDGES_W:
+        if ac_power_w < edge:
+            return f"{lower:.0f}-{edge:.0f}W"
+        lower = edge
+    return f"{lower:.0f}W+"
+
+
 def _tally(counts: dict[str, int], key: str) -> None:
     """Increment ``key`` in a bounded counter mapping."""
     counts[key] = counts.get(key, 0) + 1
@@ -505,6 +532,35 @@ class BalanceMonitor:
     #: The most recent eligible failure, whether or not it warned.
     last_failed_sample: BalanceSample | None = None
 
+    # -- residual shape, added so the residual can eventually be explained ----
+    #
+    # None of this changes a verdict, raises a warning or gates anything. It
+    # exists because the aggregate residual turned out to be a poor witness: on
+    # an installation whose house-load figure is derived from the inverter's own
+    # grid register while this check reads a separate meter, the residual reduces
+    # to the difference between those two meters. Every other term cancels. So
+    # its *magnitude* proves very little, and the features that would actually
+    # distinguish a benign measurement boundary from a broken source -- the sign,
+    # and how the overshoot scales with power -- were being discarded.
+
+    #: Eligible failures where measured supply exceeded accounted demand, and the
+    #: reverse. The sign is the informative part: a positive residual is what
+    #: unmeasured conversion loss, auxiliary draw, or a load sitting between two
+    #: meters looks like, while a negative one means energy arriving from nowhere.
+    positive_failures: int = 0
+    negative_failures: int = 0
+    #: Running sum of *signed* residuals over eligible samples, in watts. A
+    #: systematic offset shows up here as a mean that does not approach zero;
+    #: symmetric noise does the opposite. Every existing statistic takes an
+    #: absolute value first and so cannot see either.
+    signed_residual_sum_w: float = 0.0
+    #: Eligible failures per AC-power band, and the overshoot accumulated in each.
+    failed_by_power_band: dict[str, int] = field(default_factory=dict)
+    excess_sum_by_power_band: dict[str, float] = field(default_factory=dict)
+    #: Whether each of the most recent eligible samples passed, newest first.
+    #: Bounded by ``BALANCE_FAILURE_WINDOW``.
+    recent_outcomes: list[bool] = field(default_factory=list)
+
     _warned_for_current_run: bool = field(default=False, repr=False)
 
     @property
@@ -566,6 +622,9 @@ class BalanceMonitor:
         self.worst_relative_error = max(
             self.worst_relative_error, sample.relative_error
         )
+        self.signed_residual_sum_w += sample.residual_w
+        self.recent_outcomes.insert(0, sample.within_tolerance)
+        del self.recent_outcomes[BALANCE_FAILURE_WINDOW:]
 
         if sample.within_tolerance:
             self.passed_samples += 1
@@ -575,6 +634,15 @@ class BalanceMonitor:
         else:
             self.failed_samples += 1
             _tally(self.failed_by_mode, sample.mode)
+            if sample.residual_w >= 0.0:
+                self.positive_failures += 1
+            else:
+                self.negative_failures += 1
+            band = power_band(sample.ac_power_w)
+            _tally(self.failed_by_power_band, band)
+            self.excess_sum_by_power_band[band] = (
+                self.excess_sum_by_power_band.get(band, 0.0) + sample.excess_w
+            )
             self.last_failed_sample = sample
             if (
                 self.worst_excess_sample is None
@@ -586,6 +654,23 @@ class BalanceMonitor:
                 self.worst_consecutive_failures, self.consecutive_failures
             )
         return outcome
+
+    @property
+    def windowed_failures(self) -> int:
+        """Return failures among the most recent eligible samples.
+
+        Distinct from ``consecutive_failures``, which resets on any pass. An
+        intermittent fault that alternates with a pass never advances that
+        counter past one and therefore never warns; it shows up here.
+        """
+        return sum(1 for passed in self.recent_outcomes if not passed)
+
+    @property
+    def mean_signed_residual_w(self) -> float | None:
+        """Return the mean signed residual over eligible samples."""
+        if self.eligible_samples <= 0:
+            return None
+        return self.signed_residual_sum_w / self.eligible_samples
 
     @property
     def sustained_failure(self) -> bool:
@@ -630,6 +715,32 @@ class BalanceMonitor:
             # failures spread across every mode the system enters.
             "passed_samples_by_mode": dict(self.passed_by_mode),
             "failed_samples_by_mode": dict(self.failed_by_mode),
+            # Residual shape. Reporting only: nothing here gates control, and
+            # the reason it does not is worth stating plainly. Where house load
+            # is derived from one grid meter and this check reads another, the
+            # residual is the difference between those two meters -- the battery
+            # term cancels and the state of charge never enters it -- so its
+            # magnitude is not evidence about the readings a command depends on.
+            "positive_failures": self.positive_failures,
+            "negative_failures": self.negative_failures,
+            "mean_signed_residual_w": (
+                None
+                if self.mean_signed_residual_w is None
+                else round(self.mean_signed_residual_w, 1)
+            ),
+            "failed_samples_by_power_band": dict(self.failed_by_power_band),
+            "excess_sum_by_power_band": {
+                band: round(total, 1)
+                for band, total in self.excess_sum_by_power_band.items()
+            },
+            "windowed_failures": self.windowed_failures,
+            "failure_window": BALANCE_FAILURE_WINDOW,
+            "residual_shape_basis": (
+                "sign and power-band attribution, collected so a measurement "
+                "boundary can eventually be told from a broken source: a fixed "
+                "offset shrinks against the allowance as power rises, a wrong "
+                "source or sign grows with it"
+            ),
             "skipped_due_to_skew": self.skipped_due_to_skew,
             "skipped_due_to_stale_source": self.skipped_due_to_stale_source,
             "least_recently_reported_source_counts": dict(self.stale_source_counts),

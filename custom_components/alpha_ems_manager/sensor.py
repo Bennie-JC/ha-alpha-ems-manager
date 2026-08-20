@@ -1,16 +1,19 @@
 """Sensor platform for Alpha EMS Manager.
 
-Nine entities: the four Phase-1 forecast and learning sensors, the two Phase-2
-forecast-error sensors, and the three Phase-3 battery ones. Every other quantity
+Ten sensors: the four Phase-1 forecast and learning ones, the two Phase-2
+forecast-error ones, the three Phase-3 battery ones, and the single Phase-4
+control state. Every other quantity
 the integration computes -- per-slot profiles, window means, balance residuals,
 coverage statistics, per-horizon error breakdowns, the snapshot inventory, the
 simulated battery trajectory -- is available through diagnostics instead.
 Ninety-six quarter sensors and five window averages would be technically easy and
 practically awful.
 
-The three Phase-3 sensors describe a plan that is never executed. Nothing in this
-integration issues a command to a battery; the recommendation is published so it
-can be watched for weeks before anything is allowed to act on it.
+The three Phase-3 sensors describe a plan that is never executed, and the
+Phase-4 one describes what the control pipeline made of that plan -- including
+whether it would have been safe to carry out. Nothing in this integration issues
+a command to a battery: the recommendation and the verdict are published so both
+can be watched for weeks before anything is allowed to act on either.
 
 The two Phase-2 sensors measure error that has already happened, so unlike the
 forecast sensors they do carry a state class: a record of how wrong last week
@@ -51,12 +54,14 @@ from .const import (
     BATTERY_KW_PRECISION,
     BATTERY_KWH_PRECISION,
     BATTERY_SOC_PRECISION,
+    CONTROL_STATE_OPTIONS,
     DOMAIN,
     FORECAST_ERROR_WINDOW_DAYS,
     NAME,
     SENSOR_BATTERY_PLANNED_POWER,
     SENSOR_BATTERY_RECOMMENDATION,
     SENSOR_BATTERY_USABLE_ENERGY,
+    SENSOR_CONTROL_STATE,
     SENSOR_EXPECTED_LOAD_TODAY,
     SENSOR_EXPECTED_LOAD_TOMORROW,
     SENSOR_FORECAST_ERROR_WINDOW,
@@ -450,6 +455,55 @@ _USABLE_ENERGY_BASIS: str = (
 )
 
 
+_CONTROL_STATE_BASIS: str = (
+    "what the control pipeline made of this interval's recommendation. "
+    "'inhibited' means the safety gate refused; 'eligible' means it did not and "
+    "only the execution barrier stopped a command; 'idle' means there was "
+    "nothing to send. Nothing executes: this release cannot command the inverter"
+)
+
+
+def _control_state_value(coordinator: AlphaEmsCoordinator) -> str | None:
+    """Return what the control pipeline decided this refresh."""
+    report = coordinator.control_report
+    if report is None:
+        return None
+    state = report.get("state")
+    return state if state in CONTROL_STATE_OPTIONS else None
+
+
+def _control_state_attributes(
+    coordinator: AlphaEmsCoordinator,
+) -> dict[str, Any]:
+    """Return the small flat attribute set for the control state.
+
+    Eight flat values, no mappings. Everything the pipeline computed -- the
+    capability report, the read-back snapshot, the full intent, the quantised
+    command, the ordered command list, the event trail -- is in diagnostics. A
+    gate with twenty-five possible reasons has no business unpacking itself into
+    an entity's attributes.
+    """
+    report = coordinator.control_report
+    if report is None:
+        return {"basis": _CONTROL_STATE_BASIS}
+
+    safety = report.get("safety") or {}
+    authorization = report.get("authorization") or {}
+    command = report.get("command") or {}
+    capability = report.get("capability") or {}
+    device = report.get("device") or {}
+    return {
+        "inhibit_reason": safety.get("inhibit_reason"),
+        "authorization_refusal": authorization.get("refusal"),
+        "action": command.get("action"),
+        "device_power_kw": command.get("power_kw"),
+        "commands_planned": report.get("commands_planned", 0),
+        "capability_ready": capability.get("ready"),
+        "dispatch_active": device.get("dispatch_active"),
+        "basis": _CONTROL_STATE_BASIS,
+    }
+
+
 SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
     AlphaEmsSensorDescription(
         key=SENSOR_EXPECTED_LOAD_TODAY,
@@ -545,6 +599,18 @@ SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=_usable_energy_value,
         attributes_fn=_usable_energy_attributes,
+    ),
+    AlphaEmsSensorDescription(
+        key=SENSOR_CONTROL_STATE,
+        name="Control State",
+        icon="mdi:shield-check-outline",
+        # An enum, like the battery recommendation, and for the same reason: it
+        # is categorical, so Home Assistant should record it as one. No state
+        # class, because a long-term statistic over a category means nothing.
+        device_class=SensorDeviceClass.ENUM,
+        options=list(CONTROL_STATE_OPTIONS),
+        value_fn=_control_state_value,
+        attributes_fn=_control_state_attributes,
     ),
 )
 

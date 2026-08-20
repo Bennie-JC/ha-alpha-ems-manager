@@ -826,6 +826,13 @@ async def async_get_config_entry_diagnostics(
         # concluded, which limit bound it, and what would have happened. Nothing
         # here is ever executed.
         "battery_plan": _battery_report(coordinator, tz),
+        # Phase 4. What the control pipeline made of that decision: which parts
+        # of the control surface were found, what the inverter is doing, the
+        # intent, the quantised command, the exact ordered command list, the
+        # safety verdict and the authorization refusal. Populated identically in
+        # shadow and active, which is what makes shadow worth reading: the
+        # verdict and the command list below are the real ones. Nothing is sent.
+        "control": coordinator.control_report,
         "consumed_integrations": {
             "frank_entry_id": config.frank_entry_id,
             "frank_available": coordinator.frank_available,

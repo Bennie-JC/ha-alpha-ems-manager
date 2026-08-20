@@ -100,11 +100,31 @@ CONTRACT: dict[str, dict[str, object]] = {
         "state_class": "measurement",
         "icon": "mdi:battery-charging-medium",
     },
+    "sensor.alpha_ems_control_state": {
+        "unique_id_suffix": "control_state",
+        "name": "Alpha EMS Control State",
+        "unit": None,
+        "device_class": "enum",
+        "state_class": None,
+        "icon": "mdi:shield-check-outline",
+    },
+    "select.alpha_ems_control_mode": {
+        "unique_id_suffix": "control_mode",
+        "name": "Alpha EMS Control Mode",
+        "unit": None,
+        "device_class": None,
+        "state_class": None,
+        "icon": "mdi:tune-variant",
+    },
 }
 
 
 def test_no_entity_is_missing_or_extra(hass: HomeAssistant) -> None:
-    """Exactly the nine documented entities exist."""
+    """Exactly the eleven documented entities exist.
+
+    Covers both platforms, so the select is held to the same table as the
+    sensors rather than being checked somewhere looser.
+    """
     registry = er.async_get(hass)
     created = {
         entity.entity_id
@@ -112,7 +132,7 @@ def test_no_entity_is_missing_or_extra(hass: HomeAssistant) -> None:
         if entity.platform == DOMAIN
     }
     assert created == set(CONTRACT)
-    assert len(created) == len(CONTRACT) == 9
+    assert len(created) == len(CONTRACT) == 11
 
 
 #: The entity surface, phase by phase. Named rather than counted, so a new
@@ -133,6 +153,19 @@ PHASE_THREE_ENTITIES = {
     "sensor.alpha_ems_planned_battery_power",
     "sensor.alpha_ems_usable_battery_energy",
 }
+#: Phase 4 adds one sensor here and one select on its own platform. Every gate
+#: condition, capability finding, read-back value and planned command step stays
+#: in attributes and diagnostics: a pipeline with twenty-five ways to refuse must
+#: not become twenty-five rows on a dashboard.
+PHASE_FOUR_ENTITIES = {
+    "sensor.alpha_ems_control_state",
+    "select.alpha_ems_control_mode",
+}
+#: The select half of that, kept separate because it is the first writable
+#: entity this integration has ever had.
+PHASE_FOUR_SELECTS = {
+    "select.alpha_ems_control_mode",
+}
 
 
 def test_phase_two_added_exactly_two_entities(hass: HomeAssistant) -> None:
@@ -142,8 +175,9 @@ def test_phase_two_added_exactly_two_entities(hass: HomeAssistant) -> None:
     per-slot error breakdowns, modelled-versus-filled performance, storage
     health, lifecycle counts -- is diagnostics-only by design.
     """
-    assert set(CONTRACT) - PHASE_ONE_ENTITIES - PHASE_THREE_ENTITIES == (
-        PHASE_TWO_ENTITIES
+    assert (
+        set(CONTRACT) - PHASE_ONE_ENTITIES - PHASE_THREE_ENTITIES - PHASE_FOUR_ENTITIES
+        == PHASE_TWO_ENTITIES
     )
 
 
@@ -156,10 +190,71 @@ def test_phase_three_added_exactly_three_entities(hass: HomeAssistant) -> None:
     and a projection the simulator cannot honestly make has no place in an
     entity.
     """
-    assert set(CONTRACT) - PHASE_ONE_ENTITIES - PHASE_TWO_ENTITIES == (
-        PHASE_THREE_ENTITIES
+    assert (
+        set(CONTRACT) - PHASE_ONE_ENTITIES - PHASE_TWO_ENTITIES - PHASE_FOUR_ENTITIES
+        == PHASE_THREE_ENTITIES
     )
     assert len(PHASE_THREE_ENTITIES) == 3
+
+
+def test_phase_four_added_exactly_one_sensor_and_one_select(
+    hass: HomeAssistant,
+) -> None:
+    """The control layer is worth one control and one state, and no more.
+
+    Everything the pipeline computes -- which parts of the control surface were
+    found, what the inverter is doing, the intent, the quantised command, the
+    exact ordered command list, the safety verdict, the authorization refusal and
+    the event trail -- is in attributes and diagnostics.
+    """
+    assert (
+        set(CONTRACT) - PHASE_ONE_ENTITIES - PHASE_TWO_ENTITIES - PHASE_THREE_ENTITIES
+        == PHASE_FOUR_ENTITIES
+    )
+    assert len(PHASE_FOUR_ENTITIES) == 2
+
+    registry = er.async_get(hass)
+    selects = {
+        entry.entity_id
+        for entry in registry.entities.values()
+        if entry.platform == DOMAIN and entry.domain == "select"
+    }
+    assert selects == PHASE_FOUR_SELECTS
+
+
+def test_the_earlier_phase_entities_are_untouched_by_phase_four(
+    hass: HomeAssistant,
+) -> None:
+    """Phase 4 is additive. The nine existing rows keep their exact contract.
+
+    A second literal table, for the reason the first one exists: editing
+    ``CONTRACT`` to accommodate a Phase-4 change must not be able to relax an
+    earlier entity at the same time.
+    """
+    existing = {
+        "sensor.alpha_ems_expected_house_load_today": ("kWh", "energy", None),
+        "sensor.alpha_ems_expected_house_load_tomorrow": ("kWh", "energy", None),
+        "sensor.alpha_ems_learning_confidence": ("%", None, "measurement"),
+        "sensor.alpha_ems_learning_days": (None, None, "measurement"),
+        "sensor.alpha_ems_forecast_error_yesterday": ("kWh", None, "measurement"),
+        "sensor.alpha_ems_forecast_error_7_days": ("%", None, "measurement"),
+        "sensor.alpha_ems_battery_recommendation": (None, "enum", None),
+        "sensor.alpha_ems_planned_battery_power": ("kW", None, "measurement"),
+        "sensor.alpha_ems_usable_battery_energy": (
+            "kWh",
+            "energy_storage",
+            "measurement",
+        ),
+    }
+    registry = er.async_get(hass)
+    for entity_id, (unit, device_class, state_class) in existing.items():
+        entry = registry.async_get(entity_id)
+        assert entry is not None, entity_id
+        assert entry.unit_of_measurement == unit, entity_id
+        assert entry.original_device_class == device_class, entity_id
+        state = hass.states.get(entity_id)
+        assert state is not None, entity_id
+        assert state.attributes.get("state_class") == state_class, entity_id
 
 
 def test_the_phase_one_and_two_entities_are_untouched_by_phase_three(
@@ -232,7 +327,11 @@ def test_no_binary_sensors_or_other_platforms(hass: HomeAssistant) -> None:
         for entity in registry.entities.values()
         if entity.platform == DOMAIN
     }
-    assert domains == {"sensor"}
+    # Widened for Phase 4, not relaxed: ``select`` is named explicitly, so a
+    # third platform appearing still fails. The control mode has to be a runtime
+    # control rather than a configuration field -- a user stopping the
+    # integration should not have to open a dialog to do it.
+    assert domains == {"sensor", "select"}
 
 
 @pytest.mark.parametrize("entity_id", sorted(CONTRACT))

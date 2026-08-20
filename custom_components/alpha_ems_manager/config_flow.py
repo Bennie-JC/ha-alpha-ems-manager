@@ -44,6 +44,8 @@ from .const import (
     CONF_BATTERY_POWER_SIGN,
     CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_SOC_ENTITY,
+    CONF_CONTROL_EXPORT_MARGIN_PERCENT,
+    CONF_CONTROL_HORIZON_MINUTES,
     CONF_DAILY_HOUSE_LOAD_ENTITY,
     CONF_EV_POWER_ENTITY,
     CONF_FRANK_ENTRY_ID,
@@ -56,9 +58,12 @@ from .const import (
     CONF_SOLCAST_ENTRY_ID,
     CONF_USE_PV_FORECAST,
     CONFIG_ENTRY_VERSION,
+    CONTROL_DURATION_STEP_MINUTES,
     DEFAULT_BATTERY_MIN_SOC_PERCENT,
     DEFAULT_BATTERY_POWER_SIGN,
     DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+    DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
+    DEFAULT_CONTROL_HORIZON_MINUTES,
     DEFAULT_GRID_POWER_SIGN,
     DEFAULT_INSTANCE_NAME,
     DOMAIN,
@@ -68,9 +73,13 @@ from .const import (
     MAX_BATTERY_CAPACITY_KWH,
     MAX_BATTERY_POWER_KW,
     MAX_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+    MAX_CONTROL_EXPORT_MARGIN_PERCENT,
+    MAX_CONTROL_HORIZON_MINUTES,
     MIN_BATTERY_CAPACITY_KWH,
     MIN_BATTERY_POWER_KW,
     MIN_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+    MIN_CONTROL_EXPORT_MARGIN_PERCENT,
+    MIN_CONTROL_HORIZON_MINUTES,
 )
 from .validation import (
     validate_energy_entity,
@@ -164,6 +173,52 @@ _EFFICIENCY_SELECTOR = _number_selector(
 #: kilowatt-hours a percent is worth, and a power limit cannot be inferred from a
 #: capacity without assuming a C-rate. Absent means the battery layer declines to
 #: decide and names the missing field -- never a guessed value.
+_HORIZON_SELECTOR = _number_selector(
+    minimum=MIN_CONTROL_HORIZON_MINUTES,
+    maximum=MAX_CONTROL_HORIZON_MINUTES,
+    step=CONTROL_DURATION_STEP_MINUTES,
+    unit="min",
+)
+
+_EXPORT_MARGIN_SELECTOR = _number_selector(
+    minimum=MIN_CONTROL_EXPORT_MARGIN_PERCENT,
+    maximum=MAX_CONTROL_EXPORT_MARGIN_PERCENT,
+    step=1,
+    unit="%",
+)
+
+
+def _control_schema(
+    current: Callable[[str, Any], Any],
+) -> vol.Schema:
+    """Return the control-settings schema.
+
+    Both fields are ``Required`` with a default, because both always have a
+    usable value. The lower bound on the horizon is the load-bearing part: a
+    command shorter than one planning interval would lapse before the next
+    refresh could renew it, so the selector cannot express one. The safety gate
+    checks the same bound independently -- a single guard at either layer alone
+    would be a guard with a hole in it.
+    """
+    return vol.Schema(
+        {
+            vol.Required(
+                CONF_CONTROL_HORIZON_MINUTES,
+                default=current(
+                    CONF_CONTROL_HORIZON_MINUTES, DEFAULT_CONTROL_HORIZON_MINUTES
+                ),
+            ): _HORIZON_SELECTOR,
+            vol.Required(
+                CONF_CONTROL_EXPORT_MARGIN_PERCENT,
+                default=current(
+                    CONF_CONTROL_EXPORT_MARGIN_PERCENT,
+                    DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
+                ),
+            ): _EXPORT_MARGIN_SELECTOR,
+        }
+    )
+
+
 BATTERY_HARDWARE_KEYS = (
     CONF_BATTERY_CAPACITY_KWH,
     CONF_BATTERY_MAX_CHARGE_KW,
@@ -546,8 +601,41 @@ class AlphaEmsOptionsFlow(OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Offer the two groups of options."""
-        return self.async_show_menu(step_id="init", menu_options=["sources", "battery"])
+        """Offer the three groups of options."""
+        return self.async_show_menu(
+            step_id="init", menu_options=["sources", "battery", "control"]
+        )
+
+    async def async_step_control(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show and validate the control settings.
+
+        Two fields, both with defaults, both describing how Alpha EMS should
+        behave rather than what the hardware is -- so unlike the battery step
+        there is nothing here that can be missing.
+
+        The execution-enable key is deliberately **not** offered. While the
+        release barrier makes it unable to change anything, showing it would
+        promise a capability that does not exist, and an option that does nothing
+        is worse than no option at all.
+        """
+        entry = self.config_entry
+
+        def current(key: str, default: Any = None) -> Any:
+            return entry.options.get(key, entry.data.get(key, default))
+
+        if user_input is not None:
+            return self.async_create_entry(
+                title="", data={**entry.options, **user_input}
+            )
+
+        return self.async_show_form(
+            step_id="control",
+            data_schema=self.add_suggested_values_to_schema(
+                _control_schema(current), user_input
+            ),
+        )
 
     async def async_step_battery(
         self, user_input: dict[str, Any] | None = None

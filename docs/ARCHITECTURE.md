@@ -1222,6 +1222,272 @@ three entities to `unknown`, names itself in diagnostics, and leaves learning,
 both forecasts and both forecast-error sensors untouched. Tested in both
 directions — a corrupt forecast history does not take the battery down either.
 
+## Phase 4: control
+
+Phase 4 builds the whole path from a decision to an inverter command, and then
+**cannot walk it**. Every stage is real: the intent, the safety gate, the vendor
+mapping, the ordered command list, the authorization. The last step is
+unreachable, by a single build-time constant.
+
+That is not caution for its own sake. Two things are unresolved, and either alone
+would be enough (see *Ownership*, below and *Known open items*). It is also worth
+saying plainly what the layer would achieve today if it could act: the shipped
+policy asks for the discharge that covers the interval's forecast load, which is
+what a self-consumption inverter already does by itself — and does better, because
+it tracks load continuously while a fixed-power dispatch cannot. The pipeline is
+built now so it can be watched for months before anything depends on it, and so
+that the phase which finally has a reason to act — a price signal — inherits a
+proven translation layer rather than writing one under pressure.
+
+    Phase 3 decision → ControlIntent → SafetyGate → plan_commands()
+                                    → ExecutionAuthorization → (nothing)
+
+### Modules
+
+| Module | Pure? | Holds |
+|---|---|---|
+| `control.py` | yes | `ControlIntent`, `translate()` — the projection from a decision |
+| `safety.py` | yes | `ControlContext`, `evaluate()`, `authorize()` |
+| `alphaess_device.py` | yes | the entire vendor mapping: helper ids, quantisation, ordered command list |
+| `alphaess_adapter.py` | no | reads the state machine; the only module that could call a service |
+| `soc_coherence.py` | yes | instrumentation comparing state of charge against battery power |
+
+The split between `alphaess_device` and `alphaess_adapter` is what makes the
+mapping testable: everything that decides *which helper, which number, which
+order* is pure, and the impure part only fetches values. Shadow mode and the real
+path run identical code up to the final call.
+
+### Eligibility is not permission
+
+Two questions that look alike and are not:
+
+* `evaluate()` asks **would this be safe**. It never reads the control mode, so it
+  returns the same verdict in shadow as in active.
+* `authorize()` asks **may this be sent**. It knows nothing about hazards beyond
+  whether the gate passed.
+
+An earlier draft merged them, with `mode_not_active` as the first gate condition.
+Shadow then stopped at that condition and reported it — telling the user nothing
+about whether the command would have been safe, which is the only question shadow
+exists to answer. Splitting them cannot weaken anything, because `authorize()`
+requires `verdict.safe` before considering anything else, and
+`tests/test_control_pipeline.py` asserts that over the full cross-product of the
+condition table, both modes and both enable states.
+
+The gate **never scales a command.** A request that cannot be sent safely is
+refused whole, with one precise reason. There is deliberately no magnitude on
+`SafetyVerdict` at all, so nothing downstream could mistake it for a smaller
+command. A gate that trimmed a request to fit would have made a decision, and
+deciding is Phase 3's job.
+
+### Ownership — why real execution is still unreachable
+
+The control surface has exactly one arming path per direction, driven entirely by
+helper *values*. A dispatch armed from a dashboard and one armed by a service call
+leave byte-identical helper states, register values, timer and read-backs.
+**Nothing records a writer.**
+
+So matching power, cutoff, duration or mode is not evidence of ownership. It is
+worse than no evidence: the person most likely to have armed exactly the figures
+Alpha EMS would have sent is the one watching the shadow recommendation, so a
+parameter-match test would be most confident precisely when it was most likely to
+be wrong. A call context does not help either — it cannot separate this
+integration from any other automation, and a restart discards it.
+
+The consequence is not confined to stopping a dispatch. *Continuing* one needs the
+same proof, so until ownership can be established **no command spanning more than a
+single interval is expressible**: Alpha EMS would arm at one refresh and inhibit on
+its own dispatch at the next.
+
+Therefore, and asserted rather than intended:
+
+* `owned` is a constant `False`, and no module derives it — `ast`-checked.
+* Any active dispatch inhibits, with no reference to its parameters.
+* **There is no stop path.** A stop whose authorization cannot be established is
+  worse than none, because the next reader inherits an open safety question
+  dressed as working code.
+
+### What `off` promises
+
+`off` means **this integration attempts no control**. It does not mean an inverter
+reverts. In this release the distinction cannot arise — nothing here can start a
+dispatch, so there is never one of ours to revert — and the select's own
+description says so rather than calling it an emergency stop. A later release that
+can execute has to choose which of the two it promises, and it cannot promise the
+second until ownership is solved.
+
+### Energy to power and duration
+
+The decision layer's actionable primitive is `allowed_energy_ac_kwh`, and its
+`average_power_kw` carries a warning against reading it as a setpoint. Both are
+respected, and the mapping is still legitimate:
+
+* the device cannot be told an energy — it takes a power and a duration, so *some*
+  mapping is unavoidable;
+* the window a command acts over is the **planning cadence**, not the duration:
+  each refresh supersedes the last, so the duration never expires in normal
+  operation;
+* over a fixed window there is exactly **one** constant power delivering a given
+  energy. One admissible value means no choice, and no choice means no decision.
+
+What the warning does forbid is commanding full power and letting the device's own
+cutoff stop it — that would deliver the right energy by accident. So the cutoff is
+a backstop, and `energy_limit_bound` is carried from `decision.constraints` so a
+read-back that stopped at the cutoff can be told from one that stopped because the
+clamp bound.
+
+**Every quantisation resolves downwards**, giving one provable promise:
+
+> `device_power_kw(e, h) * h <= e` for every input, with equality exactly when the
+> energy is a whole number of power steps.
+
+Swept over five thousand energies in one watt-hour steps. The cost is bounded: at
+most one 0.1 kW step over one interval. The cutoff is raised one percent instead,
+because the device's register *truncates* percent to bits and would otherwise stop
+a fraction below the floor the user set — swept over every integer floor.
+
+The verification loop inside `device_power_kw` is a **measured backstop that does
+not fire**: zero walk-backs across that sweep, because the only interval this
+integration uses is a quarter hour, `0.25` exactly, and multiplying by a power of
+two is lossless. It is kept so the promise does not quietly depend on that.
+
+### Export safety
+
+A forced discharge sets the **battery** rate, so whatever the house cannot absorb
+leaves through the meter — and the dispatch path does not honour the inverter's
+configured feed-in limit. That limit is read and reported; it is never written,
+because it is a flash-backed grid-safety setting.
+
+So export is prevented in software: a discharge above the live house load, less a
+configurable margin, is refused whole. Not trimmed to fit. `Max Feed to Grid`
+appears in diagnostics so a reader can see the limit the dispatch path ignores.
+
+### Charge is a battery rate, not a grid rate
+
+The control surface offers both, and they are not interchangeable:
+
+| Actuator | The slider means | So |
+|---|---|---|
+| Force Discharging | battery discharge rate | grid export = value − house load |
+| Force Charging | battery charge rate | grid import = value + house load |
+| Force Export | grid feed-in rate | battery discharge = value + house load |
+| Force Import | grid import rate | battery charge = value − house load |
+
+A battery decision maps only to the first two, so the number commanded is the
+number the decision layer computed, in the units it computed it in. Mapping onto
+one of the grid-rate actuators would be wrong by the size of the house load. A
+structural test asserts neither appears anywhere in the package.
+
+### Hold means two opposite things
+
+Phase 3's `ACTION_HOLD` means *do not move the battery*. The control surface's
+Hold flag means *keep forcing it after the cutoff is reached*. Letting those two
+words meet would be a genuine hazard, so the second is only ever spelled
+`device_hold_flag`, and it is always left off — which gives the device one more
+automatic route back to normal operation when the battery stops moving.
+
+The same monitor is why there is a minimum commandable power. It reads a battery
+inside a ±50 W band for ten seconds as finished and tears the dispatch down, and a
+dispatch tracks the commanded power rather than matching it — so the minimum is
+two helper steps, four times that band, and anything smaller is refused rather
+than rounded up.
+
+### Flash memory
+
+The dispatch registers are not flash-backed; the schedules, their persistent
+cutoffs, the feed-in limit, the PV capacity and the grid-safety settings are. Only
+the dispatch helpers are ever written, and a structural test reads the real
+sources to confirm the others are not so much as *named* — including the two that
+differ from the ones Phase 4 does use by a single word
+(`discharging_cutoff_soc` against `force_discharging_cutoff_soc`).
+
+### Fail-safe, and the recovery paradox that does not arise
+
+Recovery needs no write, for three independent reasons: the duration expires by
+itself; the control surface resets its own dispatch on Home Assistant start; and
+it resets again when the inverter connection drops. Alpha EMS deliberately keeps
+no copy of that mechanism — a second copy of a safety mechanism is a second thing
+to keep in step — and instead **refuses to consider a command when it is absent or
+switched off**. At setup it observes and reports; it never writes.
+
+### The energy-balance residual is not a control gate
+
+An earlier design gated control on `gross_fault_suspected`. Live data disproved
+it. Where the house-load figure is derived from the inverter's own grid register
+while the balance check reads a separate meter, substituting one into the other
+cancels every term:
+
+    residual  ≡  meter_grid − inverter_grid   (+ a PV filter lag)
+
+The battery power cancels identically. The state of charge never appears. So the
+residual is a two-grid-meter comparison, and its magnitude is not evidence about
+either reading a command depends on. Two live samples make it concrete, and
+`tests/test_balance_is_not_a_control_gate.py` reproduces both from their real flow
+values:
+
+* **+1394 W** (2026-08-20, `grid->house+battery`, allowance 112.9 W, 12.35×,
+  labelled a gross fault). Reconstructs exactly as `2139 − 745`: a load drawing
+  through the meter that the inverter's register does not see.
+* **−10149 W** (2026-08-19, allowance 913.3 W, during a 10.18 kW charge ramp).
+  The same difference, from latency between two sources that both timestamp
+  promptly — which the coherence gate structurally cannot catch.
+
+Neither is a broken sensor; both would have blocked control. **No tolerance was
+widened and no threshold tuned** — the allowance still produces exactly the figures
+it always did, both samples are still labelled gross, and they still warn. What
+changed is only that control no longer consults them.
+
+What was added instead is evidence: the *sign* of each failure (which every
+existing statistic discarded by taking an absolute value first), the mean signed
+residual, failures and accumulated overshoot per AC-power band, and a windowed
+failure count that can see the alternating fault the consecutive counter cannot.
+A fixed difference between two instruments shrinks against the allowance as power
+rises; a mis-selected or mis-signed source grows with it. That is the feature that
+could eventually tell them apart. All of it is diagnostics-only.
+
+### What could gate control instead
+
+`soc_coherence.py` asks the one question that constrains the two readings a battery
+command actually depends on: over a closed interval, did the stored energy move the
+way the measured power said it would? A stuck, mis-scaled or sign-inverted sensor
+fails it; a disagreement between two grid meters cannot, because neither is
+involved.
+
+It is **instrumentation only**, and the honest reason is that its resolution is a
+property of the installation rather than something to assume — so it measures the
+smallest movement it actually sees and reports that. Promoting it to a gate is a
+question for a later phase with months of that evidence in hand. Two limits are
+worth recording now: the battery power is sampled at the boundary rather than
+integrated, because no integral exists; and below the sensor's own resolution the
+comparison is *inconclusive*, which is not the same as passing.
+
+### Entities
+
+Two. `select.alpha_ems_control_mode` is the control a user sets, and it is an
+entity rather than a configuration field because reaching for it should not mean
+opening a dialog. `sensor.alpha_ems_control_state` says what the pipeline did:
+`inhibited` (the gate refused), `eligible` (it did not, and only the barrier
+stopped a command), `idle` (the gate passed and there was nothing to send), or
+`off`.
+
+`inhibited` and `eligible` being distinct is the whole value of shadow mode.
+Everything else — the capability report, the read-back snapshot, the intent, the
+quantised command, the ordered command list, the event trail — is in eight flat
+attributes and in diagnostics. A gate with twenty-five ways to refuse must not
+become twenty-five rows on a dashboard.
+
+There is deliberately no "last control action" entity. Its state would be a
+timestamp, its history *is* the thing it reports, and the recorder already stores
+every state change of the control state with its attributes.
+
+### Failure isolation
+
+A third additive layer, isolated the way the two before it are: its own throttle
+key, its own `try`/`except`, its own degraded return. A control fault costs the two
+control entities and nothing else, and a Phase-3 fault does not take the control
+layer down with it. Both directions are tested.
+
+
 ## Entity contract
 
 Exactly nine sensors — four from Phase 1, two from Phase 2, three from Phase 3 — unique IDs
@@ -1258,22 +1524,44 @@ enforces this both statically and at runtime.
 
 ## Future phases
 
-Battery *control* belongs on top of this foundation, not inside it. Things Phases
-1 to 3 deliberately keep possible without implementing: grid import/export
-limits, degradation modelling, and EV scheduling using the flexible-load series
-already being recorded.
+Things Phases 1 to 4 deliberately keep possible without implementing: grid
+import/export limits, degradation modelling, and EV scheduling using the
+flexible-load series already being recorded.
 
 What each next phase needs, and where it plugs in:
 
 | Phase | Needs | Seam |
 |---|---|---|
-| **4** Control | a safe executable recommendation | `allowed_energy_ac_kwh` on a frozen record obtainable only from the clamp. **Give it its own boundary module** so `api.py` stays decision-free |
 | **5** Solcast PV | production joins the simulation | the stepper takes a *sequence of demands*, never the forecast — production is a second series. Makes `Projected Battery SoC` publishable, and is where asymmetric efficiency belongs |
 | **6** Frank prices | a price series joins | prices are a *policy* input; what-if already compares trajectories, so this adds a cost function over them |
 | **7** Dynamic reserve | raise the floor, never the user's setting | `dynamic_reserve` beside `static_reserve`, computing `max(configured, dynamic)` **inside** the factory. `interval_margin_kwh` is already reported |
 | **8** Economic optimisation | replace the objective, keep the simulator | the policy interface; `HoldPolicy` is already the counterfactual to price against, and the soft reserve is what makes “dip but never below the floor” expressible |
 | **9** Adaptive feedback | provenance and joins | recorded state of charge joins the Phase-2 snapshot by chronological index and target day; plans are recomputable; `policy_version` prevents pooling generations; separate efficiency fields let them be learned |
 | **10** Multi-day | a longer horizon | the simulator is horizon-agnostic and already walks today plus tomorrow |
+
+### Known open items — Phase 4
+
+**Ownership cannot be established.** Nothing in the control surface records who
+armed a dispatch, so Alpha EMS cannot prove a running one is its own. This blocks
+both stopping and continuing a command, and is therefore the primary prerequisite
+for real execution — ahead of any price signal. Do not solve it by comparing
+parameters.
+
+**The command latency is computed, not measured.** A command would act for roughly
+one interval less about ten seconds (the refresh offset, the control surface's own
+two-second settle, and service latency), delivering about 98.9 % of the allowance.
+Shadow mode cannot measure this, because nothing is sent. It stays an estimate.
+
+**The two features that drive the battery independently** — Excess Export and Peak
+Shaving — re-arm their own dispatch on a five-minute dead-man. Either being on
+inhibits Alpha EMS, so control and those features are mutually exclusive. That is
+a product decision, deliberately resolved in the user's favour: Alpha EMS stands
+down rather than switching off a setting somebody chose.
+
+**The residual carries a PV filter term.** The house-load template uses a
+low-pass-filtered PV figure while the balance check reads the raw one, so a third
+term joins the two-meter difference during PV transients. Diagnostics-only, like
+the rest.
 
 `ForecastUncertainty` exists so a reserve can be sized from measured forecast
 error rather than a guessed margin — note that its fields are `None` when there is

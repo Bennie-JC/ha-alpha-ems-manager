@@ -117,7 +117,8 @@
         "description": "Kies wat je wilt wijzigen. De geleerde geschiedenis en het prognosebewijs blijven in beide gevallen bewaard.",
         "menu_options": {
           "sources": "Bronnen",
-          "battery": "Accuplanning"
+          "battery": "Accuplanning",
+          "control": "Regeling"
         }
       },
       "sources": {
@@ -170,6 +171,18 @@
           "battery_max_charge_kw": "Het maximale laadvermogen van de accu, gemeten aan de AC-zijde, in kW. Meestal het vermogen van de omvormer. Geen standaardwaarde, om dezelfde reden als bij de capaciteit.",
           "battery_max_discharge_kw": "Het maximale ontlaadvermogen van de accu, gemeten aan de AC-zijde, in kW. Meestal het vermogen van de omvormer.",
           "battery_round_trip_efficiency_percent": "Hoeveel van de ingestopte energie er weer uit komt, AC naar AC, in procenten. Rond 90 % is gebruikelijk voor een thuisaccu. Vul 90 in, niet 0,9."
+        }
+      },
+      "control": {
+        "title": "Regeling",
+        "description": "Hoe Alpha EMS zich moet gedragen als het ooit zelf naar zijn eigen advies mag handelen. Deze versie kan helemaal geen opdracht naar je omvormer sturen: de regelketen is volledig gebouwd en getoetst, en de laatste stap die naar de batterij zou schrijven is niet beschikbaar. Zet de entiteit Control Mode op Shadow om te zien wat er gebeurd zou zijn.",
+        "data": {
+          "control_horizon_minutes": "Duur van een opdracht",
+          "control_export_margin_percent": "Veiligheidsmarge teruglevering"
+        },
+        "data_description": {
+          "control_horizon_minutes": "Hoe lang een opdracht de omvormer zou laten vasthouden, in minuten. Dit is een veiligheidstimer en geen levertijd: het plan wordt elk kwartier opnieuw opgesteld en elke opdracht vervangt de vorige, dus het telt alleen als Alpha EMS stopt -- dan gaat de omvormer na het verstrijken zelf terug naar normaal. Het moet langer zijn dan vijftien minuten, anders verloopt een opdracht voordat de volgende komt.",
+          "control_export_margin_percent": "Hoeveel procent onder je huidige huisverbruik een ontlaadopdracht moet blijven. Een geforceerde ontlading stelt het vermogen van de batterij in, dus wat het huis niet gebruikt gaat naar het net -- en de teruglevergrens van de omvormer geldt daar niet voor. Zou een opdracht hierboven uitkomen, dan wordt de hele opdracht geweigerd in plaats van verkleind."
         }
       }
     }

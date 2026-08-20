@@ -50,8 +50,8 @@ EXPECTED_CONFIG_FIELDS: dict[str, list[str]] = {
     "sources": ["frank_entry_id", "solcast_entry_id"],
 }
 
-#: The options flow is a menu of two pages. Both are checked, in order.
-EXPECTED_OPTIONS_MENU = ("sources", "battery")
+#: The options flow is a menu of three pages. All are checked, in order.
+EXPECTED_OPTIONS_MENU = ("sources", "battery", "control")
 
 EXPECTED_OPTIONS_FIELDS: dict[str, list[str]] = {
     "sources": [
@@ -79,6 +79,13 @@ EXPECTED_OPTIONS_FIELDS: dict[str, list[str]] = {
         "battery_max_charge_kw",
         "battery_max_discharge_kw",
         "battery_round_trip_efficiency_percent",
+    ],
+    # Phase 4. Two fields, both with defaults. The execution-enable key is
+    # deliberately absent: while the release barrier makes it unable to change
+    # anything, offering it would promise a capability that does not exist.
+    "control": [
+        "control_horizon_minutes",
+        "control_export_margin_percent",
     ],
 }
 

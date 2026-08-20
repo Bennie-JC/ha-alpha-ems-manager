@@ -28,10 +28,13 @@ from homeassistant.helpers.event import (
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
+from .alphaess_adapter import discover, read_snapshot
+from .alphaess_device import build_command, plan_commands
 from .api import load_forecast_from
-from .battery import sanitize_soc_percent
+from .battery import INTERVAL_HOURS, sanitize_soc_percent
 from .confidence import ConfidenceBreakdown, compute_confidence
 from .const import (
+    BALANCE_MAX_SOURCE_AGE_SECONDS,
     CONF_BATTERY_CAPACITY_KWH,
     CONF_BATTERY_MAX_CHARGE_KW,
     CONF_BATTERY_MAX_DISCHARGE_KW,
@@ -40,6 +43,9 @@ from .const import (
     CONF_BATTERY_POWER_SIGN,
     CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_SOC_ENTITY,
+    CONF_CONTROL_EXECUTION_ENABLED,
+    CONF_CONTROL_EXPORT_MARGIN_PERCENT,
+    CONF_CONTROL_HORIZON_MINUTES,
     CONF_DAILY_HOUSE_LOAD_ENTITY,
     CONF_EV_POWER_ENTITY,
     CONF_FRANK_ENTRY_ID,
@@ -50,16 +56,31 @@ from .const import (
     CONF_PV_POWER_ENTITY,
     CONF_SOLCAST_ENTRY_ID,
     CONF_USE_PV_FORECAST,
+    CONTROL_EXECUTION_AVAILABLE,
+    CONTROL_MODE_OFF,
+    CONTROL_MODE_OPTIONS,
+    CONTROL_STATE_ELIGIBLE,
+    CONTROL_STATE_IDLE,
+    CONTROL_STATE_INHIBITED,
+    CONTROL_STATE_OFF,
     DEFAULT_BATTERY_MIN_SOC_PERCENT,
     DEFAULT_BATTERY_POWER_SIGN,
     DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+    DEFAULT_CONTROL_EXECUTION_ENABLED,
+    DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
+    DEFAULT_CONTROL_HORIZON_MINUTES,
     DEFAULT_GRID_POWER_SIGN,
     DOMAIN_FRANK,
     DOMAIN_SOLCAST,
+    INHIBIT_NO_DECISION,
+    INHIBIT_NO_PLAN,
+    INHIBIT_PLAN_UNAVAILABLE,
     LOG_THROTTLE_SECONDS,
+    MAX_CONTROL_EVENTS_REPORTED,
     QUARTER_MINUTES,
     SAFETY_SAMPLE_SECONDS,
 )
+from .control import translate
 from .energy_balance import (
     OUTCOME_SKIPPED_INCOHERENT,
     BalanceMonitor,
@@ -93,7 +114,15 @@ from .quarter import (
     sanitize_ev_w,
     sanitize_load_w,
 )
-from .storage import LearningStore, index_for_start_utc, utc_midnight
+from .safety import (
+    ControlContext,
+    ExecutionDecision,
+    SafetyVerdict,
+    authorize,
+    evaluate,
+)
+from .soc_coherence import SocCoherenceMonitor
+from .storage import DayRecord, LearningStore, index_for_start_utc, utc_midnight
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -146,6 +175,16 @@ _FORECAST_HISTORY_LOG = "forecast_history"
 #: Throttle key for a battery-planning failure. Separate from the forecast one so
 #: a fault in one layer cannot silence the other.
 _BATTERY_PLAN_LOG = "battery_plan"
+#: Throttle key for a control-layer failure. Separate again, for the same reason:
+#: three additive layers must be able to fail independently and say so.
+_CONTROL_LOG = "control"
+
+#: The statement every control surface in this release repeats, because it is the
+#: single most important fact about it.
+_CONTROLS_NOTHING = (
+    "the control pipeline is fully evaluated but cannot execute: no command "
+    "reaches the inverter in this release"
+)
 
 
 def _optional_number(raw: Any) -> float | None:
@@ -207,6 +246,14 @@ class SourceConfig:
     #: this particular battery. See ``const.py``.
     battery_min_soc_percent: float
     battery_round_trip_efficiency_percent: float
+    #: Phase-4 control settings. All three have defaults: unlike the battery
+    #: hardware facts, none of them describes the installation, so a sensible
+    #: value is a choice rather than a guess about someone's equipment.
+    control_horizon_minutes: int
+    control_export_margin_percent: float
+    #: Read, and deliberately absent from the options form while the release
+    #: barrier makes it unable to change anything.
+    control_execution_enabled: bool
 
     @classmethod
     def from_entry(cls, entry: ConfigEntry) -> SourceConfig:
@@ -247,6 +294,22 @@ class SourceConfig:
             battery_round_trip_efficiency_percent=_number(
                 value(CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT),
                 DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+            ),
+            control_horizon_minutes=int(
+                _number(
+                    value(CONF_CONTROL_HORIZON_MINUTES),
+                    DEFAULT_CONTROL_HORIZON_MINUTES,
+                )
+            ),
+            control_export_margin_percent=_number(
+                value(CONF_CONTROL_EXPORT_MARGIN_PERCENT),
+                DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
+            ),
+            control_execution_enabled=bool(
+                value(
+                    CONF_CONTROL_EXECUTION_ENABLED,
+                    DEFAULT_CONTROL_EXECUTION_ENABLED,
+                )
             ),
         )
 
@@ -378,6 +441,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: the live zone so a change can be acted on rather than silently
         #: splitting the write path across two calendars.
         self._tz_key = str(dt_util.get_default_time_zone())
+        #: The selected control mode. Held here rather than on the entity so the
+        #: pipeline and the thing the user sees cannot disagree about it. Starts
+        #: off, and the entity restores the stored value once it is added.
+        self.control_mode = CONTROL_MODE_OFF
+        #: Session-scoped comparison of measured state of charge against measured
+        #: battery power. Instrumentation: it gates nothing.
+        self.soc_coherence = SocCoherenceMonitor()
+        #: Recent control outcomes, newest first, bounded for diagnostics.
+        self._control_events: list[dict[str, Any]] = []
+        #: When a command was last sent, and at what power. Both stay ``None``
+        #: for the lifetime of this release, because nothing is ever sent.
+        self._last_control_write: datetime | None = None
+        self._last_control_power_kw: float | None = None
 
     # -- lifecycle -------------------------------------------------------
 
@@ -664,6 +740,32 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         return charge - discharge
 
+    @callback
+    def _state_age_seconds(self, entity_id: str | None) -> float | None:
+        """Return how long ago an entity last published, in seconds.
+
+        ``last_reported`` in preference to ``last_updated``, for the reason the
+        balance coherence check already established: it advances on every
+        publication, including one that repeats the previous value. A steady
+        battery power that has read the same figure for ten minutes is perfectly
+        current, and judging it by ``last_updated`` would call it stale.
+
+        ``None`` means no age could be established, which the accompanying value
+        check reports as a missing source rather than an old one.
+        """
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return None
+        reported = getattr(state, "last_reported", None) or state.last_updated
+        return max(0.0, (dt_util.utcnow() - reported).total_seconds())
+
+    @callback
+    def set_control_mode(self, mode: str) -> None:
+        """Select a control mode, falling back to off for anything unknown."""
+        self.control_mode = mode if mode in CONTROL_MODE_OPTIONS else CONTROL_MODE_OFF
+
     def _read_soc_percent(self) -> float | None:
         """Return the battery state of charge in percent, or ``None``.
 
@@ -805,6 +907,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._record_rejected_quarter(result, REJECT_INTERVAL_OUT_OF_RANGE)
                 continue
 
+            if result.start_utc == latest_start and soc_percent is not None:
+                self._observe_soc_coherence(record, index, soc_percent)
+
             self.last_finalized_quarter = result.start_utc
             self.store.last_finalized = result.start_utc.isoformat()
             changed = True
@@ -818,6 +923,39 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if changed:
             self.store.schedule_save()
+
+    @callback
+    def _observe_soc_coherence(
+        self, record: DayRecord, index: int, soc_percent: float
+    ) -> None:
+        """Compare this interval's state-of-charge movement against its power.
+
+        Instrumentation only. It gates nothing, and it is here rather than in the
+        control layer because the comparison needs the interval that has just
+        closed -- the one moment both ends of the movement are known.
+
+        The battery power used is the reading at the boundary, not an integral
+        over the interval, because no integral exists: power is sampled, not
+        accumulated. That makes the comparison coarse, which is precisely why it
+        reports a direction and an order of magnitude rather than a verdict.
+        """
+        capacity = self.config.battery_capacity_kwh
+        if capacity is None or index <= 0:
+            return
+        previous = record.soc_at(index - 1)
+        if previous is None:
+            return
+        power = self._canonical_battery_power_w()
+        if power is None:
+            return
+        self.soc_coherence.observe(
+            index=index,
+            soc_before_percent=previous,
+            soc_after_percent=soc_percent,
+            battery_power_w=power,
+            capacity_kwh=capacity,
+            interval_hours=INTERVAL_HOURS,
+        )
 
     @callback
     def _record_rejected_quarter(
@@ -1130,6 +1268,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             tz_key=str(tz),
         )
 
+        control = self._build_control_report_safely(
+            plan=plan,
+            now=now,
+            today=today,
+            elapsed=elapsed,
+            today_interval_count=baseline_today.interval_count,
+        )
+
         return {
             "today": adapted,
             "today_baseline": baseline_today,
@@ -1142,7 +1288,218 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "forecast_yesterday_error": record.yesterday,
             "forecast_error_window": record.window,
             "battery_plan": plan,
+            "control": control,
         }
+
+    def _build_control_report_safely(
+        self,
+        *,
+        plan: BatteryPlan | None,
+        now: datetime,
+        today: date,
+        elapsed: int,
+        today_interval_count: int,
+    ) -> dict[str, Any] | None:
+        """Build the control report, or ``None`` if it could not be built.
+
+        Isolated the same way the two layers before it are, and under its own
+        throttle key so a fault here cannot silence one there. A control failure
+        costs the two control entities and nothing else: learning, both
+        forecasts, the forecast-error sensors and the three battery entities all
+        read from paths that never touch this one.
+        """
+        try:
+            return self._build_control_report(
+                plan=plan,
+                now=now,
+                today=today,
+                elapsed=elapsed,
+                today_interval_count=today_interval_count,
+            )
+        except Exception:
+            self._log.warning(
+                _CONTROL_LOG,
+                (
+                    "The control layer could not be evaluated this refresh. "
+                    "Learning, both forecasts, the forecast-error sensors and "
+                    "the battery plan are unaffected -- nothing in those paths "
+                    "reads the control layer -- but the two control entities "
+                    "will read unknown until it recovers. No command was sent; "
+                    "this release cannot send one"
+                ),
+            )
+            _LOGGER.debug("Control report build failed", exc_info=True)
+            return None
+
+    def _build_control_report(
+        self,
+        *,
+        plan: BatteryPlan | None,
+        now: datetime,
+        today: date,
+        elapsed: int,
+        today_interval_count: int,
+    ) -> dict[str, Any]:
+        """Run the control pipeline and report what it decided.
+
+        The whole pipeline, in shadow as much as in active: the same intent, the
+        same gate, the same command list. Only :func:`~.safety.authorize` sees
+        the mode, and only it can refuse for a reason that is not a hazard. That
+        is what makes shadow worth watching -- its verdict is the real verdict.
+
+        Nothing here writes. The command list is computed, reported, and then
+        deliberately dropped: authorization refuses on the release barrier, and
+        the executor refuses again behind it.
+        """
+        mode = self.control_mode
+        if mode == CONTROL_MODE_OFF:
+            # No intent, no gate, no command planning, and nothing read from the
+            # control surface. Off means this integration is not attempting
+            # control at all.
+            return {
+                "mode": mode,
+                "state": CONTROL_STATE_OFF,
+                "execution_available": CONTROL_EXECUTION_AVAILABLE,
+                "execution_enabled": self.config.control_execution_enabled,
+                "off_semantics": (
+                    "off means this integration attempts no control and writes "
+                    "nothing; it does not mean an inverter reverts, and in this "
+                    "release the distinction cannot arise because nothing here "
+                    "can start a dispatch"
+                ),
+                "controls_nothing": _CONTROLS_NOTHING,
+            }
+
+        capability = discover(self.hass)
+        snapshot = read_snapshot(self.hass)
+
+        # Why there is no intent, resolved here because this is where the plan
+        # lives. The gate relays it rather than reaching into Phase 3 itself.
+        problem: str | None = None
+        if plan is None:
+            problem = INHIBIT_NO_PLAN
+        elif plan.unavailable_reason is not None:
+            problem = INHIBIT_PLAN_UNAVAILABLE
+        elif not plan.decision.decided:
+            problem = INHIBIT_NO_DECISION
+
+        intent = translate(
+            plan, now=now, horizon_minutes=self.config.control_horizon_minutes
+        )
+        command = build_command(intent) if intent is not None else None
+        commands = plan_commands(command) if command is not None else ()
+
+        context = ControlContext(
+            mode=mode,
+            execution_enabled=self.config.control_execution_enabled,
+            missing_entities=capability.missing,
+            unavailable_entities=capability.unavailable,
+            failsafe_available=capability.failsafe_available,
+            excess_export_active=capability.excess_export_active,
+            peak_shaving_active=capability.peak_shaving_active,
+            dispatch_active=snapshot.dispatch_active,
+            battery_configured=self.battery_planning_configured,
+            plan_problem=problem,
+            current_start_index=min(elapsed + 1, today_interval_count),
+            today=today,
+            now=now,
+            soc_percent=self._read_soc_percent(),
+            soc_age_seconds=self._state_age_seconds(self.config.battery_soc_entity),
+            battery_power_w=self._canonical_battery_power_w(),
+            battery_power_age_seconds=self._state_age_seconds(
+                self.config.battery_power_entity
+            ),
+            house_load_w=sanitize_load_w(
+                self._read_power(self.config.house_load_entity)
+            ),
+            house_load_age_seconds=self._state_age_seconds(
+                self.config.house_load_entity
+            ),
+            max_source_age_seconds=BALANCE_MAX_SOURCE_AGE_SECONDS,
+            device_power_kw=0.0 if command is None else command.power_kw,
+            device_cutoff_percent=(
+                0 if command is None else command.cutoff_soc_percent
+            ),
+            device_duration_minutes=(
+                0 if command is None else command.duration_minutes
+            ),
+            export_margin_percent=self.config.control_export_margin_percent,
+            seconds_since_last_write=(
+                None
+                if self._last_control_write is None
+                else (now - self._last_control_write).total_seconds()
+            ),
+        )
+
+        verdict = evaluate(intent, context)
+        starts_or_increases = (
+            command is not None
+            and command.moves_battery
+            and (
+                self._last_control_power_kw is None
+                or command.power_kw > self._last_control_power_kw
+            )
+        )
+        decision = authorize(
+            verdict,
+            context,
+            commands_planned=len(commands),
+            starts_or_increases=starts_or_increases,
+        )
+
+        state = CONTROL_STATE_INHIBITED
+        if verdict.safe:
+            state = CONTROL_STATE_ELIGIBLE if commands else CONTROL_STATE_IDLE
+
+        self._record_control_event(now, state, verdict, decision)
+
+        return {
+            "mode": mode,
+            "state": state,
+            "execution_available": CONTROL_EXECUTION_AVAILABLE,
+            "execution_enabled": self.config.control_execution_enabled,
+            "capability": capability.as_dict(),
+            "device": snapshot.as_dict(),
+            "intent": None if intent is None else intent.as_dict(),
+            "command": None if command is None else command.as_dict(),
+            "commands": [step.as_dict() for step in commands],
+            "commands_planned": len(commands),
+            "safety": verdict.as_dict(),
+            "authorization": decision.as_dict(),
+            "last_write": (
+                None
+                if self._last_control_write is None
+                else self._last_control_write.isoformat()
+            ),
+            "events": list(self._control_events),
+            "soc_coherence": self.soc_coherence.as_dict(),
+            "shadow_basis": (
+                "the safety verdict and the command list above are computed by "
+                "the same functions the active path uses, so what shadow reports "
+                "is what active would have attempted"
+            ),
+            "controls_nothing": _CONTROLS_NOTHING,
+        }
+
+    @callback
+    def _record_control_event(
+        self,
+        now: datetime,
+        state: str,
+        verdict: SafetyVerdict,
+        decision: ExecutionDecision,
+    ) -> None:
+        """Keep a bounded trail of what the control layer decided and why."""
+        self._control_events.insert(
+            0,
+            {
+                "at": now.isoformat(),
+                "state": state,
+                "inhibit_reason": verdict.inhibit_reason,
+                "refusal": decision.refusal,
+            },
+        )
+        del self._control_events[MAX_CONTROL_EVENTS_REPORTED:]
 
     def _build_battery_plan(
         self,
@@ -1303,6 +1660,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def battery_plan(self) -> BatteryPlan | None:
         """Return the current battery plan, or ``None`` when there is none."""
         return (self.data or {}).get("battery_plan")
+
+    @property
+    def control_report(self) -> dict[str, Any] | None:
+        """Return this refresh's control report, or ``None``."""
+        return (self.data or {}).get("control")
 
     @property
     def current_soc_percent(self) -> float | None:

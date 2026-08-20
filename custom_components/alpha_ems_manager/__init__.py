@@ -1,8 +1,12 @@
 """The Alpha EMS Manager integration.
 
-Phase 1: source fusion, household-load learning and forecasting. This
-integration deliberately issues no commands to the battery and makes no
-charge, discharge or trading decisions.
+Source fusion, household-load learning, forecasting, a battery recommendation,
+and the full control pipeline that would execute it -- translation, safety gate,
+command planning and authorization.
+
+**No command reaches the battery.** The pipeline is complete and validated end to
+end, and its final step is unreachable rather than merely disabled: see
+``CONTROL_EXECUTION_AVAILABLE``. No trading decision is made anywhere.
 """
 
 from __future__ import annotations

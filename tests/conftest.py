@@ -117,6 +117,55 @@ def source_entities(hass: HomeAssistant) -> None:
     set_sensor(hass, GRID_POWER, -336, "W", "power")
 
 
+#: The Phase-4 control surface, at rest, with the values the live installation
+#: reports when no dispatch is running.
+CONTROL_SURFACE_AT_REST: dict[str, object] = {
+    "sensor.alphaess_dispatch_start": 0,
+    "sensor.alphaess_dispatch_mode": 0,
+    "sensor.alphaess_dispatch_active_power": 0,
+    "sensor.alphaess_dispatch_soc": 0,
+    "sensor.alphaess_dispatch_time": 90,
+    "sensor.alphaess_max_feed_to_grid": 100,
+}
+
+
+@pytest.fixture
+def control_surface(hass: HomeAssistant) -> None:
+    """Populate the state machine with a healthy control surface.
+
+    Deliberately **not** autouse. Most of the suite runs without it, which means
+    the default condition across the whole project is a control surface that is
+    absent -- and an absent one must leave the integration loading, learning and
+    forecasting exactly as before. Tests that want a usable one ask for it.
+
+    The values are the ones the live installation reports at rest: no dispatch
+    running, the feed-in limit at a hundred percent, both safety automations on,
+    and neither of the two features that drive the battery on their own.
+    """
+    from custom_components.alpha_ems_manager.alphaess_device import (
+        AUTOMATION_DISPATCH_RESET_FULL,
+        AUTOMATION_HOLD_MONITOR,
+        BOOLEAN_EXCESS_EXPORT,
+        BOOLEAN_PEAK_SHAVING,
+        CHARGE_FAMILY,
+        DISCHARGE_FAMILY,
+    )
+
+    for entity_id, value in CONTROL_SURFACE_AT_REST.items():
+        hass.states.async_set(entity_id, value)
+    for family in (DISCHARGE_FAMILY, CHARGE_FAMILY):
+        hass.states.async_set(family.activate, "off")
+        hass.states.async_set(family.hold, "off")
+        hass.states.async_set(family.power, "0.0")
+        hass.states.async_set(family.cutoff_soc, "10")
+        hass.states.async_set(family.duration, "120")
+        hass.states.async_set(family.timer, "idle")
+    hass.states.async_set(AUTOMATION_DISPATCH_RESET_FULL, "on")
+    hass.states.async_set(AUTOMATION_HOLD_MONITOR, "on")
+    hass.states.async_set(BOOLEAN_EXCESS_EXPORT, "off")
+    hass.states.async_set(BOOLEAN_PEAK_SHAVING, "off")
+
+
 @pytest.fixture
 def frank_config_entry(hass: HomeAssistant) -> MockConfigEntry:
     """Register a Frank Quarter Prices entry for Alpha EMS to reference.
