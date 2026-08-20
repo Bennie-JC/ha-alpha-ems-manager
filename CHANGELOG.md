@@ -9,6 +9,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.8] - 2026-08-20
+
+**Phase 4: AlphaESS Actions & Control.** The integration now builds the complete
+path from a battery decision to a real inverter command — translation, every
+safety check, the exact helper values in the exact order — and then cannot walk
+it.
+
+**No command reaches your inverter in this release.** That is enforced by a
+build-time constant, not by a setting: the executor refuses on its own, and a
+whole-integration test drives every mode against a healthy control surface and
+asserts the count of service calls is exactly zero.
+
+Phases 1, 2 and 3 are behaviourally unchanged, asserted rather than assumed: the
+nine existing entities are driven twice at the same instant, once with control
+running and once with it off, and compared figure for figure.
+
+### Added
+
+- **Two entities, and only two.** `Control Mode` (`off` / `shadow` / `active`,
+  starting at `off`) and `Control State` (`inhibited`, `eligible`, `idle`,
+  `off`). Everything the pipeline computes — which parts of your control surface
+  were found, what the inverter is doing, the intent, the quantised command, the
+  ordered command list, the event trail — is in eight flat attributes and in
+  diagnostics. A safety gate with twenty-five ways to refuse must not become
+  twenty-five rows on a dashboard.
+- **Shadow mode, which runs the real pipeline.** The same translation, the same
+  safety gate and the same command planner `active` uses, with nothing written.
+  Its verdict is the real verdict, so its diagnostics answer "would this have
+  been safe, and what exactly would it have sent". `inhibited` and `eligible` are
+  deliberately distinct states: the first means a safety check refused, the
+  second that none did and only the release barrier stopped a command.
+- **Safety eligibility separated from permission to execute.** Twenty-five
+  conditions, none of which reads the control mode — so shadow and active return
+  identical verdicts, proven over the full condition table. Authorization is a
+  second, narrower stage that can only ever subtract.
+- **The gate refuses; it never reduces.** A command that would push energy onto
+  the grid is refused whole rather than trimmed to fit the house load. There is
+  no magnitude on the verdict at all, so nothing downstream could mistake it for
+  a smaller command. A gate that trimmed a request would have made a decision,
+  and deciding belongs to Phase 3.
+- **Two control settings**, under Options → Control: the command duration (a
+  dead-man timeout, not a delivery window) and an export safety margin.
+- **Energy-balance instrumentation**, all diagnostics-only: the sign of each
+  failure, the mean signed residual, failures and accumulated overshoot per
+  power band, and a windowed failure count that can see an alternating fault the
+  consecutive counter cannot.
+- **A state-of-charge coherence instrument**, also diagnostics-only: over a
+  closed interval, did the stored energy move the way the measured battery power
+  said it would? It measures what your sensor can actually resolve rather than
+  assuming it.
+
+### Honest about what it cannot do
+
+- **It cannot execute, and enabling that later is not a formality.** Nothing in
+  the AlphaESS control surface records *who* armed a dispatch — a dispatch set
+  from a dashboard and one set by a service call leave byte-identical helper
+  values, registers, timers and read-backs. So Alpha EMS cannot prove a running
+  dispatch is its own, and matching power, cutoff or duration is not proof: the
+  person most likely to have armed exactly the figures Alpha EMS would have sent
+  is you, watching the shadow recommendation. That blocks stopping a command
+  *and* continuing one beyond a single interval.
+- **There is no stop path, deliberately.** A stop whose authorisation cannot be
+  established is worse than none, because the next person to read it inherits an
+  open safety question dressed as working code.
+- **`off` means Alpha EMS attempts no control.** It does not mean your inverter
+  reverts. In this release the distinction cannot arise, because nothing here can
+  start a dispatch — but it is stated rather than glossed, because a later release
+  will have to choose.
+- **Nothing today is worth executing anyway.** The shipped recommendation is the
+  discharge that covers your predicted load, which a self-consumption inverter
+  already does — and does better, because it tracks load continuously while a
+  fixed-power command cannot. The pipeline exists so it can be watched for months
+  before anything depends on it.
+
+### Changed
+
+- **The energy-balance residual is no longer a candidate control interlock.** An
+  earlier design would have blocked control on a gross-fault verdict. Live data
+  disproved it: where the house-load figure comes from the inverter's own grid
+  register and the balance check reads a separate meter, the residual reduces to
+  the difference between those two meters — the battery term cancels identically
+  and the state of charge never appears. Two real samples showed it: **+1394 W**
+  (12.35× its allowance, an unmetered load) and **−10149 W** (during a 10.18 kW
+  charge ramp). Neither is a broken sensor; both would have blocked control.
+  **No tolerance was widened and no threshold tuned** — the allowance produces
+  exactly the figures it always did, both samples are still labelled gross faults,
+  and both still warn. Control simply does not consult them.
+
+### Notes for anyone upgrading
+
+- Nothing is required, and nothing changes until you ask it to. There is no
+  migration, no new required setting, and the control mode starts at `off`.
+- To watch it: **Settings → Devices & Services → Alpha EMS Manager**, set
+  **Control Mode** to `shadow`, and read **Control State** plus the `control`
+  block in diagnostics.
+- Alpha EMS uses the AlphaESS package's own helpers and its own tested write
+  sequence; it never writes a Modbus register directly, and it never writes any
+  setting the inverter keeps in flash memory.
+- Tests: 1303 → 1545. Nineteen mutation tests deliberately break a control
+  invariant and prove a test notices — which is how two gaps in this suite were
+  found and closed.
+
 ## [1.0.0-beta.7] - 2026-08-20
 
 **Phase 3: Battery Decision & Simulation.** The integration now works out what
@@ -878,7 +980,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.7...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.8...HEAD
+[1.0.0-beta.8]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.7...v1.0.0-beta.8
 [1.0.0-beta.7]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.6...v1.0.0-beta.7
 [1.0.0-beta.6]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.5...v1.0.0-beta.6
 [1.0.0-beta.5]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.4...v1.0.0-beta.5

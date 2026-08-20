@@ -7,18 +7,19 @@
 A Home Assistant custom integration that learns how much electricity your
 household **actually** uses, and forecasts what it will use today and tomorrow.
 
-This is **Phase 3**. It observes, learns, predicts, keeps a record of how wrong
-its predictions turned out to be, and now works out what the battery *should* do
-and what would happen if it did. It still does not control anything — nothing in
-this integration sends a command to your battery.
+This is **Phase 4**. It observes, learns, predicts, keeps a record of how wrong
+its predictions turned out to be, works out what the battery *should* do, and now
+builds the complete path from that decision to an inverter command — and stops one
+step short of walking it. **Nothing in this integration sends a command to your
+battery.** The final step is unreachable, not merely switched off.
 
 ---
 
 ## Project status
 
-> **Current release: `1.0.0-beta.7` — a public beta.**
+> **Current release: `1.0.0-beta.8` — a public beta.**
 >
-> The integration is feature-complete for Phase 3 and covered by 1303 automated
+> The integration is feature-complete for Phase 4 and covered by 1545 automated
 > tests, but the learning and forecast model has **not** yet been validated
 > across enough real-world complete days to be called stable. Treat it as
 > something to run and observe, not yet as something to depend on.
@@ -58,7 +59,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.7` is not offered.
+     dialog if `1.0.0-beta.8` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -162,6 +163,47 @@ Everything else — the simulated trajectory, where the floor would bite, the
 comparison against leaving the battery alone, the projected state of charge — is
 in diagnostics rather than in an entity.
 
+### Control (new in Phase 4)
+
+Phase 4 builds everything needed to turn that recommendation into a real AlphaESS
+command: the translation, every safety check, the exact helper values, in the
+exact order. **Then it stops.** This release cannot send the command, and not
+because a switch is off — the last step is unreachable by a constant in the source.
+
+Two new entities:
+
+| Entity | What it is |
+|---|---|
+| **Control Mode** | `off`, `shadow` or `active`. Starts at `off`. |
+| **Control State** | `inhibited`, `eligible`, `idle` or `off` — what the pipeline decided, with the reason in its attributes. |
+
+**Shadow is the one to use.** It runs the *real* pipeline — the same translation,
+the same safety checks, the same command list `active` would use — and writes
+nothing. Its diagnostics answer a specific question: *would this command have
+been safe, and what exactly would it have sent?* That is why `Control State`
+distinguishes `inhibited` (a safety check refused) from `eligible` (nothing
+refused, and only the release barrier stopped it).
+
+Set it to `shadow` and watch it for a few weeks. Diagnostics shows which parts of
+your AlphaESS control surface were found, what your inverter is currently doing,
+the intent, the quantised command, and the ordered list of helper writes.
+
+Two settings, under **Options → Control**: the command duration (a safety timeout
+rather than a delivery time — if Alpha EMS stopped running, this is how long
+before your inverter returned to normal by itself) and an export safety margin.
+
+**What Alpha EMS will never do**, in this release or a later one:
+
+- write any setting your inverter keeps in flash memory — no schedules, no
+  cutoff schedules, no feed-in limit, no grid-safety settings;
+- switch off **Excess Export** or **Peak Shaving**. If either is on, Alpha EMS
+  stands down and says so, rather than taking the battery from a feature you
+  chose;
+- touch a dispatch it did not start.
+
+Alpha EMS uses the AlphaESS package's own helpers and its own tested write
+sequence. It never writes a Modbus register directly.
+
 ## What it does **not** do yet
 
 - ❌ No automatic battery control. It never writes to your inverter.
@@ -173,12 +215,18 @@ in diagnostics rather than in an entity.
   reported in diagnostics, but it does not influence the load model.
 - ❌ No self-correction. Phase 2 *records* forecast error; it does not feed it
   back into the model. Nothing adjusts itself in response to being wrong.
-- ❌ **No battery control, still.** Phase 3 works out what the battery should do
-  and publishes it. Nothing executes it, and no service call is made.
+- ❌ **No battery control, still.** Phase 4 builds the entire control path --
+  translation, safety checks, the exact command -- and cannot execute it. No
+  service call reaches your inverter, and that is enforced by a build-time
+  constant rather than by a setting.
 - ❌ No PV-aware battery planning. The simulation has no solar production term
   until Phase 5, so it answers "what if there were no sun" — see
   [Known limitations](#known-limitations).
 - ❌ No price-aware or economic battery planning, and no automatic charging.
+- ❌ No stopping or continuing a dispatch. Nothing in the AlphaESS control
+  surface records *who* started one, so Alpha EMS cannot prove a running dispatch
+  is its own -- and it will never modify or cancel one it cannot prove it
+  created. See [Known limitations](#known-limitations).
 - ❌ No API calls of its own — see [No external polling](#no-external-polling).
 
 ---
@@ -659,6 +707,29 @@ Beyond the Phase-1 scope listed at the top, these are the current honest caveats
 - **Beta status.** Real-world learning and forecast validation is ongoing. The
   model has not been observed across enough complete days, nor through a live
   daylight-saving transition, to justify a stable release.
+- **Phase 4 builds and validates the control path but cannot execute it.** This
+  is deliberate, and it is not only caution. Two things are unresolved. First,
+  nothing in the AlphaESS control surface records who armed a dispatch, so Alpha
+  EMS cannot prove a running one is its own — which blocks both stopping a
+  command and continuing one past a single fifteen-minute interval. Matching
+  power, cutoff or duration is *not* proof: the person most likely to have set
+  exactly those figures by hand is you, watching the shadow recommendation.
+  Second, today's recommendation is the discharge that covers your predicted
+  load, which your inverter already does by itself — and does better, because it
+  tracks load continuously while a fixed-power command cannot. **Do not read
+  future control as proven.** It has not been physically tested, and enabling it
+  will be a separate, explicitly authorised step.
+- **The energy-balance warning is not used to block control.** On this
+  installation the house-load figure is derived from the inverter's own grid
+  register while the balance check reads a separate meter, so the residual is
+  really the difference between two meters — the battery term cancels out and the
+  state of charge never enters it. It can therefore grow large without anything
+  being wrong with the readings a battery command depends on, and two real
+  samples (+1394 W and −10149 W) did exactly that. The warning is unchanged and
+  still fires; no tolerance was widened. It simply is not evidence about the
+  right thing, so control does not consult it. More detail is now recorded in
+  diagnostics — the sign of each failure, and how the overshoot scales with power
+  — which is what could eventually tell a measurement boundary from a real fault.
 - **Forecasts start out unavailable, and that is correct.** Around two full days
   of valid history are needed before any forecast appears. The model does not
   fabricate a value to avoid an empty state — an honest `unknown` is more useful
