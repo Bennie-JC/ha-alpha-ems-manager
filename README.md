@@ -7,16 +7,18 @@
 A Home Assistant custom integration that learns how much electricity your
 household **actually** uses, and forecasts what it will use today and tomorrow.
 
-This is **Phase 2**. It observes, learns, predicts, and now keeps a record of
-how wrong its predictions turned out to be. It still does not control anything.
+This is **Phase 3**. It observes, learns, predicts, keeps a record of how wrong
+its predictions turned out to be, and now works out what the battery *should* do
+and what would happen if it did. It still does not control anything — nothing in
+this integration sends a command to your battery.
 
 ---
 
 ## Project status
 
-> **Current release: `1.0.0-beta.6` — a public beta.**
+> **Current release: `1.0.0-beta.7` — a public beta.**
 >
-> The integration is feature-complete for Phase 2 and covered by 1026 automated
+> The integration is feature-complete for Phase 3 and covered by 1303 automated
 > tests, but the learning and forecast model has **not** yet been validated
 > across enough real-world complete days to be called stable. Treat it as
 > something to run and observe, not yet as something to depend on.
@@ -35,6 +37,8 @@ What still needs real-world observation before `1.0.0` stable:
   against measured consumption.
 - A daylight-saving transition observed live (the logic is covered by tests, but
   has not run through a real one).
+- The battery recommendation watched in shadow mode across enough real days to
+  trust it before Phase 4 is allowed to act on it.
 - One unexplained energy-balance residual on the maintainer's system resolved or
   understood — see [Known limitations](#known-limitations).
 
@@ -54,7 +58,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.6` is not offered.
+     dialog if `1.0.0-beta.7` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -127,6 +131,37 @@ rather than only that it was.
 
 None of this changes the forecast. Nothing in the learning path reads it.
 
+### Battery planning (new in Phase 3)
+
+Phase 3 works out what the battery *should* do and simulates what would happen.
+**It never sends a command to your battery, and nothing executes its plan.** It
+is published so you can watch it for a few weeks before any later phase is
+allowed to act on it.
+
+Three new entities:
+
+| Entity | What it is |
+|---|---|
+| **Battery Recommendation** | `hold`, `charge` or `discharge`, with the reason in its attributes. `unknown` when a battery setting is missing. |
+| **Planned Battery Power** | The power the recommendation implies, in kW, positive for charging. An *average* over the quarter-hour, not an inverter setpoint. |
+| **Usable Battery Energy** | How much energy is actually available above your minimum state of charge, in kWh. |
+
+To use it, enter your battery's own figures under **Options → Battery
+planning**: usable capacity, minimum state of charge, maximum charge and
+discharge power, and round-trip efficiency. The capacity and the two power limits
+have **no default** — nothing can work them out from a percentage sensor, and
+guessing would produce a plan your inverter could not carry out. Leave them empty
+and the three entities read `unknown` and say which figure is missing; learning
+and forecasting carry on exactly as before.
+
+**Minimum state of charge is a hard floor.** No recommendation and no simulation
+ever goes below it. `0 %` is allowed and means the integration keeps no reserve of
+its own, in which case only your inverter's own floor applies.
+
+Everything else — the simulated trajectory, where the floor would bite, the
+comparison against leaving the battery alone, the projected state of charge — is
+in diagnostics rather than in an entity.
+
 ## What it does **not** do yet
 
 - ❌ No automatic battery control. It never writes to your inverter.
@@ -138,6 +173,12 @@ None of this changes the forecast. Nothing in the learning path reads it.
   reported in diagnostics, but it does not influence the load model.
 - ❌ No self-correction. Phase 2 *records* forecast error; it does not feed it
   back into the model. Nothing adjusts itself in response to being wrong.
+- ❌ **No battery control, still.** Phase 3 works out what the battery should do
+  and publishes it. Nothing executes it, and no service call is made.
+- ❌ No PV-aware battery planning. The simulation has no solar production term
+  until Phase 5, so it answers "what if there were no sun" — see
+  [Known limitations](#known-limitations).
+- ❌ No price-aware or economic battery planning, and no automatic charging.
 - ❌ No API calls of its own — see [No external polling](#no-external-polling).
 
 ---
@@ -147,7 +188,7 @@ None of this changes the forecast. Nothing in the learning path reads it.
 | Integration | Required? | Why |
 |---|---|---|
 | A **house-load power** sensor | **Yes** | The measurement source. On AlphaESS this is *Current House Load*. |
-| A **battery SOC** and **battery power** sensor | **Yes** | Recorded for the energy-balance check and future phases. |
+| A **battery SOC** and **battery power** sensor | **Yes** | The state of charge drives the battery planning and is recorded per quarter-hour; the power is used for the energy-balance check. |
 | A **grid power** sensor | **Yes** | Any meter integration: HomeWizard P1, DSMR, SlimmeLezer, … |
 | [Frank Quarter Prices](https://github.com/Bennie-JC/ha-frank-quarter-prices) | **Yes** | Set up before adding Alpha EMS Manager. |
 | An **EV charger power** sensor | Optional | Enables flexible-load separation. Any W/kW sensor; no brand assumed. |
@@ -642,6 +683,19 @@ Beyond the Phase-1 scope listed at the top, these are the current honest caveats
   worse than the warning. It **cannot** affect learning — the check is a quality
   signal and can never reject an interval — and it cannot affect forecast-error
   scoring either. It does slightly depress the reported confidence score.
+- **The battery simulation cannot see your solar.** Production forecasting is
+  Phase 5, so the simulation answers a deliberately narrow question: given the
+  predicted household load and *no other generation*, what happens to the
+  battery. On a sunny day the real state of charge will be higher than the
+  projection in diagnostics, and the simulated grid import will be well above
+  what you actually import. That is why the projected state of charge is **not**
+  published as an entity. `Usable Battery Energy` and `Battery Recommendation` are
+  unaffected — neither depends on production.
+- **`Usable Battery Energy` is an upper bound.** It applies a single round-trip
+  efficiency figure, which flatters a real inverter at low power, and it does not
+  model the inverter's own standby draw. Both make the number slightly optimistic.
+  Neither is guessed at, because doing so would mean inventing figures for your
+  hardware.
 - **Solcast is validated but unused by the model.** The PV forecast source is
   checked and reported in diagnostics; it does not yet influence the load model.
 - **No in-place upgrade from 0.1.0.** The configuration models share no keys.

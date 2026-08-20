@@ -9,6 +9,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.7] - 2026-08-20
+
+**Phase 3: Battery Decision & Simulation.** The integration now works out what
+the battery *should* do and simulates the consequence.
+
+**It still controls nothing.** No command is sent to the battery, no service is
+called, and nothing executes the plan. The recommendation is published so it can
+be watched for weeks before any later phase is allowed to act on it, and that is
+enforced rather than intended: a test reads the real sources and asserts no
+Phase-3 module imports a network client or calls a service.
+
+Phase 1 and Phase 2 are behaviourally unchanged. The learning-history schema
+gains one optional array and its *minor* version moves 2.1 → 2.2; the major
+version, the forecast-history schema and the config-entry schema are all
+untouched, so learned days, forecast evidence, entity IDs and unique IDs survive
+the upgrade with no migration and no remove-and-re-add.
+
+### Added
+
+- **Three entities, and only three.** `Battery Recommendation` (`hold`, `charge`
+  or `discharge`, with its reason in the attributes, and `unknown` when a battery
+  figure is missing); `Planned Battery Power` in kW, positive for charging, and
+  labelled as the interval *average* it is rather than an inverter setpoint; and
+  `Usable Battery Energy`, the energy genuinely available above the minimum state
+  of charge. Everything else the layer computes — the simulated trajectory, where
+  the floor would bite, the per-band split, the comparison against leaving the
+  battery alone, the projected state of charge — is diagnostics-only. A
+  ninety-six-interval plan has no business in an entity attribute.
+- **Battery planning settings, in their own Options page.** Usable capacity,
+  minimum state of charge, maximum charge and discharge power, and round-trip
+  efficiency. A second page rather than five more fields on a form that already
+  had thirteen. Every label states which side of the inverter it refers to,
+  because entering a manufacturer's AC "usable energy" figure where a DC capacity
+  belongs is a five-per-cent error that nothing downstream can detect.
+- **Minimum state of charge is a hard floor.** No recommendation and no simulated
+  interval ever crosses it. It is kept deliberately distinct from the *policy*
+  reserve — identical in this release — so that a later phase can raise the
+  reserve dynamically without ever being able to lower the floor the user chose.
+- **A recorded state of charge, once per quarter-hour.** The one physical
+  observation a battery plan depends on that cannot be reconstructed from
+  anything else: a prediction can be recomputed from the stored forecast and the
+  stored settings, but where the battery actually was last Tuesday cannot. It is
+  additive evidence for a later phase and never a learning input — adding,
+  removing or corrupting it cannot move learned days, confidence, the baseline,
+  the forecast or any forecast-error figure, and a dedicated test file holds that
+  down. Absent on every day recorded by an earlier release, and read as absent
+  rather than as zero.
+- **A what-if comparison.** Every refresh simulates two futures — the battery left
+  alone, and the recommendation followed — and reports the difference. That is
+  the shape a later phase will put prices against.
+
+### Honest about what it cannot see
+
+- **The simulation has no solar production term.** Forecasting production is a
+  later phase, and inventing one would be exactly the fabrication this project
+  avoids. So the simulation answers a narrow question — given the predicted
+  household load and no other generation, what happens to the battery — and every
+  figure derived from it is labelled a battery-only counterfactual. On a sunny day
+  the real state of charge will be higher than the projection and the simulated
+  grid import well above reality. **That is why the projected state of charge is
+  not published as an entity**; a visibly wrong entity costs more trust than it
+  buys. `Usable Battery Energy` and `Battery Recommendation` do not depend on
+  production and are unaffected.
+- **`Usable Battery Energy` is an upper bound.** A single efficiency figure
+  flatters a real inverter at low power, and the inverter's own standby draw is
+  not modelled. Both biases point the same way. Neither is guessed at.
+- **Nothing here charges the battery.** Every reason to would need information
+  this release does not have — surplus production, a price, a storm warning, an
+  arbitrage spread — and the inverter already absorbs solar surplus by itself. The
+  charge path is fully built, constrained and simulated so later phases have
+  somewhere to land, and a test asserts that no policy shipped today uses it.
+- **A missing battery figure is reported, never guessed.** Capacity and the two
+  power limits have no default, because nothing can derive them. Without them the
+  three battery entities read `unknown` and name the figure that is missing;
+  learning and forecasting are untouched.
+
+### Fixed
+
+- **`ForecastUncertainty.mae_by_band` was mutable.** The public interface promises
+  that everything it returns is frozen and copied, but this was a plain
+  dictionary on a frozen dataclass: the reference could not be swapped, while a
+  caller could edit a band average in place and pass the altered object on. It is
+  now a read-only mapping.
+- **A test that could not fail.** `test_the_public_interface_exposes_only_what_it_promises`
+  compared a *subset*, so a new public name — or a decision accidentally exposed
+  on the interface — would have passed a test whose name says it would not. It now
+  compares an exact set over the names the module actually defines.
+
+### Notes for anyone upgrading
+
+- Nothing is required. The integration loads, learns and forecasts exactly as
+  before; only the three new entities read `unknown` until the battery figures are
+  entered.
+- To enable the battery planning: **Settings → Devices & Services → Alpha EMS
+  Manager → Configure → Battery planning**. Enter the usable capacity, the two
+  power limits, and adjust the minimum state of charge if 20 % is not what you
+  want. The entities become live on the next quarter-hour without a restart.
+- Tests: 1026 → 1303. Every safety invariant was demonstrated to fail against a
+  deliberately broken implementation before being accepted as evidence.
+
 ## [1.0.0-beta.6] - 2026-08-20
 
 Closes Phase 2. `beta.5` shipped the forecast evidence layer; its first real
@@ -778,7 +878,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.6...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.7...HEAD
+[1.0.0-beta.7]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.6...v1.0.0-beta.7
 [1.0.0-beta.6]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.5...v1.0.0-beta.6
 [1.0.0-beta.5]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.4...v1.0.0-beta.5
 [1.0.0-beta.4]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.3...v1.0.0-beta.4
