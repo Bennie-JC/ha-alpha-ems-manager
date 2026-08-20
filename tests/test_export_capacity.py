@@ -122,8 +122,8 @@ def test_the_old_rule_would_have_passed_every_one_of_them(
     future refactor made the new rule agree with the old one here, the fix would
     have been undone, and this fails in the same breath as saying so.
     """
-    old_permits = LIVE_COMMAND_KW <= (house_w / 1000.0) * 0.9
-    new_permits = LIVE_COMMAND_KW <= (capacity_w / 1000.0) * 0.9
+    old_permits = (house_w / 1000.0) * 0.9 >= LIVE_COMMAND_KW
+    new_permits = (capacity_w / 1000.0) * 0.9 >= LIVE_COMMAND_KW
 
     assert old_permits is True
     assert new_permits is False

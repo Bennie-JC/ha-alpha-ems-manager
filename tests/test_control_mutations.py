@@ -213,9 +213,7 @@ def test_allowing_an_export_is_caught() -> None:
     def guard() -> None:
         verdict = evaluate(
             make_intent(energy_ac_kwh=2.0),
-            make_context(
-                device_power_kw=9.0, grid_import_w=500.0, battery_power_w=0.0
-            ),
+            make_context(device_power_kw=9.0, grid_import_w=500.0, battery_power_w=0.0),
         )
         assert verdict.inhibit_reason == INHIBIT_WOULD_EXPORT
 
@@ -251,7 +249,7 @@ def test_reintroducing_the_house_load_export_rule_is_caught() -> None:
     guard()
 
     def house_load_capacity(context: object) -> float:
-        return (getattr(context, "house_load_w") or 0.0) / 1000.0
+        return (context.house_load_w or 0.0) / 1000.0
 
     with patched(safety, "absorbing_capacity_kw", house_load_capacity):
         assert not surviving(guard)
@@ -281,9 +279,7 @@ def test_dropping_the_existing_discharge_from_the_capacity_is_caught() -> None:
     guard()
 
     def meter_only(context: object) -> float:
-        net_w = (getattr(context, "grid_import_w") or 0.0) - (
-            getattr(context, "grid_export_w") or 0.0
-        )
+        net_w = (context.grid_import_w or 0.0) - (context.grid_export_w or 0.0)
         return max(0.0, net_w) / 1000.0
 
     with patched(safety, "absorbing_capacity_kw", meter_only):
@@ -312,10 +308,8 @@ def test_inverting_the_export_sign_in_the_capacity_is_caught() -> None:
     guard()
 
     def sign_flipped(context: object) -> float:
-        net_w = (getattr(context, "grid_import_w") or 0.0) + (
-            getattr(context, "grid_export_w") or 0.0
-        )
-        discharge_w = max(0.0, -(getattr(context, "battery_power_w") or 0.0))
+        net_w = (context.grid_import_w or 0.0) + (context.grid_export_w or 0.0)
+        discharge_w = max(0.0, -(context.battery_power_w or 0.0))
         return max(0.0, net_w + discharge_w) / 1000.0
 
     with patched(safety, "absorbing_capacity_kw", sign_flipped):

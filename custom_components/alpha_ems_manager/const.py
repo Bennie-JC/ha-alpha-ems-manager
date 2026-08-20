@@ -1017,3 +1017,177 @@ SENSOR_BATTERY_USABLE_ENERGY: Final = "battery_usable_energy"
 
 #: Minimum seconds between two repetitions of the same aggregated warning.
 LOG_THROTTLE_SECONDS: Final = 3600
+
+# --- Phase 5: photovoltaic forecast -------------------------------------------
+#
+# The forecast is read from a Solcast integration the user has already installed
+# and configured. Alpha EMS never talks to any network service: it calls two
+# read-only Home Assistant actions and consumes their responses. Everything below
+# is either the vocabulary of that boundary, or the vocabulary of the evidence
+# recorded on the other side of it.
+
+#: Which rooftop sites in a Solcast account belong to *this* AlphaESS
+#: installation. Stable ``resource_id`` values, never display names: a site can be
+#: renamed and must remain the same site.
+#:
+#: This is the one configuration key Phase 5 adds, and it exists because nothing
+#: already stored can express it. A Solcast account may hold a second property or
+#: a neighbour's array, and consuming the aggregate unconditionally folds those
+#: silently into the plan. The user is asked exactly one question -- which sites
+#: belong here -- and is never asked to classify a site as AC- or DC-coupled,
+#: hybrid-side or grid-inverter-side. That correspondence is not reliably known to
+#: a user, and a guessed topology in provenance is worse than a declared unknown.
+CONF_SELECTED_SOLCAST_SITE_IDS: Final = "selected_solcast_site_ids"
+
+#: Sentinel identifier for the aggregate series, which is what Solcast returns
+#: when no site is named. Deliberately not a plausible ``resource_id``.
+PV_AGGREGATE_SITE: Final = "__aggregate__"
+
+#: Whether the stored selection was resolved automatically on first discovery, or
+#: chosen by the user. A default and a decision are different facts.
+PV_SELECTION_ORIGIN_AUTO: Final = "auto_initial"
+PV_SELECTION_ORIGIN_USER: Final = "user"
+
+#: Which query produced a series. Load-bearing rather than tidy: if Solcast's own
+#: aggregation ever disagreed with a per-site sum, this is what makes a stored
+#: snapshot attributable to one or the other.
+PV_QUERY_MODE_AGGREGATE: Final = "aggregate"
+PV_QUERY_MODE_PER_SITE: Final = "per_site"
+
+#: How the percentile bands were combined.
+#:
+#: ``comonotonic_sum`` is the honest name for adding each site's tenth-percentile
+#: outcome together: it assumes every site has its bad day simultaneously, which
+#: is a *more* conservative bound than the true joint tenth percentile and is
+#: therefore safe to compute -- but it is not a calibrated interval. A later
+#: reserve calculation that treated it as one would size against a scenario far
+#: rarer than one day in ten. The label costs one string and stops that mistake at
+#: the source.
+PV_PERCENTILE_SOURCE_AGGREGATE: Final = "source_aggregate"
+PV_PERCENTILE_COMONOTONIC_SUM: Final = "comonotonic_sum"
+
+#: Bumped when the thirty-to-fifteen-minute mapping rule itself changes, so
+#: evidence recorded under an older rule is identifiable rather than pooled.
+PV_MAPPING_VERSION: Final = 1
+
+#: The electrical boundary of the *actual* PV figure on this class of
+#: installation: a sum of DC string power and an AC meter. Declared rather than
+#: corrected. Forecast-versus-actual therefore carries a structural conversion
+#: difference which is physics, not forecast error, and Phase 9 must be told so
+#: rather than learning a correction for it.
+PV_ACTUAL_BOUNDARY_MIXED: Final = "mixed_dc_strings_and_ac_meter"
+#: Solcast does not document whether its estimate sits at the AC or the DC
+#: boundary. Recording the ambiguity is more honest than picking one.
+PV_FORECAST_BOUNDARY_UNSPECIFIED: Final = "unspecified"
+#: Which selected site corresponds to which AlphaESS subsystem. Solcast partitions
+#: a roof by orientation and AlphaESS partitions it by electrical coupling, so
+#: equal site counts prove nothing. Never guessed, and never asked.
+PV_ELECTRICAL_CORRESPONDENCE_UNKNOWN: Final = "unknown"
+
+#: Why no usable PV forecast could be produced. Never an empty series presented as
+#: a forecast of zero.
+PV_UNAVAILABLE_NOT_CONFIGURED: Final = "pv_forecast_not_enabled"
+PV_UNAVAILABLE_NO_SOLCAST_ENTRY: Final = "solcast_entry_not_selected"
+PV_UNAVAILABLE_ENTRY_NOT_LOADED: Final = "solcast_entry_not_loaded"
+PV_UNAVAILABLE_SERVICE_MISSING: Final = "solcast_query_service_missing"
+PV_UNAVAILABLE_SERVICE_FAILED: Final = "solcast_query_failed"
+PV_UNAVAILABLE_NO_SITES_DISCOVERED: Final = "no_solcast_sites_discovered"
+PV_UNAVAILABLE_EMPTY_SELECTION: Final = "no_solcast_site_selected"
+PV_UNAVAILABLE_NO_ROWS: Final = "solcast_returned_no_rows"
+PV_UNAVAILABLE_UNUSABLE_ROWS: Final = "solcast_rows_unusable"
+PV_UNAVAILABLE_PERIOD_REFUSED: Final = "source_period_not_a_multiple_of_fifteen"
+
+PV_UNAVAILABLE_REASONS: Final = (
+    PV_UNAVAILABLE_NOT_CONFIGURED,
+    PV_UNAVAILABLE_NO_SOLCAST_ENTRY,
+    PV_UNAVAILABLE_ENTRY_NOT_LOADED,
+    PV_UNAVAILABLE_SERVICE_MISSING,
+    PV_UNAVAILABLE_SERVICE_FAILED,
+    PV_UNAVAILABLE_NO_SITES_DISCOVERED,
+    PV_UNAVAILABLE_EMPTY_SELECTION,
+    PV_UNAVAILABLE_NO_ROWS,
+    PV_UNAVAILABLE_UNUSABLE_ROWS,
+    PV_UNAVAILABLE_PERIOD_REFUSED,
+)
+
+#: Per-interval comparability of a forecast against what was measured. Each case
+#: has its own code rather than collapsing into one residual, because telling them
+#: apart is Phase 9's whole job.
+PV_STATUS_VALID: Final = "valid"
+PV_STATUS_FORECAST_MISSING: Final = "forecast_missing"
+PV_STATUS_ACTUAL_MISSING: Final = "actual_missing"
+PV_STATUS_NOT_ELAPSED: Final = "not_elapsed"
+PV_STATUS_NIGHT: Final = "night"
+PV_STATUS_PV_BLIND: Final = "pv_blind"
+PV_STATUS_PARTIAL_SITES: Final = "partial_sites"
+PV_STATUS_PROVENANCE_CHANGED: Final = "provenance_changed"
+
+PV_INTERVAL_STATUSES: Final = (
+    PV_STATUS_VALID,
+    PV_STATUS_FORECAST_MISSING,
+    PV_STATUS_ACTUAL_MISSING,
+    PV_STATUS_NOT_ELAPSED,
+    PV_STATUS_NIGHT,
+    PV_STATUS_PV_BLIND,
+    PV_STATUS_PARTIAL_SITES,
+    PV_STATUS_PROVENANCE_CHANGED,
+)
+
+#: Day-level flags. ``selected_sites_changed`` is a hard barrier -- evidence
+#: either side of it is never pooled -- while ``available_sites_changed`` is
+#: informational, because a site appearing in Solcast without joining the
+#: selection changes nothing about what was forecast.
+PV_FLAG_SELECTED_SITES_CHANGED: Final = "selected_sites_changed"
+PV_FLAG_SELECTED_MODEL_CHANGED: Final = "selected_model_changed"
+PV_FLAG_AVAILABLE_SITES_CHANGED: Final = "available_sites_changed"
+#: Dampening, auto-dampening and actuals blending are three ways Solcast can alter
+#: its own output. One flag, because the consequence is identical: evidence either
+#: side of the change is not poolable.
+PV_FLAG_SOURCE_CORRECTION_CHANGED: Final = "source_correction_changed"
+PV_FLAG_TIMEZONE_CHANGED: Final = "timezone_changed"
+PV_FLAG_SHAPE_MISMATCH: Final = "shape_mismatch"
+#: The measured figure sat at a plateau near the inverter's AC limit while the
+#: forecast kept climbing. Raised, never corrected: on a big day forecast exceeds
+#: actual by design, and Phase 9 must not learn a correction for physics.
+PV_FLAG_CLIPPING_SUSPECTED: Final = "clipping_suspected"
+
+PV_DAY_FLAGS: Final = (
+    PV_FLAG_SELECTED_SITES_CHANGED,
+    PV_FLAG_SELECTED_MODEL_CHANGED,
+    PV_FLAG_AVAILABLE_SITES_CHANGED,
+    PV_FLAG_SOURCE_CORRECTION_CHANGED,
+    PV_FLAG_TIMEZONE_CHANGED,
+    PV_FLAG_SHAPE_MISMATCH,
+    PV_FLAG_CLIPPING_SUSPECTED,
+)
+
+#: The Solcast domain, and the only two of its actions Alpha EMS may ever call.
+#: Both are registered response-only, both read cached data, and neither consumes
+#: the account's API allowance.
+SOLCAST_DOMAIN: Final = "solcast_solar"
+SOLCAST_SERVICE_QUERY_FORECAST: Final = "query_forecast_data"
+SOLCAST_SERVICE_DIAGNOSTIC: Final = "diagnostic"
+SOLCAST_PERMITTED_SERVICES: Final = (
+    SOLCAST_SERVICE_QUERY_FORECAST,
+    SOLCAST_SERVICE_DIAGNOSTIC,
+)
+
+#: Every mutating Solcast action, named here so a structural test can prove none
+#: of them appears anywhere in this package. The same technique as the
+#: flash-backed helper deny-list in Phase 4: naming the forbidden thing once, in
+#: one place, is what lets a test assert it is named nowhere else.
+SOLCAST_FORBIDDEN_SERVICES: Final = (
+    "update_forecasts",
+    "force_update_forecasts",
+    "force_update_estimates",
+    "clear_all_solcast_data",
+    "set_options",
+    "set_dampening",
+    "set_hard_limit",
+    "remove_hard_limit",
+)
+
+#: The source period must be a whole number of planning intervals. Fifteen
+#: minutes is not a tolerance to be widened; it is the resolution the whole
+#: project is built on.
+PV_SOURCE_PERIOD_STEP_MINUTES: Final = QUARTER_MINUTES

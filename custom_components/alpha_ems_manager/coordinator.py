@@ -914,9 +914,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # completely alone. It records no rejection, increments no counter and
         # invalidates nothing -- it simply stores no PV value for that interval.
         pv_by_start = {
-            result.start_utc: result
-            for result in (pv_results or [])
-            if result.accepted
+            result.start_utc: result for result in (pv_results or []) if result.accepted
         }
 
         changed = False

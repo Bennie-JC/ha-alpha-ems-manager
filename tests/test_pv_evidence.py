@@ -401,9 +401,7 @@ async def test_a_restart_gap_drops_the_in_flight_quarter(
 
     set_sensor(hass, PV_POWER, 4000, "W", "power")
     # Set up seven minutes into the quarter, so it can never be fully covered.
-    await setup_at(
-        hass, freezer, mock_config_entry, START.replace(minute=7, second=30)
-    )
+    await setup_at(hass, freezer, mock_config_entry, START.replace(minute=7, second=30))
     set_sensor(hass, PV_POWER, 4000, "W", "power")
     await advance(hass, freezer, 600)
 

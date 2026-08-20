@@ -222,14 +222,26 @@ def test_the_control_layer_does_not_publish_through_the_public_interface() -> No
 # -- exactly which services may be called -----------------------------------
 
 
-def test_only_the_adapter_calls_a_service() -> None:
-    """One module may call a service, and it is the vendor shell."""
+def test_only_two_named_modules_call_a_service() -> None:
+    """Two modules may call a service, and this is the whole list.
+
+    Widened from one deliberately in Phase 5, for a boundary that only ever
+    reads. An exact set rather than a subset check, so a third caller appearing
+    anywhere in the package fails here rather than being noticed later.
+
+    The two are opposites by design, and that is what makes the pair safe. The
+    vendor shell passes *variables* from a planned command, so the services it can
+    reach are exactly the ones the pure planner can construct. The Solcast reader
+    passes *literals*, so the two actions it can reach are visible in its source.
+    Neither module can reach an arbitrary domain, and they fail closed in
+    different directions.
+    """
     callers = {
         path.stem
         for path in sorted(COMPONENT_DIR.glob("*.py"))
         if "async_call" in path.read_text(encoding="utf-8")
     }
-    assert callers == {"alphaess_adapter"}
+    assert callers == {"alphaess_adapter", "solcast_source"}
 
 
 def test_the_only_service_call_takes_its_domain_from_a_planned_step() -> None:
