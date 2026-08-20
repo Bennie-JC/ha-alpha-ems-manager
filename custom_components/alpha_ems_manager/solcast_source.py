@@ -52,6 +52,9 @@ from .const import (
     PV_UNAVAILABLE_ENTRY_NOT_FOUND,
     PV_UNAVAILABLE_NO_SOLCAST_ENTRY,
     PV_UNAVAILABLE_SERVICE_MISSING,
+    RESPONSE_SHAPE_FLAT,
+    RESPONSE_SHAPE_NESTED,
+    RESPONSE_SHAPE_UNUSABLE,
     SOLCAST_DOMAIN,
     SOLCAST_SERVICE_DIAGNOSTIC,
     SOLCAST_SERVICE_QUERY_FORECAST,
@@ -206,6 +209,11 @@ class SolcastFacts:
     api_limit: int | None = None
     api_used: int | None = None
     forecast_health: str | None = None
+    #: Which shape the action's response was in. Reported so a future change of
+    #: convention is visible in a diagnostics download rather than showing up as
+    #: an unexplained absence of every field at once, which is how the beta.10
+    #: defect presented.
+    response_shape: str = RESPONSE_SHAPE_NESTED
 
     @property
     def site_ids(self) -> tuple[str, ...]:
@@ -247,6 +255,7 @@ class SolcastFacts:
             "api_limit": self.api_limit,
             "api_used": self.api_used,
             "forecast_health": self.forecast_health,
+            "response_shape": self.response_shape,
         }
 
 
@@ -297,15 +306,45 @@ def _read_site(raw: Any) -> PvSite | None:
     )
 
 
+def unwrap_response(response: Any) -> tuple[Mapping[str, Any], str]:
+    """Return the payload inside an action response, and which shape it was in.
+
+    **This is the beta.11 correction, and it was a real defect.** Both Solcast
+    actions wrap their result: ``query_forecast_data`` returns ``{"data": [...]}``
+    and ``diagnostic`` returns ``{"data": {...}}``. beta.10 unwrapped the first and
+    read the second at the top level, so every field came back absent -- no sites,
+    no estimate key, no version -- and the PV layer reported
+    ``no_solcast_sites_discovered`` on an account that plainly had two.
+
+    The reason the tests did not catch it is worth recording: the fake was written
+    from a human-readable transcription of a diagnostic download rather than from
+    the raw action response, so it reproduced the same wrong assumption and could
+    only ever confirm it.
+
+    The flat shape is still accepted. It costs one branch, it is what a future
+    release might return, and refusing it would turn a shape change into a silent
+    total loss of PV rather than a degradation.
+    """
+    if not isinstance(response, Mapping):
+        return {}, RESPONSE_SHAPE_UNUSABLE
+    inner = response.get("data")
+    if isinstance(inner, Mapping):
+        return inner, RESPONSE_SHAPE_NESTED
+    return response, RESPONSE_SHAPE_FLAT
+
+
 def parse_diagnostic(response: Any) -> SolcastFacts:
     """Return the facts carried by a diagnostic response.
 
-    Split out from the call so every shape -- absent keys, wrong types, a nested
-    block that is a list where a mapping was expected -- is testable without an
-    instance, and so the fields that are read are visible in one place.
+    Split out from the call so every shape -- absent keys, wrong types, the
+    payload nested one level down, a block that is a list where a mapping was
+    expected -- is testable without an instance, and so the fields that are read
+    are visible in one place.
     """
-    if not isinstance(response, Mapping):
-        return SolcastFacts()
+    payload, shape = unwrap_response(response)
+    if shape == RESPONSE_SHAPE_UNUSABLE:
+        return SolcastFacts(response_shape=shape)
+    response = payload
 
     raw_sites = response.get("sites")
     sites = tuple(
@@ -331,6 +370,7 @@ def parse_diagnostic(response: Any) -> SolcastFacts:
     )
 
     return SolcastFacts(
+        response_shape=shape,
         sites=sites,
         excluded_sites=excluded,
         integration_version=_as_text(response.get("version")),

@@ -271,25 +271,44 @@ async def setup_integration(
     return mock_config_entry
 
 
-#: The two sites the live account reports, with their real figures.
+#: Stable identifiers of the two live sites, named so no test repeats the literal
+#: and a change of fixture cannot leave one file behind.
+ACHTERKANT = "1111-2222-3333-a379"
+VOORKANT = "4444-5555-6666-f675"
+
+#: The two sites the live account reports, with their real figures and the full
+#: field set the live action actually returns -- including the fields Alpha EMS
+#: does not read.
+#:
+#: The extra fields are the point. A fixture carrying only what the parser wants
+#: cannot catch a parser that reads the wrong thing, and cannot demonstrate that
+#: unread fields stay unread.
 LIVE_SITES: tuple[dict[str, Any], ...] = (
     {
-        "resource_id": "site-achterkant",
+        "resource_id": "1111-2222-3333-a379",
         "name": "Achterkant",
-        "capacity": 5.0,
+        "capacity": 5,
         "capacity_dc": 3.65,
-        "azimuth": -75.0,
-        "tilt": 38.0,
+        "azimuth": -75,
+        "compass_degrees": 75,
+        "compass_direction": "ENE",
+        "tilt": 38,
+        "install_date": "2023-05-01T00:00:00+00:00",
         "loss_factor": 0.9,
+        "tags": [],
     },
     {
-        "resource_id": "site-voorkant",
+        "resource_id": "4444-5555-6666-f675",
         "name": "Voorkant",
-        "capacity": 5.0,
+        "capacity": 5,
         "capacity_dc": 2.43,
-        "azimuth": 105.0,
-        "tilt": 38.0,
+        "azimuth": 105,
+        "compass_degrees": 255,
+        "compass_direction": "WSW",
+        "tilt": 38,
+        "install_date": "2023-05-01T00:00:00+00:00",
         "loss_factor": 0.9,
+        "tags": [],
     },
 )
 
@@ -323,10 +342,13 @@ class FakeSolcast:
         self.silent_sites: set[str] = set()
         self.fail_diagnostic = False
         self.fail_forecast = False
+        #: Whether the diagnostic wraps its payload under ``data``, as the live
+        #: action does. Switchable so the flat shape stays covered too.
+        self.nested_response = True
         #: kW per site, so a per-site sum is distinguishable from the aggregate.
         self.power_by_site: dict[str, float] = {
-            "site-achterkant": 2.0,
-            "site-voorkant": 3.0,
+            ACHTERKANT: 2.0,
+            VOORKANT: 3.0,
         }
         self.aggregate_power = 5.0
 
@@ -346,10 +368,22 @@ class FakeSolcast:
         )
 
     async def _diagnostic(self, call: ServiceCall) -> dict[str, Any]:
+        """Return the diagnostic response in the shape the live action uses.
+
+        **Wrapped under ``data``**, which is the shape that exposed the beta.10
+        defect. The earlier version of this fake returned the payload flat,
+        because it was written from a human-readable transcription of a
+        diagnostics download rather than from the raw action response -- so it
+        reproduced the same wrong assumption the parser made and could only ever
+        confirm it.
+
+        Both actions wrap their result: the forecast query returns a list under
+        ``data`` and this one returns a mapping under it.
+        """
         self.diagnostic_calls += 1
         if self.fail_diagnostic:
             raise RuntimeError("solcast is reloading")
-        return {
+        payload = {
             "version": "v4.6.1",
             "api_limit": 10,
             "api_used": 8,
@@ -358,6 +392,7 @@ class FakeSolcast:
             "configuration": dict(self.configuration),
             "dampening": {"enabled": False, "auto_dampening": False},
         }
+        return {"data": payload} if self.nested_response else payload
 
     async def _forecast(self, call: ServiceCall) -> dict[str, Any]:
         self.forecast_calls.append(dict(call.data))

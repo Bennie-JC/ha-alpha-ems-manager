@@ -57,7 +57,7 @@ from custom_components.alpha_ems_manager.diagnostics import (
 )
 from custom_components.alpha_ems_manager.solcast_source import discover
 
-from .conftest import FakeSolcast
+from .conftest import ACHTERKANT, VOORKANT, FakeSolcast
 from .forecast_helpers import NORMAL
 from .test_pv_site_selection import drive, enable_forecast
 
@@ -339,8 +339,8 @@ async def test_the_two_live_sites_are_discovered_and_persisted_once(
         "Voorkant",
     ]
     assert sorted(setup_integration.options[CONF_SELECTED_SOLCAST_SITE_IDS]) == [
-        "site-achterkant",
-        "site-voorkant",
+        ACHTERKANT,
+        VOORKANT,
     ]
 
 
@@ -380,12 +380,12 @@ async def test_the_two_origins_are_distinct_and_both_reachable(
     fresh._pv_selection_write_scheduled = True  # do not race the write here
 
     resolved, origin, reason = await fresh._async_resolve_site_selection(
-        ("site-achterkant", "site-voorkant")
+        (ACHTERKANT, VOORKANT)
     )
 
     assert reason is None
     assert origin == PV_SELECTION_ORIGIN_AUTO
-    assert resolved == ("site-achterkant", "site-voorkant")
+    assert resolved == (ACHTERKANT, VOORKANT)
     assert PV_SELECTION_ORIGIN_AUTO != PV_SELECTION_ORIGIN_STORED
 
 
@@ -431,7 +431,7 @@ async def test_the_write_happens_once_however_many_refreshes(
         await hass.async_block_till_done()
 
     stored = setup_integration.options[CONF_SELECTED_SOLCAST_SITE_IDS]
-    assert sorted(stored) == ["site-achterkant", "site-voorkant"]
+    assert sorted(stored) == [ACHTERKANT, VOORKANT]
 
 
 async def test_a_user_answer_beats_a_pending_default(
@@ -459,10 +459,10 @@ async def test_a_user_answer_beats_a_pending_default(
     coordinator._pv_selection_write_scheduled = False
 
     resolved, origin, reason = await coordinator._async_resolve_site_selection(
-        ("site-achterkant", "site-voorkant")
+        (ACHTERKANT, VOORKANT)
     )
     assert reason is None
-    assert resolved == ("site-achterkant", "site-voorkant")
+    assert resolved == (ACHTERKANT, VOORKANT)
     assert origin == PV_SELECTION_ORIGIN_AUTO
 
     # The user picks one site before the scheduled write runs.
@@ -470,14 +470,12 @@ async def test_a_user_answer_beats_a_pending_default(
         setup_integration,
         options={
             **setup_integration.options,
-            CONF_SELECTED_SOLCAST_SITE_IDS: ["site-voorkant"],
+            CONF_SELECTED_SOLCAST_SITE_IDS: [VOORKANT],
         },
     )
     await hass.async_block_till_done()
 
-    assert setup_integration.options[CONF_SELECTED_SOLCAST_SITE_IDS] == [
-        "site-voorkant"
-    ]
+    assert setup_integration.options[CONF_SELECTED_SOLCAST_SITE_IDS] == [VOORKANT]
 
 
 # -- forecast ingestion recovers ----------------------------------------------
@@ -579,8 +577,8 @@ async def test_no_mutating_solcast_action_is_ever_called(
     assert called == []
     assert {call.get("site") for call in solcast.forecast_calls} <= {
         None,
-        "site-achterkant",
-        "site-voorkant",
+        ACHTERKANT,
+        VOORKANT,
     }
 
 

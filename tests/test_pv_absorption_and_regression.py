@@ -31,7 +31,7 @@ from custom_components.alpha_ems_manager.const import (
     PV_ABSORPTION_STATE_UNREADABLE,
 )
 
-from .conftest import FakeSolcast
+from .conftest import ACHTERKANT, VOORKANT, FakeSolcast
 from .forecast_helpers import NORMAL
 from .test_pv_site_selection import drive, enable_forecast
 
@@ -411,7 +411,7 @@ async def test_upgrading_from_beta_eight_keeps_everything(
     )
 
     stored = setup_integration.options[CONF_SELECTED_SOLCAST_SITE_IDS]
-    assert sorted(stored) == ["site-achterkant", "site-voorkant"]
+    assert sorted(stored) == [ACHTERKANT, VOORKANT]
 
 
 async def test_the_entity_set_is_unchanged(

@@ -379,3 +379,157 @@ async def test_a_recovered_source_still_writes_nothing(
 
     assert coordinator.pv_forecasts[NORMAL].available is True
     assert calls == []
+
+
+# ===========================================================================
+# 4. discovery: the beta.10 response-shape defect and its neighbours
+# ===========================================================================
+
+
+def live_diagnostic(sites: list | None = None) -> dict:
+    """Return a diagnostic response in the shape the live action uses."""
+    from .conftest import LIVE_SITES
+
+    return {
+        "data": {
+            "version": "v4.6.1",
+            "sites": [dict(site) for site in (LIVE_SITES if sites is None else sites)],
+            "configuration": {"key_estimate": "estimate", "hard_limit": 100.0},
+        }
+    }
+
+
+def test_reading_the_response_at_the_wrong_nesting_level_is_caught() -> None:
+    """The defect itself. Every field vanishes at once, which is the signature.
+
+    Both actions wrap their result; beta.10 unwrapped the forecast query and read
+    the diagnostic at the top level. The mutation is applied by reaching into the
+    wrapper the way the old code did, so the two readings can be compared on one
+    input.
+    """
+    response = live_diagnostic()
+
+    # As shipped: the payload is found.
+    assert len(solcast_source.parse_diagnostic(response).sites) == 2
+
+    # Mutated: read at the top level, exactly as beta.10 did.
+    assert response.get("sites") is None
+    assert solcast_source.parse_diagnostic({"sites": response.get("sites")}).sites == ()
+
+
+def test_unwrapping_a_list_as_though_it_were_the_payload_is_caught() -> None:
+    """The forecast query returns a list under ``data``; the diagnostic a mapping.
+
+    Unwrapping indiscriminately would treat the forecast's list as a diagnostic
+    payload and quietly find no sites in it.
+    """
+    _payload, shape = solcast_source.unwrap_response({"data": [1, 2, 3]})
+
+    # Not treated as the payload: a list has no named fields to read.
+    assert shape != "nested_under_data"
+    assert solcast_source.parse_diagnostic({"data": [1, 2, 3]}).sites == ()
+
+
+def test_treating_an_empty_discovery_as_success_is_caught() -> None:
+    """No sites is a named unavailability, never a working source with none."""
+    facts = solcast_source.parse_diagnostic(live_diagnostic(sites=[]))
+
+    assert facts.sites == ()
+    assert facts.site_ids == ()
+
+
+def test_storing_a_display_name_as_identity_is_caught() -> None:
+    """Membership is by resource id. A name is user text and may even collide."""
+    facts = solcast_source.parse_diagnostic(live_diagnostic())
+    stored = set(facts.site_ids)
+    names = {site.name for site in facts.sites}
+
+    assert stored.isdisjoint(names)
+    assert all("-" in identifier for identifier in stored)
+    # And the mutation: names as identity collapses two roofs called the same.
+    duplicated = solcast_source.parse_diagnostic(
+        live_diagnostic(
+            sites=[
+                {"resource_id": "id-a", "name": "Roof", "capacity_dc": 3.0},
+                {"resource_id": "id-b", "name": "Roof", "capacity_dc": 3.0},
+            ]
+        )
+    )
+    assert len(duplicated.sites) == 2
+    assert len({site.name for site in duplicated.sites}) == 1
+
+
+async def test_mislabelling_the_query_mode_is_caught(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    solcast_config_entry: MockConfigEntry,
+    solcast: FakeSolcast,
+) -> None:
+    """Which path produced a snapshot has to be attributable.
+
+    If the two ever disagree about the same roof, ``query_mode`` is the only thing
+    that makes a stored snapshot traceable to one of them.
+    """
+    from custom_components.alpha_ems_manager.const import (
+        CONF_SELECTED_SOLCAST_SITE_IDS,
+        PV_PERCENTILE_COMONOTONIC_SUM,
+        PV_PERCENTILE_SOURCE_AGGREGATE,
+        PV_QUERY_MODE_AGGREGATE,
+        PV_QUERY_MODE_PER_SITE,
+    )
+
+    from .conftest import VOORKANT
+
+    enable_forecast(setup_integration, hass, solcast_config_entry)
+    await hass.config_entries.async_reload(setup_integration.entry_id)
+    await hass.async_block_till_done()
+    coordinator = setup_integration.runtime_data
+    await drive(coordinator, solcast=solcast)
+
+    everything = coordinator.pv_forecasts[NORMAL].provenance
+    assert everything.query_mode == PV_QUERY_MODE_AGGREGATE
+    assert everything.percentile_aggregation == PV_PERCENTILE_SOURCE_AGGREGATE
+    assert "site" not in solcast.forecast_calls[-1]
+
+    hass.config_entries.async_update_entry(
+        setup_integration,
+        options={
+            **setup_integration.options,
+            CONF_SELECTED_SOLCAST_SITE_IDS: [VOORKANT],
+        },
+    )
+    await hass.async_block_till_done()
+    coordinator = setup_integration.runtime_data
+    await drive(coordinator, solcast=solcast)
+
+    subset = coordinator.pv_forecasts[NORMAL].provenance
+    assert subset.query_mode == PV_QUERY_MODE_PER_SITE
+    assert subset.percentile_aggregation == PV_PERCENTILE_SOURCE_AGGREGATE
+    assert solcast.forecast_calls[-1]["site"] == VOORKANT
+    assert PV_PERCENTILE_COMONOTONIC_SUM != PV_PERCENTILE_SOURCE_AGGREGATE
+
+
+async def test_discovery_calls_only_the_diagnostic_action(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    solcast_config_entry: MockConfigEntry,
+    solcast: FakeSolcast,
+) -> None:
+    """Site discovery reads the cache. It must not spend the account's allowance."""
+    from custom_components.alpha_ems_manager.const import SOLCAST_FORBIDDEN_SERVICES
+
+    called: list[str] = []
+
+    async def trap(call: object) -> None:
+        called.append("called")
+
+    for service in SOLCAST_FORBIDDEN_SERVICES:
+        hass.services.async_register(SOLCAST_DOMAIN, service, trap)
+
+    enable_forecast(setup_integration, hass, solcast_config_entry)
+    await hass.config_entries.async_reload(setup_integration.entry_id)
+    await drive(setup_integration.runtime_data)
+    await hass.async_block_till_done()
+
+    assert called == []
+    assert solcast.diagnostic_calls > 0

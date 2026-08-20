@@ -1885,6 +1885,31 @@ that exists, and the actions are registered. Failure is handled where it actuall
 occurs -- a call that raises is caught and reported as a failed call, which is
 strictly better information than a guess made in advance.
 
+### Both actions wrap their result
+
+``query_forecast_data`` returns a list under ``data``; ``diagnostic`` returns a
+mapping under it. beta.10 unwrapped the first and read the second at the top
+level, so an account with two rooftop sites produced no sites, no estimate key,
+no version and no API figures -- every field absent at the same time.
+
+That pattern is worth learning to recognise. **Everything empty simultaneously
+means the reader looked in the wrong place**, not that the source had nothing to
+say; a source with nothing to say still reports its version. The shape is now
+recorded on the facts as ``response_shape``, so the next convention change shows
+up as a named fact rather than as a total, unexplained absence.
+
+The flat shape is still accepted. One branch, and it means a future release that
+stopped wrapping would degrade rather than lose PV entirely.
+
+The reason the tests did not catch this is the more useful lesson. The Solcast
+fake was written from a *human-readable transcription* of a diagnostics download
+rather than from the raw action response, so it encoded the same assumption the
+parser made and could only ever agree with it. A fixture derived from the code's
+own expectations tests nothing. The fake now returns the wrapped shape with the
+full live field set, including the fields Alpha EMS deliberately does not read --
+because a fixture carrying only what the parser wants cannot catch a parser that
+reads the wrong thing, and cannot show that unread fields stay unread.
+
 ### A setup-time reading is provisional
 
 The first refresh happens during this entry's own setup, and refreshes are then

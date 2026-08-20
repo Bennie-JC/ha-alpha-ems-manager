@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.11] - 2026-08-20
+
+**Hotfix: Solcast site discovery found nothing on an account with two sites.**
+beta.10 fixed the capability check, and this fixes the layer immediately behind
+it. Diagnostics reported the source usable *and* discoverable while showing
+`site_count: 0` and `no_solcast_sites_discovered`, so the site selector never
+appeared and planning stayed PV-blind.
+
+### Fixed
+
+- **The diagnostic response was read at the wrong nesting level.** Both Solcast
+  actions wrap their result: `query_forecast_data` returns a list under `data` and
+  `diagnostic` returns a mapping under it. beta.10 unwrapped the first and read the
+  second at the top level, so every field came back absent at once — no sites, no
+  estimate key, no version, no API figures. That "everything empty simultaneously"
+  pattern is the signature of looking in the wrong place rather than of a source
+  with nothing to say, and it is now recorded as a named `response_shape` so a
+  future change of convention cannot present the same way.
+
+  The flat shape is still accepted. It costs one branch and it means a future
+  convention change degrades rather than silently losing PV entirely.
+
+- **Why the tests missed it.** The Solcast fake was written from a human-readable
+  transcription of a diagnostics download rather than from the raw action response,
+  so it reproduced the parser's own assumption and could only ever confirm it. The
+  fake now returns the wrapped shape with the full live field set — including
+  fields Alpha EMS deliberately does not read — so the whole suite exercises the
+  real response.
+
+### Verification
+
+Tests 1897 → **1940**. New coverage for the response shape itself, and for the
+site-identity rules that have to survive it: one site through nine, two sites
+sharing a display name, unicode and blank names, source ordering, renames, and
+capacity changes. Plus mutations for the wrong nesting level, unwrapping a list as
+a payload, treating empty discovery as success, storing display names as identity,
+and mislabelling the aggregate versus per-site query mode.
+
+End-to-end: sites discovered → selection resolved and persisted → rows mapped →
+the battery simulation receiving production, with `intervals_pv_aware > 0` and
+`forecast_pv_kwh > 0`. beta.10's live diagnostics showed both at zero, which was
+correct given zero sites and is what this asserts is no longer the case. The
+PV-blind path is asserted unchanged for installations without a forecast.
+
+### Unchanged
+
+No new entities, no new configuration options, no storage or config-entry version
+change. Execution remains structurally unavailable — `SHADOW` writes nothing,
+`ACTIVE` cannot execute, and that is re-asserted with a fully recovered source and
+PV-aware planning in place. The export check remains the meter-based rule alone.
+Both known findings stand: the small energy-balance boundary residual, and the
++1394 W gross-fault sample.
+
 ## [1.0.0-beta.10] - 2026-08-20
 
 **Hotfix for a live beta.9 defect: the PV forecast never started.** On a real
@@ -1185,7 +1238,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.10...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.11...HEAD
+[1.0.0-beta.11]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.10...v1.0.0-beta.11
 [1.0.0-beta.10]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.9...v1.0.0-beta.10
 [1.0.0-beta.9]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.8...v1.0.0-beta.9
 [1.0.0-beta.8]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.7...v1.0.0-beta.8

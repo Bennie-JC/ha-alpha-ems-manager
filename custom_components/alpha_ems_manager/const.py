@@ -1251,3 +1251,15 @@ PV_ABSORPTION_REASONS: Final = (
 #: for that. Absent means the detection is suppressed rather than a ceiling
 #: guessed -- a guessed limit would produce a flag that looked like evidence.
 SELECT_INVERTER_AC_LIMIT: Final = "input_select.alphaess_helper_inverter_ac_limit"
+
+#: Which shape an action response arrived in.
+#:
+#: Both Solcast actions wrap their result: the forecast query returns a list under
+#: ``data`` and the diagnostic returns a mapping under it. beta.10 unwrapped the
+#: first and read the second at the top level, so every field came back absent and
+#: the PV layer reported no discovered sites on an account that had two. Recording
+#: the shape means a future change of convention shows up as a named fact rather
+#: than as everything being empty at once.
+RESPONSE_SHAPE_NESTED: Final = "nested_under_data"
+RESPONSE_SHAPE_FLAT: Final = "flat"
+RESPONSE_SHAPE_UNUSABLE: Final = "unusable"

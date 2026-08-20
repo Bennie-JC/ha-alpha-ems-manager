@@ -39,7 +39,7 @@ from custom_components.alpha_ems_manager.const import (
     PV_UNAVAILABLE_SERVICE_MISSING,
 )
 
-from .conftest import FakeSolcast
+from .conftest import ACHTERKANT, VOORKANT, FakeSolcast
 from .forecast_helpers import NORMAL, history_before, local, refresh_at, seed
 
 
@@ -144,7 +144,7 @@ async def test_first_discovery_selects_every_site_and_stores_the_answer(
 
     stored = setup_integration.options[CONF_SELECTED_SOLCAST_SITE_IDS]
 
-    assert sorted(stored) == ["site-achterkant", "site-voorkant"]
+    assert sorted(stored) == [ACHTERKANT, VOORKANT]
     assert coordinator.config.solcast_selection_stored is True
 
     forecast = today_forecast(coordinator)
@@ -230,17 +230,15 @@ async def test_a_failed_discovery_does_not_overwrite_an_existing_selection(
         setup_integration,
         hass,
         solcast_config_entry,
-        **{CONF_SELECTED_SOLCAST_SITE_IDS: ["site-voorkant"]},
+        **{CONF_SELECTED_SOLCAST_SITE_IDS: [VOORKANT]},
     )
     await hass.config_entries.async_reload(setup_integration.entry_id)
     solcast.fail_diagnostic = True
     coordinator = setup_integration.runtime_data
     await drive(coordinator)
 
-    assert setup_integration.options[CONF_SELECTED_SOLCAST_SITE_IDS] == [
-        "site-voorkant"
-    ]
-    assert coordinator.config.selected_solcast_site_ids == ("site-voorkant",)
+    assert setup_integration.options[CONF_SELECTED_SOLCAST_SITE_IDS] == [VOORKANT]
+    assert coordinator.config.selected_solcast_site_ids == (VOORKANT,)
 
 
 # -- a stored answer ---------------------------------------------------------
@@ -259,8 +257,8 @@ async def test_all_sites_selected_uses_one_aggregate_request(
         solcast_config_entry,
         **{
             CONF_SELECTED_SOLCAST_SITE_IDS: [
-                "site-achterkant",
-                "site-voorkant",
+                ACHTERKANT,
+                VOORKANT,
             ]
         },
     )
@@ -303,8 +301,8 @@ async def test_a_subset_queries_each_selected_site_and_sums_them(
         solcast_config_entry,
         **{
             CONF_SELECTED_SOLCAST_SITE_IDS: [
-                "site-achterkant",
-                "site-voorkant",
+                ACHTERKANT,
+                VOORKANT,
             ]
         },
     )
@@ -315,7 +313,7 @@ async def test_a_subset_queries_each_selected_site_and_sums_them(
     forecast = today_forecast(coordinator)
     queried = {call.get("site") for call in solcast.forecast_calls}
 
-    assert queried == {"site-achterkant", "site-voorkant"}
+    assert queried == {ACHTERKANT, VOORKANT}
     assert forecast.provenance.query_mode == PV_QUERY_MODE_PER_SITE
     # 2 kW plus 3 kW, per interval, and nothing from the 50 kW shed.
     assert forecast.intervals[48] == pytest.approx(5.0 * 0.25)
@@ -332,7 +330,7 @@ async def test_one_site_selected_works_normally(
         setup_integration,
         hass,
         solcast_config_entry,
-        **{CONF_SELECTED_SOLCAST_SITE_IDS: ["site-achterkant"]},
+        **{CONF_SELECTED_SOLCAST_SITE_IDS: [ACHTERKANT]},
     )
     await hass.config_entries.async_reload(setup_integration.entry_id)
     coordinator = setup_integration.runtime_data
@@ -363,27 +361,25 @@ async def test_a_selected_site_that_vanished_is_reported_and_never_dropped(
         solcast_config_entry,
         **{
             CONF_SELECTED_SOLCAST_SITE_IDS: [
-                "site-achterkant",
-                "site-voorkant",
+                ACHTERKANT,
+                VOORKANT,
             ]
         },
     )
     await hass.config_entries.async_reload(setup_integration.entry_id)
-    solcast.sites = [
-        site for site in solcast.sites if site["resource_id"] != "site-voorkant"
-    ]
+    solcast.sites = [site for site in solcast.sites if site["resource_id"] != VOORKANT]
     coordinator = setup_integration.runtime_data
     await drive(coordinator)
 
     forecast = today_forecast(coordinator)
 
-    assert "site-voorkant" in forecast.provenance.selected_site_ids
+    assert VOORKANT in forecast.provenance.selected_site_ids
     assert forecast.provenance.selected_site_count == 2
     assert forecast.provenance.available_site_count == 1
     assert forecast.provenance.selection_complete is False
     assert setup_integration.options[CONF_SELECTED_SOLCAST_SITE_IDS] == [
-        "site-achterkant",
-        "site-voorkant",
+        ACHTERKANT,
+        VOORKANT,
     ]
 
 
@@ -444,7 +440,7 @@ async def test_a_silent_selected_site_leaves_a_partial_sum_never_a_zero(
         solcast_config_entry,
         **{
             CONF_SELECTED_SOLCAST_SITE_IDS: [
-                "site-achterkant",
+                ACHTERKANT,
                 "site-third",
             ]
         },
@@ -474,7 +470,7 @@ async def test_every_site_failing_is_unavailable_rather_than_empty(
         setup_integration,
         hass,
         solcast_config_entry,
-        **{CONF_SELECTED_SOLCAST_SITE_IDS: ["site-achterkant"]},
+        **{CONF_SELECTED_SOLCAST_SITE_IDS: [ACHTERKANT]},
     )
     await hass.config_entries.async_reload(setup_integration.entry_id)
     coordinator = setup_integration.runtime_data
@@ -628,7 +624,7 @@ async def test_changing_membership_changes_the_identity_fingerprint(
         setup_integration,
         options={
             **setup_integration.options,
-            CONF_SELECTED_SOLCAST_SITE_IDS: ["site-achterkant"],
+            CONF_SELECTED_SOLCAST_SITE_IDS: [ACHTERKANT],
         },
     )
     await hass.config_entries.async_reload(setup_integration.entry_id)
