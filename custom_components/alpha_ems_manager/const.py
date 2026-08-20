@@ -1263,3 +1263,149 @@ SELECT_INVERTER_AC_LIMIT: Final = "input_select.alphaess_helper_inverter_ac_limi
 RESPONSE_SHAPE_NESTED: Final = "nested_under_data"
 RESPONSE_SHAPE_FLAT: Final = "flat"
 RESPONSE_SHAPE_UNUSABLE: Final = "unusable"
+
+# --- Phase 6: quarter-hour electricity prices ---------------------------------
+#
+# Read from a Frank Quarter Prices integration the user has already installed and
+# selected. Alpha EMS never talks to any network service and never asks Frank to
+# fetch: it reads published entity state. Frank owns fetching, retry, caching,
+# tomorrow publication and the midnight rollover.
+#
+# Phase 6 *knows* prices. It decides nothing because of them. No price value
+# reaches the decision layer -- a structural guard asserts no identifier in
+# ``simulation`` or ``policy`` contains a price term, and it passes unchanged.
+
+#: The Frank domain, and the entity keys Alpha EMS resolves.
+#:
+#: Frank builds every unique id as ``f"{entry_id}_{key}"`` and documents that
+#: pattern as a deliberate stable contract. Resolving through the entity registry
+#: by unique id therefore isolates the *selected* entry by construction -- two
+#: Frank entries can never be combined -- and survives a user renaming the
+#: entity, which hard-coding ``sensor.frank_prices_today`` would not.
+FRANK_KEY_PRICES_TODAY: Final = "prices_today"
+FRANK_KEY_PRICES_TOMORROW: Final = "prices_tomorrow"
+FRANK_KEY_TOMORROW_AVAILABLE: Final = "tomorrow_prices_available"
+FRANK_KEY_CURRENT_PRICE: Final = "current_price"
+FRANK_KEY_CURRENT_RETURN_PRICE: Final = "current_return_price"
+
+#: The two Frank options the export reconstruction depends on. Read from the
+#: *Frank* entry, never duplicated as Alpha EMS settings: the user configured
+#: them once and the return-price sensor they can see is derived from them.
+FRANK_OPTION_FEED_IN_ADJUSTMENT: Final = "feed_in_adjustment"
+FRANK_OPTION_APPLY_FEED_IN_VAT: Final = "apply_feed_in_vat"
+FRANK_DEFAULT_FEED_IN_ADJUSTMENT: Final = 0.0
+FRANK_DEFAULT_APPLY_FEED_IN_VAT: Final = False
+#: Frank's VAT rate, and the precision it rounds its computed feed-in price to.
+#: Mirrored rather than chosen, because the point is to agree with the sensor the
+#: user is looking at.
+FRANK_VAT_RATE: Final = 0.21
+FRANK_PRICE_PRECISION: Final = 6
+
+#: Market timezone per country. Frank publishes a *market* day -- midnight to
+#: midnight in the market's own zone -- and deliberately refuses to use Home
+#: Assistant's. Recorded as provenance only: it never decides availability, and
+#: Alpha EMS does not reimplement Frank's publication scheduler.
+FRANK_MARKET_TIMEZONES: Final[dict[str, str]] = {
+    "NL": "Europe/Amsterdam",
+    "BE": "Europe/Brussels",
+}
+
+#: Every mutating or fetch-triggering Frank action, named once so a structural
+#: test can prove none appears anywhere in this package. Alpha EMS adds no
+#: service caller at all in Phase 6, so this is belt-and-braces over a property
+#: that is already structural.
+FRANK_FORBIDDEN_SERVICES: Final = (
+    "update_prices",
+    "force_update",
+    "refresh",
+    "fetch_prices",
+    "clear_cache",
+    "set_options",
+)
+
+#: Why no usable price series could be produced.
+#:
+#: ``PRICE_TOMORROW_NOT_PUBLISHED`` is **normal operation**, not a failure. Frank
+#: does not request tomorrow before noon market time and publishes it around
+#: 13:00-14:00, so between market midnight and publication the tomorrow entity is
+#: legitimately unavailable. Treating that as a source fault would mark a healthy
+#: installation degraded for half of every day.
+PRICE_UNAVAILABLE_NOT_CONFIGURED: Final = "frank_entry_not_selected"
+PRICE_UNAVAILABLE_ENTRY_NOT_FOUND: Final = "frank_entry_not_found"
+PRICE_UNAVAILABLE_ENTITY_MISSING: Final = "frank_prices_entity_missing"
+PRICE_UNAVAILABLE_SOURCE_UNAVAILABLE: Final = "frank_prices_unavailable"
+PRICE_UNAVAILABLE_ATTRIBUTE_UNUSABLE: Final = "frank_prices_attribute_unusable"
+PRICE_UNAVAILABLE_EMPTY: Final = "frank_prices_empty"
+PRICE_TOMORROW_NOT_PUBLISHED: Final = "frank_tomorrow_not_published"
+PRICE_UNAVAILABLE_UNUSABLE_ROWS: Final = "frank_prices_rows_unusable"
+PRICE_UNAVAILABLE_OPTIONS_UNREADABLE: Final = "frank_options_unreadable"
+
+PRICE_UNAVAILABLE_REASONS: Final = (
+    PRICE_UNAVAILABLE_NOT_CONFIGURED,
+    PRICE_UNAVAILABLE_ENTRY_NOT_FOUND,
+    PRICE_UNAVAILABLE_ENTITY_MISSING,
+    PRICE_UNAVAILABLE_SOURCE_UNAVAILABLE,
+    PRICE_UNAVAILABLE_ATTRIBUTE_UNUSABLE,
+    PRICE_UNAVAILABLE_EMPTY,
+    PRICE_TOMORROW_NOT_PUBLISHED,
+    PRICE_UNAVAILABLE_UNUSABLE_ROWS,
+    PRICE_UNAVAILABLE_OPTIONS_UNREADABLE,
+)
+
+#: How the export price for an interval was arrived at. Frank's own vocabulary,
+#: mirrored verbatim, because the export price is a *reconstruction* of a value
+#: Frank's upstream does not publish -- and a configuration-derived estimate must
+#: never be mistaken for a measured price.
+PRICE_EXPORT_BASIS_API_FIELD: Final = "api_feed_in_price"
+PRICE_EXPORT_BASIS_ADJUSTMENT: Final = "market_price_plus_adjustment"
+PRICE_EXPORT_BASIS_ADJUSTMENT_VAT: Final = (
+    "market_price_plus_adjustment_including_vat"
+)
+PRICE_EXPORT_BASIS_UNKNOWN: Final = "unavailable"
+
+#: Optional explicit feed-in field. Absent from every block the live capture
+#: observed, and absent from Frank's pinned key set -- kept because Frank honours
+#: it if its upstream ever publishes one, and dropping the branch would silently
+#: prefer a reconstruction over a real figure.
+FRANK_FIELD_FEED_IN_PRICE: Final = "feed_in_price"
+
+#: Day-level flags on stored price evidence.
+#:
+#: ``vat_ratio_unexpected`` is the observation that replaced an assumption. The
+#: 21 % relation between ``market_price_tax`` and ``market_price`` held on every
+#: captured block, but it is VAT legislation rather than arithmetic -- so it is
+#: checked and flagged, never used to derive a stored value away.
+PRICE_FLAG_VAT_RATIO_UNEXPECTED: Final = "vat_ratio_unexpected"
+PRICE_FLAG_COMPONENTS_VARIED: Final = "day_components_varied"
+PRICE_FLAG_RESOLUTION_DISAGREES: Final = "reported_resolution_disagrees"
+PRICE_FLAG_IMPORT_CROSS_CHECK_FAILED: Final = "import_cross_check_failed"
+PRICE_FLAG_EXPORT_CROSS_CHECK_FAILED: Final = "export_cross_check_failed"
+PRICE_FLAG_SOURCE_CHANGED: Final = "price_source_changed"
+
+PRICE_DAY_FLAGS: Final = (
+    PRICE_FLAG_VAT_RATIO_UNEXPECTED,
+    PRICE_FLAG_COMPONENTS_VARIED,
+    PRICE_FLAG_RESOLUTION_DISAGREES,
+    PRICE_FLAG_IMPORT_CROSS_CHECK_FAILED,
+    PRICE_FLAG_EXPORT_CROSS_CHECK_FAILED,
+    PRICE_FLAG_SOURCE_CHANGED,
+)
+
+#: Tolerance for the two live cross-checks, in EUR/kWh. One tenth of the source's
+#: own least significant digit: the captured fields carry five decimal places, so
+#: anything at or below this is rounding and anything above it is a real
+#: disagreement worth reporting.
+PRICE_CROSS_CHECK_TOLERANCE_EUR_KWH: Final = 1e-6
+
+#: Tolerance for the VAT-ratio observation. The source rounds the tax to five
+#: decimals, so the comparison is made at that scale rather than exactly.
+PRICE_VAT_RATIO_TOLERANCE_EUR_KWH: Final = 5e-6
+
+#: Bumped when the price mapping rule itself changes, so evidence recorded under
+#: an older rule is identifiable rather than pooled.
+PRICE_MAPPING_VERSION: Final = 1
+
+#: The source period must be a whole number of planning intervals. The live
+#: source publishes fifteen-minute blocks and Frank supports an hourly fallback;
+#: both are whole multiples, and anything else is refused rather than rounded.
+PRICE_SOURCE_PERIOD_STEP_MINUTES: Final = QUARTER_MINUTES
