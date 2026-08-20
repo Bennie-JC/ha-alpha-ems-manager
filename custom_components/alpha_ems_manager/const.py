@@ -1043,10 +1043,20 @@ CONF_SELECTED_SOLCAST_SITE_IDS: Final = "selected_solcast_site_ids"
 #: when no site is named. Deliberately not a plausible ``resource_id``.
 PV_AGGREGATE_SITE: Final = "__aggregate__"
 
-#: Whether the stored selection was resolved automatically on first discovery, or
-#: chosen by the user. A default and a decision are different facts.
+#: How the selection reaching this refresh was arrived at.
+#:
+#: ``auto_initial`` is the refresh that resolved it from discovery and wrote it
+#: down. ``stored`` is every refresh after that, which read it from the entry.
+#:
+#: Deliberately *not* "user", which was the first attempt. Once the resolved
+#: default has been persisted it is indistinguishable from a set the user chose
+#: by hand, because both are simply a list in the options -- so calling it a user
+#: decision would have labelled the first snapshot of every installation as a
+#: choice nobody made. Telling the two apart would need a second stored field,
+#: which is more configuration than the distinction is worth. This records what is
+#: actually known.
 PV_SELECTION_ORIGIN_AUTO: Final = "auto_initial"
-PV_SELECTION_ORIGIN_USER: Final = "user"
+PV_SELECTION_ORIGIN_STORED: Final = "stored"
 
 #: Which query produced a series. Load-bearing rather than tidy: if Solcast's own
 #: aggregation ever disagreed with a per-site sum, this is what makes a stored

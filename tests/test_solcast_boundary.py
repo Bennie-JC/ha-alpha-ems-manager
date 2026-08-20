@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from custom_components.alpha_ems_manager import const as const_module
 from custom_components.alpha_ems_manager import solcast_source
 from custom_components.alpha_ems_manager.const import (
     SOLCAST_DOMAIN,
@@ -45,11 +46,13 @@ TOPOLOGY_WORDS = (
     "ac_coupled",
     "dc-coupled",
     "ac-coupled",
+    "coupled",
     "hybrid_side",
+    "hybrid-side",
     "grid_inverter_side",
     "inverter_input",
     "electrical_coupling",
-    "coupling_type",
+    "coupling",
 )
 
 
@@ -285,14 +288,17 @@ def test_no_configuration_field_asks_the_user_about_electrical_topology(
     declared unknown. Asserted over the sources *and* both translation files,
     because a translation string is where such a question would actually appear.
     """
-    # Scoped to where a question can actually be put to a user: the config flow
-    # that builds the forms, and the translation files that carry their wording.
-    # Deliberately *not* every comment in the package -- ``const`` documents at
-    # length that this question is never asked, and a substring guard that fires
-    # on the documentation of its own rule is how guards get deleted.
-    flow = (COMPONENT_DIR / "config_flow.py").read_text(encoding="utf-8").lower()
-
-    assert word not in flow, f"{word} in config_flow"
+    # Scoped to the two surfaces a user can actually see: the configuration keys
+    # a form can be built from, and the translated wording those forms carry.
+    #
+    # Deliberately *not* the comments. Both ``const`` and ``config_flow`` explain
+    # at length that this question is never asked, and the first version of this
+    # test failed on that explanation -- which is precisely how a guard comes to
+    # be deleted rather than fixed. A comment cannot ask a user anything; a key
+    # and a label can.
+    for name, value in vars(const_module).items():
+        if name.startswith("CONF_") and isinstance(value, str):
+            assert word not in value.lower(), f"{word} in {name}"
 
     for path in sorted((COMPONENT_DIR / "translations").glob("*.json")):
         assert word not in path.read_text(encoding="utf-8").lower(), path.name

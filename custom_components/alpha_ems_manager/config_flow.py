@@ -19,7 +19,7 @@ Two selection styles are used deliberately:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import voluptuous as vol
@@ -55,6 +55,7 @@ from .const import (
     CONF_HOUSE_LOAD_ENTITY,
     CONF_NAME,
     CONF_PV_POWER_ENTITY,
+    CONF_SELECTED_SOLCAST_SITE_IDS,
     CONF_SOLCAST_ENTRY_ID,
     CONF_USE_PV_FORECAST,
     CONFIG_ENTRY_VERSION,
@@ -81,6 +82,8 @@ from .const import (
     MIN_CONTROL_EXPORT_MARGIN_PERCENT,
     MIN_CONTROL_HORIZON_MINUTES,
 )
+from .solcast_source import discover as discover_solcast
+from .solcast_source import read_facts
 from .validation import (
     validate_energy_entity,
     validate_percentage_entity,
@@ -310,6 +313,60 @@ def _validate_battery(user_input: dict[str, Any]) -> dict[str, str]:
     ):
         errors[CONF_BATTERY_MIN_SOC_PERCENT] = "min_soc_not_below_max"
     return errors
+
+
+def _stored_site_ids(raw: Any) -> list[str]:
+    """Return the stored site identifiers, sorted and filtered.
+
+    Deliberately tolerant of a hand-edited document: a null or a number among
+    the entries costs that entry rather than the whole form.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return sorted({item for item in raw if isinstance(item, str) and item})
+
+
+async def _site_options(
+    hass: HomeAssistant,
+    *,
+    entry_id: str | None,
+    stored: Sequence[str],
+) -> list[selector.SelectOptionDict] | None:
+    """Return the selectable Solcast sites, or ``None`` if none could be read.
+
+    ``None`` means discovery failed or the boundary is unusable, and the caller
+    must then leave the stored selection completely alone. Overwriting a valid
+    selection because Solcast happened to be reloading would silently change
+    which roofs the plan is about.
+
+    A stored identifier the source no longer offers is **kept in the option
+    list**, labelled as missing. That is the lesson the two dropdowns above
+    already carry: a ``SelectSelector`` validates its submission against its
+    option list, so a stored value that has vanished rejects *every* submission
+    of the form at schema validation -- leaving the user unable to change any
+    unrelated setting. It is also the right behaviour on its own terms, because a
+    site that disappears must stay visible rather than being silently dropped.
+    """
+    capability = discover_solcast(hass, entry_id)
+    if not capability.usable or not capability.diagnostic_service:
+        return None
+
+    facts = await read_facts(hass)
+    if facts is None or not facts.sites:
+        return None
+
+    options = [
+        selector.SelectOptionDict(value=site.resource_id, label=site.name)
+        for site in sorted(facts.sites, key=lambda site: site.name.lower())
+    ]
+    known = {site.resource_id for site in facts.sites}
+    options.extend(
+        selector.SelectOptionDict(
+            value=site_id, label=f"{site_id} (no longer offered by Solcast)"
+        )
+        for site_id in sorted(set(stored) - known)
+    )
+    return options
 
 
 def _sign_selector(options: tuple[str, ...], key: str) -> selector.SelectSelector:
@@ -801,6 +858,52 @@ class AlphaEmsOptionsFlow(OptionsFlow):
                 ),
             }
         )
+
+        # Which rooftop sites belong to this installation. Offered only when the
+        # boundary is usable and sites could actually be read, so the form never
+        # presents an empty multi-select -- submitting one would wipe a valid
+        # selection, and a form that can destroy data by being saved unchanged is
+        # worse than a form that omits the field.
+        #
+        # The question is membership and nothing else. The user is never asked
+        # which site is AC- or DC-coupled, or which one feeds the hybrid: that is
+        # not reliably knowable to them, and a guessed topology recorded as fact
+        # would be worse than the declared unknown Phase 5 stores instead.
+        stored_sites = _stored_site_ids(current(CONF_SELECTED_SOLCAST_SITE_IDS))
+        site_options = None
+        if current(CONF_USE_PV_FORECAST, False) and current(CONF_SOLCAST_ENTRY_ID):
+            site_options = await _site_options(
+                self.hass,
+                entry_id=current(CONF_SOLCAST_ENTRY_ID),
+                stored=stored_sites,
+            )
+        if site_options is not None:
+            offered = {option["value"] for option in site_options}
+            schema = schema.extend(
+                {
+                    vol.Optional(
+                        CONF_SELECTED_SOLCAST_SITE_IDS,
+                        description={
+                            "suggested_value": [
+                                site_id
+                                for site_id in stored_sites
+                                if site_id in offered
+                            ]
+                            # No stored answer yet means every discovered site,
+                            # which is the same default the coordinator persists
+                            # on first discovery. Shown rather than assumed, so
+                            # the user sees what they are agreeing to.
+                            or sorted(offered)
+                        },
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=site_options,
+                            mode=selector.SelectSelectorMode.LIST,
+                            multiple=True,
+                        )
+                    )
+                }
+            )
 
         return self.async_show_form(
             step_id="sources",

@@ -13,18 +13,24 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
-from homeassistant.const import EVENT_CORE_CONFIG_UPDATE
+from homeassistant.const import (
+    EVENT_CORE_CONFIG_UPDATE,
+    SUN_EVENT_SUNRISE,
+    SUN_EVENT_SUNSET,
+)
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_change,
     async_track_time_interval,
 )
+from homeassistant.helpers.sun import get_astral_event_date
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
@@ -54,6 +60,7 @@ from .const import (
     CONF_HAS_PV,
     CONF_HOUSE_LOAD_ENTITY,
     CONF_PV_POWER_ENTITY,
+    CONF_SELECTED_SOLCAST_SITE_IDS,
     CONF_SOLCAST_ENTRY_ID,
     CONF_USE_PV_FORECAST,
     CONTROL_EXECUTION_AVAILABLE,
@@ -77,6 +84,14 @@ from .const import (
     INHIBIT_PLAN_UNAVAILABLE,
     LOG_THROTTLE_SECONDS,
     MAX_CONTROL_EVENTS_REPORTED,
+    PV_AGGREGATE_SITE,
+    PV_SELECTION_ORIGIN_AUTO,
+    PV_SELECTION_ORIGIN_STORED,
+    PV_UNAVAILABLE_EMPTY_SELECTION,
+    PV_UNAVAILABLE_NO_SITES_DISCOVERED,
+    PV_UNAVAILABLE_NOT_CONFIGURED,
+    PV_UNAVAILABLE_SERVICE_FAILED,
+    PV_UNAVAILABLE_SERVICE_MISSING,
     QUARTER_MINUTES,
     SAFETY_SAMPLE_SECONDS,
 )
@@ -108,6 +123,15 @@ from .normalization import (
     split_grid_power,
 )
 from .plan import BatteryPlan, build_plan
+from .pv_forecast import (
+    PvForecast,
+    PvProvenance,
+    sites_identity,
+    sites_model,
+)
+from .pv_forecast import (
+    build_forecast as build_pv_forecast,
+)
 from .quarter import (
     QuarterAccumulator,
     QuarterResult,
@@ -125,7 +149,15 @@ from .safety import (
     evaluate,
 )
 from .soc_coherence import SocCoherenceMonitor
-from .storage import DayRecord, LearningStore, index_for_start_utc, utc_midnight
+from .solcast_source import SolcastCapability, SolcastFacts, read_facts, read_forecast
+from .solcast_source import discover as discover_solcast
+from .storage import (
+    DayRecord,
+    LearningStore,
+    expected_quarters_for,
+    index_for_start_utc,
+    utc_midnight,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -181,6 +213,9 @@ _BATTERY_PLAN_LOG = "battery_plan"
 #: Throttle key for a control-layer failure. Separate again, for the same reason:
 #: three additive layers must be able to fail independently and say so.
 _CONTROL_LOG = "control"
+#: Throttle key for the PV forecast layer. Its own, so a Solcast fault cannot
+#: silence a control warning or the other way round.
+_PV_LOG = "pv_forecast"
 
 #: The statement every control surface in this release repeats, because it is the
 #: single most important fact about it.
@@ -236,6 +271,19 @@ class SourceConfig:
     frank_entry_id: str | None
     use_pv_forecast: bool
     solcast_entry_id: str | None
+    #: Which Solcast rooftop sites belong to this installation. Stable
+    #: ``resource_id`` values, never display names.
+    #:
+    #: An empty tuple means the question has not been answered yet, which is
+    #: distinct from "none of them": on first successful discovery the resolved
+    #: set is persisted once, after which a site newly added to Solcast is
+    #: reported as available but unselected rather than silently joining the plan.
+    #: An explicitly stored empty list is a different thing again, and produces a
+    #: named unavailability rather than a silent fall back to everything.
+    selected_solcast_site_ids: tuple[str, ...]
+    #: Whether a selection has actually been stored. Without this, "no key" and
+    #: "an empty list" would be the same fact, and they are not.
+    solcast_selection_stored: bool
     #: Phase-3 battery planning facts. ``None`` where the user has not supplied
     #: one: capacity and the two power limits have no default, because a
     #: capacity cannot be derived from a percentage sensor and a power limit
@@ -285,6 +333,11 @@ class SourceConfig:
             frank_entry_id=value(CONF_FRANK_ENTRY_ID),
             use_pv_forecast=bool(value(CONF_USE_PV_FORECAST, False)),
             solcast_entry_id=value(CONF_SOLCAST_ENTRY_ID),
+            selected_solcast_site_ids=_site_ids(value(CONF_SELECTED_SOLCAST_SITE_IDS)),
+            solcast_selection_stored=(
+                CONF_SELECTED_SOLCAST_SITE_IDS in entry.options
+                or CONF_SELECTED_SOLCAST_SITE_IDS in entry.data
+            ),
             battery_capacity_kwh=_optional_number(value(CONF_BATTERY_CAPACITY_KWH)),
             battery_max_charge_kw=_optional_number(value(CONF_BATTERY_MAX_CHARGE_KW)),
             battery_max_discharge_kw=_optional_number(
@@ -315,6 +368,30 @@ class SourceConfig:
                 )
             ),
         )
+
+
+def _site_ids(raw: Any) -> tuple[str, ...]:
+    """Return stored Solcast site identifiers, sorted and de-duplicated.
+
+    Sorted so the stored order cannot affect a fingerprint, and filtered so a
+    hand-edited document containing a number or a null degrades to the entries
+    that are usable rather than to a crash on the next refresh.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(sorted({item for item in raw if isinstance(item, str) and item}))
+
+
+def _capacity_total(values: Iterable[float | None]) -> float | None:
+    """Return the sum of the capacities that were reported, or ``None``.
+
+    ``None`` when the source reported none of them, which is not the same as a
+    total of zero: one is "it did not say" and the other is "there is no array".
+    """
+    present = [value for value in values if value is not None]
+    if not present:
+        return None
+    return round(sum(present), 4)
 
 
 def _tally(counts: dict[str, int], key: str) -> None:
@@ -455,6 +532,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: for the lifetime of this release, because nothing is ever sent.
         self._last_control_write: datetime | None = None
         self._last_control_power_kw: float | None = None
+        #: What of the Solcast boundary was found on the last refresh, and what it
+        #: said. Held for diagnostics so a user can see which sites exist, which
+        #: are selected and which selected one has gone missing -- without a
+        #: per-site entity, which would multiply entities for information that is
+        #: read once and then acted on by nobody.
+        self.pv_capability: SolcastCapability = SolcastCapability()
+        self.pv_facts: SolcastFacts | None = None
+        #: The most recent forecast per target day. Rebuilt every refresh.
+        self.pv_forecasts: dict[date, PvForecast] = {}
 
     # -- lifecycle -------------------------------------------------------
 
@@ -1323,6 +1409,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             tz_key=str(tz),
         )
 
+        pv_forecasts = await self._async_pv_forecasts_safely(today=today, tz=tz)
+        self.pv_forecasts = pv_forecasts
+
         control = self._build_control_report_safely(
             plan=plan,
             now=now,
@@ -1344,7 +1433,294 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "forecast_error_window": record.window,
             "battery_plan": plan,
             "control": control,
+            "pv_today": pv_forecasts.get(today),
+            "pv_tomorrow": pv_forecasts.get(tomorrow),
         }
+
+    # -- photovoltaic forecast -------------------------------------------
+
+    async def _async_pv_forecasts_safely(
+        self, *, today: date, tz: tzinfo
+    ) -> dict[date, PvForecast]:
+        """Read the PV forecast, or report why there is none.
+
+        Isolated exactly as the three layers before it are, and under its own
+        throttle key. A Solcast failure costs the PV forecast and nothing else:
+        learning, both load forecasts, the forecast-error sensors, the battery
+        plan and the control layer all read paths that never touch this one, so a
+        third party's integration being reloaded must not cost a refresh.
+        """
+        tomorrow = today + timedelta(days=1)
+        try:
+            return await self._async_pv_forecasts(today=today, tz=tz)
+        except Exception:
+            self._log.warning(
+                _PV_LOG,
+                (
+                    "The PV forecast could not be read this refresh. Planning "
+                    "continues PV-blind and every other layer is unaffected; no "
+                    "value is substituted for the missing forecast"
+                ),
+            )
+            _LOGGER.debug("PV forecast build failed", exc_info=True)
+            return {
+                day: self._pv_unavailable(day, tz, PV_UNAVAILABLE_SERVICE_FAILED)
+                for day in (today, tomorrow)
+            }
+
+    def _pv_unavailable(
+        self,
+        day: date,
+        tz: tzinfo,
+        reason: str,
+        provenance: PvProvenance | None = None,
+    ) -> PvForecast:
+        """Return a named unavailability of the right shape for one day."""
+        return PvForecast.unavailable_for(
+            target_day=day,
+            tz_key=str(tz),
+            interval_count=expected_quarters_for(day, tz),
+            reason=reason,
+            provenance=provenance,
+            daylight=self._daylight_window(day, tz),
+        )
+
+    async def _async_pv_forecasts(
+        self, *, today: date, tz: tzinfo
+    ) -> dict[date, PvForecast]:
+        """Read today's and tomorrow's expected generation.
+
+        One request covers both days -- the source returns a contiguous series and
+        the same rows are mapped twice, once per civil day, by two different index
+        resolvers. Splitting it into two requests would double the work for
+        identical data.
+        """
+        tomorrow = today + timedelta(days=1)
+        days = (today, tomorrow)
+
+        if not self.config.use_pv_forecast:
+            reason = PV_UNAVAILABLE_NOT_CONFIGURED
+            return {day: self._pv_unavailable(day, tz, reason) for day in days}
+
+        capability = discover_solcast(self.hass, self.config.solcast_entry_id)
+        self.pv_capability = capability
+        if not capability.usable:
+            reason = capability.unavailable_reason or PV_UNAVAILABLE_SERVICE_MISSING
+            return {day: self._pv_unavailable(day, tz, reason) for day in days}
+
+        facts = await read_facts(self.hass) if capability.diagnostic_service else None
+        self.pv_facts = facts
+        discovered = facts.site_ids if facts is not None else ()
+
+        selected, origin, reason = await self._async_resolve_site_selection(discovered)
+        if reason is not None:
+            provenance = self._pv_provenance(facts, selected, discovered, origin=origin)
+            return {
+                day: self._pv_unavailable(day, tz, reason, provenance) for day in days
+            }
+
+        complete = bool(discovered) and set(selected) == set(discovered)
+        start = utc_midnight(today, tz)
+        # Through the *start* of the day after tomorrow: the requested range is
+        # half-open, so a row beginning exactly at the end is not returned, which
+        # is what makes this cover both days exactly and neither more nor less.
+        end = utc_midnight(tomorrow + timedelta(days=1), tz)
+
+        if complete:
+            # Every discovered site belongs here, so the source's own aggregate is
+            # the right series and one request is enough.
+            queries = [await read_forecast(self.hass, start=start, end=end)]
+            site_rows = [(PV_AGGREGATE_SITE, list(queries[0].rows))]
+        else:
+            queries = [
+                await read_forecast(self.hass, start=start, end=end, site_id=site_id)
+                for site_id in selected
+            ]
+            site_rows = [
+                (query.site_id, list(query.rows))
+                for query in queries
+                if not query.failed
+            ]
+
+        if all(query.failed for query in queries):
+            provenance = self._pv_provenance(
+                facts, selected, discovered, complete, origin
+            )
+            return {
+                day: self._pv_unavailable(
+                    day, tz, PV_UNAVAILABLE_SERVICE_FAILED, provenance
+                )
+                for day in days
+            }
+
+        provenance = self._pv_provenance(facts, selected, discovered, complete, origin)
+        return {
+            day: build_pv_forecast(
+                site_rows,
+                target_day=day,
+                tz_key=str(tz),
+                interval_count=expected_quarters_for(day, tz),
+                index_of=self._pv_index_resolver(day, tz),
+                daylight=self._daylight_window(day, tz),
+                provenance=provenance,
+            )
+            for day in days
+        }
+
+    async def _async_resolve_site_selection(
+        self, discovered: tuple[str, ...]
+    ) -> tuple[tuple[str, ...], str, str | None]:
+        """Return the selected identifiers, how they were chosen, and why not.
+
+        The origin is returned rather than read back from the entry afterwards.
+        Reading it back reported ``user`` on the very refresh that had just
+        resolved it automatically, because the write had already landed by then --
+        which would have labelled the first snapshot of every installation as a
+        decision the user never made.
+
+        Three distinct states, deliberately kept distinct:
+
+        * **No answer stored yet.** Every discovered site is selected and the
+          resolved set is written to the entry options *once*. Persisting it is
+          the point: resolving "all of them" afresh on every refresh would mean a
+          site added to Solcast next year silently joined this installation's
+          plan, which is the exact failure the option exists to prevent. After
+          persistence a new site is reported as available but unselected.
+        * **A stored answer.** Used exactly as stored. A site the source no longer
+          offers stays in it and is reported as missing rather than dropped, so a
+          Solcast outage cannot quietly narrow the declaration.
+        * **A stored empty answer.** A named unavailability. It is a decision, and
+          falling back to "all of them" would overrule it.
+        """
+        if self.config.solcast_selection_stored:
+            selected = self.config.selected_solcast_site_ids
+            if not selected:
+                return (), PV_SELECTION_ORIGIN_STORED, PV_UNAVAILABLE_EMPTY_SELECTION
+            return selected, PV_SELECTION_ORIGIN_STORED, None
+
+        if not discovered:
+            # Nothing to persist, and nothing guessed. The next refresh tries
+            # again; a failed discovery must never write a selection.
+            return (
+                (),
+                PV_SELECTION_ORIGIN_AUTO,
+                PV_UNAVAILABLE_NO_SITES_DISCOVERED,
+            )
+
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            options={
+                **self.entry.options,
+                CONF_SELECTED_SOLCAST_SITE_IDS: list(discovered),
+            },
+        )
+        self.config = SourceConfig.from_entry(self.entry)
+        _LOGGER.info(
+            "Solcast site membership resolved to %s on first discovery and stored; "
+            "a site added later will be reported as available but not selected",
+            ", ".join(discovered),
+        )
+        return discovered, PV_SELECTION_ORIGIN_AUTO, None
+
+    def _pv_provenance(
+        self,
+        facts: SolcastFacts | None,
+        selected: tuple[str, ...],
+        discovered: tuple[str, ...],
+        complete: bool = False,
+        origin: str = PV_SELECTION_ORIGIN_AUTO,
+    ) -> PvProvenance:
+        """Assemble the provenance block from what the source actually said."""
+        by_id = (
+            {} if facts is None else {site.resource_id: site for site in facts.sites}
+        )
+        chosen = [by_id[site_id] for site_id in selected if site_id in by_id]
+        ac_total = _capacity_total(site.capacity_kw for site in chosen)
+        dc_total = _capacity_total(site.capacity_dc_kw for site in chosen)
+
+        return PvProvenance(
+            integration_version=None if facts is None else facts.integration_version,
+            selected_site_ids=tuple(selected),
+            selected_site_display_names=tuple(site.name for site in chosen),
+            selected_sites_identity=sites_identity(selected),
+            selected_sites_model=sites_model(
+                chosen, () if facts is None else facts.excluded_sites
+            ),
+            selected_site_count=len(selected),
+            available_site_count=len(discovered),
+            available_sites_identity=sites_identity(discovered),
+            selection_complete=complete,
+            selection_origin=origin,
+            membership_declared=bool(selected),
+            selected_capacity_ac_total_kw=ac_total,
+            selected_capacity_dc_total_kw=dc_total,
+            excluded_sites=() if facts is None else facts.excluded_sites,
+            estimate_key=None if facts is None else facts.estimate_key,
+            dampened=None if facts is None else facts.dampening_enabled,
+            auto_dampening_active=None if facts is None else facts.auto_dampening,
+            get_actuals=None if facts is None else facts.get_actuals,
+            use_actuals=None if facts is None else facts.use_actuals,
+            hard_limit_raw=None if facts is None else facts.hard_limit_raw,
+            hard_limit_binding=(
+                None if facts is None else facts.hard_limit_binds(dc_total)
+            ),
+            api_limit=None if facts is None else facts.api_limit,
+            api_used=None if facts is None else facts.api_used,
+            forecast_health=None if facts is None else facts.forecast_health,
+            actual_pv_entity=self.config.pv_power_entity,
+        )
+
+    @callback
+    def _pv_index_resolver(
+        self, day: date, tz: tzinfo
+    ) -> Callable[[datetime], int | None]:
+        """Return an index resolver for one civil day.
+
+        The storage coupling stays here rather than travelling into the pure
+        module, which is both a structural rule of this project and the reason
+        every mapping case is testable against a resolver written by hand.
+        """
+
+        def index_of(start: datetime) -> int | None:
+            return index_for_start_utc(day, start, tz)
+
+        return index_of
+
+    @callback
+    def _daylight_window(self, day: date, tz: tzinfo) -> tuple[bool, ...]:
+        """Return which of a day's intervals fall between sunrise and sunset.
+
+        Advisory throughout: it never modifies a forecast value and it is on no
+        safety path. What it buys is the best available detector for a whole class
+        of timezone and offset bugs -- generation forecast in the dark -- caught on
+        an installation rather than only in a test.
+
+        ``sun.sun`` alone cannot do this, because it exposes only the *next*
+        sunrise and sunset and so cannot describe tomorrow. Home Assistant's own
+        astral helper can, for any date, with no new dependency. When it cannot
+        answer, every interval is reported as non-daylight, which suppresses the
+        detector rather than inventing a window -- the conservative direction for
+        something whose only job is to raise a suspicion.
+        """
+        count = expected_quarters_for(day, tz)
+        try:
+            sunrise = get_astral_event_date(self.hass, SUN_EVENT_SUNRISE, day)
+            sunset = get_astral_event_date(self.hass, SUN_EVENT_SUNSET, day)
+        except Exception:  # pragma: no cover - astral is bundled and stable
+            return (False,) * count
+        if sunrise is None or sunset is None:
+            return (False,) * count
+
+        midnight = utc_midnight(day, tz)
+        window: list[bool] = []
+        for index in range(count):
+            start = midnight + timedelta(minutes=QUARTER_MINUTES * index)
+            end = start + timedelta(minutes=QUARTER_MINUTES)
+            # An interval counts as daylight when any part of it is lit, so the
+            # two boundary intervals are included rather than excluded. A forecast
+            # of real generation in the interval containing sunrise is not a bug.
+            window.append(end > sunrise and start < sunset)
+        return tuple(window)
 
     def _build_control_report_safely(
         self,
