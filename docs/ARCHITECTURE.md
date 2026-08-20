@@ -72,6 +72,13 @@ The pure modules carry the interesting logic deliberately: they can be tested
 against synthetic timelines without a Home Assistant instance, which is why the
 DST and forecast tests are fast and exhaustive.
 
+### Phase-6 modules
+
+| Module | Role |
+|---|---|
+| `price_forecast.py` | the price model, the mapping, the export reconstruction, both fingerprints, provenance and the stored snapshot. Pure |
+| `frank_source.py` | the read-only source boundary. Reads published state and calls nothing |
+
 ### Phase-5 modules
 
 | Module | Role |
@@ -1788,9 +1795,277 @@ nine. "Eight" was a convention rather than a rule, and this is the one fact need
 to read the recommendation that cannot live in the prose beside it, because prose
 cannot be automated against.
 
+## Phase 6: prices
+
+Phase 6 knows what electricity costs. It decides nothing because of it, and the
+interesting part of the design is which of those two statements is enforced by
+structure rather than by a test.
+
+### The neutrality is structural, and deliberately so
+
+An earlier draft proposed carrying a price on the trajectory interval and proving
+with a regression test that the recommendation was unchanged. That was rejected.
+Phase 5 added `pv_kwh` to `IntervalDemand` **because the simulator consumed it**;
+a price field would have no consumer at all, and a field with no consumer is an
+invitation. Worse, it converts a property the structure guarantees for free into
+one that depends on somebody continuing to run a comparison.
+
+So the price layer is simply not reachable from the decision layer:
+
+- neither `price_forecast` nor `frank_source` is imported by `plan`, `policy`,
+  `simulation`, `battery`, `control` or `safety` — asserted from the syntax tree,
+  in both directions;
+- no identifier in those four decision modules contains `price`, `tariff`,
+  `cost`, `arbitrage`, `cheap`, `expensive`, `eur` or `spread`. That guard existed
+  before prices did and **passes unchanged**, which is a far stronger statement
+  than a behavioural comparison: an economic term added with a zero coefficient
+  would behave identically today and be load-bearing tomorrow;
+- obtaining prices calls **no service at all**, so the two-module service-caller
+  exact set is untouched and there is no call site through which Alpha EMS could
+  make the source fetch.
+
+The behavioural regression is still written, as belt-and-braces rather than as the
+guarantee.
+
+### Three prices, and only one of them is a measurement of the same kind
+
+| Concept | Status |
+|---|---|
+| wholesale / market | published, per interval |
+| cost to import 1 kWh | published, per interval (`total_price_eur_kwh`) |
+| revenue from exporting 1 kWh | **not published — reconstructed** |
+
+The upstream endpoint exposes no feed-in field at all; every such field name is
+rejected with a validation error. So the export figure is `market_price +
+adjustment`, optionally times 1.21, where the adjustment and the VAT flag are
+**options on the source's config entry** — user configuration, not market data.
+Each interval carries an `export_basis` naming which of the three rules produced
+it, mirrored verbatim from the source's own vocabulary, so a
+configuration-derived estimate can never be read as a published price.
+
+Naming a field `export_price` beside `market_price` and `import_price` without
+that label would put an estimate on the same footing as two measured facts.
+
+**The asymmetry is load-bearing.** `sourcing_markup_price + energy_tax_price` is a
+fixed 0.129 EUR/kWh floor on the import side — exact on every captured block — and
+absent from the export side. Consequence: on a negative wholesale interval,
+importing still costs money while exporting earns a negative amount. Phase 8
+cannot answer "what does buying cost" and "what does exporting earn" from one
+field, which is why all four floats plus the two components survive Phase 6.
+
+### Reusing the source's semantics, not approximating them
+
+The formula is re-implemented rather than imported: a code-level import of another
+custom integration's *internal* module fails at import time when that integration
+is absent, is not the Home-Assistant-facing contract this phase is built on, and
+Alpha EMS declares no dependency on that domain.
+
+Re-implementation means matching field for field, including two accessors with
+**different** tolerances:
+
+| Option | Rule |
+|---|---|
+| `feed_in_adjustment` | `int`/`float` only. Booleans and strings rejected, falling back to `0.0` |
+| `apply_feed_in_vat` | plain `bool()`. Python truthiness |
+
+Both are surprising, in opposite directions. `feed_in_adjustment = "0.05"` makes
+the source use `0.0`, so parsing `0.05` here would put Alpha EMS at odds with the
+sensor on the user's dashboard. `apply_feed_in_vat = "false"` is *truthy*, so the
+source applies VAT — and a stricter parser here would disagree with the running
+integration. The point is not to be correct in the abstract; it is to agree with
+the figure the user can see.
+
+### Capability, and the probe that is gone
+
+`_entry_loaded` is deleted, along with the `ConfigEntryState` import that existed
+only to serve it. That probe asked whether a consumed integration's config entry
+was `LOADED`, and it produced a live false negative on every restart, twice: an
+integration's usability has nothing to do with which phase of setup its entry
+happens to be in when you look. A test asserts the symbol appears nowhere in the
+package, so reintroducing the pattern means reintroducing the import.
+
+Capability is now four demonstrable facts: an entry is selected, that entry
+exists, the entities resolve **through the registry by unique id**, and their state
+is readable.
+
+Resolving by unique id rather than by a guessed `sensor.` name matters three ways.
+The entry id is *inside* the unique id, so two entries can never be combined and
+isolating the selected one is not a filter that could be forgotten. It survives a
+rename. And it needs no new configuration.
+
+`runtime_data` would be a more direct route to the source's coordinator and is
+refused: private, deleted on unload, and not the interface another integration is
+entitled to plan against.
+
+### The publication gap is normal operation
+
+Between market midnight and the next day's publication — observed around 13:00 to
+14:00 market time, and never requested before noon — a healthy installation is in
+this state:
+
+```
+today.available    = true      (complete current-day series)
+tomorrow.available = false     (no next-day series yet)
+availability signal = off
+```
+
+It must not make the source unavailable, must not read as degraded, and must not
+be filled in. Today alone is a complete, correct result.
+
+**The disambiguator is the separate binary entity, not the price entity's
+attributes**, and the reason is a Home Assistant behaviour rather than a
+preference: the state write is guarded by `if available:` around *both*
+`state_attributes` and `extra_state_attributes`. The next-day price sensor
+overrides `available` to be false precisely when the day is unpublished, so its
+own `available` attribute is **absent in exactly the case one would consult it**.
+Reading it would give `None` forever. The binary entity has no such override.
+
+| Signal | Next-day entity | Meaning | Reason |
+|---|---|---|---|
+| `off` | unavailable | **normal** | `frank_tomorrow_not_published` |
+| `on` | unavailable | abnormal — claimed, not carried | `frank_prices_unavailable` |
+| `on` | available, `[]` | abnormal — claimed and empty | `frank_prices_empty` |
+| any | today unavailable | abnormal — today is not optional | `frank_prices_unavailable` |
+
+`frank_prices_empty` is deliberately **not** overloaded for the unpublished case.
+One means "not got it yet"; the other means "claims to have it and it is empty".
+Collapsing them hides a real fault behind a daily routine.
+
+**State beats the clock, in both directions.** Never "it is past 13:00, so
+tomorrow ought to exist" — publication can be late. Never "it is before 13:00, so
+tomorrow cannot exist" — if the source reports it, consume it. Market timezone
+belongs in provenance for context and is never an input to an availability
+decision; Alpha EMS does not reimplement anyone else's publication scheduler.
+
+The midnight rollover is the source's. There is no old-tomorrow-to-new-today copy
+on this side, no retained stale day, and no synthesised D+2.
+
+### Mapping, and why by instant is mandatory
+
+The source publishes a **market** day — midnight to midnight in `Europe/Amsterdam`
+or `Europe/Brussels`, explicitly refusing Home Assistant's timezone — while Alpha
+EMS plans a Home Assistant civil day. For anyone outside the market zone those are
+different spans, so positional mapping is not merely fragile: it is wrong, and
+silently. Coverage below 1.0 is then a normal outcome to be *reported*, not a
+fault to be repaired by extrapolation.
+
+Two reported values are not trusted for mapping, and neither is a defect in the
+source — both are summaries being used for the wrong job if leaned on:
+
+- **`resolution_minutes`** is derived from the *first block alone* and snapped to
+  15 or 60, so a thirty-minute source is reported as 15. It is provenance. Alpha
+  EMS measures every block from its own instants and flags a disagreement.
+- **"one civil date per array"** holds in the source's own harness only because
+  that harness runs in the market timezone. Alpha EMS relies on it nowhere, and
+  the last block of every day already ends on the *next* civil date.
+
+A period longer than one planning interval is split **piecewise-constant**: a
+price is a rate, so every quarter of an hourly block carries the same rate.
+Interpolation would invent prices nobody published. A period that is not a whole
+multiple of fifteen minutes is refused and counted rather than rounded.
+
+### Unknown is never zero
+
+An interval with no price is absent from the series. An interval priced `0.0` is a
+known zero. Beyond the horizon there are no intervals at all — not placeholders,
+not zeroes. On disk the arrays are the length of the day so a hole is a `None` at
+a known position rather than a shorter array whose gap could be anywhere.
+
+`economic_price_horizon_end` is the end of the last interval in the **contiguous**
+run of known prices, defined now so a later phase inherits one definition rather
+than inventing its own. Contiguity is deliberate: knowing prices on both sides of
+a hole is not knowing them continuously, so the run stops at the first gap and
+`intervals_beyond_horizon` keeps the isolated remainder visible. It causes
+nothing.
+
+### Evidence, with no outcome half
+
+Price issuances are persisted in the existing partitioned forecast store,
+change-triggered by content fingerprint, minor `1.2` → `1.3`.
+
+There is deliberately **no outcome counterpart**. A price has no "what actually
+happened" to be scored against; it *was* the price. What cannot be recovered
+afterwards is **which future prices were visible when a plan was made** — they get
+revised and republished, so a later phase reading today's series has no way to
+tell what nine o'clock knew. That hindsight bias can only be avoided in advance.
+
+Four floats an interval, and `market_price_tax` is one of them. An earlier design
+stored three and derived the tax from `0.21 × market_price`. That was revoked in
+review, and the reasoning is worth keeping: the identity is asserted in the
+source's prose and in its own test fixture, never against real API data; it is VAT
+legislation rather than arithmetic; and storage decisions are irrecoverable, so an
+identity that quietly stopped holding would corrupt the very evidence the store
+exists to preserve. It is a *checked observation* now, flagged as
+`vat_ratio_unexpected` when it deviates.
+
+"Minimum" therefore means the minimum **source fields actually consumed**, not the
+minimum after applying an unenforced arithmetic claim. The two fixed components sit
+at day level with a variation flag, which is a genuine observation about contract
+terms.
+
+Not stored: the raw arrays (~25 kB per state change, reconstructible), and none of
+the derived sensors.
+
+### What is deliberately not consumed
+
+The source also publishes cheapest/most-expensive figures, cheap and expensive
+*zones*, and optional optimal-period entities. None is read.
+
+The zones are computed from margins configured on the *source's* entry, and the
+optimal periods are a precomputed answer to a question that needs load, generation,
+state of charge, efficiency, limits and reserve to answer honestly. Consuming
+either would make Alpha EMS's behaviour depend on another integration's settings —
+a stronger argument than "we want our own optimiser". They are reported in
+diagnostics as context, labelled as refused.
+
+### The three layers of the contract, and what each proves
+
+Alpha EMS's CI checks out **only** this repository, so a test that read the
+source's own module would fail or be skipped — and a skipped guard is not a guard.
+Instead:
+
+1. **A captured live artefact**, taken from a running installation before any code
+   was written, headed with the source version, commit and capture date. It keeps
+   the fields Alpha EMS ignores and asserts they stay ignored.
+2. **Synthetic tests** of this implementation against the observed contract,
+   covering everything the capture could not reach and labelled as synthetic
+   throughout.
+3. **The runtime cross-check** — the current interval against the source's own
+   import and return figures — which is the *only* layer that can fail when the
+   **source** changes.
+
+Stated plainly: layers 1 and 2 prove Alpha EMS reads *the shape that was
+observed*; only layer 3 proves it reads the source. Blurring that distinction is
+precisely how the beta.10 defect shipped, and the plan does not pretend otherwise.
+
+One hazard the live data creates rather than the code: on the captured
+installation `feed_in_adjustment` and `sourcing_markup_price` are **both
+0.01815**. Reaching for the markup where the adjustment was meant — two small
+per-kWh addends sitting side by side — reconstructs the export price *correctly*
+and passes every check including the cross-check. Every synthetic fixture
+therefore uses an adjustment distinct from both components, and a test asserts the
+three stay distinct.
+
+### Known and unresolved
+
+**Freshness is observed, not reported.** The source's own `last_update` is not
+exposed on any entity, so what is recorded is when the state machine last wrote —
+a different fact, labelled as one. Asking for it to be published is a reasonable
+future request upstream.
+
+**A two-second race.** The source refreshes at second 3 of each quarter; Alpha EMS
+reads at second 5. A slow fetch means reading the previous quarter's series.
+Harmless here, and harmless in principle because mapping is by instant — a stale
+read is an older series, not a misaligned one — but it is in provenance so Phase 7
+does not assume the current quarter is present.
+
+
 ## Entity contract
 
-Exactly nine sensors — four from Phase 1, two from Phase 2, three from Phase 3 — unique IDs
+Exactly nine sensors — four from Phase 1, two from Phase 2, three from Phase 3.
+Phases 5 and 6 add **none**: expected production and price both reach the plan or
+the diagnostics without becoming published state, and a price entity would
+duplicate one the source already publishes. Unique IDs
 `{entry_id}_{key}`, all on one service device named from the entry title. Names
 are literal English with **no** `translation_key`: Home Assistant derives the
 entity ID from the translated name, so a translation key would give a Dutch user
@@ -1817,10 +2092,15 @@ recorder writes every attribute on every state change.
 
 ## Boundaries
 
-The integration reads the Home Assistant state machine and config-entry registry
-and nothing else. No HTTP client is imported, `requirements` is empty, and the
-coordinator has no `update_interval`. `tests/test_no_external_polling.py`
-enforces this both statically and at runtime.
+The integration reads the Home Assistant state machine, the entity registry and
+the config-entry registry, and nothing else. No HTTP client is imported,
+`requirements` is empty, and the coordinator has no `update_interval`.
+`tests/test_no_external_polling.py` enforces this both statically and at runtime.
+
+Exactly two modules call a service — `alphaess_adapter` and `solcast_source` — and
+that set is asserted as an exact list. Phase 6 did not extend it: prices are read
+from published state, so "Alpha EMS cannot make the price source fetch" is a
+property of there being no call site rather than of a name being avoided.
 
 ## Future phases
 
@@ -1833,7 +2113,7 @@ What each next phase needs, and where it plugs in:
 | Phase | Needs | Seam |
 |---|---|---|
 | ~~**5** Solcast PV~~ | *shipped in beta.9* | production is a second series on the same index; the stepper still takes a sequence of demands. Asymmetric efficiency remains available and unused |
-| **6** Frank prices | a price series joins | prices are a *policy* input; what-if already compares trajectories, so this adds a cost function over them |
+| ~~**6** Frank prices~~ | *shipped in beta.12* | the series exists, normalised and stored, and is reachable from no module that decides anything. Phase 8 adds a cost function over the trajectories what-if already compares |
 | **7** Dynamic reserve | raise the floor, never the user's setting | `dynamic_reserve` beside `static_reserve`, computing `max(configured, dynamic)` **inside** the factory. `interval_margin_kwh` is already reported, and the P10/P90 series is now recorded per interval — but read `percentile_aggregation` first: a per-site sum is not a calibrated band |
 | **8** Economic optimisation | replace the objective, keep the simulator | the policy interface; `HoldPolicy` is already the counterfactual to price against, and the soft reserve is what makes “dip but never below the floor” expressible |
 | **9** Adaptive feedback | provenance and joins | recorded state of charge joins the Phase-2 snapshot by chronological index and target day; plans are recomputable; `policy_version` prevents pooling generations; separate efficiency fields let them be learned |

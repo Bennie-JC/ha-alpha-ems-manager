@@ -17,9 +17,9 @@ battery.** The final step is unreachable, not merely switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.11` — a public beta.**
+> **Current release: `1.0.0-beta.12` — a public beta.**
 >
-> The integration is feature-complete for Phase 5 and covered by 1940 automated
+> The integration is feature-complete for Phase 6 and covered by 2087 automated
 > tests, but the learning and forecast model has **not** yet been validated
 > across enough real-world complete days to be called stable. Treat it as
 > something to run and observe, not yet as something to depend on.
@@ -59,7 +59,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.11` is not offered.
+     dialog if `1.0.0-beta.12` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -259,6 +259,65 @@ defines export. It needs no PV term at all, so no daylight rule and no assumptio
 about how your arrays are wired, and it accounts for loads your house-load sensor
 cannot see.
 
+### Prices, and why they change nothing yet
+
+Alpha EMS reads quarter-hour electricity prices from your
+[Frank Quarter Prices](https://github.com/Bennie-JC/ha-frank-quarter-prices)
+integration and normalises them onto the same interval identity as load and
+generation. **No price value reaches a battery decision.** That is not a policy
+statement to be trusted — the price layer is not importable from the modules that
+decide anything, no identifier in those modules is an economic term, and obtaining
+prices calls no service at all. All three are asserted by tests that fail if the
+structure changes.
+
+If your battery recommendation moves after upgrading to beta.12, that is a bug.
+
+**Three prices, and only one of them is a measurement of the same kind.** The
+source publishes a wholesale price and an all-in purchase price for each interval.
+It publishes **no export price at all** — the upstream endpoint has no such field —
+so the export figure is *reconstructed* from the wholesale price plus the
+adjustment you configured in Frank, and every interval carries a label saying
+which rule produced it. A configuration-derived estimate must never be readable as
+a published price.
+
+That asymmetry matters more than it looks. Sourcing markup plus energy tax is a
+fixed **0.129 EUR/kWh floor** on the import side and absent from the export side,
+so on a negative wholesale interval **importing still costs money while exporting
+earns a negative amount**. Import and export are not two signs of one number, and
+a later phase cannot answer "what does buying cost" and "what does exporting
+earn" from a single field.
+
+**The two feed-in settings are read from Frank, not duplicated here.** You
+configured them once, the return-price sensor on your dashboard is derived from
+them, and a second copy in Alpha EMS would drift away from the figure you can see.
+There is nothing new to configure.
+
+**The next day being absent before about 13:00 is normal.** Frank does not request
+tomorrow's prices before noon market time and publishes them around 13:00 to
+14:00. Until then a healthy installation shows today complete and tomorrow absent,
+and Alpha EMS reports that with its own reason rather than as a fault. It draws no
+conclusion from the clock in either direction: publication can be late, and if
+Frank already has the day before 13:00 it is consumed. The midnight rollover is
+Frank's to perform — Alpha EMS copies nothing, retains nothing stale and
+synthesises no day-after-next.
+
+**Unknown is never zero.** An interval with no price is absent from the series. An
+interval priced at zero is a known zero. Beyond the horizon there are no intervals
+at all — not placeholders, not zeroes — because a later phase that confused the two
+would plan free electricity across a hole in the data.
+
+Coverage below 1.0 is normal for some installations rather than a fault: Frank
+publishes a *market* day, midnight to midnight in the market's own timezone, while
+Alpha EMS plans a Home Assistant civil day. If you run Home Assistant outside
+`Europe/Amsterdam` or `Europe/Brussels` those are different spans, so part of your
+local day is priced by a market day that may not exist yet. Mapping is by instant
+for exactly this reason, and the shortfall is reported rather than extrapolated
+away.
+
+The `price` block in a diagnostics download carries the counts, coverage, the
+horizon, both cross-checks against Frank's own current-interval figures, and the
+reason the next day is absent. It never carries the series itself.
+
 ## What it does **not** do yet
 
 - ❌ No automatic battery control. It never writes to your inverter.
@@ -280,6 +339,12 @@ cannot see.
   cheap-hour buying, no reserve sized for tomorrow's weather, no overnight
   carry-over, no arbitrage. Expected production is an input to the plan, never a
   reason to buy or sell.
+- ❌ **No economic behaviour from prices, even though prices are now known.**
+  Phase 6 reads, normalises, cross-checks, reports and stores them. Nothing ranks
+  an interval, picks a cheapest window, sizes a reserve or expresses an objective.
+  The price layer is not reachable from any module that decides what the battery
+  does, and that is enforced structurally rather than by a behavioural comparison
+  — see [Prices, and why they change nothing yet](#prices-and-why-they-change-nothing-yet).
 - ❌ No self-learning PV correction. Forecast and actual are both recorded raw;
   nothing is adjusted in response to error.
 - ❌ No stopping or continuing a dispatch. Nothing in the AlphaESS control
@@ -297,7 +362,7 @@ cannot see.
 | A **house-load power** sensor | **Yes** | The measurement source. On AlphaESS this is *Current House Load*. |
 | A **battery SOC** and **battery power** sensor | **Yes** | The state of charge drives the battery planning and is recorded per quarter-hour; the power is used for the energy-balance check. |
 | A **grid power** sensor | **Yes** | Any meter integration: HomeWizard P1, DSMR, SlimmeLezer, … |
-| [Frank Quarter Prices](https://github.com/Bennie-JC/ha-frank-quarter-prices) | **Yes** | Set up before adding Alpha EMS Manager. |
+| [Frank Quarter Prices](https://github.com/Bennie-JC/ha-frank-quarter-prices) | **Yes** | Set up before adding Alpha EMS Manager. From beta.12 its price series is read and normalised; it still drives no decision. |
 | An **EV charger power** sensor | Optional | Enables flexible-load separation. Any W/kW sensor; no brand assumed. |
 | A **PV production power** sensor | Only if you have solar | |
 | [Solcast PV Forecast](https://github.com/BJReplay/ha-solcast-solar) | Only if you enable the PV forecast | |

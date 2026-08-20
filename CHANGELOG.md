@@ -9,6 +9,181 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.12] - 2026-08-20
+
+**Alpha EMS now knows what electricity costs, and does nothing differently
+because of it.** Prices are read, normalised, cross-checked, reported and stored
+as evidence. No price value reaches a battery decision, a policy, a simulation or
+a command — and that is enforced structurally rather than by comparing behaviour.
+
+If your battery recommendation changes after this upgrade, that is a bug. It
+should read exactly as it did before prices arrived.
+
+### Added
+
+- **Quarter-hour import, wholesale and export prices**, read from a Frank Quarter
+  Prices integration you have already installed and selected. Both published days
+  are re-read every refresh and mapped onto the same chronological interval
+  identity load and generation already use, so 92-, 96- and 100-quarter days are
+  handled by measurement rather than assumption.
+
+- **Three prices, and only one of them is a measurement of the same kind.** The
+  source publishes a wholesale price and an all-in purchase price per interval. It
+  publishes **no export price at all** — the upstream endpoint has no such field —
+  so the export figure is *reconstructed* from the wholesale price plus the
+  adjustment configured on the source's own entry, and every interval carries a
+  label saying which rule produced it.
+
+  The asymmetry is load-bearing rather than pedantic. Sourcing markup plus energy
+  tax is a fixed **0.129 EUR/kWh floor** on the import side and absent from the
+  export side, so on a negative wholesale interval **importing still costs money
+  while exporting earns a negative amount**. Import and export are not two signs
+  of one number, and no single price field can answer both questions.
+
+- **A price block in diagnostics** — eighteen sections now. Counts, coverage,
+  edges, both cross-checks, the horizon, the capability probed now *and* as
+  recorded at the last refresh, and the reason the next day is absent. Never the
+  price series itself: ninety-six values truncated to the payload's sixteen-item
+  ceiling would read as a short day rather than as a clipped payload.
+
+- **Price evidence in the existing forecast store**, change-triggered by content
+  fingerprint. Four floats an interval — wholesale, its tax, the all-in import
+  price and the reconstructed export price — plus the two fixed components once
+  per day with a flag if they ever vary within one.
+
+  There is deliberately no outcome half. A price has no "what actually happened"
+  to be scored against; it *was* the price. What cannot be recovered afterwards is
+  **which future prices were visible when a plan was made** — they get revised and
+  republished, so a later phase reading today's series has no way to tell what
+  nine o'clock knew. That hindsight bias can only be avoided in advance.
+
+- **An economic price horizon**, defined now so a later phase inherits one
+  definition rather than inventing its own: the end of the last interval in the
+  *contiguous* run of known prices. Contiguity is deliberate — knowing prices on
+  both sides of a hole is not knowing them continuously — and intervals beyond a
+  gap stay visible in their own count rather than disappearing.
+
+### Changed
+
+- **`_entry_loaded` is deleted**, along with the `ConfigEntryState` import that
+  existed only to serve it. That probe asked whether a consumed integration's
+  config entry was `LOADED`, and it was the cause of the beta.9 defect: an
+  integration's usability has nothing to do with which phase of setup its entry
+  happens to be in when you look. A test now asserts the symbol appears nowhere in
+  the package, so reintroducing the pattern means reintroducing the import.
+
+  `frank_available` is established from facts instead — an entry selected, that
+  entry present, the price entities resolvable through the registry by unique id,
+  their state readable.
+
+- **Entities are resolved by unique id, never by name.** The source builds every
+  unique id as `{entry_id}_{key}` and documents that as a stable contract, so
+  resolving through the registry isolates the selected entry *by construction* —
+  a Dutch and a Belgian entry can never be combined — and survives you renaming
+  the entity. No entity id is hard-coded anywhere.
+
+- Forecast-history minor version `1.2` → `1.3`, a backward-compatible addition.
+  Every earlier document reads unchanged and nothing is migrated or discarded.
+
+- The economics guard is widened from two decision modules to four. With a real
+  normalised price series in the build, the interesting claim is no longer "no
+  optimiser has been written" but "the data exists and still cannot reach a
+  decision".
+
+### The publication gap is normal operation
+
+Between market midnight and the next day's publication — normally around 13:00 to
+14:00 market time — a healthy installation reports **today complete and tomorrow
+absent**. That is the source working exactly as designed, and it is reported with
+its own reason rather than as a fault. Treating it as one would mark every
+installation degraded for a good part of every day.
+
+Three outcomes stay distinguishable, and only the source's own availability
+signal separates them:
+
+| Signal | Next-day entity | Meaning |
+|---|---|---|
+| `off` | unavailable | **normal** — not published yet |
+| `on` | unavailable | abnormal — the source claims a day it is not carrying |
+| `on` | available, empty | abnormal — claimed and empty |
+
+Alpha EMS draws **no** conclusion from the clock, in either direction:
+publication can be late, and if the source already reports the day before 13:00 it
+is consumed. Market timezone is recorded as context and decides nothing.
+
+The midnight rollover is the source's to perform. There is no copy operation on
+this side, no retained stale day, and no synthesised day-after-next.
+
+### Verification
+
+Tests **1940 → 2087**.
+
+The primary fixture is a **captured live contract** from a running installation,
+headed with the source version, commit and capture date. It keeps the fields Alpha
+EMS deliberately does not read — `duration_minutes` and `per_unit` — and tests
+assert they stay unread, because a fixture holding only what the parser wants
+cannot catch a parser reading the wrong thing. That is exactly how the beta.10
+defect shipped.
+
+What that fixture proves is stated precisely and not overstated: it proves Alpha
+EMS reads *the shape that was observed*. It does **not** prove Alpha EMS reads the
+source — CI cannot see that repository. Only the runtime cross-check, comparing the
+current interval against the two figures the source publishes, can fail when the
+*source* changes, and that is the check that runs on your installation.
+
+Nineteen mutation tests, each a plausible refactor rather than an absurdity. The
+one worth naming: on the captured installation `feed_in_adjustment` and
+`sourcing_markup_price` are **the same number**, so reaching for the wrong one
+reconstructs the export price correctly and passes every check including the live
+cross-check. Only synthetic fixtures that keep the three components distinct can
+catch it, so every synthetic block does.
+
+Everything the live capture could not reach is covered synthetically and labelled
+as such, never upgraded to live-verified: the unpublished next-day shape, an hourly
+source, 92- and 100-quarter days, Home Assistant running outside the market
+timezone, an explicit upstream feed-in field, and two-country isolation.
+
+### Unchanged
+
+No new entities. No new configuration options — the two feed-in settings are read
+from the source's own entry rather than duplicated here, because the return-price
+figure on your dashboard is derived from them and a second copy would drift. No
+config-entry version change, so nothing to migrate.
+
+Obtaining prices calls **no service at all** — not "no forbidden service", none.
+Both days come from published entity state, so the permitted service-caller set is
+untouched and there is no call site through which Alpha EMS could make the source
+fetch. That is structural, not a promise.
+
+Execution remains structurally unavailable: `CONTROL_EXECUTION_AVAILABLE` is
+still `False`, ownership is still unproven, `SHADOW` writes nothing and `ACTIVE`
+cannot execute. A fully healthy price source driven through `ACTIVE` is asserted
+to produce zero service calls. The meter-based export rule is still the sole
+export basis.
+
+Both known findings stand: the small energy-balance boundary residual is still a
+limitation with no tolerance widened, and the +1394 W gross-fault sample is still
+recorded and still not a control input.
+
+### Known limitations
+
+- **Coverage below 1.0 is normal for some installations, not a fault.** The source
+  publishes a *market* day — midnight to midnight in the market's own zone — while
+  Alpha EMS plans a Home Assistant civil day. If you run Home Assistant outside
+  the market timezone those are different spans, so part of your local day is
+  priced by a market day that may not be published yet. It is reported, never
+  repaired by extrapolation.
+
+- **Freshness is observed, not reported.** The source does not publish its own
+  last-update instant on any entity, so what Alpha EMS records is when the state
+  machine last wrote. A different fact, and labelled as the different fact it is.
+
+- The source refreshes at second 3 of each quarter and Alpha EMS reads at second
+  5. A two-second margin against a network fetch, so a slow refresh means reading
+  the previous quarter's series. Harmless here — mapping is by instant, so a stale
+  read is an older series rather than a misaligned one — and recorded in
+  provenance so a later phase does not assume the current quarter is present.
+
 ## [1.0.0-beta.11] - 2026-08-20
 
 **Hotfix: Solcast site discovery found nothing on an account with two sites.**
