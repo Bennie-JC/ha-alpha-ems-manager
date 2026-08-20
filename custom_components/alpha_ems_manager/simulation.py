@@ -519,11 +519,7 @@ def simulate(
         # mode rather than a magnitude matters: a directed request whose magnitude
         # was clamped to zero still *asked* for something, and layering an ambient
         # charge on top of it would put two directions in one interval.
-        if (
-            absorb_surplus
-            and request.mode == MODE_IDLE
-            and demand.surplus_kwh > 0.0
-        ):
+        if absorb_surplus and request.mode == MODE_IDLE and demand.surplus_kwh > 0.0:
             request = BatteryRequest.charge(demand.surplus_kwh / INTERVAL_HOURS)
             ambient = True
         outcome = apply_request(current, request)

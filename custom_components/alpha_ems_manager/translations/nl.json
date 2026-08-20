@@ -18,7 +18,7 @@
           "house_load_entity": "Momentaan huishoudelijk verbruik in W of kW, los van zon, accu en net. Bij AlphaESS is dit Current House Load.",
           "daily_house_load_entity": "Optioneel cumulatief dagtotaal in kWh, alleen als controle aan het eind van de dag. Dit wordt nooit als leerbron gebruikt.",
           "has_pv": "Schakelt de zonneproductiebron in op de volgende schermen.",
-          "use_pv_forecast": "Vereist een geconfigureerde Solcast PV Forecast-integratie. Fase 1 controleert alleen of de bron bereikbaar is en past de verbruiksvoorspelling nog niet aan.",
+          "use_pv_forecast": "Vereist een geconfigureerde Solcast PV Forecast-integratie. Wanneer dit aan staat wordt de verwachte productie van de voorspelde belasting afgetrokken en vastgelegd als bewijs tegenover wat de panelen werkelijk hebben geproduceerd.",
           "ev_power_entity": "Optioneel. Als je auto achter de huisverbruikmeter laadt, kies hier dan de vermogenssensor van de lader. Alpha EMS leert het huishoudelijk verbruik dan zonder het laden mee te tellen. Elke W- of kW-sensor werkt; er wordt geen specifiek merk verondersteld."
         }
       },
@@ -53,7 +53,7 @@
           "pv_power_entity": "PV-productievermogen"
         },
         "data_description": {
-          "pv_power_entity": "Momentane zonneopwekking in W of kW. Dit wordt alleen vastgelegd voor de energiebalanscontrole en verandert nooit het geleerde huisverbruik."
+          "pv_power_entity": "Momentane zonneproductie in W of kW. Wordt per kwartier vastgelegd voor de energiebalanscontrole en als bewijs tegenover de voorspelling; het verandert nooit de geleerde huisbelasting."
         }
       },
       "grid": {
@@ -137,7 +137,8 @@
           "frank_entry_id": "Frank Quarter Prices-instantie",
           "use_pv_forecast": "Gebruik een PV-voorspellingsbron",
           "solcast_entry_id": "Solcast PV Forecast-instantie",
-          "ev_power_entity": "Laadvermogen elektrische auto (optioneel)"
+          "ev_power_entity": "Laadvermogen elektrische auto (optioneel)",
+          "selected_solcast_site_ids": "Solcast-locaties die bij dit systeem horen"
         },
         "data_description": {
           "house_load_entity": "Momentaan huishoudelijk verbruik in W of kW, los van zon, accu en net.",
@@ -145,14 +146,15 @@
           "battery_soc_entity": "Een percentagesensor, bijvoorbeeld AlphaESS SoC Battery.",
           "battery_power_entity": "Momentaan accuvermogen in W of kW.",
           "battery_power_sign": "AlphaESS rapporteert tijdens laden een negatieve waarde.",
-          "has_pv": "Zet dit aan om zonneproductie vast te leggen voor de energiebalanscontrole.",
-          "pv_power_entity": "Vereist wanneer dit systeem zonnepanelen heeft.",
+          "has_pv": "Zet dit aan om zonneproductie vast te leggen, te gebruiken in de energiebalanscontrole en te vergelijken met de PV-voorspelling.",
+          "pv_power_entity": "Vereist wanneer dit systeem zonnepanelen heeft. Wordt per kwartier vastgelegd als bewijs en vergeleken met de voorspelling; het verandert nooit de geleerde huisbelasting.",
           "grid_power_entity": "Momentane netuitwisseling in W of kW.",
           "grid_power_sign": "De meeste Nederlandse meters rapporteren tijdens afname een positieve waarde.",
           "frank_entry_id": "De Frank Quarter Prices-instantie waaruit prijzen worden gelezen.",
-          "use_pv_forecast": "Vereist een geconfigureerde Solcast PV Forecast-integratie.",
+          "use_pv_forecast": "Vereist een geconfigureerde Solcast PV Forecast-integratie. Wanneer dit aan staat wordt de verwachte productie van de voorspelde belasting afgetrokken, zodat de batterij geen energie hoeft te leveren die de zon al levert.",
           "solcast_entry_id": "Vereist wanneer de PV-voorspelling is ingeschakeld.",
-          "ev_power_entity": "Optionele flexibele belasting. Het geleerde verbruik sluit het laden van de auto uit wanneer dit is ingesteld."
+          "ev_power_entity": "Optionele flexibele belasting. Het geleerde verbruik sluit het laden van de auto uit wanneer dit is ingesteld.",
+          "selected_solcast_site_ids": "Selecteer elke locatie in uw Solcast-account die op dit AlphaESS-systeem is aangesloten. Andere locaties -- een tweede woning, iemand anders zijn panelen -- blijven buiten de planning. U hoeft niet aan te geven welke locatie op welke omvormer is aangesloten."
         }
       },
       "battery": {

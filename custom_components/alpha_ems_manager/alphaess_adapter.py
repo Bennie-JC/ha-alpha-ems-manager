@@ -77,7 +77,42 @@ class DeviceCapability:
     hold_monitor_available: bool
     excess_export_active: bool
     peak_shaving_active: bool
-    max_feed_to_grid_percent: float | None
+    #: The raw states of the two feature booleans, carried the way
+    #: ``failsafe_state`` already is.
+    #:
+    #: Needed because neither boolean is in ``REQUIRED_ENTITIES``, so neither
+    #: appears in ``missing`` or ``unavailable`` -- which meant an *unreadable*
+    #: Excess Export boolean was indistinguishable from one switched off. That is
+    #: the unsafe direction for the surplus-absorption question: Excess Export
+    #: sends production to the grid rather than the battery, so reading it as off
+    #: when it cannot be read at all would claim stored energy that is being
+    #: exported.
+    excess_export_state: str | None = None
+    peak_shaving_state: str | None = None
+    max_feed_to_grid_percent: float | None = None
+
+    @property
+    def feature_flags_present(self) -> bool:
+        """Return whether both feature booleans exist on this installation.
+
+        False means the vendor package is absent, so neither feature exists and
+        neither can be suppressing anything.
+        """
+        return (
+            self.excess_export_state is not None and self.peak_shaving_state is not None
+        )
+
+    @property
+    def feature_flags_readable(self) -> bool:
+        """Return whether both feature booleans could actually be read.
+
+        A boolean that exists and reads ``unavailable`` could be hiding a feature
+        that is switched on, which is a different answer from one that is absent.
+        """
+        return all(
+            state is not None and state not in _UNUSABLE_STATES
+            for state in (self.excess_export_state, self.peak_shaving_state)
+        )
 
     @property
     def ready(self) -> bool:
@@ -194,6 +229,8 @@ def discover(hass: HomeAssistant) -> DeviceCapability:
         hold_monitor_available=monitor == STATE_ON,
         excess_export_active=_state_of(hass, BOOLEAN_EXCESS_EXPORT) == STATE_ON,
         peak_shaving_active=_state_of(hass, BOOLEAN_PEAK_SHAVING) == STATE_ON,
+        excess_export_state=_state_of(hass, BOOLEAN_EXCESS_EXPORT),
+        peak_shaving_state=_state_of(hass, BOOLEAN_PEAK_SHAVING),
         max_feed_to_grid_percent=_numeric_state(hass, SENSOR_MAX_FEED_TO_GRID),
     )
 

@@ -1686,15 +1686,20 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         three booleans to find out.
         """
         capability = discover(self.hass)
-        if capability.unavailable:
-            return False, PV_ABSORPTION_STATE_UNREADABLE
         if capability.excess_export_active:
             return False, PV_ABSORPTION_EXCESS_EXPORT
         if capability.peak_shaving_active:
             return False, PV_ABSORPTION_PEAK_SHAVING
+        # Checked before the dispatch read, because a feature boolean that cannot
+        # be read could be hiding a feature that is on -- and neither boolean is
+        # in the required-entity set, so neither appears in ``unavailable``.
+        if capability.feature_flags_present and not capability.feature_flags_readable:
+            return False, PV_ABSORPTION_STATE_UNREADABLE
+        if capability.unavailable:
+            return False, PV_ABSORPTION_STATE_UNREADABLE
         if read_snapshot(self.hass).dispatch_active:
             return False, PV_ABSORPTION_DISPATCH_ACTIVE
-        if capability.missing:
+        if capability.missing or not capability.feature_flags_present:
             # No suppressing feature exists here, so ordinary self-consumption
             # applies. Named rather than folded into the permitted case, because
             # "there is nothing to suppress it" and "we checked and nothing is"

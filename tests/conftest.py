@@ -12,12 +12,14 @@ import sys
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_socket
-from homeassistant.core import HomeAssistant
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
 )
@@ -48,6 +50,9 @@ from custom_components.alpha_ems_manager.const import (
     DOMAIN,
     DOMAIN_FRANK,
     DOMAIN_SOLCAST,
+    SOLCAST_DOMAIN,
+    SOLCAST_SERVICE_DIAGNOSTIC,
+    SOLCAST_SERVICE_QUERY_FORECAST,
 )
 
 # On Windows every asyncio event loop creates an ``AF_INET`` socket for its
@@ -264,3 +269,134 @@ async def setup_integration(
     assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
     return mock_config_entry
+
+
+#: The two sites the live account reports, with their real figures.
+LIVE_SITES: tuple[dict[str, Any], ...] = (
+    {
+        "resource_id": "site-achterkant",
+        "name": "Achterkant",
+        "capacity": 5.0,
+        "capacity_dc": 3.65,
+        "azimuth": -75.0,
+        "tilt": 38.0,
+        "loss_factor": 0.9,
+    },
+    {
+        "resource_id": "site-voorkant",
+        "name": "Voorkant",
+        "capacity": 5.0,
+        "capacity_dc": 2.43,
+        "azimuth": 105.0,
+        "tilt": 38.0,
+        "loss_factor": 0.9,
+    },
+)
+
+#: The configuration block the live account reports, verbatim in substance.
+LIVE_CONFIGURATION: dict[str, Any] = {
+    "key_estimate": "estimate",
+    "get_actuals": False,
+    "use_actuals": 0,
+    "auto_dampen": False,
+    "hard_limit": 100.0,
+    "excluded_sites": [],
+    # Deliberately present, and deliberately never read: nothing may carry key
+    # material out of this boundary.
+    "api_key": "SECRET-KEY-VALUE",
+}
+
+
+class FakeSolcast:
+    """A stand-in for the Solcast integration's two read-only actions.
+
+    Registered with ``SupportsResponse.ONLY`` like the real ones, so a caller that
+    forgot ``return_response`` fails here exactly as it would in production.
+    """
+
+    def __init__(self) -> None:
+        self.sites: list[dict[str, Any]] = [dict(site) for site in LIVE_SITES]
+        self.configuration: dict[str, Any] = dict(LIVE_CONFIGURATION)
+        self.diagnostic_calls = 0
+        self.forecast_calls: list[dict[str, Any]] = []
+        #: Site identifiers that should return nothing, for the partial case.
+        self.silent_sites: set[str] = set()
+        self.fail_diagnostic = False
+        self.fail_forecast = False
+        #: kW per site, so a per-site sum is distinguishable from the aggregate.
+        self.power_by_site: dict[str, float] = {
+            "site-achterkant": 2.0,
+            "site-voorkant": 3.0,
+        }
+        self.aggregate_power = 5.0
+
+    def register(self, hass: HomeAssistant) -> None:
+        """Register both actions on the fake domain."""
+        hass.services.async_register(
+            SOLCAST_DOMAIN,
+            SOLCAST_SERVICE_DIAGNOSTIC,
+            self._diagnostic,
+            supports_response=SupportsResponse.ONLY,
+        )
+        hass.services.async_register(
+            SOLCAST_DOMAIN,
+            SOLCAST_SERVICE_QUERY_FORECAST,
+            self._forecast,
+            supports_response=SupportsResponse.ONLY,
+        )
+
+    async def _diagnostic(self, call: ServiceCall) -> dict[str, Any]:
+        self.diagnostic_calls += 1
+        if self.fail_diagnostic:
+            raise RuntimeError("solcast is reloading")
+        return {
+            "version": "v4.6.1",
+            "api_limit": 10,
+            "api_used": 8,
+            "forecast_health": "fresh",
+            "sites": [dict(site) for site in self.sites],
+            "configuration": dict(self.configuration),
+            "dampening": {"enabled": False, "auto_dampening": False},
+        }
+
+    async def _forecast(self, call: ServiceCall) -> dict[str, Any]:
+        self.forecast_calls.append(dict(call.data))
+        if self.fail_forecast:
+            raise RuntimeError("no cached data")
+        site = call.data.get("site")
+        if site in self.silent_sites:
+            return {"data": []}
+        kw = self.aggregate_power if site is None else self.power_by_site.get(site, 0.0)
+        start = datetime.fromisoformat(call.data["start_date_time"])
+        end = datetime.fromisoformat(call.data["end_date_time"])
+        rows: list[dict[str, Any]] = []
+        moment = start
+        while moment < end:
+            rows.append(
+                {
+                    "period_start": moment.astimezone(TZ),
+                    "pv_estimate": kw,
+                    "pv_estimate10": kw / 2.0,
+                    "pv_estimate90": kw * 2.0,
+                }
+            )
+            moment += timedelta(minutes=30)
+        return {"data": rows}
+
+
+@pytest.fixture
+def solcast(hass: HomeAssistant, solcast_config_entry: MockConfigEntry) -> FakeSolcast:
+    """Register the fake Solcast boundary and mark its entry loaded.
+
+    The entry state matters: the capability check refuses to query an integration
+    that is not loaded, which is what stops Alpha EMS calling into Solcast while
+    it is reloading. A bare ``MockConfigEntry`` is ``NOT_LOADED``.
+
+    Lives here rather than in a test module because two files need it, and
+    importing a fixture across test modules shadows the name in every test that
+    takes it as a parameter.
+    """
+    solcast_config_entry.mock_state(hass, ConfigEntryState.LOADED)
+    fake = FakeSolcast()
+    fake.register(hass)
+    return fake
