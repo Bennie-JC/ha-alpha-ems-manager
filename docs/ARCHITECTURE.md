@@ -1863,6 +1863,60 @@ low-pass-filtered PV figure while the balance check reads the raw one, so a thir
 term joins the two-meter difference during PV transients. Diagnostics-only, like
 the rest.
 
+### Capability is established from facts, never from another entry's state
+
+beta.9 decided whether the Solcast source could be read by asking whether its
+config entry was in state ``LOADED``. That was a category error, and it produced a
+live false negative on every Home Assistant restart: Solcast registers its actions
+at component level, so both are visible while its config entry is still setting
+up, and Alpha EMS takes its first refresh during its own setup. One diagnostics
+download reported both actions registered and the entry not loaded, in a single
+call.
+
+The rule now, asserted from the syntax tree: **the probe may not read any config
+entry internals.** Existence is a fact about configuration and is fair game;
+setup state, runtime data and everything else say nothing about whether a
+registered action can be called. ``ConfigEntryState`` is not imported in the
+module at all, so reaching for it again is a visible decision rather than an easy
+one.
+
+What replaced it is provable: an entry is selected, the stored id names an entry
+that exists, and the actions are registered. Failure is handled where it actually
+occurs -- a call that raises is caught and reported as a failed call, which is
+strictly better information than a guess made in advance.
+
+### A setup-time reading is provisional
+
+The first refresh happens during this entry's own setup, and refreshes are then
+driven by the quarter-hour tick rather than an interval. Anything read at setup --
+before the AlphaESS Modbus sensors have published, or before a consumed
+integration has loaded -- therefore stood for up to fifteen minutes. That is what
+made the beta.9 symptom look permanent, and it is also why the battery plan
+reported a missing state of charge beside a live reading of 96 %.
+
+A refresh now also runs on ``async_at_started``, which fires immediately when Home
+Assistant is already running so a reload behaves like a cold boot. It uses
+``async_refresh`` rather than ``async_request_refresh``: the requesting form is
+debounced, and a startup refresh colliding with a user action inside the cooldown
+would collapse the two -- with the survivor possibly being the one taken *before*
+the user acted.
+
+One consequence worth knowing: a reload now performs two refreshes rather than one,
+so per-refresh tallies such as duplicate issuances double. Nothing is issued twice;
+the same content fingerprint is simply recognised twice.
+
+### Two instants, said out loud
+
+Diagnostics mixes live probes with snapshots from the last refresh, and beta.9
+printed a stale capability beside a live availability flag computed by a *different
+rule*. The pair contradicted itself and there was nothing in the payload to say
+why.
+
+Now there is one definition of availability, the capability block is probed at
+download time, the last refresh's capability is kept beside it under its own name,
+and the refresh instant is published. An invariant test asserts the two cannot
+disagree.
+
 ### Known open items — Phase 5
 
 **Which selected site feeds which AlphaESS subsystem is unknown.** Solcast divides

@@ -9,6 +9,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.10] - 2026-08-20
+
+**Hotfix for a live beta.9 defect: the PV forecast never started.** On a real
+installation, after a full Home Assistant restart, Alpha EMS refused to read a
+Solcast source that was demonstrably working — the site selector never appeared in
+the options form and planning stayed PV-blind. Every restart reproduced it.
+
+### Fixed
+
+- **Solcast capability was decided from something unprovable.** beta.9 required
+  the Solcast config entry to be in state `LOADED`. Solcast registers its actions
+  at component level, so they are visible while its config entry is still setting
+  up — and Alpha EMS takes its first refresh during its own setup, which can win
+  that race. One diagnostics download therefore reported both actions registered
+  *and* the entry not loaded, captured in a single call.
+
+  That state was never load-bearing. Calling a registered action is safe by
+  definition, and a failure was already caught and reported as a failed call
+  rather than guessed at in advance. So `entry_loaded` is **removed** rather than
+  forced true, and capability now comes from facts that can be demonstrated: an
+  entry is selected, the stored id names an entry that exists, and the two
+  read-only actions are registered.
+
+  `solcast_entry_not_loaded` is replaced by `solcast_entry_not_found`, which is
+  provable — Solcast removed, or removed and re-added under a new id. A missing
+  *diagnostic* action is now named separately from a missing *query* action,
+  because one costs the site list and the other costs the forecast.
+- **A reading taken during setup could stand for a quarter of an hour.** Refreshes
+  are driven by the quarter-hour tick rather than an interval, so anything read
+  before the sources had published held until the next boundary. A refresh now
+  also runs once Home Assistant reports itself started, after every integration
+  has had its chance to load.
+
+  This is also why the battery plan reported `missing_soc` beside a live state of
+  charge of 96 %. The refusal itself was right — with no state of charge there is
+  nothing to apply the model to — but it should not have been unrevisitable.
+- **The one-time site-membership write reloaded the entry from inside a refresh.**
+  Writing the options fires this entry's own update listener, and doing that
+  inline tore the coordinator down halfway through the refresh that had just
+  resolved the answer. The write is deferred and re-checks before writing, so a
+  user answering the question themselves is never overwritten by a default
+  resolved from discovery.
+- **Diagnostics could contradict itself, and now cannot.** `solcast_available`
+  asked whether the entry was loaded and answered at download time, while the `pv`
+  block carried a capability from the last refresh — two definitions and two
+  instants, printed as though they described the same thing. There is one
+  definition now, the capability block is probed live, the last refresh's snapshot
+  is kept beside it under its own name, and the refresh instant is published. An
+  invariant test asserts the pair the user saw is unrepresentable.
+
+### Not a defect
+
+`pv.actual_today.intervals_recorded: 0` immediately after a restart is expected: no
+complete quarter had elapsed, and a partly observed quarter cannot be recorded
+without inventing the unobserved remainder. Both cases now have tests, so which is
+which is asserted rather than argued.
+
+### Unchanged
+
+No new entities, no new configuration options, no storage or config-entry version
+change. Execution remains structurally unavailable, `SHADOW` still writes nothing,
+and `ACTIVE` still cannot execute — asserted again from the recovery path, driving
+a recovered source through active mode and confirming zero service calls. No
+mutating Solcast action exists anywhere in the package. The two known findings
+stand: the small energy-balance boundary residual is still a limitation with no
+tolerance widened, and the +1394 W gross-fault sample is still recorded and still
+not a control input.
+
+### Verification
+
+Tests 1844 → **1897**. Every new test fails on beta.9 behaviour, and the beta.9
+probe is reproduced verbatim beside the new one so the disagreement is visible
+rather than asserted. Twenty-one mutations shaped like the original mistake —
+reinstating the state check, inferring from runtime data, dropping the existence
+check, assuming the actions exist, caching the refusal — plus a structural guard
+that forbids reading *any* config-entry internals to decide capability, since
+inferring it from someone else's setup state is the category error this defect was.
+
+CI green on the release SHA: Lint, Tests, Hassfest, HACS validation.
+
 ## [1.0.0-beta.9] - 2026-08-20
 
 **Phase 5: Solcast PV Forecast Integration.** Alpha EMS was completely blind to
@@ -1105,7 +1185,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.9...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.10...HEAD
+[1.0.0-beta.10]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.9...v1.0.0-beta.10
 [1.0.0-beta.9]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.8...v1.0.0-beta.9
 [1.0.0-beta.8]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.7...v1.0.0-beta.8
 [1.0.0-beta.7]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.6...v1.0.0-beta.7

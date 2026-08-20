@@ -2424,7 +2424,24 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # -- consumed integrations -------------------------------------------
 
     def _entry_loaded(self, domain: str, entry_id: str | None) -> bool:
-        """Return whether a referenced config entry is present and loaded."""
+        """Return whether a referenced config entry is present and loaded.
+
+        **Do not use this to decide whether another integration can be read.**
+        Only ``frank_available`` still consults it, and only to report a status
+        nothing acts on -- Frank is not consumed yet.
+
+        The PV layer used to ask this question and it was wrong to. Setup state
+        says nothing about whether a registered action can be called: an
+        integration that registers its actions at component level has them
+        available while its config entry is still setting up, so requiring
+        ``LOADED`` produced a live false negative on every restart. See
+        ``solcast_source.SolcastCapability``, which establishes capability from
+        the entry existing and the actions being registered instead.
+
+        Phase 6 will start consuming Frank, and this is the trap it should not
+        walk into: work out what can actually be called, not what state somebody
+        else's entry happens to be in.
+        """
         for entry in self.hass.config_entries.async_entries(domain):
             if entry_id is not None and entry.entry_id != entry_id:
                 continue
