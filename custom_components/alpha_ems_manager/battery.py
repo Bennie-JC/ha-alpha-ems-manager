@@ -670,25 +670,37 @@ class GridEnergy:
 
 
 def split_grid_energy(
-    *, load_ac_kwh: float, charge_ac_kwh: float, discharge_ac_kwh: float
+    *,
+    load_ac_kwh: float,
+    charge_ac_kwh: float,
+    discharge_ac_kwh: float,
+    pv_ac_kwh: float = 0.0,
 ) -> GridEnergy:
     """Return the grid exchange implied by one interval's AC flows.
 
-    There is deliberately **no photovoltaic term**: forecasting production is a
-    later phase, and inventing one here would be exactly the fabrication this
-    project refuses. The consequence has to be stated wherever these figures
-    appear -- for a household with solar, simulated import will substantially
-    exceed reality, because the real array is covering load the model cannot see.
-    These are a battery-only counterfactual, not a grid forecast.
+    ``pv_ac_kwh`` defaults to zero, which is what every caller passed before a
+    photovoltaic forecast existed and what a caller without one still passes. It
+    is a *forecast* of production, not an invention of one: with no forecast the
+    term stays absent and the figures remain the battery-only counterfactual they
+    always were -- for a household with solar, simulated import then substantially
+    exceeds reality, because the real array is covering load the model cannot see.
+    That caveat has to be stated wherever these figures appear, and it stops being
+    true only for the intervals a real forecast covers.
 
-    Note also that export can only be non-zero when discharge exceeds load, which
-    is legitimate but surprising in a phase with no production term.
+    Every term is netted here, in AC energy, before anything is converted. That is
+    the same rule that makes :class:`BatteryRequest` refuse a signed power:
+    netting after conversion destroys energy invisibly, because a charge and a
+    discharge of equal size are not inverse operations once efficiency is applied.
+
+    Export can be non-zero either because discharge exceeds the remaining load or
+    because production does, and the second is now a real case rather than a
+    surprising artefact.
 
     A grid limit is not modelled. Adding one later turns this into a fixed-point
     problem, because a grid clamp constrains the battery request, which changes
     the residual. Worth knowing before attempting it.
     """
-    net = load_ac_kwh + charge_ac_kwh - discharge_ac_kwh
+    net = load_ac_kwh - pv_ac_kwh + charge_ac_kwh - discharge_ac_kwh
     return GridEnergy(import_kwh=max(0.0, net), export_kwh=max(0.0, -net))
 
 

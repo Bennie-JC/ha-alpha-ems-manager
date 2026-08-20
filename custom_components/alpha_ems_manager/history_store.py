@@ -60,6 +60,7 @@ from .const import (
     FORECAST_SUMMARY_RETENTION_DAYS,
 )
 from .forecast_history import DayOutcome, ForecastSnapshot
+from .pv_forecast import PvOutcome, PvSnapshot
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -145,6 +146,10 @@ class DayIndexRow:
     summary: dict[str, Any] | None = None
     #: True once the per-interval arrays have been pruned from the partitions.
     raw_pruned: bool = False
+    #: Content fingerprints of the photovoltaic issuances recorded for this day.
+    #: Kept in the index rather than the partition so the ninety-odd refreshes a
+    #: day that change nothing need not load a month of arrays to discover it.
+    pv_fingerprints: list[str] = field(default_factory=list)
 
     @property
     def snapshot_count(self) -> int:
@@ -164,6 +169,8 @@ class DayIndexRow:
             payload["sum"] = self.summary
         if self.raw_pruned:
             payload["rp"] = True
+        if self.pv_fingerprints:
+            payload["pvfp"] = list(self.pv_fingerprints)
         return payload
 
     @classmethod
@@ -189,6 +196,11 @@ class DayIndexRow:
             finalized_at=finalized if isinstance(finalized, str) else None,
             summary=summary if isinstance(summary, dict) else None,
             raw_pruned=bool(raw.get("rp")),
+            pv_fingerprints=(
+                [str(value) for value in raw.get("pvfp")]
+                if isinstance(raw.get("pvfp"), list)
+                else []
+            ),
         )
 
 
@@ -200,6 +212,18 @@ class _Partition:
     store: _ForecastStoreBackend
     snapshots: dict[date, list[ForecastSnapshot]] = field(default_factory=dict)
     outcomes: dict[date, DayOutcome] = field(default_factory=dict)
+    #: Photovoltaic evidence, namespaced beside the load evidence rather than in
+    #: a store of its own.
+    #:
+    #: A third partitioned store would have duplicated seven hundred lines of
+    #: partitioning, atomic writes, write ordering, corruption suspension,
+    #: never-write-after-failed-read and the month sweep -- and Phase 3 rejected
+    #: exactly that reasoning for plan storage. The counter-argument is different
+    #: failure blast radii, which is weaker here: load and PV evidence for the
+    #: same day are analysed together, and the load snapshots already share a
+    #: partition with their own outcomes.
+    pv_snapshots: dict[date, list[PvSnapshot]] = field(default_factory=dict)
+    pv_outcomes: dict[date, PvOutcome] = field(default_factory=dict)
     #: Set when this partition could not be read. Writes to it are suspended for
     #: the session; the rest of the history keeps working.
     corrupt: bool = False
@@ -208,7 +232,13 @@ class _Partition:
     def to_dict(self) -> dict[str, Any]:
         """Return the compact serialisable form."""
         days: dict[str, Any] = {}
-        for day in sorted(set(self.snapshots) | set(self.outcomes)):
+        known = (
+            set(self.snapshots)
+            | set(self.outcomes)
+            | set(self.pv_snapshots)
+            | set(self.pv_outcomes)
+        )
+        for day in sorted(known):
             entry: dict[str, Any] = {}
             snapshots = self.snapshots.get(day)
             if snapshots:
@@ -216,6 +246,14 @@ class _Partition:
             outcome = self.outcomes.get(day)
             if outcome is not None:
                 entry["o"] = outcome.to_dict()
+            # Omitted entirely on an installation without PV, exactly as the
+            # flexible-load arrays are in the learning store.
+            pv_snapshots = self.pv_snapshots.get(day)
+            if pv_snapshots:
+                entry["pvs"] = [snapshot.to_dict() for snapshot in pv_snapshots]
+            pv_outcome = self.pv_outcomes.get(day)
+            if pv_outcome is not None:
+                entry["pvo"] = pv_outcome.to_dict()
             if entry:
                 days[day.isoformat()] = entry
         return {"days": days}
@@ -351,6 +389,20 @@ class ForecastHistoryStore:
             outcome = DayOutcome.from_dict(day, value.get("o"))
             if outcome is not None:
                 partition.outcomes[day] = outcome
+            pv_raw = value.get("pvs")
+            if isinstance(pv_raw, list):
+                rebuilt_pv = [
+                    snapshot
+                    for snapshot in (
+                        PvSnapshot.from_dict(day, entry) for entry in pv_raw
+                    )
+                    if snapshot is not None
+                ]
+                if rebuilt_pv:
+                    partition.pv_snapshots[day] = rebuilt_pv
+            pv_outcome = PvOutcome.from_dict(day, value.get("pvo"))
+            if pv_outcome is not None:
+                partition.pv_outcomes[day] = pv_outcome
         return partition
 
     async def async_ensure_days(self, days: list[date]) -> None:
@@ -412,6 +464,96 @@ class ForecastHistoryStore:
         )
 
     # -- writing ---------------------------------------------------------
+
+    def pv_snapshots(self, day: date) -> list[PvSnapshot]:
+        """Return the PV issuances recorded for a target day."""
+        partition = self._partitions.get(month_key(day))
+        if partition is None:
+            return []
+        return list(partition.pv_snapshots.get(day, ()))
+
+    def latest_pv_snapshot(self, day: date) -> PvSnapshot | None:
+        """Return the most recent PV issuance for a target day, or ``None``.
+
+        The most recent is what the headline comparison uses. Every earlier one is
+        retained, because a forecast issued at breakfast and one issued at noon
+        are different claims about the same day and a later phase will want both.
+        """
+        snapshots = self.pv_snapshots(day)
+        if not snapshots:
+            return None
+        return max(snapshots, key=lambda snapshot: snapshot.issued_at)
+
+    def pv_outcome(self, day: date) -> PvOutcome | None:
+        """Return the finalised PV comparison for a target day, or ``None``."""
+        partition = self._partitions.get(month_key(day))
+        if partition is None:
+            return None
+        return partition.pv_outcomes.get(day)
+
+    def has_pv_fingerprint(self, day: date, fingerprint: str) -> bool:
+        """Return whether this PV forecast has already been recorded.
+
+        Read from the index rather than the partition, so the ninety-odd refreshes
+        a day that change nothing do not have to load a month of arrays to find
+        that out.
+        """
+        row = self.days.get(day)
+        return row is not None and fingerprint in row.pv_fingerprints
+
+    def add_pv_snapshot(self, snapshot: PvSnapshot) -> bool:
+        """Persist a PV issuance, unless it duplicates one already recorded.
+
+        Change-triggered by content fingerprint, exactly as the load snapshots
+        are. The source updates a handful of times a day at best, so this bounds
+        growth naturally rather than by a cap that would have to be tuned.
+        """
+        day = snapshot.target_day
+        if not self.writable(day):
+            return False
+        if self.has_pv_fingerprint(day, snapshot.fingerprint):
+            return False
+
+        row = self.days.setdefault(day, DayIndexRow())
+        if len(row.pv_fingerprints) >= FORECAST_MAX_SNAPSHOTS_PER_TARGET:
+            self.snapshot_cap_hits += 1
+            _LOGGER.warning(
+                "Forecast history already holds %d photovoltaic snapshots for "
+                "%s, which is the per-day ceiling, so this issuance is not being "
+                "recorded. The records already kept are unaffected",
+                len(row.pv_fingerprints),
+                day.isoformat(),
+            )
+            return False
+
+        partition = self._partitions[month_key(day)]
+        partition.pv_snapshots.setdefault(day, []).append(snapshot)
+        partition.dirty = True
+
+        row.pv_fingerprints.append(snapshot.fingerprint)
+        row.interval_count = snapshot.interval_count
+        self.months.add(month_key(day))
+        self._index_dirty = True
+        return True
+
+    def set_pv_outcome(self, outcome: PvOutcome) -> bool:
+        """Persist a finalised PV comparison.
+
+        Idempotent, like its load-side counterpart: finalisation is a pure
+        recomputation from the stored snapshot and the learning history, so
+        writing it twice produces the same document.
+        """
+        day = outcome.target_day
+        if not self.writable(day):
+            return False
+
+        partition = self._partitions[month_key(day)]
+        partition.pv_outcomes[day] = outcome
+        partition.dirty = True
+        self.days.setdefault(day, DayIndexRow())
+        self.months.add(month_key(day))
+        self._index_dirty = True
+        return True
 
     def add_snapshot(self, snapshot: ForecastSnapshot) -> bool:
         """Persist an issuance, unless it duplicates the last one for its target.

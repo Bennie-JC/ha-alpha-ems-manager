@@ -51,6 +51,8 @@ from .forecast_history import (
 from .metrics import compute_window, window_from_summaries
 from .plan import plan_as_dict
 from .policy import DEFAULT_POLICY, SHIPPED_POLICIES
+from .pv_forecast import PvForecast, pv_error_metrics
+from .solcast_source import SolcastFacts
 from .storage import DayRecord, elapsed_quarters_for, expected_quarters_for
 
 
@@ -523,6 +525,105 @@ def _battery_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any]
     return payload
 
 
+#: Most sites reported individually. A list in a diagnostics payload is held to
+#: sixteen entries, and an account with more roofs than this is described by its
+#: counts and its declared set rather than by silently truncating the list -- a
+#: truncated list reads as complete, which is worse than an explicit count.
+MAX_PV_SITES_REPORTED = 12
+
+
+def _pv_site_report(
+    facts: SolcastFacts | None, selected: tuple[str, ...]
+) -> dict[str, Any]:
+    """Return what is known about the rooftop sites, bounded."""
+    if facts is None:
+        return {
+            "discovered": None,
+            "note": (
+                "the source's own diagnostic could not be read this refresh, so "
+                "nothing is claimed about which sites exist"
+            ),
+        }
+
+    known = {site.resource_id for site in facts.sites}
+    listed = sorted(facts.sites, key=lambda site: site.name.lower())
+    return {
+        "discovered": len(facts.sites),
+        "selected": len(selected),
+        "sites": [site.as_dict() for site in listed[:MAX_PV_SITES_REPORTED]],
+        "sites_not_listed": max(0, len(listed) - MAX_PV_SITES_REPORTED),
+        "selected_ids": list(selected[:MAX_PV_SITES_REPORTED]),
+        # Declared but no longer offered by the source. Reported rather than
+        # dropped: a declaration must not narrow itself because of an outage.
+        "selected_but_missing": sorted(set(selected) - known)[:MAX_PV_SITES_REPORTED],
+        # Present in the account and deliberately not part of this installation.
+        "available_but_not_selected": sorted(known - set(selected))[
+            :MAX_PV_SITES_REPORTED
+        ],
+        "excluded_by_source": list(facts.excluded_sites[:MAX_PV_SITES_REPORTED]),
+        "question_asked": (
+            "which rooftop sites belong to this installation, and nothing else. "
+            "the user is never asked which site is AC- or DC-coupled, or which "
+            "feeds the hybrid: that is not reliably knowable to them, and a "
+            "guessed topology recorded as fact would be worse than the declared "
+            "unknown stored instead"
+        ),
+    }
+
+
+def _pv_forecast_report(forecast: PvForecast | None) -> dict[str, Any]:
+    """Return one day's forecast state, counts only."""
+    if forecast is None:
+        return {"available": False, "unavailable_reason": "not_evaluated"}
+    payload = forecast.as_dict()
+    payload["percentiles_available"] = bool(
+        [value for value in forecast.p10 if value is not None]
+    )
+    return payload
+
+
+def _pv_evidence_report(history: Any, today: date) -> dict[str, Any]:
+    """Return the stored forecast-versus-actual evidence, derived on demand.
+
+    The metrics are recomputed from the two stored sides rather than stored, which
+    is the rule the load-side metrics already follow: a stored statistic is a
+    second source of truth, and the first time it disagreed with the arrays beside
+    it, it is the stored one that would be believed.
+    """
+    yesterday = today - timedelta(days=1)
+    snapshot = history.latest_pv_snapshot(yesterday)
+    outcome = history.pv_outcome(yesterday)
+    return {
+        "target_day": yesterday.isoformat(),
+        "snapshots_today": len(history.pv_snapshots(today)),
+        "snapshots_yesterday": len(history.pv_snapshots(yesterday)),
+        "issued_total_kwh": None if snapshot is None else snapshot.total_kwh,
+        "comparison": pv_error_metrics(snapshot, outcome),
+        "adaptive_correction": (
+            "none. Phase 5 records what was forecast and what was measured and "
+            "computes no correction, no bias term and no dampening of its own, so "
+            "a bad day cannot change the next day's forecast"
+        ),
+    }
+
+
+def _pv_actual_report(record: DayRecord | None, elapsed: int) -> dict[str, Any]:
+    """Return how much measured generation today has, and how complete it is."""
+    if record is None:
+        return {"intervals_recorded": 0, "total_kwh": 0.0}
+    covered = max(1, elapsed)
+    return {
+        "intervals_recorded": record.pv_sample_count,
+        "total_kwh": record.pv_total_kwh,
+        "coverage_so_far": _fraction(record.pv_sample_count, covered),
+        "note": (
+            "measured generation, integrated on the same machinery as house "
+            "load and subject to the same coverage threshold. a missing interval "
+            "is missing, never zero"
+        ),
+    }
+
+
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: AlphaEmsConfigEntry
 ) -> dict[str, Any]:
@@ -833,6 +934,53 @@ async def async_get_config_entry_diagnostics(
         # shadow and active, which is what makes shadow worth reading: the
         # verdict and the command list below are the real ones. Nothing is sent.
         "control": coordinator.control_report,
+        "pv": {
+            "enabled": config.use_pv_forecast,
+            "capability": coordinator.pv_capability.as_dict(),
+            "source": (
+                None if coordinator.pv_facts is None else coordinator.pv_facts.as_dict()
+            ),
+            "sites": _pv_site_report(
+                coordinator.pv_facts, config.selected_solcast_site_ids
+            ),
+            "selection_stored": config.solcast_selection_stored,
+            "forecast_today": _pv_forecast_report(
+                coordinator.pv_forecasts.get(today_date)
+            ),
+            "forecast_tomorrow": _pv_forecast_report(
+                coordinator.pv_forecasts.get(today_date + timedelta(days=1))
+            ),
+            "mapping": (
+                coordinator.pv_forecasts[today_date].mapping.as_dict()
+                if today_date in coordinator.pv_forecasts
+                else None
+            ),
+            "provenance": (
+                coordinator.pv_forecasts[today_date].provenance.as_dict()
+                if today_date in coordinator.pv_forecasts
+                else None
+            ),
+            "absorption": (coordinator.data or {}).get("pv_absorption"),
+            "actual_today": _pv_actual_report(
+                store.days.get(today_date),
+                elapsed_quarters_for(today_date, tz, now),
+            ),
+            "evidence": _pv_evidence_report(coordinator.history, today_date),
+            "quota": {
+                "note": (
+                    "the two actions Alpha EMS calls read the source's own cache "
+                    "and consume none of the account's allowance, so a low "
+                    "remaining count explains a stale forecast without being "
+                    "caused by this integration"
+                ),
+            },
+            "daylight_note": (
+                "the daylight window is advisory: it never modifies a forecast "
+                "value and sits on no safety path. generation forecast outside it "
+                "is the signature of a timezone or offset error, and is reported "
+                "rather than clamped"
+            ),
+        },
         "consumed_integrations": {
             "frank_entry_id": config.frank_entry_id,
             "frank_available": coordinator.frank_available,

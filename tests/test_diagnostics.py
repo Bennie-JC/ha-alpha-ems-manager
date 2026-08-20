@@ -34,6 +34,10 @@ async def test_diagnostics_report_every_documented_section(
         "forecast_history",
         "battery_plan",
         "control",
+        # Phase 5. Sixteen sections to seventeen: a dict key rather than a list
+        # entry, so the sixteen-item list ceiling every payload is held to is
+        # untouched.
+        "pv",
         "consumed_integrations",
     }
 

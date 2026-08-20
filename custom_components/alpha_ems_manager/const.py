@@ -1201,3 +1201,34 @@ SOLCAST_FORBIDDEN_SERVICES: Final = (
 #: minutes is not a tolerance to be widened; it is the resolution the whole
 #: project is built on.
 PV_SOURCE_PERIOD_STEP_MINUTES: Final = QUARTER_MINUTES
+
+#: Why surplus production is or is not modelled as entering the battery.
+#:
+#: The approved Phase-5 design treated autonomous absorption as unconditional
+#: physics. The vendor control surface contradicts that in its own design notes:
+#: with Excess Export on, PV below the inverter's AC limit goes to house load and
+#: feed-in and the battery is charged with zero. So it is predicated on observable
+#: state, and the reason is recorded rather than assumed.
+PV_ABSORPTION_SELF_CONSUMPTION: Final = "self_consumption"
+PV_ABSORPTION_NO_SUPPRESSING_FEATURE: Final = "no_suppressing_feature_present"
+PV_ABSORPTION_EXCESS_EXPORT: Final = "excess_export_active"
+PV_ABSORPTION_PEAK_SHAVING: Final = "peak_shaving_active"
+PV_ABSORPTION_DISPATCH_ACTIVE: Final = "dispatch_active"
+PV_ABSORPTION_STATE_UNREADABLE: Final = "device_state_unreadable"
+
+PV_ABSORPTION_REASONS: Final = (
+    PV_ABSORPTION_SELF_CONSUMPTION,
+    PV_ABSORPTION_NO_SUPPRESSING_FEATURE,
+    PV_ABSORPTION_EXCESS_EXPORT,
+    PV_ABSORPTION_PEAK_SHAVING,
+    PV_ABSORPTION_DISPATCH_ACTIVE,
+    PV_ABSORPTION_STATE_UNREADABLE,
+)
+
+#: The vendor helper that carries the inverter's configured AC limit, read for
+#: one purpose only: telling a clipped day from an over-forecast one. On a big day
+#: the forecast exceeds the actual by design, because an inverter cannot pass more
+#: than its limit however bright it is, and Phase 9 must not learn a correction
+#: for that. Absent means the detection is suppressed rather than a ceiling
+#: guessed -- a guessed limit would produce a flag that looked like evidence.
+SELECT_INVERTER_AC_LIMIT: Final = "input_select.alphaess_helper_inverter_ac_limit"

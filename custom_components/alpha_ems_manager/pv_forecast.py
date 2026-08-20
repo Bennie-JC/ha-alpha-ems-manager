@@ -66,9 +66,13 @@ from itertools import pairwise
 from typing import Any
 
 from .const import (
+    BATTERY_KWH_PRECISION,
     PV_ACTUAL_BOUNDARY_MIXED,
     PV_AGGREGATE_SITE,
     PV_ELECTRICAL_CORRESPONDENCE_UNKNOWN,
+    PV_FLAG_CLIPPING_SUSPECTED,
+    PV_FLAG_SHAPE_MISMATCH,
+    PV_FLAG_TIMEZONE_CHANGED,
     PV_FORECAST_BOUNDARY_UNSPECIFIED,
     PV_MAPPING_VERSION,
     PV_PERCENTILE_COMONOTONIC_SUM,
@@ -77,6 +81,13 @@ from .const import (
     PV_QUERY_MODE_PER_SITE,
     PV_SELECTION_ORIGIN_AUTO,
     PV_SOURCE_PERIOD_STEP_MINUTES,
+    PV_STATUS_ACTUAL_MISSING,
+    PV_STATUS_FORECAST_MISSING,
+    PV_STATUS_NIGHT,
+    PV_STATUS_NOT_ELAPSED,
+    PV_STATUS_PARTIAL_SITES,
+    PV_STATUS_PV_BLIND,
+    PV_STATUS_VALID,
     PV_UNAVAILABLE_NO_ROWS,
     PV_UNAVAILABLE_PERIOD_REFUSED,
     PV_UNAVAILABLE_UNUSABLE_ROWS,
@@ -910,3 +921,442 @@ def _sum_arrays(arrays: Sequence[Sequence[float | None]]) -> tuple[float | None,
         ]
         result.append(round(sum(present), 6) if present else None)
     return tuple(result)
+
+
+# --- forecast against actual ---------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class PvSnapshot:
+    """One issuance of a PV forecast, as it was issued.
+
+    The raw series, never a corrected one. Phase 5 computes no adaptive
+    correction of any kind, and this is the record a later phase would need in
+    order to compute one honestly -- which it cannot do from a series that had
+    already been adjusted.
+
+    Percentile bands are retained at interval resolution rather than as daily
+    scalars. A snapshot is a historical record, so uncertainty for a day that has
+    already passed cannot be back-filled; the bands cost nothing to fetch and
+    are irrecoverable afterwards.
+    """
+
+    issued_at: datetime
+    target_day: date
+    tz_key: str
+    interval_count: int
+    horizon_days: int
+    available: bool
+    unavailable_reason: str | None
+    predicted: tuple[float | None, ...]
+    p10: tuple[float | None, ...]
+    p90: tuple[float | None, ...]
+    daylight: tuple[bool, ...]
+    sites_contributing: tuple[int, ...]
+    fingerprint: str
+    provenance: PvProvenance
+
+    def predicted_at(self, index: int) -> float | None:
+        """Return one interval's issued forecast, or ``None``."""
+        if not 0 <= index < len(self.predicted):
+            return None
+        return self.predicted[index]
+
+    @property
+    def total_kwh(self) -> float | None:
+        """Return the issued total across the intervals that carried a value."""
+        present = [value for value in self.predicted if value is not None]
+        return round(sum(present), BATTERY_KWH_PRECISION) if present else None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the compact serialisable form.
+
+        Short keys throughout, like every other stored document in this project:
+        a year of quarter-hour arrays is where the bytes are.
+        """
+        return {
+            "at": self.issued_at.isoformat(),
+            "tz": self.tz_key,
+            "n": self.interval_count,
+            "h": self.horizon_days,
+            "a": 1 if self.available else 0,
+            "r": self.unavailable_reason,
+            "p": list(self.predicted),
+            "lo": list(self.p10),
+            "hi": list(self.p90),
+            "d": _mask_to_text(self.daylight),
+            "c": list(self.sites_contributing),
+            "f": self.fingerprint,
+            "pr": self.provenance.as_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, target_day: date, raw: Any) -> PvSnapshot | None:
+        """Rebuild a snapshot, or return ``None`` when the entry is unusable."""
+        if not isinstance(raw, Mapping):
+            return None
+        issued = _parse_moment(raw.get("at"))
+        count = raw.get("n")
+        if issued is None or not isinstance(count, int) or isinstance(count, bool):
+            return None
+        if not 1 <= count <= 2 * 96:
+            return None
+        tz_key = raw.get("tz")
+        return cls(
+            issued_at=issued,
+            target_day=target_day,
+            tz_key=tz_key if isinstance(tz_key, str) and tz_key else "UTC",
+            interval_count=count,
+            horizon_days=(raw["h"] if isinstance(raw.get("h"), int) else 0),
+            available=bool(raw.get("a")),
+            unavailable_reason=(raw["r"] if isinstance(raw.get("r"), str) else None),
+            predicted=_optional_series(raw.get("p"), count),
+            p10=_optional_series(raw.get("lo"), count),
+            p90=_optional_series(raw.get("hi"), count),
+            daylight=_mask_from_text(raw.get("d"), count),
+            sites_contributing=_int_series(raw.get("c"), count),
+            fingerprint=str(raw.get("f") or ""),
+            provenance=PvProvenance(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PvOutcome:
+    """What a day's generation turned out to be, beside what was forecast.
+
+    ``status`` carries one code per interval rather than a single day-level
+    verdict, because telling the cases apart is the entire point. A residual that
+    collapses "the forecast was wrong", "the sensor was down", "it was night",
+    "no forecast was ever obtained" and "one declared site went quiet" into one
+    number is not evidence of anything.
+    """
+
+    target_day: date
+    finalized_at: datetime
+    tz_key: str
+    interval_count: int
+    actual: tuple[float | None, ...]
+    status: tuple[str, ...]
+    flags: tuple[str, ...] = ()
+
+    @property
+    def scored_indices(self) -> tuple[int, ...]:
+        """Return the intervals that are genuinely comparable."""
+        return tuple(
+            index for index, code in enumerate(self.status) if code == PV_STATUS_VALID
+        )
+
+    def status_counts(self) -> dict[str, int]:
+        """Return how many intervals fell into each status."""
+        counts: dict[str, int] = {}
+        for code in self.status:
+            counts[code] = counts.get(code, 0) + 1
+        return counts
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the compact serialisable form."""
+        return {
+            "at": self.finalized_at.isoformat(),
+            "tz": self.tz_key,
+            "n": self.interval_count,
+            "a": list(self.actual),
+            "st": list(self.status),
+            "fl": list(self.flags),
+        }
+
+    @classmethod
+    def from_dict(cls, target_day: date, raw: Any) -> PvOutcome | None:
+        """Rebuild an outcome, or return ``None`` when the entry is unusable."""
+        if not isinstance(raw, Mapping):
+            return None
+        finalized = _parse_moment(raw.get("at"))
+        count = raw.get("n")
+        if finalized is None or not isinstance(count, int) or isinstance(count, bool):
+            return None
+        if not 1 <= count <= 2 * 96:
+            return None
+        tz_key = raw.get("tz")
+        statuses = raw.get("st")
+        status = (
+            tuple(
+                code if isinstance(code, str) else PV_STATUS_ACTUAL_MISSING
+                for code in statuses[:count]
+            )
+            if isinstance(statuses, list)
+            else ()
+        )
+        status = status + (PV_STATUS_ACTUAL_MISSING,) * (count - len(status))
+        flags = raw.get("fl")
+        return cls(
+            target_day=target_day,
+            finalized_at=finalized,
+            tz_key=tz_key if isinstance(tz_key, str) and tz_key else "UTC",
+            interval_count=count,
+            actual=_optional_series(raw.get("a"), count),
+            status=status,
+            flags=(
+                tuple(str(flag) for flag in flags) if isinstance(flags, list) else ()
+            ),
+        )
+
+
+def fingerprint_pv(forecast: PvForecast) -> str:
+    """Return the content fingerprint of a forecast, for change-triggered issuance.
+
+    Content, not time. The source updates a handful of times a day at best -- the
+    live account has an allowance of ten calls -- so recording every refresh would
+    store ninety-six identical documents a day. Two issuances with the same
+    fingerprint are the same forecast, whatever the clock said.
+
+    Provenance identity is folded in, so a forecast that happens to carry the same
+    numbers after the declared site set changed is still a different issuance.
+    """
+    return _fingerprint(
+        [
+            forecast.target_day.isoformat(),
+            forecast.interval_count,
+            forecast.available,
+            forecast.unavailable_reason,
+            forecast.intervals,
+            forecast.p10,
+            forecast.p90,
+            forecast.provenance.selected_sites_identity,
+            forecast.provenance.selected_sites_model,
+            forecast.provenance.correction_key,
+            forecast.provenance.query_mode,
+            forecast.provenance.mapping_version,
+        ]
+    )
+
+
+def build_pv_snapshot(
+    forecast: PvForecast, *, issued_at: datetime, today: date
+) -> PvSnapshot:
+    """Return the snapshot to store for one issued forecast."""
+    return PvSnapshot(
+        issued_at=issued_at,
+        target_day=forecast.target_day,
+        tz_key=forecast.tz_key,
+        interval_count=forecast.interval_count,
+        horizon_days=(forecast.target_day - today).days,
+        available=forecast.available,
+        unavailable_reason=forecast.unavailable_reason,
+        predicted=forecast.intervals,
+        p10=forecast.p10,
+        p90=forecast.p90,
+        daylight=forecast.daylight,
+        sites_contributing=forecast.sites_contributing,
+        fingerprint=fingerprint_pv(forecast),
+        provenance=forecast.provenance,
+    )
+
+
+def score_pv_day(
+    snapshot: PvSnapshot | None,
+    *,
+    actual: Sequence[float | None],
+    finalized_at: datetime,
+    tz_key: str,
+    interval_count: int,
+    target_day: date,
+    elapsed_intervals: int | None = None,
+    ac_limit_kw: float | None = None,
+    flags: Sequence[str] = (),
+) -> PvOutcome:
+    """Return one day's comparability, interval by interval.
+
+    Computes **no correction and no bias term**. It classifies, and the
+    classification is the evidence: a later phase that wants to learn from this
+    needs to know which intervals were genuinely comparable, and that is a
+    question nothing else can answer after the fact.
+
+    The ordering of the codes is deliberate, because an interval can qualify for
+    several and only the most fundamental is useful. No forecast was ever obtained
+    outranks a missing actual, which outranks partial site coverage, which
+    outranks night -- and an interval that has not happened yet is not evidence
+    about anything.
+    """
+    statuses: list[str] = []
+    for index in range(interval_count):
+        if elapsed_intervals is not None and index > elapsed_intervals:
+            statuses.append(PV_STATUS_NOT_ELAPSED)
+            continue
+        if snapshot is None or not snapshot.available:
+            # Scoring a forecast that was never obtained against a real reading
+            # would manufacture error out of an outage.
+            statuses.append(PV_STATUS_PV_BLIND)
+            continue
+        predicted = snapshot.predicted_at(index)
+        if predicted is None:
+            statuses.append(PV_STATUS_FORECAST_MISSING)
+            continue
+        measured = actual[index] if index < len(actual) else None
+        if measured is None:
+            statuses.append(PV_STATUS_ACTUAL_MISSING)
+            continue
+        expected_sites = snapshot.provenance.selected_site_count
+        contributing = (
+            snapshot.sites_contributing[index]
+            if index < len(snapshot.sites_contributing)
+            else expected_sites
+        )
+        if expected_sites > 1 and 0 < contributing < expected_sites:
+            # A known under-estimate. Comparing it would charge the source for a
+            # shortfall it did not cause.
+            statuses.append(PV_STATUS_PARTIAL_SITES)
+            continue
+        lit = index < len(snapshot.daylight) and snapshot.daylight[index]
+        if not lit and predicted == 0.0 and measured == 0.0:
+            # Both legitimately nothing. Kept out of percentage error, where a
+            # ratio against roughly zero is meaningless rather than perfect.
+            statuses.append(PV_STATUS_NIGHT)
+            continue
+        statuses.append(PV_STATUS_VALID)
+
+    day_flags = list(flags)
+    if snapshot is not None and snapshot.available:
+        if snapshot.interval_count != interval_count:
+            day_flags.append(PV_FLAG_SHAPE_MISMATCH)
+        if snapshot.tz_key != tz_key:
+            day_flags.append(PV_FLAG_TIMEZONE_CHANGED)
+        if _clipping_suspected(snapshot, actual, ac_limit_kw):
+            day_flags.append(PV_FLAG_CLIPPING_SUSPECTED)
+
+    return PvOutcome(
+        target_day=target_day,
+        finalized_at=finalized_at,
+        tz_key=tz_key,
+        interval_count=interval_count,
+        actual=tuple(
+            actual[index] if index < len(actual) else None
+            for index in range(interval_count)
+        ),
+        status=tuple(statuses),
+        flags=tuple(dict.fromkeys(day_flags)),
+    )
+
+
+def _clipping_suspected(
+    snapshot: PvSnapshot,
+    actual: Sequence[float | None],
+    ac_limit_kw: float | None,
+) -> bool:
+    """Return whether the measured day looks clipped rather than over-forecast.
+
+    On a big day the forecast exceeds the actual *by design*, because an inverter
+    cannot pass more than its AC limit however bright it is. Raised, never
+    corrected: a later phase must not learn a correction for physics.
+
+    Detection is deliberately crude and cheap: the measured figure sits at a
+    plateau within a few percent of the configured limit while the forecast keeps
+    climbing above it. Without a configured limit there is nothing to compare
+    against and the answer is no rather than a guess.
+    """
+    if ac_limit_kw is None or ac_limit_kw <= 0.0:
+        return False
+    ceiling = ac_limit_kw * _QUARTER_HOURS
+    plateau = 0
+    for index in range(min(len(actual), len(snapshot.predicted))):
+        measured = actual[index]
+        predicted = snapshot.predicted[index]
+        if measured is None or predicted is None:
+            continue
+        if measured >= ceiling * 0.95 and predicted > measured * 1.02:
+            plateau += 1
+    return plateau >= 2
+
+
+def pv_error_metrics(
+    snapshot: PvSnapshot | None, outcome: PvOutcome | None
+) -> dict[str, Any]:
+    """Return the derived comparison, recomputed rather than stored.
+
+    Derived from the two stored sides on demand, which is the rule the load-side
+    metrics already follow: a stored statistic is a second source of truth, and
+    the first time it disagreed with the arrays beside it, it is the stored one
+    that would be believed.
+    """
+    if snapshot is None or outcome is None:
+        return {"comparable": False, "scored_intervals": 0}
+
+    indices = outcome.scored_indices
+    if not indices:
+        return {
+            "comparable": False,
+            "scored_intervals": 0,
+            "status_counts": outcome.status_counts(),
+            "flags": list(outcome.flags),
+        }
+
+    predicted = [snapshot.predicted[index] or 0.0 for index in indices]
+    measured = [outcome.actual[index] or 0.0 for index in indices]
+    total_predicted = sum(predicted)
+    total_measured = sum(measured)
+    absolute = sum(abs(p - m) for p, m in zip(predicted, measured, strict=True))
+    signed = sum(p - m for p, m in zip(predicted, measured, strict=True))
+
+    return {
+        "comparable": True,
+        "scored_intervals": len(indices),
+        "predicted_kwh": round(total_predicted, BATTERY_KWH_PRECISION),
+        "actual_kwh": round(total_measured, BATTERY_KWH_PRECISION),
+        "absolute_error_kwh": round(absolute, BATTERY_KWH_PRECISION),
+        # Signed, because the sign is the whole diagnostic: a structural
+        # conversion difference or clipping biases one way, while forecast noise
+        # does not. Taking the absolute value first is what threw that away.
+        "signed_error_kwh": round(signed, BATTERY_KWH_PRECISION),
+        "wape_percent": (
+            round(100.0 * absolute / total_measured, 2) if total_measured > 0 else None
+        ),
+        "status_counts": outcome.status_counts(),
+        "flags": list(outcome.flags),
+        "basis": (
+            "only intervals both sides could describe are scored; night, "
+            "partial site coverage, a missing actual and a PV-blind interval "
+            "each have their own code and none of them is counted as error"
+        ),
+    }
+
+
+def _optional_series(raw: Any, count: int) -> tuple[float | None, ...]:
+    """Return a fixed-length series of optional finite floats."""
+    values: list[float | None] = []
+    source = raw if isinstance(raw, list) else []
+    for index in range(count):
+        values.append(_finite(source[index]) if index < len(source) else None)
+    return tuple(values)
+
+
+def _int_series(raw: Any, count: int) -> tuple[int, ...]:
+    """Return a fixed-length series of counts, defaulting to zero."""
+    source = raw if isinstance(raw, list) else []
+    return tuple(
+        int(source[index])
+        if index < len(source) and isinstance(source[index], int)
+        else 0
+        for index in range(count)
+    )
+
+
+def _mask_to_text(mask: Sequence[bool]) -> str:
+    """Return a boolean mask as a compact string of ones and zeros."""
+    return "".join("1" if flag else "0" for flag in mask)
+
+
+def _mask_from_text(text: Any, count: int) -> tuple[bool, ...]:
+    """Return a boolean mask from its compact form, padded to ``count``."""
+    source = text if isinstance(text, str) else ""
+    return tuple(
+        source[index] == "1" if index < len(source) else False for index in range(count)
+    )
+
+
+def _parse_moment(raw: Any) -> datetime | None:
+    """Return a stored timestamp, or ``None`` when it cannot be read."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)

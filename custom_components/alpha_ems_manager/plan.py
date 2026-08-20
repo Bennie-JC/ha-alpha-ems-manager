@@ -44,6 +44,7 @@ release rather than leaving it untested until Phase 10.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
@@ -284,6 +285,9 @@ def build_plan(
     today: date,
     battery_power_w: float | None = None,
     policy: BatteryPolicy | None = None,
+    today_pv: Sequence[float | None] = (),
+    tomorrow_pv: Sequence[float | None] = (),
+    absorb_surplus: bool = False,
 ) -> BatteryPlan:
     """Build one refresh's plan. Pure, total, and it never raises.
 
@@ -339,10 +343,12 @@ def build_plan(
     # The decision is for the interval in progress, whose predicted demand is at
     # the elapsed index. An index outside the day yields no demand rather than
     # wrapping into a neighbour's.
-    current = _current_demand(today_forecast, elapsed_intervals)
+    current = _current_demand(today_forecast, elapsed_intervals, today_pv)
     decision, _outcome = _decide(state, current, chosen)
 
-    demands = _horizon(today_forecast, tomorrow_forecast, elapsed_intervals)
+    demands = _horizon(
+        today_forecast, tomorrow_forecast, elapsed_intervals, today_pv, tomorrow_pv
+    )
     if not demands:
         return BatteryPlan(
             decision=decision,
@@ -355,8 +361,16 @@ def build_plan(
             forecast=_forecast_report(today_forecast, tomorrow_forecast),
         )
 
-    reference = simulate(state, demands, HoldPolicy().provider())
-    candidate = simulate(state, demands, chosen.provider())
+    # Both trajectories absorb on the same terms, so the comparison between them
+    # is about the decision rather than about which one was allowed to store the
+    # sun. The hold reference is the counterfactual "the battery does nothing it
+    # was asked to do", not "the inverter is switched off".
+    reference = simulate(
+        state, demands, HoldPolicy().provider(), absorb_surplus=absorb_surplus
+    )
+    candidate = simulate(
+        state, demands, chosen.provider(), absorb_surplus=absorb_surplus
+    )
 
     return BatteryPlan(
         decision=decision,
@@ -378,7 +392,9 @@ def _count(forecast: LoadForecast | None) -> int:
 
 
 def _current_demand(
-    forecast: LoadForecast | None, elapsed_intervals: int
+    forecast: LoadForecast | None,
+    elapsed_intervals: int,
+    pv: Sequence[float | None] = (),
 ) -> IntervalDemand:
     """Return the demand for the interval now in progress.
 
@@ -396,6 +412,7 @@ def _current_demand(
         index=index,
         baseline_kwh=forecast.intervals[index],
         filled=bool(index < len(forecast.filled) and forecast.filled[index]),
+        pv_kwh=pv[index] if index < len(pv) else None,
     )
 
 
@@ -403,6 +420,8 @@ def _horizon(
     today_forecast: LoadForecast | None,
     tomorrow_forecast: LoadForecast | None,
     elapsed_intervals: int,
+    today_pv: Sequence[float | None] = (),
+    tomorrow_pv: Sequence[float | None] = (),
 ) -> tuple[IntervalDemand, ...]:
     """Return the intervals to simulate: the rest of today, then all of tomorrow.
 
@@ -417,6 +436,7 @@ def _horizon(
                 today_forecast.intervals,
                 today_forecast.filled,
                 start_index=elapsed_intervals + 1,
+                pv=today_pv,
             )
         )
     if tomorrow_forecast is not None and tomorrow_forecast.available:
@@ -426,12 +446,45 @@ def _horizon(
                 index=offset + demand.index,
                 baseline_kwh=demand.baseline_kwh,
                 filled=demand.filled,
+                pv_kwh=demand.pv_kwh,
             )
             for demand in demands_from_forecast(
-                tomorrow_forecast.intervals, tomorrow_forecast.filled
+                tomorrow_forecast.intervals,
+                tomorrow_forecast.filled,
+                pv=tomorrow_pv,
             )
         )
     return tuple(demands)
+
+
+def _projection_note(trajectory: SimulatedTrajectory) -> str:
+    """Return the caveat that belongs to this projection.
+
+    Conditional rather than deleted. The PV-blind wording was pinned by a test on
+    purpose: a projection published without its limitation costs more trust than
+    it buys, and the honest fix when the limitation changes is to change the
+    words, not to remove them.
+    """
+    if not trajectory.pv_aware:
+        return (
+            "diagnostics only, and PV-blind: the simulator has no photovoltaic "
+            "production term, so on a sunny day the real state of charge will "
+            "be higher than this and the simulated grid import higher than "
+            "reality. Not published as an entity for that reason"
+        )
+    if trajectory.intervals_absorbing:
+        return (
+            "diagnostics only, and PV-aware: forecast production is netted "
+            "against predicted load, and surplus is modelled as stored because "
+            "the inverter's own state shows it storing surplus. Still a "
+            "projection rather than a measurement, and still not an entity"
+        )
+    return (
+        "diagnostics only, PV-aware, and a lower bound: forecast production is "
+        "netted against predicted load, but surplus is treated as exported "
+        "because the inverter's state does not show it being stored -- so the "
+        "real state of charge may be higher than this. Not an entity"
+    )
 
 
 def _forecast_report(
@@ -604,12 +657,7 @@ def plan_as_dict(plan: BatteryPlan, tz: Any = None) -> dict[str, Any]:
         payload["projected_soc_percent"] = _round(
             plan.candidate.end_soc_percent, BATTERY_SOC_PRECISION
         )
-        payload["projected_soc_note"] = (
-            "diagnostics only, and PV-blind: the simulator has no photovoltaic "
-            "production term, so on a sunny day the real state of charge will "
-            "be higher than this and the simulated grid import higher than "
-            "reality. Not published as an entity for that reason"
-        )
+        payload["projected_soc_note"] = _projection_note(plan.candidate)
         payload["coverage_hours"] = _round(plan.coverage_hours, 2)
     if plan.reference is not None:
         payload["hold_reference"] = plan.reference.as_dict()

@@ -64,6 +64,7 @@ from .const import (
     MAX_BINDING_INTERVALS_REPORTED,
     MODE_CHARGE,
     MODE_DISCHARGE,
+    MODE_IDLE,
 )
 from .storage import local_slot_for_index
 
@@ -106,6 +107,10 @@ class IntervalDemand:
     #: consumer can widen its margin, and so a later phase can ask whether the
     #: plan went wrong where the forecast was weakest.
     filled: bool = False
+    #: Expected photovoltaic production for this interval, AC energy, or ``None``
+    #: when there is no forecast for it. ``None`` and zero are different: the
+    #: first is PV-blind and the second is a forecast of darkness.
+    pv_kwh: float | None = None
 
     @property
     def known(self) -> bool:
@@ -113,11 +118,52 @@ class IntervalDemand:
         return self.baseline_kwh is not None
 
     @property
-    def power_kw(self) -> float | None:
-        """Return the demand as an average AC power over the interval."""
+    def net_demand_kwh(self) -> float | None:
+        """Return the load the battery could usefully serve, AC energy.
+
+        Production is netted against load **before** anything is converted, and
+        the result is floored at zero, so at most one of this and
+        :attr:`surplus_kwh` is non-zero. That keeps the single-direction-per-
+        interval invariant intact: a policy shown a net demand can only ask for a
+        discharge, and a surplus is not a demand at all.
+
+        Netting the two after conversion instead would destroy energy invisibly --
+        the same reason :class:`~.battery.BatteryRequest` refuses a signed power.
+        """
         if self.baseline_kwh is None:
             return None
-        return self.baseline_kwh / INTERVAL_HOURS
+        return max(0.0, self.baseline_kwh - (self.pv_kwh or 0.0))
+
+    @property
+    def surplus_kwh(self) -> float:
+        """Return the production expected to exceed load, AC energy.
+
+        Zero when there is no forecast, which is the honest reading: an unknown
+        interval is not a known surplus.
+        """
+        if self.baseline_kwh is None or self.pv_kwh is None:
+            return 0.0
+        return max(0.0, self.pv_kwh - self.baseline_kwh)
+
+    @property
+    def pv_aware(self) -> bool:
+        """Return whether this interval has a production forecast at all."""
+        return self.pv_kwh is not None
+
+    @property
+    def power_kw(self) -> float | None:
+        """Return the demand a policy should serve, as an average AC power.
+
+        The **net** demand, which is what makes the plan PV-aware without any
+        policy learning a new objective: when the sun covers the house the net
+        demand is zero and ``ReserveGuardPolicy`` asks for nothing, entirely by
+        its existing rule. With no production forecast this is the raw baseline
+        exactly as before.
+        """
+        net = self.net_demand_kwh
+        if net is None:
+            return None
+        return net / INTERVAL_HOURS
 
 
 def constant_provider(request: BatteryRequest) -> RequestProvider:
@@ -166,6 +212,10 @@ class SimulatedTrajectory:
     outcomes: tuple[IntervalOutcome, ...]
     #: Grid exchange per interval, or ``None`` where the demand was unknown.
     grid: tuple[GridEnergy | None, ...]
+    #: Which intervals carried an *ambient* charge -- production the inverter
+    #: stored without being asked. Empty on a trajectory built without a
+    #: production forecast, and never true where the policy asked for anything.
+    absorbed: tuple[bool, ...] = ()
 
     # -- shape -----------------------------------------------------------
 
@@ -178,6 +228,42 @@ class SimulatedTrajectory:
     def intervals_with_demand(self) -> int:
         """Return how many intervals carried a usable predicted demand."""
         return sum(1 for demand in self.demands if demand.known)
+
+    @property
+    def intervals_pv_aware(self) -> int:
+        """Return how many intervals carried a production forecast."""
+        return sum(1 for demand in self.demands if demand.pv_aware)
+
+    @property
+    def pv_aware(self) -> bool:
+        """Return whether any interval of this trajectory was PV-aware.
+
+        What the published disclaimer turns on. Deliberately "any" rather than
+        "all": a partly covered horizon is genuinely partly PV-aware, and calling
+        it blind would be as wrong as calling it sighted.
+        """
+        return self.intervals_pv_aware > 0
+
+    @property
+    def intervals_absorbing(self) -> int:
+        """Return how many intervals stored production nobody asked for."""
+        return sum(1 for flag in self.absorbed if flag)
+
+    @property
+    def forecast_pv_kwh(self) -> float:
+        """Return the production forecast across the compared intervals."""
+        return round(
+            sum(demand.pv_kwh or 0.0 for demand in self.demands),
+            BATTERY_KWH_PRECISION,
+        )
+
+    @property
+    def forecast_surplus_kwh(self) -> float:
+        """Return the production expected to exceed load across the horizon."""
+        return round(
+            sum(demand.surplus_kwh for demand in self.demands),
+            BATTERY_KWH_PRECISION,
+        )
 
     @property
     def intervals_filled(self) -> int:
@@ -317,6 +403,39 @@ class SimulatedTrajectory:
             for name, values in bands.items()
         }
 
+    def _basis(self) -> str:
+        """Return what this trajectory is a counterfactual *of*.
+
+        Three branches, not two, and the middle one is why. Deleting the PV-blind
+        disclaimer once a forecast existed would have been the worst outcome
+        available: the note exists because a visibly wrong figure costs more trust
+        than it buys, and a partly covered horizon is still partly wrong. So the
+        wording follows what was actually known.
+        """
+        if not self.pv_aware:
+            return (
+                "battery-only counterfactual: predicted baseline load against "
+                "the battery, with no photovoltaic production term. For a "
+                "household with solar the simulated grid import is expected to "
+                "exceed reality"
+            )
+        if self.intervals_absorbing:
+            return (
+                "PV-aware: predicted baseline load net of forecast photovoltaic "
+                "production, with surplus stored where the inverter's own state "
+                f"shows it storing surplus ({self.intervals_pv_aware} of "
+                f"{self.intervals} intervals carried a production forecast). "
+                "Still a counterfactual rather than a grid forecast"
+            )
+        return (
+            "PV-aware, absorption not modelled: predicted baseline load net of "
+            "forecast photovoltaic production, with surplus treated as exported "
+            "because the inverter's own state does not show it being stored "
+            f"({self.intervals_pv_aware} of {self.intervals} intervals carried a "
+            "production forecast). The projected state of charge is therefore a "
+            "lower bound"
+        )
+
     def as_dict(self, day: date | None = None, tz: Any = None) -> dict[str, Any]:
         """Return the reduced, bounded form diagnostics publishes.
 
@@ -343,12 +462,11 @@ class SimulatedTrajectory:
             # visible without the list being able to grow with the history.
             "binding_intervals_total": len(binding),
             "binding_intervals": list(binding[:MAX_BINDING_INTERVALS_REPORTED]),
-            "basis": (
-                "battery-only counterfactual: predicted baseline load against "
-                "the battery, with no photovoltaic production term. For a "
-                "household with solar the simulated grid import is expected to "
-                "exceed reality"
-            ),
+            "intervals_pv_aware": self.intervals_pv_aware,
+            "intervals_absorbing_surplus": self.intervals_absorbing,
+            "forecast_pv_kwh": self.forecast_pv_kwh,
+            "forecast_surplus_kwh": self.forecast_surplus_kwh,
+            "basis": self._basis(),
         }
         if day is not None and tz is not None:
             payload["bands"] = self.band_summary(day, tz)
@@ -359,21 +477,58 @@ def simulate(
     state: BatteryState,
     demands: Sequence[IntervalDemand],
     provider: RequestProvider,
+    *,
+    absorb_surplus: bool = False,
 ) -> SimulatedTrajectory:
     """Walk the battery through ``demands``, asking ``provider`` what to do.
 
     Pure, total and deterministic: the same state, demands and provider always
     produce an equal trajectory. Every limit comes from
     :func:`battery.apply_request`; nothing is enforced here.
+
+    ``absorb_surplus`` models the inverter storing production the house cannot
+    use. It is **ambient physical behaviour, never intent**, and the distinction
+    is what keeps this from becoming an optimiser:
+
+    * It is applied only where the policy asked for nothing. A policy that wants
+      something has expressed intent, and intent wins -- so no interval can ever
+      carry both a requested direction and an ambient one, and the
+      single-direction invariant holds structurally rather than by argument.
+    * It goes through :func:`battery.apply_request` like everything else, so the
+      power limit, the headroom and the conversion efficiency all apply once, in
+      the one place they are implemented.
+    * It cannot become a command. ``ControlIntent`` derives from the *policy's*
+      action, and nothing here touches that, so an absorbed surplus is visible in
+      a projected state of charge and nowhere else.
+
+    The caller decides whether it is permitted, because the answer is a property
+    of the live installation rather than of physics -- see the coordinator. When
+    it is not permitted the surplus becomes simulated export instead, which
+    projects a *lower* state of charge and never promises stored energy the
+    inverter is actually sending to the grid.
     """
     current = state
     outcomes: list[IntervalOutcome] = []
     grid: list[GridEnergy | None] = []
+    absorbed: list[bool] = []
 
     for demand in demands:
         request = provider(current, demand)
+        ambient = False
+        # ``MODE_IDLE`` is the only request that expresses no intent. Testing the
+        # mode rather than a magnitude matters: a directed request whose magnitude
+        # was clamped to zero still *asked* for something, and layering an ambient
+        # charge on top of it would put two directions in one interval.
+        if (
+            absorb_surplus
+            and request.mode == MODE_IDLE
+            and demand.surplus_kwh > 0.0
+        ):
+            request = BatteryRequest.charge(demand.surplus_kwh / INTERVAL_HOURS)
+            ambient = True
         outcome = apply_request(current, request)
         outcomes.append(outcome)
+        absorbed.append(ambient)
         if demand.baseline_kwh is None:
             # No predicted load, so no honest grid residual for this interval.
             # The battery still moved, and that is recorded; the grid total
@@ -383,6 +538,7 @@ def simulate(
             grid.append(
                 split_grid_energy(
                     load_ac_kwh=demand.baseline_kwh,
+                    pv_ac_kwh=demand.pv_kwh or 0.0,
                     charge_ac_kwh=outcome.charge_ac_kwh,
                     discharge_ac_kwh=outcome.discharge_ac_kwh,
                 )
@@ -396,6 +552,7 @@ def simulate(
         demands=tuple(demands),
         outcomes=tuple(outcomes),
         grid=tuple(grid),
+        absorbed=tuple(absorbed),
     )
 
 
@@ -438,6 +595,7 @@ def demands_from_forecast(
     *,
     start_index: int = 0,
     count: int | None = None,
+    pv: Sequence[float | None] = (),
 ) -> tuple[IntervalDemand, ...]:
     """Build demands from a forecast's chronological arrays.
 
@@ -449,6 +607,11 @@ def demands_from_forecast(
     day would otherwise reach the fill mask, and this project has already been
     bitten once by an out-of-range chronological index being filed as though it
     were inside the day.
+
+    ``pv`` is optional and defaults to empty, which is exactly what a caller
+    without a production forecast passes and what every caller passed before one
+    existed. A short array leaves the uncovered intervals PV-blind rather than
+    reading off the end.
     """
     total = len(intervals)
     first = max(0, min(start_index, total))
@@ -458,6 +621,10 @@ def demands_from_forecast(
             index=index,
             baseline_kwh=intervals[index],
             filled=bool(index < len(filled) and filled[index]),
+            # Absent when there is no production forecast at all, and absent for
+            # an individual interval the forecast did not cover. Both are
+            # PV-blind, and neither is a forecast of darkness.
+            pv_kwh=pv[index] if index < len(pv) else None,
         )
         for index in range(first, last)
     )

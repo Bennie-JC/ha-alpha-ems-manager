@@ -84,7 +84,17 @@ from .const import (
     INHIBIT_PLAN_UNAVAILABLE,
     LOG_THROTTLE_SECONDS,
     MAX_CONTROL_EVENTS_REPORTED,
+    PV_ABSORPTION_DISPATCH_ACTIVE,
+    PV_ABSORPTION_EXCESS_EXPORT,
+    PV_ABSORPTION_NO_SUPPRESSING_FEATURE,
+    PV_ABSORPTION_PEAK_SHAVING,
+    PV_ABSORPTION_SELF_CONSUMPTION,
+    PV_ABSORPTION_STATE_UNREADABLE,
     PV_AGGREGATE_SITE,
+    PV_FLAG_AVAILABLE_SITES_CHANGED,
+    PV_FLAG_SELECTED_MODEL_CHANGED,
+    PV_FLAG_SELECTED_SITES_CHANGED,
+    PV_FLAG_SOURCE_CORRECTION_CHANGED,
     PV_SELECTION_ORIGIN_AUTO,
     PV_SELECTION_ORIGIN_STORED,
     PV_UNAVAILABLE_EMPTY_SELECTION,
@@ -94,6 +104,7 @@ from .const import (
     PV_UNAVAILABLE_SERVICE_MISSING,
     QUARTER_MINUTES,
     SAFETY_SAMPLE_SECONDS,
+    SELECT_INVERTER_AC_LIMIT,
 )
 from .control import translate
 from .energy_balance import (
@@ -126,6 +137,9 @@ from .plan import BatteryPlan, build_plan
 from .pv_forecast import (
     PvForecast,
     PvProvenance,
+    PvSnapshot,
+    build_pv_snapshot,
+    score_pv_day,
     sites_identity,
     sites_model,
 )
@@ -1401,16 +1415,27 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             breakdown=breakdown,
         )
 
+        # Before the plan, because the plan consumes it. A failure here is
+        # contained and yields named unavailability rather than an exception, so
+        # the plan is always built -- PV-aware when there is a forecast, PV-blind
+        # and labelled when there is not.
+        pv_forecasts = await self._async_pv_forecasts_safely(today=today, tz=tz)
+        self.pv_forecasts = pv_forecasts
+        await self._async_record_pv_evidence_safely(
+            forecasts=pv_forecasts, now=now, today=today, tz=tz
+        )
+        absorb_surplus, absorption_reason = self._surplus_absorption()
+
         plan = self._build_battery_plan(
             today=today,
             elapsed=elapsed,
             baseline_today=baseline_today,
             tomorrow=forecast_tomorrow,
             tz_key=str(tz),
+            pv_today=pv_forecasts.get(today),
+            pv_tomorrow=pv_forecasts.get(tomorrow),
+            absorb_surplus=absorb_surplus,
         )
-
-        pv_forecasts = await self._async_pv_forecasts_safely(today=today, tz=tz)
-        self.pv_forecasts = pv_forecasts
 
         control = self._build_control_report_safely(
             plan=plan,
@@ -1435,7 +1460,247 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "control": control,
             "pv_today": pv_forecasts.get(today),
             "pv_tomorrow": pv_forecasts.get(tomorrow),
+            "pv_absorption": {
+                "modelled": absorb_surplus,
+                "reason": absorption_reason,
+            },
         }
+
+    async def _async_record_pv_evidence_safely(
+        self,
+        *,
+        forecasts: dict[date, PvForecast],
+        now: datetime,
+        today: date,
+        tz: tzinfo,
+    ) -> None:
+        """Record PV evidence, or say why it could not be recorded.
+
+        Wrapped for the reason the forecast-evidence step beside it is: evidence
+        is the newest half and the learning history is the irreplaceable half, so
+        a fault here must never take a refresh down with it.
+        """
+        try:
+            await self._async_record_pv_evidence(
+                forecasts=forecasts, now=now, today=today, tz=tz
+            )
+        except Exception:
+            self._log.warning(
+                _PV_LOG,
+                (
+                    "PV forecast evidence could not be recorded this refresh. "
+                    "The forecast itself, the plan and every other layer are "
+                    "unaffected; the evidence for this issuance is simply not "
+                    "stored"
+                ),
+            )
+            _LOGGER.debug("PV evidence recording failed", exc_info=True)
+
+    async def _async_record_pv_evidence(
+        self,
+        *,
+        forecasts: dict[date, PvForecast],
+        now: datetime,
+        today: date,
+        tz: tzinfo,
+    ) -> None:
+        """Store what was forecast, and score days that have finished.
+
+        Two halves, and neither computes a correction of any kind. Phase 5 records;
+        deciding what the record *means* is Phase 9's job, and it can only do that
+        honestly from a series that was never adjusted on the way in.
+
+        Issuance is change-triggered by content fingerprint. Ninety-six refreshes a
+        day against a source that updates a handful of times would otherwise store
+        ninety-six identical documents.
+
+        Scoring happens once a day is over, from the measured PV array in the
+        learning store. A PV-blind interval is never scored: comparing a forecast
+        that was never obtained against a real reading would manufacture error out
+        of an outage, which is the same mistake the load-side scoring already
+        refuses for a partly observed day.
+        """
+        if not self.config.has_pv:
+            return
+
+        yesterday = today - timedelta(days=1)
+        days = sorted({*forecasts, yesterday})
+        try:
+            await self.history.async_ensure_days(days)
+        except Exception:
+            _LOGGER.debug("PV evidence partitions unavailable", exc_info=True)
+            return
+
+        changed = False
+        for _day, forecast in sorted(forecasts.items()):
+            snapshot = build_pv_snapshot(forecast, issued_at=now, today=today)
+            if self.history.add_pv_snapshot(snapshot):
+                changed = True
+
+        if self.history.pv_outcome(yesterday) is None:
+            snapshot = self.history.latest_pv_snapshot(yesterday)
+            record = self.store.days.get(yesterday)
+            if snapshot is not None and record is not None:
+                outcome = score_pv_day(
+                    snapshot,
+                    actual=record.pv,
+                    finalized_at=now,
+                    tz_key=str(tz),
+                    interval_count=record.interval_count,
+                    target_day=yesterday,
+                    ac_limit_kw=self._inverter_ac_limit_kw(),
+                    flags=self._pv_day_flags(yesterday, snapshot),
+                )
+                if self.history.set_pv_outcome(outcome):
+                    changed = True
+
+        if changed:
+            self.history.schedule_save()
+
+    @callback
+    def _pv_day_flags(self, day: date, snapshot: PvSnapshot) -> tuple[str, ...]:
+        """Return the day-level flags for a finalised PV comparison.
+
+        Membership is a **hard** barrier and the physical model is another: a
+        forecast of a different set of roofs, or of the same roofs re-rated, is not
+        poolable with what came before. A site merely appearing in the source
+        without joining the declaration is informational, because it changed
+        nothing about what was forecast.
+        """
+        flags: list[str] = []
+        earlier = [
+            other
+            for other in self.history.pv_snapshots(day)
+            if other.fingerprint != snapshot.fingerprint
+        ]
+        if any(
+            other.provenance.selected_sites_identity
+            != snapshot.provenance.selected_sites_identity
+            for other in earlier
+        ):
+            flags.append(PV_FLAG_SELECTED_SITES_CHANGED)
+        if any(
+            other.provenance.selected_sites_model
+            != snapshot.provenance.selected_sites_model
+            for other in earlier
+        ):
+            flags.append(PV_FLAG_SELECTED_MODEL_CHANGED)
+        if any(
+            other.provenance.available_sites_identity
+            != snapshot.provenance.available_sites_identity
+            for other in earlier
+        ):
+            flags.append(PV_FLAG_AVAILABLE_SITES_CHANGED)
+        if any(
+            other.provenance.correction_key != snapshot.provenance.correction_key
+            for other in earlier
+        ):
+            flags.append(PV_FLAG_SOURCE_CORRECTION_CHANGED)
+        return tuple(flags)
+
+    @callback
+    def _inverter_ac_limit_kw(self) -> float | None:
+        """Return the inverter's configured AC limit, in kW, or ``None``.
+
+        Read from the vendor helper when it exists, for one purpose only:
+        distinguishing a clipped day from an over-forecast one. On a big day the
+        forecast exceeds the actual *by design*, because an inverter cannot pass
+        more than its limit however bright it is -- and a later phase must not
+        learn a correction for that.
+
+        ``None`` when the helper is absent, which suppresses the detection rather
+        than guessing a limit. A guessed ceiling would produce a flag that looked
+        like evidence.
+        """
+        state = self.hass.states.get(SELECT_INVERTER_AC_LIMIT)
+        if state is None:
+            return None
+        return _optional_number(str(state.state).split()[0] if state.state else None)
+
+    @callback
+    def _surplus_absorption(self) -> tuple[bool, str]:
+        """Return whether the inverter is storing surplus, without ever raising.
+
+        Wrapped for the same reason every layer added since Phase 2 is: this reads
+        the vendor control surface, and a fault there must cost the projected state
+        of charge rather than the whole refresh. The existing control-isolation
+        test found this the moment it was added, which is exactly what it is for.
+
+        A failure means the state could not be established, which is the same
+        answer as an unreadable entity: absorption is not modelled.
+        """
+        try:
+            return self._surplus_absorption_from_device()
+        except Exception:
+            self._log.warning(
+                _PV_LOG,
+                (
+                    "Whether the inverter is storing surplus production could not "
+                    "be determined; the projected state of charge treats surplus "
+                    "as exported, which is the conservative reading. Nothing else "
+                    "is affected"
+                ),
+            )
+            _LOGGER.debug("Surplus absorption state unreadable", exc_info=True)
+            return False, PV_ABSORPTION_STATE_UNREADABLE
+
+    @callback
+    def _surplus_absorption_from_device(self) -> tuple[bool, str]:
+        """Return whether the inverter is storing surplus, and how that is known.
+
+        The approved design treated "the inverter absorbs surplus autonomously" as
+        unconditional physics. The vendor control surface contradicts that, and its
+        own design notes say so: with **Excess Export** switched on, PV output
+        below the inverter's AC limit is directed to house load and feed-in and the
+        battery is charged with *zero*. Peak Shaving arms its own dispatch, and the
+        dispatch vocabulary itself contains modes that forbid battery charging
+        outright.
+
+        So absorption is predicated on observable state rather than asserted. What
+        it is *not* predicated on is the charging/discharging settings helper,
+        whose four options govern grid charging and timed discharge only -- nothing
+        there touches PV to battery, which is why baseline self-consumption
+        absorption is real in the default configuration.
+
+        Three outcomes, and the distinction between the last two is the point:
+
+        * A feature is present and **on**, or a dispatch is running: absorption is
+          suppressed or unknowable, so it is not modelled.
+        * A feature is present but **unreadable**: it could be suppressing
+          absorption and we cannot see it, so it is not modelled either.
+        * A feature is **absent**: it does not exist on this installation and
+          therefore cannot be suppressing anything, so absorption is modelled.
+          Reading absence as ignorance would leave every installation without the
+          vendor package permanently pessimistic about its own battery, which
+          would be wrong rather than cautious.
+
+        When absorption is not modelled the surplus becomes simulated export.
+        That projects a *lower* state of charge and never claims stored energy the
+        inverter is actually sending to the grid, which is the direction to be
+        wrong in.
+
+        This reads the inverter's state in every control mode, including ``off``.
+        Reading is not controlling: ``off`` still means this integration attempts
+        no control and writes nothing. A projected state of charge that silently
+        assumed the opposite of the truth would be worse than one that looked at
+        three booleans to find out.
+        """
+        capability = discover(self.hass)
+        if capability.unavailable:
+            return False, PV_ABSORPTION_STATE_UNREADABLE
+        if capability.excess_export_active:
+            return False, PV_ABSORPTION_EXCESS_EXPORT
+        if capability.peak_shaving_active:
+            return False, PV_ABSORPTION_PEAK_SHAVING
+        if read_snapshot(self.hass).dispatch_active:
+            return False, PV_ABSORPTION_DISPATCH_ACTIVE
+        if capability.missing:
+            # No suppressing feature exists here, so ordinary self-consumption
+            # applies. Named rather than folded into the permitted case, because
+            # "there is nothing to suppress it" and "we checked and nothing is"
+            # are different pieces of evidence.
+            return True, PV_ABSORPTION_NO_SUPPRESSING_FEATURE
+        return True, PV_ABSORPTION_SELF_CONSUMPTION
 
     # -- photovoltaic forecast -------------------------------------------
 
@@ -1796,7 +2061,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "off means this integration attempts no control and writes "
                     "nothing; it does not mean an inverter reverts, and in this "
                     "release the distinction cannot arise because nothing here "
-                    "can start a dispatch"
+                    "can start a dispatch. it does still read whether the "
+                    "inverter is storing surplus production, because a projected "
+                    "state of charge that assumed the opposite would be wrong -- "
+                    "reading is not controlling"
                 ),
                 "controls_nothing": _CONTROLS_NOTHING,
             }
@@ -1969,6 +2237,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         baseline_today: DayForecast,
         tomorrow: DayForecast,
         tz_key: str,
+        pv_today: PvForecast | None = None,
+        pv_tomorrow: PvForecast | None = None,
+        absorb_surplus: bool = False,
     ) -> BatteryPlan | None:
         """Build this refresh's battery plan, or ``None`` if it could not be.
 
@@ -1999,6 +2270,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 elapsed_intervals=elapsed,
                 today=today,
                 battery_power_w=self._canonical_battery_power_w(),
+                # Empty when there is no forecast, which leaves every interval
+                # PV-blind rather than forecasting darkness.
+                today_pv=() if pv_today is None else pv_today.intervals,
+                tomorrow_pv=() if pv_tomorrow is None else pv_tomorrow.intervals,
+                absorb_surplus=absorb_surplus,
             )
         except Exception:
             self._log.warning(

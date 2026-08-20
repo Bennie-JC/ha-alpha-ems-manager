@@ -356,6 +356,14 @@ def _recommendation_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, An
         "configured_min_soc_percent": plan.reserve.configured_min_soc_percent,
         "effective_min_soc_percent": plan.reserve.effective_min_soc_percent,
         "constraints": list(decision.constraints),
+        # The one fact a user needs in order to read this recommendation, and the
+        # only one that cannot be folded into the prose beside it: prose cannot be
+        # automated against. False means the sun is not in this figure at all, so
+        # a sunny midday recommendation is asking the battery to supply energy the
+        # array is already supplying.
+        "pv_aware": (
+            plan.candidate is not None and plan.candidate.pv_aware
+        ),
         "basis": _SHADOW_BASIS,
     }
 

@@ -73,6 +73,12 @@ RECOMMENDATION_ATTRIBUTES = {
     "configured_min_soc_percent",
     "effective_min_soc_percent",
     "constraints",
+    # Widened deliberately in Phase 5, from eight to nine. "Eight" was a
+    # convention rather than a rule, and this is the one fact a user needs in
+    # order to read the recommendation that cannot live in the prose beside it:
+    # prose cannot be automated against. The hard caps -- no dicts, no list above
+    # eight entries -- are untouched.
+    "pv_aware",
     "basis",
 }
 PLANNED_POWER_ATTRIBUTES = {
