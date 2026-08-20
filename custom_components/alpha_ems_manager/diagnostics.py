@@ -34,6 +34,7 @@ from .const import (
     MAX_HISTORY_DAYS,
     MIN_DAY_COMPLETENESS,
     MIN_QUARTER_COVERAGE,
+    PRICE_MAPPING_VERSION,
     SLOTS_PER_DAY,
     STORAGE_VERSION,
 )
@@ -48,9 +49,12 @@ from .forecast_history import (
     lifecycle_from_summary,
     model_params_hash,
 )
+from .frank_source import FrankCapability, read_current_prices
+from .frank_source import discover as discover_frank
 from .metrics import compute_window, window_from_summaries
 from .plan import plan_as_dict
 from .policy import DEFAULT_POLICY, SHIPPED_POLICIES
+from .price_forecast import PriceForecast
 from .pv_forecast import PvForecast, pv_error_metrics
 from .solcast_source import SolcastFacts
 from .solcast_source import discover as discover_solcast
@@ -583,6 +587,67 @@ def _pv_forecast_report(forecast: PvForecast | None) -> dict[str, Any]:
     return payload
 
 
+def _price_report(forecast: PriceForecast | None) -> dict[str, Any]:
+    """Return one day's price series as counts, edges and status.
+
+    Never the series itself. A day is ninety-six intervals and the payload is
+    capped at sixteen list entries, so printing prices here would be truncated
+    into something misleading rather than merely large.
+    """
+    if forecast is None:
+        return {"available": False, "unavailable_reason": REASON_NOT_BUILT}
+    return forecast.as_dict()
+
+
+def _price_evidence_report(history: Any, today: date) -> dict[str, Any]:
+    """Return what price evidence has been recorded, without the arrays."""
+    yesterday = today - timedelta(days=1)
+    latest = history.latest_price_snapshot(today)
+    return {
+        "issuances_today": len(history.price_snapshots(today)),
+        "issuances_yesterday": len(history.price_snapshots(yesterday)),
+        "latest_issued_at": (None if latest is None else latest.issued_at.isoformat()),
+        "latest_intervals_known": None if latest is None else latest.intervals_known,
+        "latest_flags": [] if latest is None else list(latest.flags),
+        "mapping_version": PRICE_MAPPING_VERSION,
+        "note": (
+            "issuances are change-triggered by content fingerprint, so a day "
+            "with one entry means the series has not changed since it was first "
+            "read -- not that recording failed. there is deliberately no outcome "
+            "half: a price has no 'what actually happened' to be scored against"
+        ),
+    }
+
+
+def _price_derived_report(
+    hass: HomeAssistant, capability: FrankCapability
+) -> dict[str, Any]:
+    """Return the source's own derived figures, labelled as context.
+
+    Reported so a reader can see them, and **never** consumed. The cheap and
+    expensive zones are computed from margins configured on the *source's* entry,
+    and the optimal-period entities are a precomputed answer to a question that
+    needs load, generation, state of charge, efficiency, limits and reserve to
+    answer honestly. Treating either as input would make this integration's
+    behaviour depend on another integration's settings.
+    """
+    current_import, current_export = read_current_prices(hass, capability)
+    return {
+        "current_import_eur_kwh": current_import,
+        "current_export_eur_kwh": current_export,
+        "note": (
+            "the source's own current-interval figures, read only to cross-check "
+            "the normalised series against what the user can see. a disagreement "
+            "is recorded as contract drift and never overrides the series"
+        ),
+        "zones_and_optimal_periods": (
+            "not read. those entities are derived from margins configured on the "
+            "source's entry, so consuming them would make this integration's "
+            "behaviour depend on somebody else's thresholds"
+        ),
+    }
+
+
 def _pv_evidence_report(history: Any, today: date) -> dict[str, Any]:
     """Return the stored forecast-versus-actual evidence, derived on demand.
 
@@ -995,8 +1060,68 @@ async def async_get_config_entry_diagnostics(
                 "rather than clamped"
             ),
         },
+        # Phase 6. What electricity costs, and the fact that it changes nothing.
+        # Every field here is a fact or a named absence; none of it reaches a
+        # decision, and the guards that make that structural are listed under
+        # ``neutrality`` so this block can be read on its own.
+        "price": {
+            "entry_selected": config.frank_entry_id is not None,
+            # Probed **now**, like the PV capability beside it and for the same
+            # reason: printing a stale capability next to live readings is what
+            # made an earlier defect read as a contradiction.
+            "capability": discover_frank(hass, config.frank_entry_id).as_dict(),
+            "capability_at_last_refresh": coordinator.price_capability.as_dict(),
+            "options": {
+                "readable": coordinator.price_options.readable,
+                "feed_in_adjustment": coordinator.price_options.adjustment,
+                "apply_feed_in_vat": coordinator.price_options.apply_vat,
+                "note": (
+                    "read from the price integration's own entry, never "
+                    "duplicated as an alpha ems setting: the return-price figure "
+                    "on the user's dashboard is derived from these, and a second "
+                    "copy here would drift away from it"
+                ),
+            },
+            "today": _price_report(coordinator.price_forecasts.get(today_date)),
+            "tomorrow": _price_report(
+                coordinator.price_forecasts.get(today_date + timedelta(days=1))
+            ),
+            "mapping": (
+                coordinator.price_forecasts[today_date].mapping.as_dict()
+                if today_date in coordinator.price_forecasts
+                else None
+            ),
+            "provenance": (
+                coordinator.price_forecasts[today_date].provenance.as_dict()
+                if today_date in coordinator.price_forecasts
+                else None
+            ),
+            "evidence": _price_evidence_report(coordinator.history, today_date),
+            "derived_source_data": _price_derived_report(
+                hass, coordinator.price_capability
+            ),
+            "boundaries": (
+                "the source publishes a market day -- midnight to midnight in "
+                "the market's own zone -- while this integration plans a home "
+                "assistant civil day. for anyone running outside the market zone "
+                "those are different spans, so coverage below 1.0 is normal and "
+                "part of the local day is priced by a market day that may not be "
+                "published yet. mapping is by instant for exactly this reason"
+            ),
+            "neutrality": (
+                "prices are known and change nothing. the price layer is not "
+                "imported by plan, policy, simulation, battery, control or "
+                "safety; no identifier in those modules is an economic term; and "
+                "obtaining prices calls no service at all, so this integration "
+                "cannot make the source fetch. all three are asserted "
+                "structurally rather than by comparing behaviour"
+            ),
+        },
         "consumed_integrations": {
             "frank_entry_id": config.frank_entry_id,
+            # Established from resolvable entities, never from that entry's setup
+            # state. The lifecycle probe this used to call is gone; see the
+            # ``price.capability`` block above for what is actually checked.
             "frank_available": coordinator.frank_available,
             "pv_forecast_enabled": config.use_pv_forecast,
             "solcast_entry_id": config.solcast_entry_id,

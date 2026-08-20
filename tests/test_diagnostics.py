@@ -38,6 +38,9 @@ async def test_diagnostics_report_every_documented_section(
         # entry, so the sixteen-item list ceiling every payload is held to is
         # untouched.
         "pv",
+        # Phase 6, on the same reasoning. What electricity costs, and the
+        # structural reasons it changes nothing.
+        "price",
         "consumed_integrations",
     }
 
