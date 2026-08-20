@@ -371,7 +371,16 @@ FORECAST_STORAGE_VERSION: Final = 1
 #: * **1.2** -- v1.0.0-beta.6. Summary rows gained ``mr``, the matching-rule
 #:   generation that produced them. A row without it is generation 1, which is
 #:   exactly what every beta.5 row is.
-FORECAST_STORAGE_MINOR_VERSION: Final = 2
+#: * **1.3** -- v1.0.0-beta.12. Partitions gained ``prs``, the price issuances,
+#:   and index rows gained ``prfp``, their fingerprints. A document without
+#:   either reads unchanged.
+#:
+#: One honest note for anyone diffing stored documents: photovoltaic snapshots
+#: (``pvs``/``pvo``) arrived in v1.0.0-beta.9 **without** a minor bump, so a
+#: document stamped 1.2 may or may not carry them. The reader tolerates both,
+#: which is why that omission is recorded here rather than papered over by
+#: restamping documents that were written correctly.
+FORECAST_STORAGE_MINOR_VERSION: Final = 3
 
 #: Index document: schema version, the month partitions that exist, and the
 #: small daily summary rows. Always loaded.

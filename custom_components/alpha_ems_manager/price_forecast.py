@@ -925,3 +925,234 @@ def unavailable_price_forecast(
         tomorrow_reason=reason,
         provenance=provenance or PriceProvenance(),
     )
+
+
+# --- evidence -----------------------------------------------------------------
+
+#: Per-interval export basis, stored as one character each. A basis can differ
+#: between intervals -- an upstream that published an explicit figure for part of
+#: a day would produce exactly that -- so it is kept per interval rather than
+#: reduced to one day-level label that would be wrong for some of it.
+_BASIS_CODES: dict[str, str] = {
+    PRICE_EXPORT_BASIS_API_FIELD: "a",
+    PRICE_EXPORT_BASIS_ADJUSTMENT: "m",
+    PRICE_EXPORT_BASIS_ADJUSTMENT_VAT: "v",
+    PRICE_EXPORT_BASIS_UNKNOWN: "-",
+}
+_BASIS_FROM_CODE: dict[str, str] = {code: basis for basis, code in _BASIS_CODES.items()}
+
+
+@dataclass(frozen=True, slots=True)
+class PriceSnapshot:
+    """What prices were known for one day, at one instant.
+
+    Why record this at all, when nothing in this release learns from it: **which
+    future prices were visible when a plan was made is irrecoverable afterwards.**
+    Prices are revised and republished, so a later phase reading today's series
+    cannot tell what was on screen at nine in the morning. That is a hindsight
+    bias which cannot be fixed retroactively, only avoided in advance.
+
+    Four floats an interval, and ``market_price_tax`` is one of them. An earlier
+    design stored three and derived the tax from the twenty-one per cent relation
+    it satisfies on every observed block. That was revoked: the relation is VAT
+    legislation rather than arithmetic, the rate can change, and a stored series
+    that discarded the field could not be repaired afterwards -- which would
+    defeat the only reason for storing anything. It is checked and flagged
+    instead.
+
+    The two fixed components sit at day level, with a flag when they vary within
+    the day. That is a genuine observation about contract terms rather than an
+    assumed identity, and it is what lets a later phase tell "the market moved"
+    from "the energy tax changed on the first of January".
+
+    Holes are holes. The arrays are the length of the day and carry ``None``
+    where no price was known, which is not a price of zero.
+    """
+
+    issued_at: datetime
+    target_day: date
+    tz_key: str
+    interval_count: int
+
+    available: bool
+    unavailable_reason: str | None
+    tomorrow_available: bool
+    tomorrow_reason: str | None
+
+    market_price: tuple[float | None, ...]
+    market_price_tax: tuple[float | None, ...]
+    import_price: tuple[float | None, ...]
+    export_price: tuple[float | None, ...]
+    export_basis: tuple[str, ...]
+
+    sourcing_markup_eur_kwh: float | None
+    energy_tax_eur_kwh: float | None
+
+    known_window_start: datetime | None
+    economic_price_horizon_end: datetime | None
+    intervals_known: int
+    intervals_beyond_horizon: int
+
+    flags: tuple[str, ...]
+    fingerprint: str
+    mapping_version: int = PRICE_MAPPING_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the compact serialisable form.
+
+        Short keys, like every other stored document here: a year of quarter-hour
+        arrays is where the bytes are. The raw source arrays are **not** stored --
+        twenty-five kilobytes a state change, and reconstructible from these four
+        series plus the day-level components.
+        """
+        return {
+            "at": self.issued_at.isoformat(),
+            "tz": self.tz_key,
+            "n": self.interval_count,
+            "a": 1 if self.available else 0,
+            "r": self.unavailable_reason,
+            "ta": 1 if self.tomorrow_available else 0,
+            "tr": self.tomorrow_reason,
+            "mp": list(self.market_price),
+            "mt": list(self.market_price_tax),
+            "ip": list(self.import_price),
+            "xp": list(self.export_price),
+            "xb": "".join(_BASIS_CODES.get(basis, "-") for basis in self.export_basis),
+            "sm": self.sourcing_markup_eur_kwh,
+            "et": self.energy_tax_eur_kwh,
+            "ws": (
+                None
+                if self.known_window_start is None
+                else self.known_window_start.isoformat()
+            ),
+            "he": (
+                None
+                if self.economic_price_horizon_end is None
+                else self.economic_price_horizon_end.isoformat()
+            ),
+            "k": self.intervals_known,
+            "bh": self.intervals_beyond_horizon,
+            "fl": list(self.flags),
+            "f": self.fingerprint,
+            "mv": self.mapping_version,
+        }
+
+    @classmethod
+    def from_dict(cls, target_day: date, raw: Any) -> PriceSnapshot | None:
+        """Rebuild a snapshot, or return ``None`` when the entry is unusable."""
+        if not isinstance(raw, Mapping):
+            return None
+        issued = _parse_stored_moment(raw.get("at"))
+        count = raw.get("n")
+        if issued is None or not isinstance(count, int) or isinstance(count, bool):
+            return None
+        if not 1 <= count <= 2 * 96:
+            return None
+        tz_key = raw.get("tz")
+        codes = raw.get("xb") if isinstance(raw.get("xb"), str) else ""
+        return cls(
+            issued_at=issued,
+            target_day=target_day,
+            tz_key=tz_key if isinstance(tz_key, str) and tz_key else "UTC",
+            interval_count=count,
+            available=bool(raw.get("a")),
+            unavailable_reason=(raw["r"] if isinstance(raw.get("r"), str) else None),
+            tomorrow_available=bool(raw.get("ta")),
+            tomorrow_reason=(raw["tr"] if isinstance(raw.get("tr"), str) else None),
+            market_price=_stored_series(raw.get("mp"), count),
+            market_price_tax=_stored_series(raw.get("mt"), count),
+            import_price=_stored_series(raw.get("ip"), count),
+            export_price=_stored_series(raw.get("xp"), count),
+            export_basis=tuple(
+                _BASIS_FROM_CODE.get(
+                    codes[index] if index < len(codes) else "-",
+                    PRICE_EXPORT_BASIS_UNKNOWN,
+                )
+                for index in range(count)
+            ),
+            sourcing_markup_eur_kwh=_finite(raw.get("sm")),
+            energy_tax_eur_kwh=_finite(raw.get("et")),
+            known_window_start=_parse_stored_moment(raw.get("ws")),
+            economic_price_horizon_end=_parse_stored_moment(raw.get("he")),
+            intervals_known=(raw["k"] if isinstance(raw.get("k"), int) else 0),
+            intervals_beyond_horizon=(
+                raw["bh"] if isinstance(raw.get("bh"), int) else 0
+            ),
+            flags=tuple(
+                str(flag) for flag in (raw.get("fl") or []) if isinstance(flag, str)
+            ),
+            fingerprint=str(raw.get("f") or ""),
+            mapping_version=(
+                raw["mv"] if isinstance(raw.get("mv"), int) else PRICE_MAPPING_VERSION
+            ),
+        )
+
+
+def _stored_series(raw: Any, count: int) -> tuple[float | None, ...]:
+    """Return a fixed-length series of optional finite floats."""
+    source = raw if isinstance(raw, list) else []
+    return tuple(
+        _finite(source[index]) if index < len(source) else None
+        for index in range(count)
+    )
+
+
+def _parse_stored_moment(raw: Any) -> datetime | None:
+    """Return a stored timestamp, or ``None`` when it cannot be read."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def build_price_snapshot(
+    forecast: PriceForecast, *, issued_at: datetime, interval_count: int
+) -> PriceSnapshot:
+    """Return the persistable record of one price issuance.
+
+    The series is sparse in memory -- it holds only the intervals it knows -- and
+    dense on disk, indexed by the day's own interval identity. Both are the same
+    fact stated two ways, and the dense form is what makes a hole on disk
+    unambiguous rather than a shorter array.
+    """
+    market: list[float | None] = [None] * interval_count
+    tax: list[float | None] = [None] * interval_count
+    import_price: list[float | None] = [None] * interval_count
+    export_price: list[float | None] = [None] * interval_count
+    basis: list[str] = [PRICE_EXPORT_BASIS_UNKNOWN] * interval_count
+
+    for interval in forecast.intervals:
+        if not 0 <= interval.index < interval_count:
+            continue
+        market[interval.index] = interval.market_price_eur_kwh
+        tax[interval.index] = interval.market_price_tax_eur_kwh
+        import_price[interval.index] = interval.import_price_eur_kwh
+        export_price[interval.index] = interval.export_price_eur_kwh
+        basis[interval.index] = interval.export_basis
+
+    return PriceSnapshot(
+        issued_at=issued_at,
+        target_day=forecast.target_day or issued_at.date(),
+        tz_key=forecast.tz_key,
+        interval_count=interval_count,
+        available=forecast.available,
+        unavailable_reason=forecast.today_reason,
+        tomorrow_available=forecast.tomorrow_available,
+        tomorrow_reason=forecast.tomorrow_reason,
+        market_price=tuple(market),
+        market_price_tax=tuple(tax),
+        import_price=tuple(import_price),
+        export_price=tuple(export_price),
+        export_basis=tuple(basis),
+        sourcing_markup_eur_kwh=forecast.provenance.sourcing_markup_eur_kwh,
+        energy_tax_eur_kwh=forecast.provenance.energy_tax_eur_kwh,
+        known_window_start=forecast.known_window_start,
+        economic_price_horizon_end=forecast.economic_price_horizon_end,
+        intervals_known=forecast.intervals_known,
+        intervals_beyond_horizon=forecast.intervals_beyond_horizon,
+        flags=forecast.flags,
+        fingerprint=forecast.fingerprint(),
+    )

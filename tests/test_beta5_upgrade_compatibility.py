@@ -195,7 +195,16 @@ async def test_a_beta5_forecast_document_is_read_not_discarded(
 
     # The rows beta.5 wrote are recognised as first-generation matches.
     assert matcher_version(store.days[DAY_ONE].summary) == 1
-    assert FORECAST_STORAGE_MINOR_VERSION == 2
+
+    # A beta.5 document carries neither photovoltaic nor price evidence, and
+    # reading it must not invent either. The minor version has moved on twice
+    # since -- it is pinned here so a *major* bump, which would decide the
+    # document is unreadable, cannot slip in as a minor one.
+    assert FORECAST_STORAGE_VERSION == 1
+    assert FORECAST_STORAGE_MINOR_VERSION == 3
+    assert store.days[DAY_ONE].pv_fingerprints == []
+    assert store.days[DAY_ONE].price_fingerprints == []
+    assert store.price_snapshots(DAY_ONE) == []
 
 
 async def test_a_beta5_installation_keeps_every_entity_and_unique_id(

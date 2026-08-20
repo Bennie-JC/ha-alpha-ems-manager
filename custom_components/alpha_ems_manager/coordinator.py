@@ -153,6 +153,7 @@ from .price_forecast import (
     PriceForecast,
     PriceProvenance,
     build_price_forecast,
+    build_price_snapshot,
     cross_check,
     unavailable_price_forecast,
 )
@@ -1510,6 +1511,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # the structure guarantees rather than something a test checks.
         price_forecasts = self._price_forecasts_safely(now=now, today=today, tz=tz)
         self.price_forecasts = price_forecasts
+        await self._async_record_price_evidence_safely(
+            forecasts=price_forecasts, now=now, tz=tz
+        )
 
         absorb_surplus, absorption_reason = self._surplus_absorption()
 
@@ -1554,6 +1558,79 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "price_today": price_forecasts.get(today),
             "price_tomorrow": price_forecasts.get(tomorrow),
         }
+
+    async def _async_record_price_evidence_safely(
+        self,
+        *,
+        forecasts: dict[date, PriceForecast],
+        now: datetime,
+        tz: tzinfo,
+    ) -> None:
+        """Record what prices were known, or say why it could not be recorded.
+
+        Wrapped like every evidence step beside it: the learning history is the
+        irreplaceable half and evidence is the newest half, so a fault here must
+        never cost a refresh.
+        """
+        try:
+            await self._async_record_price_evidence(forecasts=forecasts, now=now, tz=tz)
+        except Exception:
+            self._log.warning(
+                _PRICE_LOG,
+                (
+                    "Price evidence could not be recorded this refresh. The "
+                    "series itself and every other layer are unaffected; the "
+                    "evidence for this issuance is simply not stored"
+                ),
+            )
+            _LOGGER.debug("price evidence recording failed", exc_info=True)
+
+    async def _async_record_price_evidence(
+        self,
+        *,
+        forecasts: dict[date, PriceForecast],
+        now: datetime,
+        tz: tzinfo,
+    ) -> None:
+        """Store which prices were visible, at the instant they were visible.
+
+        **There is no outcome half, and that is not an omission.** A price has no
+        "what actually happened" to be scored against -- it was the price. What
+        cannot be recovered afterwards is *which future prices were on screen when
+        a plan was made*: they are revised and republished, so a later phase
+        reading today's series has no way to tell what nine o'clock knew. That is
+        a hindsight bias which can only be avoided in advance.
+
+        Change-triggered by content fingerprint, so ninety-six refreshes a day
+        against a source that republishes a handful of times do not store
+        ninety-six identical documents. Nothing is learned here and nothing is
+        corrected: this release records, and what the record *means* belongs to a
+        later phase that can only answer it honestly from an unadjusted series.
+        """
+        if not self.config.frank_entry_id:
+            return
+
+        days = sorted(forecasts)
+        try:
+            await self.history.async_ensure_days(days)
+        except Exception:
+            _LOGGER.debug("price evidence partitions unavailable", exc_info=True)
+            return
+
+        changed = False
+        for day, forecast in sorted(forecasts.items()):
+            snapshot = build_price_snapshot(
+                forecast,
+                issued_at=now,
+                interval_count=expected_quarters_for(day, tz),
+            )
+            if self.history.add_price_snapshot(snapshot):
+                changed = True
+
+        if changed:
+            # Debounced, like the two evidence layers beside it. Ninety-odd
+            # refreshes a day must not each force a document write.
+            self.history.schedule_save()
 
     async def _async_record_pv_evidence_safely(
         self,

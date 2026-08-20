@@ -60,6 +60,7 @@ from .const import (
     FORECAST_SUMMARY_RETENTION_DAYS,
 )
 from .forecast_history import DayOutcome, ForecastSnapshot
+from .price_forecast import PriceSnapshot
 from .pv_forecast import PvOutcome, PvSnapshot
 
 _LOGGER = logging.getLogger(__name__)
@@ -150,6 +151,11 @@ class DayIndexRow:
     #: Kept in the index rather than the partition so the ninety-odd refreshes a
     #: day that change nothing need not load a month of arrays to discover it.
     pv_fingerprints: list[str] = field(default_factory=list)
+    #: Content fingerprints of the price issuances recorded for this day, for the
+    #: same reason: the source republishes a handful of times a day, so the
+    #: overwhelmingly common answer is "nothing changed" and it should not cost a
+    #: partition load to reach it.
+    price_fingerprints: list[str] = field(default_factory=list)
 
     @property
     def snapshot_count(self) -> int:
@@ -171,6 +177,8 @@ class DayIndexRow:
             payload["rp"] = True
         if self.pv_fingerprints:
             payload["pvfp"] = list(self.pv_fingerprints)
+        if self.price_fingerprints:
+            payload["prfp"] = list(self.price_fingerprints)
         return payload
 
     @classmethod
@@ -201,6 +209,11 @@ class DayIndexRow:
                 if isinstance(raw.get("pvfp"), list)
                 else []
             ),
+            price_fingerprints=(
+                [str(value) for value in raw.get("prfp")]
+                if isinstance(raw.get("prfp"), list)
+                else []
+            ),
         )
 
 
@@ -224,6 +237,12 @@ class _Partition:
     #: partition with their own outcomes.
     pv_snapshots: dict[date, list[PvSnapshot]] = field(default_factory=dict)
     pv_outcomes: dict[date, PvOutcome] = field(default_factory=dict)
+    #: Price evidence, namespaced beside the other two for the same reason -- and
+    #: with no outcome counterpart, deliberately. A price has no "what actually
+    #: happened" to be scored against: it was the price. The record exists so a
+    #: later phase can know *what was visible when a plan was made*, which is the
+    #: one thing that cannot be recovered afterwards.
+    price_snapshots: dict[date, list[PriceSnapshot]] = field(default_factory=dict)
     #: Set when this partition could not be read. Writes to it are suspended for
     #: the session; the rest of the history keeps working.
     corrupt: bool = False
@@ -237,6 +256,7 @@ class _Partition:
             | set(self.outcomes)
             | set(self.pv_snapshots)
             | set(self.pv_outcomes)
+            | set(self.price_snapshots)
         )
         for day in sorted(known):
             entry: dict[str, Any] = {}
@@ -254,6 +274,11 @@ class _Partition:
             pv_outcome = self.pv_outcomes.get(day)
             if pv_outcome is not None:
                 entry["pvo"] = pv_outcome.to_dict()
+            # Omitted entirely on an installation with no price source, exactly
+            # as the photovoltaic arrays are without a forecast.
+            price_snapshots = self.price_snapshots.get(day)
+            if price_snapshots:
+                entry["prs"] = [snapshot.to_dict() for snapshot in price_snapshots]
             if entry:
                 days[day.isoformat()] = entry
         return {"days": days}
@@ -403,6 +428,17 @@ class ForecastHistoryStore:
             pv_outcome = PvOutcome.from_dict(day, value.get("pvo"))
             if pv_outcome is not None:
                 partition.pv_outcomes[day] = pv_outcome
+            price_raw = value.get("prs")
+            if isinstance(price_raw, list):
+                rebuilt_price = [
+                    snapshot
+                    for snapshot in (
+                        PriceSnapshot.from_dict(day, entry) for entry in price_raw
+                    )
+                    if snapshot is not None
+                ]
+                if rebuilt_price:
+                    partition.price_snapshots[day] = rebuilt_price
         return partition
 
     async def async_ensure_days(self, days: list[date]) -> None:
@@ -464,6 +500,62 @@ class ForecastHistoryStore:
         )
 
     # -- writing ---------------------------------------------------------
+
+    def price_snapshots(self, day: date) -> list[PriceSnapshot]:
+        """Return the price issuances recorded for a target day."""
+        partition = self._partitions.get(month_key(day))
+        if partition is None:
+            return []
+        return list(partition.price_snapshots.get(day, ()))
+
+    def latest_price_snapshot(self, day: date) -> PriceSnapshot | None:
+        """Return the most recent price issuance for a target day, or ``None``."""
+        recorded = self.price_snapshots(day)
+        return recorded[-1] if recorded else None
+
+    def has_price_fingerprint(self, day: date, fingerprint: str) -> bool:
+        """Return whether a price issuance with this content is already recorded.
+
+        Answered from the index, so the ninety-odd refreshes a day that change
+        nothing never load a month of arrays to find that out.
+        """
+        row = self.days.get(day)
+        return row is not None and fingerprint in row.price_fingerprints
+
+    def add_price_snapshot(self, snapshot: PriceSnapshot) -> bool:
+        """Persist a price issuance, unless it duplicates one already recorded.
+
+        Change-triggered by content fingerprint, like both series before it. The
+        source republishes a handful of times a day, so this bounds growth by how
+        often the data actually changes rather than by a cap that would need
+        tuning -- and the per-day ceiling is still there as a backstop.
+        """
+        day = snapshot.target_day
+        if not self.writable(day):
+            return False
+        if self.has_price_fingerprint(day, snapshot.fingerprint):
+            return False
+
+        row = self.days.setdefault(day, DayIndexRow())
+        if len(row.price_fingerprints) >= FORECAST_MAX_SNAPSHOTS_PER_TARGET:
+            self.snapshot_cap_hits += 1
+            _LOGGER.warning(
+                "Forecast history already holds %d price snapshots for %s, "
+                "which is the per-day ceiling, so this issuance is not being "
+                "recorded. The records already kept are unaffected",
+                len(row.price_fingerprints),
+                day.isoformat(),
+            )
+            return False
+
+        partition = self._partitions[month_key(day)]
+        partition.price_snapshots.setdefault(day, []).append(snapshot)
+        partition.dirty = True
+
+        row.price_fingerprints.append(snapshot.fingerprint)
+        self.months.add(month_key(day))
+        self._index_dirty = True
+        return True
 
     def pv_snapshots(self, day: date) -> list[PvSnapshot]:
         """Return the PV issuances recorded for a target day."""
