@@ -1358,9 +1358,7 @@ PRICE_UNAVAILABLE_REASONS: Final = (
 #: never be mistaken for a measured price.
 PRICE_EXPORT_BASIS_API_FIELD: Final = "api_feed_in_price"
 PRICE_EXPORT_BASIS_ADJUSTMENT: Final = "market_price_plus_adjustment"
-PRICE_EXPORT_BASIS_ADJUSTMENT_VAT: Final = (
-    "market_price_plus_adjustment_including_vat"
-)
+PRICE_EXPORT_BASIS_ADJUSTMENT_VAT: Final = "market_price_plus_adjustment_including_vat"
 PRICE_EXPORT_BASIS_UNKNOWN: Final = "unavailable"
 
 #: Optional explicit feed-in field. Absent from every block the live capture
@@ -1400,6 +1398,13 @@ PRICE_CROSS_CHECK_TOLERANCE_EUR_KWH: Final = 1e-6
 #: Tolerance for the VAT-ratio observation. The source rounds the tax to five
 #: decimals, so the comparison is made at that scale rather than exactly.
 PRICE_VAT_RATIO_TOLERANCE_EUR_KWH: Final = 5e-6
+
+#: Outcome of comparing the normalised series against the two figures the source
+#: publishes for the current interval. Recorded as evidence of contract drift; it
+#: never overrides the series and never reaches a decision.
+PRICE_CROSS_CHECK_AGREES: Final = "agrees"
+PRICE_CROSS_CHECK_DISAGREES: Final = "disagrees"
+PRICE_CROSS_CHECK_NOT_COMPARABLE: Final = "not_comparable"
 
 #: Bumped when the price mapping rule itself changes, so evidence recorded under
 #: an older rule is identifiable rather than pooled.

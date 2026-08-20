@@ -12,14 +12,16 @@ import sys
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_socket
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
 )
@@ -50,10 +52,17 @@ from custom_components.alpha_ems_manager.const import (
     DOMAIN,
     DOMAIN_FRANK,
     DOMAIN_SOLCAST,
+    FRANK_KEY_CURRENT_PRICE,
+    FRANK_KEY_CURRENT_RETURN_PRICE,
+    FRANK_KEY_PRICES_TODAY,
+    FRANK_KEY_PRICES_TOMORROW,
+    FRANK_KEY_TOMORROW_AVAILABLE,
     SOLCAST_DOMAIN,
     SOLCAST_SERVICE_DIAGNOSTIC,
     SOLCAST_SERVICE_QUERY_FORECAST,
 )
+
+from .frank_capture import SYNTHETIC_FEED_IN_ADJUSTMENT, synthetic_day
 
 # On Windows every asyncio event loop creates an ``AF_INET`` socket for its
 # self-pipe, which pytest_socket blocks. On Linux/macOS CI the self-pipe uses an
@@ -200,8 +209,14 @@ def frank_config_entry(hass: HomeAssistant) -> MockConfigEntry:
     dropdown built from the entries that actually exist -- so without this the
     stored id would not be a selectable value.
     """
+    # ``data`` carries the country, as the live entry does. It is what the
+    # market timezone is derived from, and the unique id is the country too --
+    # which is why at most two of these entries can ever exist.
     entry = MockConfigEntry(
-        domain=DOMAIN_FRANK, title="Frank Quarter Prices (NL)", unique_id="NL"
+        domain=DOMAIN_FRANK,
+        title="Frank Quarter Prices (NL)",
+        unique_id="NL",
+        data={"country": "NL"},
     )
     entry.add_to_hass(hass)
     return entry
@@ -417,6 +432,182 @@ class FakeSolcast:
             )
             moment += timedelta(minutes=30)
         return {"data": rows}
+
+
+#: The day the price fixture publishes. Mirrors ``forecast_helpers.NORMAL``,
+#: which cannot be imported here because that module imports this one --
+#: ``test_price_capability`` asserts the two have not drifted apart.
+PRICE_DAY = date(2026, 8, 19)
+
+
+class FakeFrank:
+    """The price source as Alpha EMS actually sees it: published entity state.
+
+    Deliberately **not** a service fake, because there is nothing to fake: prices
+    are read from state, no action is called to obtain them, and there is no call
+    site in Alpha EMS that could make this integration fetch. A fake with a
+    ``calls`` counter would imply a coupling that does not exist.
+
+    Entities are registered with the real unique ids -- ``f"{entry_id}_{key}"`` --
+    so the capability probe resolves them the way it does in production, through
+    the registry. Hard-coding the entity ids here would test a lookup nobody
+    performs, and would hide a rename that the real resolution survives.
+    """
+
+    #: ``domain`` and the source's own entity key, per entity.
+    KEYS = (
+        ("sensor", FRANK_KEY_PRICES_TODAY, "frank_prices_today"),
+        ("sensor", FRANK_KEY_PRICES_TOMORROW, "frank_prices_tomorrow"),
+        (
+            "binary_sensor",
+            FRANK_KEY_TOMORROW_AVAILABLE,
+            "frank_tomorrow_prices_available",
+        ),
+        ("sensor", FRANK_KEY_CURRENT_PRICE, "frank_current_price"),
+        ("sensor", FRANK_KEY_CURRENT_RETURN_PRICE, "frank_current_return_price"),
+    )
+
+    def __init__(self, hass: HomeAssistant, entry: MockConfigEntry) -> None:
+        self.hass = hass
+        self.entry = entry
+        self.entity_ids: dict[str, str] = {}
+
+    def register(self, *, keys: tuple[str, ...] | None = None) -> None:
+        """Create the source's entities in the registry.
+
+        ``keys`` narrows the set, so a test can describe an installation where one
+        entity is genuinely absent rather than merely unavailable. Those are
+        different facts and the capability reports them differently.
+        """
+        registry = er.async_get(self.hass)
+        for domain, key, object_id in self.KEYS:
+            if keys is not None and key not in keys:
+                continue
+            entry = registry.async_get_or_create(
+                domain,
+                DOMAIN_FRANK,
+                f"{self.entry.entry_id}_{key}",
+                config_entry=self.entry,
+                suggested_object_id=object_id,
+            )
+            self.entity_ids[key] = entry.entity_id
+
+    def rename(self, key: str, entity_id: str) -> str:
+        """Rename one entity, as a user may.
+
+        Resolution is by unique id, so this must change nothing. The test that
+        uses it is the one that proves no entity id is hard-coded anywhere.
+        """
+        registry = er.async_get(self.hass)
+        updated = registry.async_update_entity(
+            self.entity_ids[key], new_entity_id=entity_id
+        )
+        self.entity_ids[key] = updated.entity_id
+        return updated.entity_id
+
+    def set_options(self, **options: Any) -> None:
+        """Set the source entry's options, which the export figure derives from."""
+        self.hass.config_entries.async_update_entry(self.entry, options=options)
+
+    # -- publication ----------------------------------------------------------
+
+    def publish_day(
+        self,
+        key: str,
+        blocks: list[dict[str, Any]] | None,
+        *,
+        resolution_minutes: int | None = 15,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Publish one day, or mark it unavailable the way the source does.
+
+        ``blocks is None`` reproduces the unpublished next day **faithfully**, and
+        the faithful part is what matters: Home Assistant writes an entity's
+        attributes only while it is available, so an unavailable entity carries
+        *no* ``prices`` and no ``available`` attribute either. Setting the state to
+        ``unavailable`` while leaving attributes in place would be a shape that
+        cannot occur, and a test built on it would prove nothing about the real
+        one.
+        """
+        entity_id = self.entity_ids[key]
+        if blocks is None:
+            self.hass.states.async_set(entity_id, STATE_UNAVAILABLE, {})
+            return
+        attributes: dict[str, Any] = {"prices": blocks, **(extra or {})}
+        if resolution_minutes is not None:
+            attributes["resolution_minutes"] = resolution_minutes
+        self.hass.states.async_set(entity_id, str(len(blocks)), attributes)
+
+    def publish(
+        self,
+        *,
+        today: list[dict[str, Any]] | None,
+        tomorrow: list[dict[str, Any]] | None = None,
+        tomorrow_published: bool | str | None = None,
+        current_price: float | str | None = None,
+        current_return_price: float | str | None = None,
+        resolution_minutes: int | None = 15,
+    ) -> None:
+        """Publish a whole coherent state of the source.
+
+        ``tomorrow_published`` defaults to whether a next day was given, which is
+        the coherent pairing. It is settable independently precisely so a test can
+        describe the incoherent combinations -- the source claiming a day it is not
+        carrying, or carrying one it has not announced -- because those are the
+        cases the reason taxonomy has to keep apart.
+        """
+        self.publish_day(
+            FRANK_KEY_PRICES_TODAY, today, resolution_minutes=resolution_minutes
+        )
+        self.publish_day(
+            FRANK_KEY_PRICES_TOMORROW,
+            tomorrow,
+            resolution_minutes=resolution_minutes,
+            extra={"available": True, "last_attempt": "2026-08-20T13:31:00+02:00"},
+        )
+
+        published = (
+            tomorrow is not None if tomorrow_published is None else (tomorrow_published)
+        )
+        if FRANK_KEY_TOMORROW_AVAILABLE in self.entity_ids:
+            state = (
+                published
+                if isinstance(published, str)
+                else (STATE_ON if published else STATE_OFF)
+            )
+            self.hass.states.async_set(
+                self.entity_ids[FRANK_KEY_TOMORROW_AVAILABLE], state, {}
+            )
+
+        for key, value in (
+            (FRANK_KEY_CURRENT_PRICE, current_price),
+            (FRANK_KEY_CURRENT_RETURN_PRICE, current_return_price),
+        ):
+            if key not in self.entity_ids:
+                continue
+            self.hass.states.async_set(
+                self.entity_ids[key],
+                STATE_UNAVAILABLE if value is None else str(value),
+                {},
+            )
+
+
+@pytest.fixture
+def frank(hass: HomeAssistant, frank_config_entry: MockConfigEntry) -> FakeFrank:
+    """Register the price source's entities and publish a healthy day.
+
+    The entry is **not** marked loaded, and that omission is deliberate: nothing
+    in Alpha EMS consults another integration's setup state any more. If a future
+    change reintroduced a lifecycle probe, every test taking this fixture would
+    fail -- which is a stronger guard than a comment.
+    """
+    fake = FakeFrank(hass, frank_config_entry)
+    fake.register()
+    fake.set_options(
+        feed_in_adjustment=SYNTHETIC_FEED_IN_ADJUSTMENT, apply_feed_in_vat=False
+    )
+    fake.publish(today=synthetic_day(PRICE_DAY), tomorrow=None)
+    return fake
 
 
 @pytest.fixture

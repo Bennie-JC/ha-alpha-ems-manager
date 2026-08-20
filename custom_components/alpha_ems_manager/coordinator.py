@@ -14,11 +14,11 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     EVENT_CORE_CONFIG_UPDATE,
     SUN_EVENT_SUNRISE,
@@ -78,12 +78,17 @@ from .const import (
     DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
     DEFAULT_CONTROL_HORIZON_MINUTES,
     DEFAULT_GRID_POWER_SIGN,
-    DOMAIN_FRANK,
     INHIBIT_NO_DECISION,
     INHIBIT_NO_PLAN,
     INHIBIT_PLAN_UNAVAILABLE,
     LOG_THROTTLE_SECONDS,
     MAX_CONTROL_EVENTS_REPORTED,
+    PRICE_CROSS_CHECK_DISAGREES,
+    PRICE_FLAG_EXPORT_CROSS_CHECK_FAILED,
+    PRICE_FLAG_IMPORT_CROSS_CHECK_FAILED,
+    PRICE_UNAVAILABLE_NOT_CONFIGURED,
+    PRICE_UNAVAILABLE_OPTIONS_UNREADABLE,
+    PRICE_UNAVAILABLE_SOURCE_UNAVAILABLE,
     PV_ABSORPTION_DISPATCH_ACTIVE,
     PV_ABSORPTION_EXCESS_EXPORT,
     PV_ABSORPTION_NO_SUPPRESSING_FEATURE,
@@ -123,6 +128,16 @@ from .forecast import (
     collect_forecast_inputs,
 )
 from .forecast_recorder import ForecastRecorder, RecorderResult
+from .frank_source import (
+    DayRead,
+    FrankCapability,
+    FrankOptions,
+    read_current_prices,
+    read_options,
+    read_today,
+    read_tomorrow,
+)
+from .frank_source import discover as discover_frank
 from .history_store import ForecastHistoryStore
 from .normalization import (
     PowerFlows,
@@ -134,6 +149,13 @@ from .normalization import (
     split_grid_power,
 )
 from .plan import BatteryPlan, build_plan
+from .price_forecast import (
+    PriceForecast,
+    PriceProvenance,
+    build_price_forecast,
+    cross_check,
+    unavailable_price_forecast,
+)
 from .pv_forecast import (
     PvForecast,
     PvProvenance,
@@ -230,6 +252,7 @@ _CONTROL_LOG = "control"
 #: Throttle key for the PV forecast layer. Its own, so a Solcast fault cannot
 #: silence a control warning or the other way round.
 _PV_LOG = "pv_forecast"
+_PRICE_LOG = "price_forecast"
 
 #: The statement every control surface in this release repeats, because it is the
 #: single most important fact about it.
@@ -563,6 +586,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.pv_facts: SolcastFacts | None = None
         #: The most recent forecast per target day. Rebuilt every refresh.
         self.pv_forecasts: dict[date, PvForecast] = {}
+
+        #: The price layer. Published for diagnostics and evidence, and read by
+        #: nothing in the decision layer -- which is what makes "prices change no
+        #: decision" a structural property rather than a promise.
+        self.price_forecasts: dict[date, PriceForecast] = {}
+        self.price_capability = FrankCapability()
+        self.price_options = FrankOptions(readable=False)
 
     # -- lifecycle -------------------------------------------------------
 
@@ -1470,6 +1500,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._async_record_pv_evidence_safely(
             forecasts=pv_forecasts, now=now, today=today, tz=tz
         )
+        # Read after PV and before the plan, and consumed by neither. It sits
+        # here so one refresh carries one consistent instant across every layer,
+        # which is what made the beta.9 symptom readable once it was fixed.
+        #
+        # The plan below is *not* passed prices, and that omission is the design:
+        # a field with no consumer is an invitation, and keeping the series out of
+        # the decision layer entirely makes "prices change no decision" something
+        # the structure guarantees rather than something a test checks.
+        price_forecasts = self._price_forecasts_safely(now=now, today=today, tz=tz)
+        self.price_forecasts = price_forecasts
+
         absorb_surplus, absorption_reason = self._surplus_absorption()
 
         plan = self._build_battery_plan(
@@ -1510,6 +1551,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "modelled": absorb_surplus,
                 "reason": absorption_reason,
             },
+            "price_today": price_forecasts.get(today),
+            "price_tomorrow": price_forecasts.get(tomorrow),
         }
 
     async def _async_record_pv_evidence_safely(
@@ -2009,6 +2052,217 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     @callback
+    # -- quarter-hour prices ---------------------------------------------
+
+    def _price_index_resolver(
+        self, day: date, tz: tzinfo
+    ) -> Callable[[datetime], int | None]:
+        """Return a **bounded** index resolver for one civil day.
+
+        Bounded where the PV resolver is not, because the two models differ: a PV
+        forecast is a fixed-length day and range-checks downstream, while a price
+        series holds only the intervals it actually knows. An unbounded index here
+        would file a block from the neighbouring market day at a position that
+        does not exist -- so out of range returns ``None`` and is counted, which is
+        the normal and expected outcome whenever Home Assistant does not run in
+        the market's own timezone.
+        """
+        count = expected_quarters_for(day, tz)
+
+        def index_of(start: datetime) -> int | None:
+            index = index_for_start_utc(day, start, tz)
+            return index if 0 <= index < count else None
+
+        return index_of
+
+    def _price_unavailable(
+        self,
+        day: date,
+        tz: tzinfo,
+        reason: str,
+        provenance: PriceProvenance | None = None,
+    ) -> PriceForecast:
+        """Return a named unavailability of the right shape for one day."""
+        return unavailable_price_forecast(
+            tz_key=str(tz),
+            reason=reason,
+            target_day=day,
+            expected_intervals=expected_quarters_for(day, tz),
+            provenance=provenance,
+        )
+
+    def _price_forecasts_safely(
+        self, *, now: datetime, today: date, tz: tzinfo
+    ) -> dict[date, PriceForecast]:
+        """Read the price series, or report why there is none.
+
+        Isolated under its own log key exactly as the layers before it are. A
+        price failure costs the price block and nothing else -- and since nothing
+        in the decision layer reads prices at all, it cannot cost a battery plan
+        even in principle.
+        """
+        tomorrow = today + timedelta(days=1)
+        try:
+            return self._price_forecasts(now=now, today=today, tz=tz)
+        except Exception:
+            self._log.warning(
+                _PRICE_LOG,
+                (
+                    "The price series could not be read this refresh. Nothing "
+                    "downstream depends on it: no battery decision, no policy "
+                    "and no command reads a price in this release"
+                ),
+            )
+            _LOGGER.debug("price series build failed", exc_info=True)
+            return {
+                day: self._price_unavailable(
+                    day, tz, PRICE_UNAVAILABLE_SOURCE_UNAVAILABLE
+                )
+                for day in (today, tomorrow)
+            }
+
+    def _price_forecasts(
+        self, *, now: datetime, today: date, tz: tzinfo
+    ) -> dict[date, PriceForecast]:
+        """Read both published days and normalise them onto our own identity.
+
+        Synchronous, and that is the substantive point rather than a detail:
+        obtaining prices calls **no service at all**. Both days are read from
+        entity state the source has already published, so there is no call site
+        to misuse and the permitted service-caller set is untouched by this
+        phase. "Alpha EMS cannot make the price source fetch" is structural.
+
+        Both source days feed both of our days. The source publishes a *market*
+        day and we plan a local civil day; when Home Assistant runs outside the
+        market's timezone those are different spans, so part of one of our days is
+        priced by the neighbouring market day. That is why the mapping is by
+        instant and why partial coverage is reported rather than repaired.
+        """
+        tomorrow = today + timedelta(days=1)
+        days = (today, tomorrow)
+        entry_id = self.config.frank_entry_id
+
+        capability = discover_frank(self.hass, entry_id)
+        self.price_capability = capability
+        if not capability.usable:
+            reason = capability.unavailable_reason or PRICE_UNAVAILABLE_NOT_CONFIGURED
+            self.price_options = FrankOptions(readable=False)
+            return {day: self._price_unavailable(day, tz, reason) for day in days}
+
+        options = read_options(self.hass, entry_id)
+        self.price_options = options
+
+        today_read = read_today(self.hass, capability)
+        tomorrow_read = read_tomorrow(self.hass, capability)
+
+        if not today_read.available:
+            # Today is not optional, whatever the next day's publication state is.
+            provenance = self._price_provenance(capability, options, today_read)
+            reason = today_read.reason or PRICE_UNAVAILABLE_SOURCE_UNAVAILABLE
+            return {
+                day: self._price_unavailable(day, tz, reason, provenance)
+                for day in days
+            }
+
+        provenance = self._price_provenance(capability, options, today_read)
+        flags = () if options.readable else (PRICE_UNAVAILABLE_OPTIONS_UNREADABLE,)
+        blocks = (
+            ("today", list(today_read.blocks)),
+            ("tomorrow", list(tomorrow_read.blocks)),
+        )
+
+        forecasts = {
+            day: build_price_forecast(
+                blocks,
+                tz_key=str(tz),
+                index_of=self._price_index_resolver(day, tz),
+                target_day=day,
+                expected_intervals=expected_quarters_for(day, tz),
+                # An unreadable configuration yields no export price rather than a
+                # guessed one: a fabricated adjustment would look exactly like a
+                # real figure, which is worse than an absent one.
+                adjustment=options.adjustment if options.readable else None,
+                apply_vat=options.apply_vat,
+                today_available=True,
+                tomorrow_available=tomorrow_read.available,
+                tomorrow_reason=tomorrow_read.reason,
+                provenance=provenance,
+                extra_flags=flags,
+            )
+            for day in days
+        }
+        return {
+            day: self._price_cross_checked(forecast, capability, now)
+            for day, forecast in forecasts.items()
+        }
+
+    def _price_provenance(
+        self,
+        capability: FrankCapability,
+        options: FrankOptions,
+        today_read: DayRead,
+    ) -> PriceProvenance:
+        """Return what is known about where this series came from."""
+        return PriceProvenance(
+            source_entry_id=self.config.frank_entry_id,
+            source_country=capability.country,
+            market_timezone=capability.market_timezone,
+            today_entity_id=capability.today_entity_id,
+            tomorrow_entity_id=capability.tomorrow_entity_id,
+            availability_entity_id=capability.availability_entity_id,
+            feed_in_adjustment=options.adjustment if options.readable else None,
+            apply_feed_in_vat=options.apply_vat if options.readable else None,
+            options_readable=options.readable,
+            reported_resolution_minutes=today_read.reported_resolution_minutes,
+            # Observed rather than reported: the source does not publish its own
+            # last-update instant on any entity, so this is when the state machine
+            # last wrote, which is a different fact and labelled as one.
+            source_updated_at=today_read.updated_at,
+            observed_freshness=True,
+        )
+
+    def _price_cross_checked(
+        self,
+        forecast: PriceForecast,
+        capability: FrankCapability,
+        now: datetime,
+    ) -> PriceForecast:
+        """Compare the current interval against the source's own two figures.
+
+        The one check in this phase that can fail when the **source** changes
+        rather than when our reading of a fixture changes. Agreement proves the
+        reconstruction and the interval alignment simultaneously, against the
+        running integration instead of against our own assumptions -- which is the
+        direct answer to a defect that shipped because a fixture agreed with the
+        parser that produced it.
+
+        A disagreement is recorded. It never overrides the series, and it reaches
+        no decision, because nothing in the decision layer reads prices.
+        """
+        current = forecast.interval_at(now)
+        if current is None:
+            return forecast
+
+        their_import, their_export = read_current_prices(self.hass, capability)
+        import_result = cross_check(current.import_price_eur_kwh, their_import)
+        export_result = cross_check(current.export_price_eur_kwh, their_export)
+
+        flags = list(forecast.flags)
+        if import_result == PRICE_CROSS_CHECK_DISAGREES:
+            flags.append(PRICE_FLAG_IMPORT_CROSS_CHECK_FAILED)
+        if export_result == PRICE_CROSS_CHECK_DISAGREES:
+            flags.append(PRICE_FLAG_EXPORT_CROSS_CHECK_FAILED)
+
+        return replace(
+            forecast,
+            flags=tuple(flags),
+            provenance=replace(
+                forecast.provenance,
+                import_cross_check=import_result,
+                export_cross_check=export_result,
+            ),
+        )
+
     def _pv_index_resolver(
         self, day: date, tz: tzinfo
     ) -> Callable[[datetime], int | None]:
@@ -2423,35 +2677,25 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # -- consumed integrations -------------------------------------------
 
-    def _entry_loaded(self, domain: str, entry_id: str | None) -> bool:
-        """Return whether a referenced config entry is present and loaded.
-
-        **Do not use this to decide whether another integration can be read.**
-        Only ``frank_available`` still consults it, and only to report a status
-        nothing acts on -- Frank is not consumed yet.
-
-        The PV layer used to ask this question and it was wrong to. Setup state
-        says nothing about whether a registered action can be called: an
-        integration that registers its actions at component level has them
-        available while its config entry is still setting up, so requiring
-        ``LOADED`` produced a live false negative on every restart. See
-        ``solcast_source.SolcastCapability``, which establishes capability from
-        the entry existing and the actions being registered instead.
-
-        Phase 6 will start consuming Frank, and this is the trap it should not
-        walk into: work out what can actually be called, not what state somebody
-        else's entry happens to be in.
-        """
-        for entry in self.hass.config_entries.async_entries(domain):
-            if entry_id is not None and entry.entry_id != entry_id:
-                continue
-            return entry.state is ConfigEntryState.LOADED
-        return False
-
     @property
     def frank_available(self) -> bool:
-        """Return whether the configured Frank Quarter Prices entry is loaded."""
-        return self._entry_loaded(DOMAIN_FRANK, self.config.frank_entry_id)
+        """Return whether the price source can actually be read right now.
+
+        Established from facts -- a selected entry, that entry present, the price
+        entities resolvable through the registry by unique id -- and **never**
+        from the setup state of somebody else's config entry.
+
+        That distinction is not theoretical. The property this replaces asked
+        whether the referenced entry was in state ``LOADED``, and its own
+        docstring carried the warning: the PV layer asked the same question two
+        releases ago and produced a live false negative on every restart, because
+        an integration's usability has nothing to do with which phase of setup its
+        entry happens to be in when we look. There is no lifecycle probe left in
+        this file.
+        """
+        if not self.config.frank_entry_id:
+            return False
+        return discover_frank(self.hass, self.config.frank_entry_id).usable
 
     @property
     def solcast_available(self) -> bool:

@@ -49,6 +49,10 @@ from .const import (
     FRANK_OPTION_FEED_IN_ADJUSTMENT,
     FRANK_PRICE_PRECISION,
     FRANK_VAT_RATE,
+    PRICE_CROSS_CHECK_AGREES,
+    PRICE_CROSS_CHECK_DISAGREES,
+    PRICE_CROSS_CHECK_NOT_COMPARABLE,
+    PRICE_CROSS_CHECK_TOLERANCE_EUR_KWH,
     PRICE_EXPORT_BASIS_ADJUSTMENT,
     PRICE_EXPORT_BASIS_ADJUSTMENT_VAT,
     PRICE_EXPORT_BASIS_API_FIELD,
@@ -139,6 +143,29 @@ def apply_vat_of(options: Mapping[str, Any] | None, default: bool) -> bool:
     return bool(options.get(FRANK_OPTION_APPLY_FEED_IN_VAT, default))
 
 
+def cross_check(
+    ours: float | None,
+    theirs: float | None,
+    tolerance: float = PRICE_CROSS_CHECK_TOLERANCE_EUR_KWH,
+) -> str:
+    """Compare one of our figures against the source's own published figure.
+
+    The only check in this phase that can fail when the **source** changes rather
+    than when our reading of a fixture changes. A captured artefact proves we read
+    the shape we observed; only this proves we still agree with the running
+    integration, and it is the direct answer to a defect that shipped because a
+    fixture agreed with the parser that wrote it.
+
+    ``not_comparable`` is a third outcome on purpose: no current interval, or an
+    unreadable sensor, is an absence of evidence rather than a disagreement.
+    """
+    if ours is None or theirs is None:
+        return PRICE_CROSS_CHECK_NOT_COMPARABLE
+    if abs(ours - theirs) <= tolerance:
+        return PRICE_CROSS_CHECK_AGREES
+    return PRICE_CROSS_CHECK_DISAGREES
+
+
 # --- one interval -------------------------------------------------------------
 
 
@@ -218,7 +245,7 @@ def vat_ratio_holds(
 
 def reconstruct_export_price(
     block: Mapping[str, Any],
-    adjustment: float,
+    adjustment: float | None,
     apply_vat: bool,
 ) -> tuple[float | None, str]:
     """Return the export price for one block, and how it was arrived at.
@@ -241,7 +268,10 @@ def reconstruct_export_price(
         return round(explicit, _PRICE_DECIMALS), PRICE_EXPORT_BASIS_API_FIELD
 
     market = _finite(block.get("market_price"))
-    if market is None:
+    if market is None or adjustment is None:
+        # No wholesale figure, or a configuration that could not be read. Either
+        # way there is no honest reconstruction -- and a guessed adjustment would
+        # be worse than no figure, because it would look like one.
         return None, PRICE_EXPORT_BASIS_UNKNOWN
 
     total = market + adjustment
@@ -668,7 +698,7 @@ def _parse_moment(value: Any) -> datetime | None:
 def _parse_blocks(
     blocks: Sequence[Mapping[str, Any]],
     *,
-    adjustment: float,
+    adjustment: float | None,
     apply_vat: bool,
 ) -> tuple[list[_Row], PriceMappingReport]:
     """Return parsed rows and a report, refusing anything unusable."""
@@ -735,7 +765,7 @@ def build_price_forecast(
     index_of: Callable[[datetime], int | None],
     target_day: date | None = None,
     expected_intervals: int = 0,
-    adjustment: float,
+    adjustment: float | None,
     apply_vat: bool,
     today_available: bool,
     tomorrow_available: bool,

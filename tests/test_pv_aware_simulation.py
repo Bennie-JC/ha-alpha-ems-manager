@@ -33,6 +33,8 @@ from datetime import date
 
 import pytest
 
+from custom_components.alpha_ems_manager import battery as battery_module
+from custom_components.alpha_ems_manager import plan as plan_module
 from custom_components.alpha_ems_manager import policy as policy_module
 from custom_components.alpha_ems_manager import simulation as simulation_module
 from custom_components.alpha_ems_manager.battery import (
@@ -464,13 +466,22 @@ def identifiers(module: object) -> set[str]:
     return {name.lower() for name in names}
 
 
-@pytest.mark.parametrize("module", [simulation_module, policy_module])
+@pytest.mark.parametrize(
+    "module",
+    [simulation_module, policy_module, plan_module, battery_module],
+    ids=["simulation", "policy", "plan", "battery"],
+)
 def test_no_economic_term_appears_in_the_decision_layer(module: object) -> None:
     """Prices are Phase 6, reserve sizing is Phase 7, arbitrage is Phase 8.
 
     Asserted structurally rather than by absence of behaviour, because an economic
     term added with a zero coefficient would behave identically today and be
     load-bearing tomorrow.
+
+    Widened to the whole decision layer when prices arrived. The price series is
+    real and normalised now, so the interesting statement is no longer "we have
+    not written an optimiser" but "the data exists and still cannot reach a
+    decision" -- and that is only worth asserting where the decisions are made.
     """
     for name in identifiers(module):
         for forbidden in ECONOMIC_WORDS:
