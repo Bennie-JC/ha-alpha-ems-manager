@@ -279,8 +279,14 @@ async def test_the_whole_chain_running_at_once_writes_nothing(
     data path with a real discharge recommendation and a healthy control surface,
     in the mode that would act if it could.
     """
+    from .conftest import set_absorbing_snapshot
+
     coordinator = setup_integration.runtime_data
     await set_mode(hass, CONTROL_MODE_ACTIVE)
+    # A site that can absorb the discharge, so the gate passes and the barrier is
+    # the only thing left standing between the pipeline and a write. That is the
+    # claim being made here, and it is only worth making when the gate said yes.
+    set_absorbing_snapshot(hass)
     await drive(coordinator)
 
     report = coordinator.control_report
@@ -388,13 +394,16 @@ async def test_the_instrument_never_changes_a_verdict(
     from .conftest import (
         BATTERY_POWER,
         BATTERY_SOC,
+        GRID_POWER,
         HOUSE_LOAD,
+        set_absorbing_snapshot,
         set_sensor,
     )
     from .test_init import advance
 
     coordinator = setup_integration.runtime_data
     await set_mode(hass, CONTROL_MODE_SHADOW)
+    set_absorbing_snapshot(hass)
     await drive(coordinator)
     before = dict(coordinator.control_report["safety"])
     assert before["safe"] is True
@@ -407,8 +416,9 @@ async def test_the_instrument_never_changes_a_verdict(
     # Republish every reading the gate reads, so the comparison is about the
     # instrument rather than about how long the clock was frozen.
     set_sensor(hass, BATTERY_SOC, 55, "%", "battery")
-    set_sensor(hass, BATTERY_POWER, -664, "W", "power")
+    set_sensor(hass, BATTERY_POWER, 0, "W", "power")
     set_sensor(hass, HOUSE_LOAD, 2000, "W", "power")
+    set_sensor(hass, GRID_POWER, 2000, "W", "power")
     await drive(coordinator)
 
     assert coordinator.control_report["safety"] == before

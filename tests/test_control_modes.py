@@ -501,9 +501,11 @@ async def test_the_state_entity_reports_eligible_when_only_the_barrier_stopped_i
     have been safe". Driven to a real discharge recommendation, because with a
     hold the state would be ``idle`` and the interesting case would go untested.
     """
+    from .conftest import set_absorbing_snapshot
     from .test_battery_entities import drive
 
     await set_mode(hass, CONTROL_MODE_SHADOW)
+    set_absorbing_snapshot(hass)
     await drive(setup_integration.runtime_data)
     report = setup_integration.runtime_data.control_report
 

@@ -38,8 +38,10 @@ from .const import (
     MAX_CATCHUP_SECONDS,
     MAX_PLAUSIBLE_EV_W,
     MAX_PLAUSIBLE_LOAD_W,
+    MAX_PLAUSIBLE_PV_W,
     MAX_SAMPLE_GAP_SECONDS,
     MIN_QUARTER_COVERAGE,
+    PV_NEGATIVE_NOISE_FLOOR_W,
     QUARTER_MINUTES,
     QUARTER_SECONDS,
 )
@@ -94,6 +96,63 @@ def sanitize_ev_w(value_w: float | None) -> float | None:
     if value_w > MAX_PLAUSIBLE_EV_W:
         return None
     if value_w < EV_NEGATIVE_NOISE_FLOOR_W:
+        return None
+    return max(0.0, value_w)
+
+
+def interpretable_pv_w(value_w: float | None) -> float | None:
+    """Return an *interpretable* instantaneous PV reading, or ``None``.
+
+    The rule the energy-balance path needs, and deliberately stricter than
+    :func:`sanitize_pv_w` in one specific way: **any** negative reading is
+    refused rather than clamped.
+
+    That is not fussiness. The balance path's only freshness exemption applies to
+    a PV reading of *exactly* zero -- the documented behaviour of a template that
+    stops republishing once generation has stopped -- and it is sound precisely
+    because substituting zero for a true generation ``P`` makes supply short by
+    ``P``, so such a sample can never spuriously pass. Clamping a small negative
+    up to zero would manufacture an exactly-zero reading that had not actually
+    been published as zero, and hand it that exemption. A reading below zero is
+    a reading whose sign convention cannot be established, so it is refused.
+
+    What this *does* add is the missing ceiling. PV previously had no upper bound
+    at all while house load and the flexible load both did, so a spike to a
+    million watts was accepted, inflated the balance allowance, and made the
+    check most permissive exactly when the entity was most obviously wrong.
+    """
+    if value_w is None:
+        return None
+    if value_w < 0.0 or value_w > MAX_PLAUSIBLE_PV_W:
+        return None
+    return value_w
+
+
+def sanitize_pv_w(value_w: float | None) -> float | None:
+    """Return a plausible PV generation figure for accumulation, or ``None``.
+
+    The third accumulation sanitizer, beside :func:`sanitize_load_w` and
+    :func:`sanitize_ev_w`, and it exists because PV did not have one. Both of the
+    others refuse a value above a plausibility ceiling and clamp a narrow noise
+    band up to zero; PV had only a bare non-negative check, so it was
+    simultaneously the least protected of the three and the one about to be
+    integrated into a stored series.
+
+    Here the narrow negative band *is* clamped, unlike in
+    :func:`interpretable_pv_w`, because the question being asked is different. An
+    inverter drawing a few watts of standby power after dark contributed no
+    generation, and no generation is zero energy -- not a missing interval. On an
+    installation whose PV figure is a sum across four strings and an AC meter,
+    refusing those samples would invalidate most of every night.
+
+    A sign-inverted sensor is still refused rather than clamped, because at midday
+    it reads thousands of watts negative and lands far outside the band.
+    """
+    if value_w is None:
+        return None
+    if value_w > MAX_PLAUSIBLE_PV_W:
+        return None
+    if value_w < PV_NEGATIVE_NOISE_FLOOR_W:
         return None
     return max(0.0, value_w)
 

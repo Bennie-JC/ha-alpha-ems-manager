@@ -202,6 +202,24 @@ class DayRecord:
     #: quarters close together after a restart, only the one that just ended
     #: takes the sample -- the others genuinely are not known.
     soc: list[float | None] = field(default_factory=list)
+    #: Measured photovoltaic generation per chronological interval, in kWh, or
+    #: ``None`` where there was no usable reading.
+    #:
+    #: Additive evidence on exactly the same terms as ``soc``: nothing in the
+    #: learning or forecast path reads it. It does not affect ``baseline_at``,
+    #: ``completeness``, ``is_learned``, the forecast, the confidence score or any
+    #: Phase-2 figure, and ``test_pv_independence.py`` -- which predates this
+    #: field and passes unmodified beside it -- pins the reason why: if a sunny
+    #: day taught the model that the house consumes less simply because the panels
+    #: supplied the energy, every later decision would be built on that lie.
+    #:
+    #: It is recorded because a PV forecast is worth nothing without something to
+    #: check it against, and generation actually observed at 13:15 last Tuesday
+    #: cannot be reconstructed from anything else. Integrated rather than sampled,
+    #: because generation is a flow: it goes through ``QuarterAccumulator`` like
+    #: house load and the flexible load, and is subject to the same coverage
+    #: threshold, so a partially observed interval is missing rather than short.
+    pv: list[float | None] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Size the parallel lists to the day's real interval count."""
@@ -216,6 +234,7 @@ class DayRecord:
             ("ev", None),
             ("ev_expected", False),
             ("soc", None),
+            ("pv", None),
         ):
             values = list(getattr(self, name))
             if len(values) < count:
@@ -263,6 +282,27 @@ class DayRecord:
     def soc_sample_count(self) -> int:
         """Return how many intervals carry a state-of-charge sample."""
         return sum(1 for value in self.soc if value is not None)
+
+    def pv_at(self, index: int) -> float | None:
+        """Return the measured PV energy of one interval, or ``None``."""
+        if not 0 <= index < self.interval_count:
+            return None
+        return self.pv[index]
+
+    @property
+    def pv_sample_count(self) -> int:
+        """Return how many intervals carry a measured PV reading."""
+        return sum(1 for value in self.pv if value is not None)
+
+    @property
+    def pv_total_kwh(self) -> float:
+        """Return the day's measured PV energy across the intervals that have it.
+
+        A partial total, and honestly so: it is the sum of what was observed, not
+        an estimate of the day. ``pv_sample_count`` is what says how much of the
+        day that covers.
+        """
+        return round(sum(value for value in self.pv if value is not None), 4)
 
     @property
     def measured_valid_count(self) -> int:
@@ -322,6 +362,7 @@ class DayRecord:
         ev_kwh: float | None,
         ev_expected: bool,
         soc_percent: float | None = None,
+        pv_kwh: float | None = None,
     ) -> bool:
         """Store one finalised interval by chronological index.
 
@@ -342,6 +383,8 @@ class DayRecord:
         self.ev_expected[index] = ev_expected
         if soc_percent is not None:
             self.soc[index] = round(soc_percent, _SOC_PRECISION)
+        if pv_kwh is not None:
+            self.pv[index] = round(pv_kwh, _KWH_PRECISION)
         return True
 
     # -- serialisation ---------------------------------------------------
@@ -365,6 +408,12 @@ class DayRecord:
             # usable reading, exactly as the flexible-load arrays are, so the
             # document does not grow for a user this evidence cannot help.
             payload["s"] = self.soc
+        if any(value is not None for value in self.pv):
+            # Omitted entirely on an installation with no PV, or with no usable
+            # reading yet, exactly as the flexible-load and state-of-charge
+            # arrays are. The document does not grow for a user this evidence
+            # cannot help.
+            payload["p"] = self.pv
         return payload
 
     @classmethod
@@ -415,6 +464,10 @@ class DayRecord:
         # a non-finite or non-numeric entry, so a damaged array degrades to
         # missing samples rather than to plausible-looking numbers.
         record.soc = _numeric_list(raw.get("s"), count)
+        # Absent on every document written before beta.9, and on any installation
+        # without PV. Read as missing samples rather than as zeros, which is the
+        # difference between "the panels produced nothing" and "nobody looked".
+        record.pv = _numeric_list(raw.get("p"), count)
         flags_raw = raw.get("x")
         if isinstance(flags_raw, list):
             record.ev_expected = [bool(flag) for flag in flags_raw[:count]] + [

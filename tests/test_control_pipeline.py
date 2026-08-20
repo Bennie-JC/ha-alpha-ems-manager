@@ -68,6 +68,8 @@ from custom_components.alpha_ems_manager.const import (
     INHIBIT_DURATION_OUT_OF_RANGE,
     INHIBIT_EXCESS_EXPORT_ACTIVE,
     INHIBIT_HOUSE_LOAD_STALE,
+    INHIBIT_GRID_STALE,
+    INHIBIT_GRID_UNUSABLE,
     INHIBIT_HOUSE_LOAD_UNUSABLE,
     INHIBIT_MISSING_CONTROL_ENTITY,
     INHIBIT_NO_DECISION,
@@ -168,6 +170,13 @@ def make_context(**overrides: object) -> ControlContext:
         "battery_power_age_seconds": 1.0,
         "house_load_w": 4000.0,
         "house_load_age_seconds": 2.0,
+        # Deliberately self-consistent with the two readings above:
+        # house 4000 W = PV 0 + battery discharge 1200 W + import 2800 W. The
+        # absorbing capacity is therefore 2800 + 1200 = 4000 W, so a 2 kW
+        # command clears the 10 % margin with room to spare.
+        "grid_import_w": 2800.0,
+        "grid_export_w": 0.0,
+        "grid_age_seconds": 2.0,
         "max_source_age_seconds": 300.0,
         "device_power_kw": command_power,
         "device_cutoff_percent": 21,
@@ -652,11 +661,23 @@ GATE_CASES: tuple[tuple[str, dict[str, object]], ...] = (
     (INHIBIT_POWER_BELOW_DEVICE_MINIMUM, {"device_power_kw": 0.1}),
     (
         INHIBIT_POWER_ABOVE_DEVICE_MAXIMUM,
-        {"device_power_kw": CONTROL_MAX_POWER_KW + 0.1, "house_load_w": 5.0e7},
+        {
+            "device_power_kw": CONTROL_MAX_POWER_KW + 0.1,
+            "house_load_w": 5.0e7,
+            "grid_import_w": 5.0e7,
+        },
     ),
     (INHIBIT_CUTOFF_OUT_OF_RANGE, {"device_cutoff_percent": 1}),
     (INHIBIT_DURATION_OUT_OF_RANGE, {"device_duration_minutes": 5}),
-    (INHIBIT_WOULD_EXPORT, {"house_load_w": 1000.0, "device_power_kw": 2.0}),
+    (
+        INHIBIT_GRID_UNUSABLE,
+        {"grid_import_w": None, "grid_export_w": None},
+    ),
+    (INHIBIT_GRID_STALE, {"grid_age_seconds": 301.0}),
+    (
+        INHIBIT_WOULD_EXPORT,
+        {"grid_import_w": 0.0, "grid_export_w": 0.0, "device_power_kw": 2.0},
+    ),
 )
 
 
@@ -709,7 +730,7 @@ def test_the_gate_never_returns_a_reduced_command() -> None:
     """
     verdict = evaluate(
         make_intent(energy_ac_kwh=2.0),
-        make_context(device_power_kw=8.0, house_load_w=1000.0),
+        make_context(device_power_kw=8.0, grid_import_w=100.0, battery_power_w=0.0),
     )
 
     assert verdict.safe is False
@@ -721,17 +742,28 @@ def test_the_gate_never_returns_a_reduced_command() -> None:
 
 
 def test_the_export_margin_is_applied() -> None:
-    """Ten percent below a four kilowatt load leaves 3.6 kW of headroom."""
+    """Ten percent below four kilowatts of capacity leaves 3.6 kW of headroom.
+
+    The margin is applied to the *capacity*, never to the command: the command
+    is compared against a reduced bound and refused whole, rather than being
+    scaled down to fit one.
+    """
     safe = evaluate(
         make_intent(),
         make_context(
-            house_load_w=4000.0, device_power_kw=3.6, export_margin_percent=10.0
+            grid_import_w=2800.0,
+            battery_power_w=-1200.0,
+            device_power_kw=3.6,
+            export_margin_percent=10.0,
         ),
     )
     unsafe = evaluate(
         make_intent(),
         make_context(
-            house_load_w=4000.0, device_power_kw=3.7, export_margin_percent=10.0
+            grid_import_w=2800.0,
+            battery_power_w=-1200.0,
+            device_power_kw=3.7,
+            export_margin_percent=10.0,
         ),
     )
 
@@ -751,6 +783,9 @@ def test_a_hold_needs_no_house_load_and_no_device_range() -> None:
         make_context(
             house_load_w=None,
             house_load_age_seconds=9999.0,
+            grid_import_w=None,
+            grid_export_w=None,
+            grid_age_seconds=9999.0,
             device_power_kw=0.0,
             device_cutoff_percent=0,
             device_duration_minutes=0,
@@ -764,7 +799,12 @@ def test_a_charge_is_never_refused_for_exporting() -> None:
     """A charge imports; it cannot push energy out."""
     verdict = evaluate(
         make_intent(action=ACTION_CHARGE, energy_ac_kwh=2.0),
-        make_context(device_power_kw=8.0, house_load_w=100.0),
+        make_context(
+            device_power_kw=8.0,
+            house_load_w=100.0,
+            grid_import_w=0.0,
+            grid_export_w=5000.0,
+        ),
     )
 
     assert verdict.safe is True

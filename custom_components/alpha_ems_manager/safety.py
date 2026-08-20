@@ -23,6 +23,19 @@ The gate **never scales a command.** If a request cannot be sent safely it is
 refused whole, with one precise reason. A gate that reduced a request to make it
 fit would have made a decision of its own, and deciding is not its job.
 
+Export protection is measured at the meter, not reconstructed. The absorbing
+capacity a discharge is checked against is ``grid_import - grid_export +
+battery_discharge`` (:func:`absorbing_capacity_kw`), because a forced discharge
+first displaces import and only spills onto the grid once import reaches zero.
+An earlier release checked the command against the house load alone, which was
+under-protective whenever PV was already covering the house: on this
+installation, live samples with 3.1 kW of PV against 2.0 kW of load passed a
+gate that should have refused, because the site was already exporting a kilowatt
+before the battery was asked to add to it. Subtracting PV from house load would
+also have caught those, but the meter needs no PV term at all -- so no answer to
+the mixed DC/AC boundary question, no exposure to the vendor's PV filter lag,
+and no daylight rule for a sensor that legitimately reads zero all night.
+
 One condition that is deliberately *absent*: the aggregate energy-balance
 residual. On an installation whose house-load figure is derived from one grid
 meter while the balance check uses another, that residual reduces algebraically
@@ -70,6 +83,8 @@ from .const import (
     INHIBIT_STALE_PLAN_AGE,
     INHIBIT_STALE_PLAN_DAY,
     INHIBIT_STALE_PLAN_INTERVAL,
+    INHIBIT_GRID_STALE,
+    INHIBIT_GRID_UNUSABLE,
     INHIBIT_WOULD_EXPORT,
     MAX_CONTROL_HORIZON_MINUTES,
     MIN_CONTROL_HORIZON_MINUTES,
@@ -133,6 +148,12 @@ class ControlContext:
     battery_power_age_seconds: float | None = None
     house_load_w: float | None = None
     house_load_age_seconds: float | None = None
+    #: The grid meter, canonical and unsigned: at most one of these is non-zero.
+    #: This is the boundary that *defines* export, so it is what the export check
+    #: is measured against -- see :func:`absorbing_capacity_kw`.
+    grid_import_w: float | None = None
+    grid_export_w: float | None = None
+    grid_age_seconds: float | None = None
     #: How old a reading may be before it is no longer evidence about now.
     max_source_age_seconds: float = 300.0
 
@@ -142,7 +163,8 @@ class ControlContext:
     device_power_kw: float = 0.0
     device_cutoff_percent: int = 0
     device_duration_minutes: int = 0
-    #: How far below the live house load a discharge must stay, in percent.
+    #: How far below the measured absorbing capacity a discharge must stay, in
+    #: percent. Applied to the capacity, never to the command.
     export_margin_percent: float = 0.0
 
     # -- rate limiting --------------------------------------------------------
@@ -217,6 +239,48 @@ def _stale(age: float | None, limit: float) -> bool:
     wrong reason for a source that simply does not exist.
     """
     return age is not None and age > limit
+
+
+def absorbing_capacity_kw(context: ControlContext) -> float:
+    """Return how much discharge power the site can absorb without exporting.
+
+    Measured at the meter rather than reconstructed from house load and PV,
+    because the meter is the instrument that *defines* export.
+
+    A forced discharge first displaces grid import and only spills onto the grid
+    once import reaches zero. Writing ``D_old`` for the discharge already
+    flowing, and taking the importing case::
+
+        grid_import  = house_load - pv - D_old
+        post_export  = pv + D_new - house_load = D_new - (grid_import + D_old)
+
+    so a new discharge is safe exactly while
+
+        D_new <= grid_import - grid_export + D_old
+
+    which is what this returns, floored at zero. Because import and export are
+    canonical and unsigned, at most one of them is non-zero, and the subtraction
+    handles the already-exporting case: a site exporting 500 W with the battery
+    idle has a capacity of zero and any discharge is refused.
+
+    Three things this deliberately does not do:
+
+    * It does not read PV. So it needs no answer to the mixed DC/AC boundary
+      question, it cannot be skewed by the vendor's low-pass filter on the PV
+      signal, and it needs no daylight or staleness rule for a sensor that
+      legitimately reports a constant zero all night.
+    * It does not read house load. So it bounds loads no house-load sensor sees
+      -- on this installation the energy-balance work exposed roughly 1.4 kW
+      drawing through the meter that the inverter's own register does not.
+    * It does not scale anything. It returns a bound; refusing on it is the
+      caller's decision, and the command is refused whole or not at all.
+    """
+    net_import_w = (context.grid_import_w or 0.0) - (context.grid_export_w or 0.0)
+    # ``battery_power_w`` is positive for charging, so a discharge is its
+    # negation. Charging contributes nothing: it is already absorbing, and
+    # counting it would credit the battery for load it is itself creating.
+    discharge_now_w = max(0.0, -(context.battery_power_w or 0.0))
+    return max(0.0, net_import_w + discharge_now_w) / 1000.0
 
 
 def evaluate(intent: ControlIntent | None, context: ControlContext) -> SafetyVerdict:
@@ -365,6 +429,24 @@ def evaluate(intent: ControlIntent | None, context: ControlContext) -> SafetyVer
     ):
         return SafetyVerdict(False, INHIBIT_DURATION_OUT_OF_RANGE, tuple(checks))
 
+    # -- is the meter readable? ---------------------------------------------
+    # Only a discharge can export, so only a discharge needs the meter. Gating a
+    # charge on it would refuse to store energy because the grid sensor was
+    # briefly quiet, which buys nothing.
+    grid_usable = True
+    grid_fresh = True
+    if intent.action == ACTION_DISCHARGE:
+        grid_usable = (
+            context.grid_import_w is not None and context.grid_export_w is not None
+        )
+        grid_fresh = not _stale(
+            context.grid_age_seconds, context.max_source_age_seconds
+        )
+    if not check(INHIBIT_GRID_UNUSABLE, grid_usable):
+        return SafetyVerdict(False, INHIBIT_GRID_UNUSABLE, tuple(checks))
+    if not check(INHIBIT_GRID_STALE, grid_fresh):
+        return SafetyVerdict(False, INHIBIT_GRID_STALE, tuple(checks))
+
     # -- would this push energy onto the grid? ------------------------------
     # A forced discharge sets the *battery* rate, so whatever the house cannot
     # absorb leaves through the meter -- and the dispatch path does not honour
@@ -373,9 +455,9 @@ def evaluate(intent: ControlIntent | None, context: ControlContext) -> SafetyVer
     # this module choosing a different energy than the decision layer allowed.
     export_ok = True
     if intent.action == ACTION_DISCHARGE:
-        house_kw = (context.house_load_w or 0.0) / 1000.0
+        capacity_kw = absorbing_capacity_kw(context)
         headroom = 1.0 - (context.export_margin_percent / 100.0)
-        export_ok = context.device_power_kw <= house_kw * max(0.0, headroom)
+        export_ok = context.device_power_kw <= capacity_kw * max(0.0, headroom)
     if not check(INHIBIT_WOULD_EXPORT, export_ok):
         return SafetyVerdict(False, INHIBIT_WOULD_EXPORT, tuple(checks))
 

@@ -112,6 +112,30 @@ MAX_PLAUSIBLE_EV_W: Final = 50_000.0
 #: the baseline, which is exactly the contamination this feature prevents.
 EV_NEGATIVE_NOISE_FLOOR_W: Final = -10.0
 
+# --- Photovoltaic generation --------------------------------------------------
+
+#: Implausibly high instantaneous PV generation, in watts. A domestic rooftop
+#: above this is not a domestic rooftop, so a reading beyond it is a sensor
+#: glitch rather than an unusually good day.
+#:
+#: This ceiling exists because PV had none. House load went through
+#: ``sanitize_load_w``, which refuses a value above ``MAX_PLAUSIBLE_LOAD_W``,
+#: while PV went through a bare non-negative check -- so a spike to a million
+#: watts was accepted, inflated the balance allowance and made the energy-balance
+#: check most permissive exactly when the PV entity was most obviously wrong.
+MAX_PLAUSIBLE_PV_W: Final = 50_000.0
+
+#: PV generation is never negative, but a PV *sensor* legitimately can be: an
+#: inverter draws a little standby power after dark, and on an installation whose
+#: PV figure is a sum across several strings and an AC meter, that shows up as a
+#: few watts below zero.
+#:
+#: Readings inside this band are clamped up to zero. Anything more negative is an
+#: invalid sample, not zero generation -- and the band is deliberately narrow so
+#: a sign-inverted sensor, which reads thousands of watts negative at midday, is
+#: refused outright instead of being quietly clamped to a plausible zero.
+PV_NEGATIVE_NOISE_FLOOR_W: Final = -50.0
+
 # --- Persistence --------------------------------------------------------------
 
 #: Storage schema version.
@@ -130,7 +154,11 @@ STORAGE_VERSION: Final = 2
 #: * **2.2** -- v1.0.0-beta.7. Day records gained an optional per-interval
 #:   battery state-of-charge array. Absent on every earlier document, and read as
 #:   "no samples" rather than as zeros.
-STORAGE_MINOR_VERSION: Final = 2
+#: * **2.3** -- v1.0.0-beta.9. Day records gained an optional per-interval
+#:   measured PV array, on exactly the same terms: absent on every earlier
+#:   document, read as "no samples" rather than as zeros, and read by nothing on
+#:   the learning path.
+STORAGE_MINOR_VERSION: Final = 3
 STORAGE_KEY_TEMPLATE: Final = f"{DOMAIN}.{{entry_id}}.learning"
 
 #: Config-entry schema version. v1 was the previous integration's source model,
@@ -883,6 +911,11 @@ INHIBIT_POWER_BELOW_DEVICE_MINIMUM: Final = "power_below_device_minimum"
 INHIBIT_POWER_ABOVE_DEVICE_MAXIMUM: Final = "power_above_device_maximum"
 INHIBIT_CUTOFF_OUT_OF_RANGE: Final = "cutoff_out_of_range"
 INHIBIT_DURATION_OUT_OF_RANGE: Final = "duration_out_of_range"
+#: The grid meter could not be read, or read too long ago to be evidence about
+#: now. The absorbing capacity a discharge is checked against is measured at the
+#: meter, so without it there is no bound and the command is refused.
+INHIBIT_GRID_UNUSABLE: Final = "grid_unusable"
+INHIBIT_GRID_STALE: Final = "grid_stale"
 #: The commanded discharge would push energy onto the grid. The gate refuses the
 #: whole command; it never reduces it to fit, because a gate that scales a
 #: request has made a decision of its own.
@@ -913,6 +946,8 @@ CONTROL_INHIBIT_REASONS: Final = (
     INHIBIT_POWER_ABOVE_DEVICE_MAXIMUM,
     INHIBIT_CUTOFF_OUT_OF_RANGE,
     INHIBIT_DURATION_OUT_OF_RANGE,
+    INHIBIT_GRID_UNUSABLE,
+    INHIBIT_GRID_STALE,
     INHIBIT_WOULD_EXPORT,
 )
 

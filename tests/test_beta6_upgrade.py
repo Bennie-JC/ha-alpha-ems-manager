@@ -560,7 +560,10 @@ async def test_the_storage_minor_version_moved_and_the_major_did_not(
     from custom_components.alpha_ems_manager.const import STORAGE_MINOR_VERSION
 
     assert STORAGE_VERSION == 2
-    assert STORAGE_MINOR_VERSION == 2
+    # 2.3 as of beta.9, which added the measured-PV array. The *major* staying at
+    # 2 is the load-bearing half of this assertion: it is what guarantees a
+    # beta.6 document is read rather than discarded.
+    assert STORAGE_MINOR_VERSION == 3
 
     coordinator = upgraded.runtime_data
     assert coordinator.store.reset_by_migration is False
@@ -568,7 +571,7 @@ async def test_the_storage_minor_version_moved_and_the_major_did_not(
 
     document = hass_storage[f"alpha_ems_manager.{upgraded.entry_id}.learning"]
     assert document["version"] == 2
-    assert document["minor_version"] == 2
+    assert document["minor_version"] == 3
     # The six days beta.6 wrote are all still there.
     assert len(document["data"]["days"]) == 6
 

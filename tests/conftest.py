@@ -117,6 +117,27 @@ def source_entities(hass: HomeAssistant) -> None:
     set_sensor(hass, GRID_POWER, -336, "W", "power")
 
 
+def set_absorbing_snapshot(hass: HomeAssistant) -> None:
+    """Re-point the live flows at a site that can absorb a discharge.
+
+    ``source_entities`` is deliberately a sunny midday snapshot -- 3 kW of PV
+    against 2 kW of house load, *exporting* 336 W -- so a forced discharge there
+    would push energy straight onto the grid, and the export gate rightly
+    refuses it. Under the beta.8 rule it did not: that rule compared the command
+    against the house load alone and so read 2 kW of absorbing capacity on a site
+    that had none.
+
+    Any test that needs a *safe* verdict therefore has to describe a site that
+    can actually take one. This is the same house load with the sun down and the
+    shortfall imported, which balances exactly: 2000 W of load = 0 W of PV + 0 W
+    of battery + 2000 W of import, giving 2 kW of capacity.
+    """
+    set_sensor(hass, PV_POWER, 0, "W", "power")
+    set_sensor(hass, HOUSE_LOAD, 2000, "W", "power")
+    set_sensor(hass, BATTERY_POWER, 0, "W", "power")
+    set_sensor(hass, GRID_POWER, 2000, "W", "power")
+
+
 #: The Phase-4 control surface, at rest, with the values the live installation
 #: reports when no dispatch is running.
 CONTROL_SURFACE_AT_REST: dict[str, object] = {

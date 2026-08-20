@@ -111,13 +111,16 @@ from .plan import BatteryPlan, build_plan
 from .quarter import (
     QuarterAccumulator,
     QuarterResult,
+    interpretable_pv_w,
     sanitize_ev_w,
     sanitize_load_w,
+    sanitize_pv_w,
 )
 from .safety import (
     ControlContext,
     ExecutionDecision,
     SafetyVerdict,
+    absorbing_capacity_kw,
     authorize,
     evaluate,
 )
@@ -319,13 +322,6 @@ def _tally(counts: dict[str, int], key: str) -> None:
     counts[key] = counts.get(key, 0) + 1
 
 
-def _non_negative(value: float | None) -> float | None:
-    """Return ``value`` when it is a usable non-negative power, else ``None``."""
-    if value is None or value < 0:
-        return None
-    return value
-
-
 class _ThrottledLogger:
     """Emits each distinct warning at most once per throttle window.
 
@@ -413,6 +409,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.last_record: RecorderResult = RecorderResult()
         self._accumulator = QuarterAccumulator(dt_util.get_default_time_zone())
         self._ev_accumulator: QuarterAccumulator | None = None
+        #: Measured PV generation, integrated on the same machinery as the other
+        #: two. Present only when a PV source is configured. Its output is
+        #: additive evidence: it can never reject an interval or change a learned
+        #: baseline, which is what keeps ``test_pv_independence.py`` true.
+        self._pv_accumulator: QuarterAccumulator | None = None
         self._log = _ThrottledLogger()
         self.last_balance: BalanceSample | None = None
         #: Session-scoped balance tally and debounce state. Not persisted:
@@ -482,12 +483,22 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self.config.ev_power_entity
             else None
         )
+        self._pv_accumulator = (
+            QuarterAccumulator(tz, sanitizer=sanitize_pv_w)
+            if self.config.has_pv and self.config.pv_power_entity
+            else None
+        )
 
         watched = [
             entity_id
             for entity_id in (
                 self.config.house_load_entity,
                 self.config.ev_power_entity,
+                # Watched so generation is integrated at the rate the sensor
+                # actually publishes. The 60-second safety sample alone would
+                # left-hold each reading for a whole minute, which on a partly
+                # cloudy day is where the energy is.
+                self.config.pv_power_entity if self.config.has_pv else None,
             )
             if entity_id
         ]
@@ -615,7 +626,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # the balance check most permissive exactly when the house-load entity
         # is most obviously wrong.
         house = sanitize_load_w(self._read_power(self.config.house_load_entity))
-        pv = _non_negative(pv)
+        # The plausibility ceiling PV never had. Deliberately the *strict* rule
+        # rather than the accumulation sanitizer: this path's freshness exemption
+        # applies to a PV reading of exactly zero, so clamping a small negative up
+        # to zero here would hand that exemption to a reading nobody published as
+        # zero. See ``interpretable_pv_w``.
+        pv = interpretable_pv_w(pv)
 
         return PowerFlows(
             house_load_w=house,
@@ -675,7 +691,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 moment, self._read_ev_power_w()
             )
 
-        self._ingest(house_results, ev_results)
+        pv_results: list[QuarterResult] = []
+        if self._pv_accumulator is not None:
+            pv_results = self._pv_accumulator.add_sample(
+                moment, self._read_pv_power_w()
+            )
+
+        self._ingest(house_results, ev_results, pv_results)
 
     @callback
     def _read_house_load_w(self) -> float | None:
@@ -834,10 +856,33 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return value_w
 
     @callback
+    def _read_pv_power_w(self) -> float | None:
+        """Return the current PV reading for accumulation, or ``None``.
+
+        Deliberately sets **no** problem attribution and increments no counter.
+        The other two readers do, because a bad house-load or flexible-load
+        reading invalidates that interval's baseline and the user needs to know
+        which source cost them the interval. PV cannot invalidate anything: it is
+        recorded beside the baseline and read by nothing that computes it. A PV
+        entity that vanishes costs PV evidence and nothing else, and reporting it
+        as a learning problem would be false.
+        """
+        entity_id = self.config.pv_power_entity
+        if not entity_id or not self.config.has_pv:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return None
+        return normalize_power_w(
+            state.state, state.attributes.get("unit_of_measurement")
+        )
+
+    @callback
     def _ingest(
         self,
         house_results: list[QuarterResult],
         ev_results: list[QuarterResult],
+        pv_results: list[QuarterResult] | None = None,
     ) -> None:
         """Persist finalised intervals that carry enough coverage.
 
@@ -864,6 +909,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # lists are the normal case; pairing by start instant keeps the mapping
         # correct even if one of them was created later.
         ev_by_start = {result.start_utc: result for result in ev_results}
+        # Same pairing idiom, and deliberately kept separate from the EV branch
+        # below: a missing or under-covered PV interval must leave the baseline
+        # completely alone. It records no rejection, increments no counter and
+        # invalidates nothing -- it simply stores no PV value for that interval.
+        pv_by_start = {
+            result.start_utc: result
+            for result in (pv_results or [])
+            if result.accepted
+        }
 
         changed = False
         for result in house_results:
@@ -892,12 +946,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self._ev_problem or REJECT_INSUFFICIENT_COVERAGE,
                     )
 
+            pv_result = pv_by_start.get(result.start_utc)
+
             if not record.record_interval(
                 index,
                 measured_kwh=result.energy_kwh,
                 ev_kwh=ev_kwh,
                 ev_expected=ev_expected,
                 soc_percent=soc_percent if result.start_utc == latest_start else None,
+                pv_kwh=None if pv_result is None else pv_result.energy_kwh,
             ):
                 # The index fell outside the day. Unreachable under a stable
                 # timezone, so reaching it means the stored day's shape and the
@@ -1372,6 +1429,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         capability = discover(self.hass)
         snapshot = read_snapshot(self.hass)
+        # One snapshot for the whole evaluation, so the gate cannot see a
+        # different world halfway through deciding.
+        flows_now = self.read_flows()
 
         # Why there is no intent, resolved here because this is where the plan
         # lives. The gate relays it rather than reaching into Phase 3 itself.
@@ -1415,6 +1475,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             house_load_age_seconds=self._state_age_seconds(
                 self.config.house_load_entity
             ),
+            # The meter, canonical and unsigned. This is what the export check is
+            # measured against, so it is read through the same splitter the rest
+            # of the integration uses rather than off the raw entity.
+            grid_import_w=flows_now.grid_import_w,
+            grid_export_w=flows_now.grid_export_w,
+            grid_age_seconds=self._state_age_seconds(self.config.grid_power_entity),
             max_source_age_seconds=BALANCE_MAX_SOURCE_AGE_SECONDS,
             device_power_kw=0.0 if command is None else command.power_kw,
             device_cutoff_percent=(
@@ -1465,6 +1531,26 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "commands": [step.as_dict() for step in commands],
             "commands_planned": len(commands),
             "safety": verdict.as_dict(),
+            # The export bound as the gate actually saw it, at the instant the
+            # gate saw it. Without this a ``would_export`` verdict could not be
+            # reconstructed from a diagnostics download, because the flow block
+            # elsewhere in the payload is read at download time and describes a
+            # different instant -- which is exactly how a correct inhibit came to
+            # look arithmetically wrong beside the readings printed next to it.
+            "export_check": {
+                "absorbing_capacity_kw": round(absorbing_capacity_kw(context), 4),
+                "grid_import_w": context.grid_import_w,
+                "grid_export_w": context.grid_export_w,
+                "battery_power_w": context.battery_power_w,
+                "margin_percent": context.export_margin_percent,
+                "commanded_power_kw": context.device_power_kw,
+                "basis": (
+                    "capacity = max(0, grid_import - grid_export + battery "
+                    "discharge), measured at the meter; the margin reduces the "
+                    "capacity and never the command, and the command is refused "
+                    "whole rather than scaled to fit"
+                ),
+            },
             "authorization": decision.as_dict(),
             "last_write": (
                 None
@@ -1710,6 +1796,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._ev_accumulator is None:
             return None
         return self._ev_accumulator.open_coverage
+
+    @property
+    def open_pv_coverage(self) -> float | None:
+        """Return the coverage accrued so far in the open PV quarter."""
+        if self._pv_accumulator is None:
+            return None
+        return self._pv_accumulator.open_coverage
 
     def today_date(self) -> date:
         """Return the current local civil date.

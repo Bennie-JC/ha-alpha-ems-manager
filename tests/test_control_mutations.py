@@ -34,6 +34,8 @@ from custom_components.alpha_ems_manager.const import (
     CONTROL_MODE_ACTIVE,
     CONTROL_MODE_SHADOW,
     INHIBIT_DISPATCH_ACTIVE,
+    INHIBIT_GRID_STALE,
+    INHIBIT_GRID_UNUSABLE,
     INHIBIT_SOC_STALE,
     INHIBIT_WOULD_EXPORT,
 )
@@ -202,7 +204,7 @@ def test_scaling_a_command_instead_of_refusing_it_is_caught() -> None:
 
 
 def test_allowing_an_export_is_caught() -> None:
-    """A forced discharge above the house load leaves through the meter.
+    """A forced discharge beyond what the meter can absorb leaves the site.
 
     Nothing downstream catches it: the dispatch path does not honour the
     inverter's own feed-in limit.
@@ -211,7 +213,9 @@ def test_allowing_an_export_is_caught() -> None:
     def guard() -> None:
         verdict = evaluate(
             make_intent(energy_ac_kwh=2.0),
-            make_context(device_power_kw=9.0, house_load_w=500.0),
+            make_context(
+                device_power_kw=9.0, grid_import_w=500.0, battery_power_w=0.0
+            ),
         )
         assert verdict.inhibit_reason == INHIBIT_WOULD_EXPORT
 
@@ -219,6 +223,135 @@ def test_allowing_an_export_is_caught() -> None:
     with patched(safety, "ACTION_DISCHARGE", "not_a_real_action"):
         # With the discharge constant no longer matching, the export condition
         # never applies -- exactly the shape of an accidental refactor.
+        assert not surviving(guard)
+
+
+def test_reintroducing_the_house_load_export_rule_is_caught() -> None:
+    """The beta.8 rule, restored, and the live sample that proves it is wrong.
+
+    House load 2071 W against 3132 W of PV: the site was already exporting a
+    kilowatt, so the absorbing capacity was zero and the recorded 22 W of import
+    is all there was. The old rule read 2071 W of capacity and passed.
+    """
+
+    def guard() -> None:
+        verdict = evaluate(
+            make_intent(energy_ac_kwh=0.225),
+            make_context(
+                house_load_w=2071.0,
+                grid_import_w=22.0,
+                grid_export_w=0.0,
+                battery_power_w=0.0,
+                device_power_kw=0.9,
+                export_margin_percent=10.0,
+            ),
+        )
+        assert verdict.inhibit_reason == INHIBIT_WOULD_EXPORT
+
+    guard()
+
+    def house_load_capacity(context: object) -> float:
+        return (getattr(context, "house_load_w") or 0.0) / 1000.0
+
+    with patched(safety, "absorbing_capacity_kw", house_load_capacity):
+        assert not surviving(guard)
+
+
+def test_dropping_the_existing_discharge_from_the_capacity_is_caught() -> None:
+    """A battery already discharging genuinely has that much more headroom.
+
+    Omitting the term would refuse commands that are provably safe -- which is a
+    real defect even though it errs on the cautious side, because the whole point
+    of the rule is that it bounds the physics rather than guessing at them.
+    """
+
+    def guard() -> None:
+        verdict = evaluate(
+            make_intent(),
+            make_context(
+                grid_import_w=100.0,
+                grid_export_w=0.0,
+                battery_power_w=-2000.0,
+                device_power_kw=1.8,
+                export_margin_percent=10.0,
+            ),
+        )
+        assert verdict.safe is True
+
+    guard()
+
+    def meter_only(context: object) -> float:
+        net_w = (getattr(context, "grid_import_w") or 0.0) - (
+            getattr(context, "grid_export_w") or 0.0
+        )
+        return max(0.0, net_w) / 1000.0
+
+    with patched(safety, "absorbing_capacity_kw", meter_only):
+        assert not surviving(guard)
+
+
+def test_inverting_the_export_sign_in_the_capacity_is_caught() -> None:
+    """Adding export instead of subtracting it inverts the whole rule.
+
+    An exporting site would read as having the *most* capacity, which is exactly
+    backwards and would permit a command on the one site that can absorb nothing.
+    """
+
+    def guard() -> None:
+        verdict = evaluate(
+            make_intent(),
+            make_context(
+                grid_import_w=0.0,
+                grid_export_w=4000.0,
+                battery_power_w=0.0,
+                device_power_kw=2.0,
+            ),
+        )
+        assert verdict.inhibit_reason == INHIBIT_WOULD_EXPORT
+
+    guard()
+
+    def sign_flipped(context: object) -> float:
+        net_w = (getattr(context, "grid_import_w") or 0.0) + (
+            getattr(context, "grid_export_w") or 0.0
+        )
+        discharge_w = max(0.0, -(getattr(context, "battery_power_w") or 0.0))
+        return max(0.0, net_w + discharge_w) / 1000.0
+
+    with patched(safety, "absorbing_capacity_kw", sign_flipped):
+        assert not surviving(guard)
+
+
+def test_reading_an_unusable_meter_as_zero_is_caught() -> None:
+    """Zero here is not conservative -- it is the unsafe direction.
+
+    A capacity of zero refuses, which looks safe, but the mutation that matters
+    is the *other* substitution: treating an unreadable meter as though it had
+    been read. This asserts the gate names the missing reading rather than
+    silently computing a bound from nothing.
+    """
+
+    def guard() -> None:
+        verdict = evaluate(
+            make_intent(),
+            make_context(grid_import_w=None, grid_export_w=None),
+        )
+        assert verdict.inhibit_reason == INHIBIT_GRID_UNUSABLE
+
+    guard()
+    with patched(safety, "INHIBIT_GRID_UNUSABLE", INHIBIT_WOULD_EXPORT):
+        assert not surviving(guard)
+
+
+def test_dropping_the_meter_freshness_check_is_caught() -> None:
+    """A capacity computed from a reading minutes old is not a bound on now."""
+
+    def guard() -> None:
+        verdict = evaluate(make_intent(), make_context(grid_age_seconds=301.0))
+        assert verdict.inhibit_reason == INHIBIT_GRID_STALE
+
+    guard()
+    with patched(safety, "_stale", lambda age, limit: False):
         assert not surviving(guard)
 
 
