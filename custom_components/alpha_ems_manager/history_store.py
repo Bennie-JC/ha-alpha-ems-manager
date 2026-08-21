@@ -62,6 +62,7 @@ from .const import (
 from .forecast_history import DayOutcome, ForecastSnapshot
 from .price_forecast import PriceSnapshot
 from .pv_forecast import PvOutcome, PvSnapshot
+from .reserve import ReserveSnapshot
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -156,6 +157,12 @@ class DayIndexRow:
     #: overwhelmingly common answer is "nothing changed" and it should not cost a
     #: partition load to reach it.
     price_fingerprints: list[str] = field(default_factory=list)
+    #: Content fingerprints of the reserve requirements recorded for this day.
+    #: In the index for the same reason as the three before it: the requirement
+    #: changes only when a forecast or the battery configuration does, so the
+    #: common answer is "nothing changed" and reaching it must not cost a
+    #: partition load.
+    reserve_fingerprints: list[str] = field(default_factory=list)
 
     @property
     def snapshot_count(self) -> int:
@@ -179,6 +186,8 @@ class DayIndexRow:
             payload["pvfp"] = list(self.pv_fingerprints)
         if self.price_fingerprints:
             payload["prfp"] = list(self.price_fingerprints)
+        if self.reserve_fingerprints:
+            payload["rsvfp"] = list(self.reserve_fingerprints)
         return payload
 
     @classmethod
@@ -214,6 +223,14 @@ class DayIndexRow:
                 if isinstance(raw.get("prfp"), list)
                 else []
             ),
+            # Absent on a document written before minor 4, which reads as "no
+            # requirements recorded" rather than as an error: the addition is
+            # backward compatible in both directions.
+            reserve_fingerprints=(
+                [str(value) for value in raw.get("rsvfp")]
+                if isinstance(raw.get("rsvfp"), list)
+                else []
+            ),
         )
 
 
@@ -243,6 +260,12 @@ class _Partition:
     #: later phase can know *what was visible when a plan was made*, which is the
     #: one thing that cannot be recovered afterwards.
     price_snapshots: dict[date, list[PriceSnapshot]] = field(default_factory=dict)
+    #: Reserve evidence, namespaced beside the other three and likewise with no
+    #: outcome counterpart. The requirement does have a natural outcome -- the
+    #: measured state of charge, which the learning store already keeps per
+    #: interval -- but scoring one against the other is a later phase, and a
+    #: verdict written here would be one this phase has no basis for.
+    reserve_snapshots: dict[date, list[ReserveSnapshot]] = field(default_factory=dict)
     #: Set when this partition could not be read. Writes to it are suspended for
     #: the session; the rest of the history keeps working.
     corrupt: bool = False
@@ -257,6 +280,7 @@ class _Partition:
             | set(self.pv_snapshots)
             | set(self.pv_outcomes)
             | set(self.price_snapshots)
+            | set(self.reserve_snapshots)
         )
         for day in sorted(known):
             entry: dict[str, Any] = {}
@@ -279,6 +303,11 @@ class _Partition:
             price_snapshots = self.price_snapshots.get(day)
             if price_snapshots:
                 entry["prs"] = [snapshot.to_dict() for snapshot in price_snapshots]
+            # Omitted entirely where no requirement was ever calculable, so an
+            # installation without battery planning stores nothing here.
+            reserve_snapshots = self.reserve_snapshots.get(day)
+            if reserve_snapshots:
+                entry["rsv"] = [snapshot.to_dict() for snapshot in reserve_snapshots]
             if entry:
                 days[day.isoformat()] = entry
         return {"days": days}
@@ -439,6 +468,17 @@ class ForecastHistoryStore:
                 ]
                 if rebuilt_price:
                     partition.price_snapshots[day] = rebuilt_price
+            reserve_raw = value.get("rsv")
+            if isinstance(reserve_raw, list):
+                rebuilt_reserve = [
+                    snapshot
+                    for snapshot in (
+                        ReserveSnapshot.from_dict(day, entry) for entry in reserve_raw
+                    )
+                    if snapshot is not None
+                ]
+                if rebuilt_reserve:
+                    partition.reserve_snapshots[day] = rebuilt_reserve
         return partition
 
     async def async_ensure_days(self, days: list[date]) -> None:
@@ -553,6 +593,63 @@ class ForecastHistoryStore:
         partition.dirty = True
 
         row.price_fingerprints.append(snapshot.fingerprint)
+        self.months.add(month_key(day))
+        self._index_dirty = True
+        return True
+
+    def reserve_snapshots(self, day: date) -> list[ReserveSnapshot]:
+        """Return the reserve requirements recorded for a target day."""
+        partition = self._partitions.get(month_key(day))
+        if partition is None:
+            return []
+        return list(partition.reserve_snapshots.get(day, ()))
+
+    def latest_reserve_snapshot(self, day: date) -> ReserveSnapshot | None:
+        """Return the most recent recorded requirement, or ``None``."""
+        recorded = self.reserve_snapshots(day)
+        return recorded[-1] if recorded else None
+
+    def has_reserve_fingerprint(self, day: date, fingerprint: str) -> bool:
+        """Return whether a requirement with this content is already recorded.
+
+        Answered from the index, so the ninety-odd refreshes a day that change
+        nothing never load a month of arrays to find that out.
+        """
+        row = self.days.get(day)
+        return row is not None and fingerprint in row.reserve_fingerprints
+
+    def add_reserve_snapshot(self, snapshot: ReserveSnapshot) -> bool:
+        """Persist a requirement, unless it duplicates one already recorded.
+
+        Change-triggered by content fingerprint, like all three families before
+        it. The requirement moves only when a forecast or the battery
+        configuration does, so this bounds growth by how often the belief
+        actually changes rather than by a cap that would need tuning -- and the
+        per-day ceiling is still there as a backstop.
+        """
+        day = snapshot.target_day
+        if not self.writable(day):
+            return False
+        if self.has_reserve_fingerprint(day, snapshot.fingerprint):
+            return False
+
+        row = self.days.setdefault(day, DayIndexRow())
+        if len(row.reserve_fingerprints) >= FORECAST_MAX_SNAPSHOTS_PER_TARGET:
+            self.snapshot_cap_hits += 1
+            _LOGGER.warning(
+                "Forecast history already holds %d reserve snapshots for %s, "
+                "which is the per-day ceiling, so this requirement is not being "
+                "recorded. The records already kept are unaffected",
+                len(row.reserve_fingerprints),
+                day.isoformat(),
+            )
+            return False
+
+        partition = self._partitions[month_key(day)]
+        partition.reserve_snapshots.setdefault(day, []).append(snapshot)
+        partition.dirty = True
+
+        row.reserve_fingerprints.append(snapshot.fingerprint)
         self.months.add(month_key(day))
         self._index_dirty = True
         return True

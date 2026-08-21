@@ -28,8 +28,8 @@ TZ = ZoneInfo(TEST_TIMEZONE)
 START = datetime(2026, 8, 17, 10, 0, 0, tzinfo=TZ)
 
 #: Four from Phase 1, two from Phase 2, three from Phase 3, one from Phase 4,
-#: plus the Phase-4 select. Named individually so a new entity cannot slip in
-#: behind a changed count.
+#: one from Phase 7, plus the Phase-4 select. Named individually so a new entity
+#: cannot slip in behind a changed count.
 SENSORS = (
     "sensor.alpha_ems_expected_house_load_today",
     "sensor.alpha_ems_expected_house_load_tomorrow",
@@ -40,6 +40,7 @@ SENSORS = (
     "sensor.alpha_ems_battery_recommendation",
     "sensor.alpha_ems_planned_battery_power",
     "sensor.alpha_ems_usable_battery_energy",
+    "sensor.alpha_ems_dynamic_battery_reserve",
     "sensor.alpha_ems_control_state",
     "select.alpha_ems_control_mode",
 )
@@ -317,6 +318,6 @@ async def test_two_instances_coexist_without_sharing_state(
         for entity in registry.entities.values()
         if entity.platform == DOMAIN
     ]
-    # Two entries, eleven entities each, no id shared between them.
+    # Two entries, twelve entities each, no id shared between them.
     assert len(ours) == 2 * len(SENSORS)
     assert len(set(ours)) == 2 * len(SENSORS)

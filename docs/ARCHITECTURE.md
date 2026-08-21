@@ -2060,12 +2060,251 @@ read is an older series, not a misaligned one — but it is in provenance so Pha
 does not assume the current quarter is present.
 
 
+## Phase 7: the dynamic reserve
+
+One question, and it is physical rather than economic:
+
+> `required_reserve_kwh` is the minimum DC energy present at the start of an
+> interval such that, following the forecast sequence, the battery covers every
+> unit of net demand it is physically capable of serving — the only grid import
+> being demand above the discharge power limit.
+
+Computed every refresh, published as one sensor and one diagnostics section, and
+**obeyed by nothing**. `build_plan` still calls `static_reserve`, so
+`effective_min_soc_percent` still equals the user's configured minimum and
+`ReserveGuardPolicy` still discharges to the same place. The published
+recommendation, planned power, usable energy and control state are what beta.12
+produced for the same inputs, and `test_reserve_published` asserts it.
+
+### Why the floor is not the answer
+
+The obvious formulation — "the minimum energy such that the pack stays above the
+hard floor" — has the answer *the floor*, always, for every interval.
+`apply_request` clamps there and unserved demand spills to the grid, so no
+starting energy can drive the pack below it. The floor is enforced, not risked.
+
+So the requirement is defined against what is actually at stake, which is the
+grid. That is the definition above, and it is the reason this phase is about
+running short rather than about crossing a line.
+
+### The recursion, and the proof
+
+With `s(k) = x(k) − y(k)` the signed DC movement of interval `k`, "never runs
+short" means `E(j) = E(i) − Σ s(k) ≥ F` for every later `j`, which holds exactly
+when `E(i) ≥ F + max(0, max_j Σ)`. That maximum, floored at zero, is a two-line
+backward pass:
+
+```
+R[n] = F
+R[i] = max(F, R[i+1] + x(i) − y(i))
+```
+
+`max(F, …)` is a **documented backstop, not the safety mechanism** — the term it
+guards is already non-negative — exactly as `_clamp_energy` is a measured backstop
+rather than what keeps a trajectory in its band.
+
+Both `x` and `y` are read as the energy difference `apply_request` produced. So
+`reserve.py` performs **no efficiency arithmetic at all**: it divides by no
+efficiency, multiplies by none, converts no percentage, and defines no interval
+duration. The AC/DC direction is not merely tested but unrepresentable, which
+removes four of the mutation shapes this phase was warned about from the space of
+possible bugs. The discharge power limit comes from the same call, so it is not a
+second copy of a limit either.
+
+The definition is proved against an **independent oracle** rather than restated:
+for six horizon shapes, starting at the requirement is handed to
+`simulation.simulate` — which imports nothing from this module — and the pack
+touches its floor without crossing it while the only grid import is what the
+inverter could never have delivered in time. One step below, import strictly
+increases. Necessity and sufficiency, both asserted.
+
+### Superseded: same-interval netting only
+
+An earlier revision of this phase specified that production may reduce
+*simultaneous* demand but forecast surplus may never be credited as future battery
+energy. **That decision is withdrawn**, and it is recorded rather than quietly
+replaced, because the replacement is the one assumption the phase makes.
+
+Withdrawn because with no cross-interval credit `s(k) ≥ 0`, so the recursion
+reduces to `F +` all remaining net demand to the end of the forecast. Three things
+disqualify that as a physical requirement: it grows when the forecast horizon
+lengthens, so it is a property of the forecast rather than of the battery; on the
+reference installation it lands 21.3 kWh against a 22 kWh pack on a sunny August
+day with 30 kWh of production forecast; and the brief's own worked example — 8 kWh
+of load made "materially lower" by 5 kWh of expected production — describes
+production arriving *before* the load it offsets, which same-interval netting
+cannot express.
+
+The replacement, stated once:
+
+> **Forecast surplus may offset accumulated deficit in the same window, up to that
+> deficit and no further.** Capped per interval by the inverter's charge power
+> through the clamp, converted at the **charge** boundary (`S × η`, the smaller of
+> the two conversions and therefore the safe one — the discharge boundary would
+> credit `S / η`, eleven per cent more), floored so it never accumulates across a
+> zero, and flagged where capacity would have prevented it.
+
+It is arithmetically equivalent to assuming forecast surplus becomes usable future
+battery energy, and it is a *forecast* rather than an observation: it does not
+prove the real inverter will store that surplus. What makes it auditable rather
+than merely declared is that the superseded definition is still computed every
+refresh, as `required_same_interval_only_kwh`, with the difference published as
+`replenishment_dependency_kwh`. The cost of the relaxation is measured, per
+interval, rather than argued once here.
+
+Time is part of the arithmetic rather than a thing to check: surplus arriving
+*after* the demand it would pay for credits nothing, because walking backwards it
+meets a deficit of zero and the floor stops the credit propagating past it.
+
+### The requirement is not the peak
+
+`R` is **not monotone**, and that is correct: it is low while replenishment is
+imminent and high once it has passed. An earlier draft published the running
+maximum instead — the largest requirement anywhere in the horizon — which is a
+different quantity and wrong as a reserve, because it demands that energy needed
+later already be present now and so ignores every charging opportunity in between.
+
+Two cases show it. At midday with production arriving before the evening, the
+requirement is the floor and the peak is the coming night: publishing the peak
+would reserve energy the sun is about to supply. At a cheap overnight hour the
+requirement is 5.98 kWh and the peak 8.62, so a later phase acting on the peak
+would buy 2.6 kWh it never needed. It survives as `peak_required_reserve_kwh`, a
+diagnostic — it *is* what the pack will be asked to hold, which Phase 8 needs —
+and `test_reserve_mutations` pins the substitution as a caught mutation.
+
+### Blind by construction
+
+`build_reserve` takes limits, a floor energy and a sequence of demands. That is
+the whole of its input, and the signature is asserted exactly, so a price, a
+control mode, a dispatch state or an absorption flag cannot reach the requirement
+because there is nowhere to put it.
+
+This is not hypothetical. On the reference installation `pv_absorption.modelled`
+flipped from true to false inside fifteen minutes because a dispatch began, while
+both forecasts stood still — and the projected end-of-horizon state of charge in
+diagnostics fell from 55.1 % to 20.0 % on that flag alone. A requirement that
+consulted it would have jumped from roughly 15 kWh to 21.3 for no physical reason,
+and an earlier belief would not be reproducible from stored evidence.
+
+So the pair is **recorded and read by nothing**. Recording it is what makes the
+blindness checkable: two snapshots differing only in the flag carry the same
+requirement and the same fingerprint, and that comparison is impossible if the
+flag was never written down. Three layers hold the rule — the pinned signature,
+the absence of any such identifier in the calculation, and `reserve` on the
+price-neutrality module list, a guard that existed before this module did.
+
+### Two ways the figure can understate, both named
+
+`lower_bound_reason` is `None`, `truncated`, `headroom_limited`, or both.
+
+**Truncated** means the deficit was still climbing at the last interval anyone
+forecast, so demand continues past the horizon. A backward recursion from a
+cut-off horizon always understates, and publishing that without saying so would be
+the mistake the PV-blind disclaimer exists to prevent.
+
+**Headroom-limited** means some requirement *in* the horizon exceeds the whole
+pack, so later credit pulled the published figure back down and erased an
+infeasibility no starting energy could have fixed. The detector is `peak >
+ceiling`, and getting there took a wrong turn worth recording: an earlier version
+tested whether the *cumulative excursion* exceeded usable capacity, which fires on
+a correct answer — thirty kilowatt-hours of surplus followed by fifteen of demand
+needs only the floor and delivers no grid import from it. The recursion is exact
+under a ceiling as long as every intermediate requirement fits, because clipping a
+full pack only discards credit that was not needed.
+
+Neither is ever corrected, and neither selects a different reserve model. There is
+exactly one authoritative figure.
+
+### Missing data
+
+An unforecast **load** interval stops the recursion: every earlier requirement is
+`None` and `required_now` is `None` with `reserve_horizon_incomplete`. Reading the
+hole as zero produces a smaller, entirely plausible-looking figure, which is worse
+than no figure.
+
+A missing **production** interval is PV-blind: no netting *and* no credit, which
+raises the requirement. Conservative, and declared — `pv_blind_intervals` counts
+them, so a requirement built on a covered horizon is distinguishable from one built
+on a partly uncovered one. `IntervalDemand.surplus_kwh` already returns zero when
+either term is absent, so this is reused rather than re-decided.
+
+No state of charge means no shortfall and still a requirement: it does not depend
+on what the pack currently holds, which is what keeps it reproducible.
+
+### Evidence, and why the fingerprint is over the inputs
+
+A fourth change-fingerprinted snapshot family, scalars only. The per-interval curve
+is not stored: 192 floats a refresh, recomputable from the two forecast snapshots
+plus the configuration fingerprint and `RESERVE_MODEL_VERSION`.
+
+The **configuration fingerprint is the whole reason the family exists.** Both
+forecasts are already persisted, so the arithmetic is reproducible — but capacity,
+the floor, the power limits and the efficiency live in the config entry, which
+keeps no history. Raising a minimum state of charge would otherwise make every
+earlier belief unverifiable.
+
+The digest is over the **inputs, not the answer**, and that distinction is
+load-bearing. The requirement is a function of the interval it is asked from — the
+horizon starts at the next boundary — so it genuinely differs every quarter-hour
+even when nothing has changed. An earlier version digested the figure, stored
+ninety-six documents a day, and broke the rule that a refresh reproducing what it
+produced fifteen minutes ago costs no I/O at all. `test_forecast_issuance` caught
+it; `fingerprint_forecast` had already solved the same problem the same way.
+
+No outcome half, like the price evidence. The natural outcome is the measured state
+of charge, which the learning store already keeps per interval — scoring one
+against the other is Phase 9, and a verdict written here would be one this phase
+has no basis for.
+
+### What Phase 8 receives
+
+`required_reserve_kwh` per interval, plus `lower_bound_reason`,
+`replenishment_dependency_kwh`, `peak_required_reserve_kwh`, the three
+fingerprints and the model version. One clean input with no economic content, and
+the two floors still separate and numerically identical — so "a price spike
+justifies dipping into the reserve, but never below the floor the user set" is
+still sayable.
+
+### Known open items — Phase 7
+
+**The requirement carries no margin for forecast error.**
+`ForecastUncertainty.interval_margin_kwh` exists and stays deliberately unread;
+widening a figure by measured error is reserve *sizing under uncertainty*, which is
+Phase 9. On the reference installation the measured load bias is currently
+negative — the model under-predicts — so the requirement may be biased low. The
+direction is reported in provenance and stated in the sensor's own basis string.
+Naming it is this phase's obligation; correcting for it is not.
+
+**A persistently non-absorbing installation makes the figure optimistic
+indefinitely.** With Excess Export or Peak Shaving left enabled, forecast surplus
+structurally never reaches the battery, so the replenishment assumption never
+holds. `required_same_interval_only_kwh` is the applicable figure there. Phase 7
+does not substitute it automatically, because selecting a reserve model on a live
+control flag is exactly what would make the requirement irreproducible — the same
+reason the absorption pair is recorded rather than consulted.
+
+**Winter behaviour is designed and unobserved.** With nothing to credit the
+requirement is the horizon's whole net demand, `truncated`, and a lower bound. That
+is honest and cannot be confirmed against a real December before December.
+
+**The forecast and the measured production sit on different, undeclared
+electrical boundaries** (Phase 5). The requirement inherits that ambiguity:
+netting AC load against a possibly-DC production figure is a few per cent in an
+unknown direction. Recorded, not corrected.
+
+
 ## Entity contract
 
-Exactly nine sensors — four from Phase 1, two from Phase 2, three from Phase 3.
+Exactly eleven sensors and one select — four from Phase 1, two from Phase 2,
+three from Phase 3, one sensor and the select from Phase 4, one from Phase 7.
 Phases 5 and 6 add **none**: expected production and price both reach the plan or
 the diagnostics without becoming published state, and a price entity would
-duplicate one the source already publishes. Unique IDs
+duplicate one the source already publishes. Phase 7 adds one, because the
+requirement it computes is invisible in every existing entity — `Usable Battery
+Energy` is measured against the *configured* floor, so without a sensor the whole
+phase would be a diagnostics download from the user's chair. Its two
+counterfactuals, the peak, the constraint tallies and the provenance stay in
+diagnostics. Unique IDs
 `{entry_id}_{key}`, all on one service device named from the entry title. Names
 are literal English with **no** `translation_key`: Home Assistant derives the
 entity ID from the translated name, so a translation key would give a Dutch user
@@ -2114,8 +2353,8 @@ What each next phase needs, and where it plugs in:
 |---|---|---|
 | ~~**5** Solcast PV~~ | *shipped in beta.9* | production is a second series on the same index; the stepper still takes a sequence of demands. Asymmetric efficiency remains available and unused |
 | ~~**6** Frank prices~~ | *shipped in beta.12* | the series exists, normalised and stored, and is reachable from no module that decides anything. Phase 8 adds a cost function over the trajectories what-if already compares |
-| **7** Dynamic reserve | raise the floor, never the user's setting | `dynamic_reserve` beside `static_reserve`, computing `max(configured, dynamic)` **inside** the factory. `interval_margin_kwh` is already reported, and the P10/P90 series is now recorded per interval — but read `percentile_aggregation` first: a per-site sum is not a calibrated band |
-| **8** Economic optimisation | replace the objective, keep the simulator | the policy interface; `HoldPolicy` is already the counterfactual to price against, and the soft reserve is what makes “dip but never below the floor” expressible |
+| ~~**7** Dynamic reserve~~ | *shipped in beta.13, calculation only* | the requirement is computed and published; nothing obeys it. `dynamic_reserve` is deliberately **unwritten** and its tripwire test is still green, so this phase is structurally incapable of raising the floor. `interval_margin_kwh` remains unread, and the P10/P90 series remains unused — read `percentile_aggregation` first: a per-site sum is not a calibrated band |
+| **8** Economic optimisation, automatic buy and sell, **safety buy** | replace the objective, keep the simulator | the policy interface; `HoldPolicy` is already the counterfactual to price against, and the soft reserve is what makes “dip but never below the floor” expressible. `dynamic_reserve` goes beside `static_reserve`, computing `max(configured, dynamic)` **inside** the factory. Phase 7 identifies need; this phase decides the action, which is why safety buy belongs here and not there |
 | **9** Adaptive feedback | provenance and joins | recorded state of charge joins the Phase-2 snapshot by chronological index and target day; plans are recomputable; `policy_version` prevents pooling generations; separate efficiency fields let them be learned |
 | **10** Multi-day | a longer horizon | the simulator is horizon-agnostic and already walks today plus tomorrow |
 

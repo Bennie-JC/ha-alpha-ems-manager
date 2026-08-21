@@ -33,6 +33,7 @@ charge beside a live reading of 96 %.
 from __future__ import annotations
 
 from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 from homeassistant.config_entries import ConfigEntryState
@@ -58,8 +59,31 @@ from custom_components.alpha_ems_manager.diagnostics import (
 from custom_components.alpha_ems_manager.solcast_source import discover
 
 from .conftest import ACHTERKANT, VOORKANT, FakeSolcast
-from .forecast_helpers import NORMAL
+from .forecast_helpers import NORMAL, local
 from .test_pv_site_selection import drive, enable_forecast
+
+
+async def diagnostics_at_the_driven_instant(
+    hass: HomeAssistant, entry: MockConfigEntry, hour: int = 12
+):
+    """Read diagnostics on the same day the refresh was driven on.
+
+    ``drive`` pins the *coordinator's* clock to a fixed date. Diagnostics reads
+    its own clock, so a payload taken afterwards describes whatever day it really
+    is -- and ``pv.forecast_today`` is looked up by that date, which the driven
+    refresh never produced a forecast for.
+
+    The two agreed only while the real date happened to be the driven one, so
+    this file passed on the day it was written and began failing two days later.
+    Pinning both clocks to one instant is what the assertions here always meant;
+    the alternative would be to weaken them, which would throw away the check
+    rather than fix it.
+    """
+    with patch(
+        "custom_components.alpha_ems_manager.diagnostics.dt_util.now",
+        return_value=local(NORMAL, hour, 5),
+    ):
+        return await async_get_config_entry_diagnostics(hass, entry)
 
 
 def beta9_probe(hass: HomeAssistant, entry_id: str | None) -> bool:
@@ -204,7 +228,7 @@ async def test_diagnostics_never_reports_available_and_unusable_together(
     await hass.config_entries.async_reload(setup_integration.entry_id)
     await drive(setup_integration.runtime_data)
 
-    payload = await async_get_config_entry_diagnostics(hass, setup_integration)
+    payload = await diagnostics_at_the_driven_instant(hass, setup_integration)
     available = payload["consumed_integrations"]["solcast_available"]
     usable = payload["pv"]["capability"]["usable"]
 
@@ -226,7 +250,7 @@ async def test_the_invariant_holds_whatever_the_entry_state(
     await hass.config_entries.async_reload(setup_integration.entry_id)
     await drive(setup_integration.runtime_data)
 
-    payload = await async_get_config_entry_diagnostics(hass, setup_integration)
+    payload = await diagnostics_at_the_driven_instant(hass, setup_integration)
 
     assert (
         payload["consumed_integrations"]["solcast_available"]
@@ -251,7 +275,7 @@ async def test_the_capability_block_is_probed_live_and_the_snapshot_is_dated(
     await hass.config_entries.async_reload(setup_integration.entry_id)
     await drive(setup_integration.runtime_data)
 
-    payload = await async_get_config_entry_diagnostics(hass, setup_integration)
+    payload = await diagnostics_at_the_driven_instant(hass, setup_integration)
 
     assert "capability" in payload["pv"]
     assert "capability_at_last_refresh" in payload["pv"]
@@ -630,7 +654,7 @@ async def test_no_api_key_reaches_diagnostics_after_the_fix(
     await hass.config_entries.async_reload(setup_integration.entry_id)
     await drive(setup_integration.runtime_data)
 
-    payload = await async_get_config_entry_diagnostics(hass, setup_integration)
+    payload = await diagnostics_at_the_driven_instant(hass, setup_integration)
 
     assert "SECRET-KEY-VALUE" not in repr(payload)
     assert "api_key" not in repr(payload)

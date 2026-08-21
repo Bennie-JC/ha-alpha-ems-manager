@@ -33,6 +33,11 @@ async def test_diagnostics_report_every_documented_section(
         "storage",
         "forecast_history",
         "battery_plan",
+        # Phase 7. How much stored energy the forecast says must remain
+        # available, and the counterfactuals it is bracketed by. Nothing
+        # enforces it, and the calculation reads none of the provenance beside
+        # it.
+        "reserve",
         "control",
         # Phase 5. Sixteen sections to seventeen: a dict key rather than a list
         # entry, so the sixteen-item list ceiling every payload is held to is

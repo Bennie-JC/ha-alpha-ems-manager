@@ -1,8 +1,9 @@
 """The exact entity surface Alpha EMS Manager is allowed to create.
 
-Six sensors and nothing else: four from Phase 1, two from Phase 2. This module
-freezes that promise, so an accidental extra entity, a changed unique id or a
-lost unit fails here rather than surprising a user whose dashboard silently
+Twelve entities and nothing else: four from Phase 1, two from Phase 2, three
+from Phase 3, one sensor and one select from Phase 4, and one from Phase 7. This
+module freezes that promise, so an accidental extra entity, a changed unique id
+or a lost unit fails here rather than surprising a user whose dashboard silently
 gained a row.
 
 The two Phase-2 sensors deliberately break the Phase-1 pattern in one respect
@@ -100,6 +101,17 @@ CONTRACT: dict[str, dict[str, object]] = {
         "state_class": "measurement",
         "icon": "mdi:battery-charging-medium",
     },
+    # Phase 7. A stored-energy level like Usable Battery Energy, and
+    # deliberately not ENERGY: a requirement is not consumption, and offering it
+    # to the Energy dashboard would invite exactly that reading.
+    "sensor.alpha_ems_dynamic_battery_reserve": {
+        "unique_id_suffix": "dynamic_battery_reserve",
+        "name": "Alpha EMS Dynamic Battery Reserve",
+        "unit": "kWh",
+        "device_class": "energy_storage",
+        "state_class": "measurement",
+        "icon": "mdi:battery-lock",
+    },
     "sensor.alpha_ems_control_state": {
         "unique_id_suffix": "control_state",
         "name": "Alpha EMS Control State",
@@ -120,7 +132,7 @@ CONTRACT: dict[str, dict[str, object]] = {
 
 
 def test_no_entity_is_missing_or_extra(hass: HomeAssistant) -> None:
-    """Exactly the eleven documented entities exist.
+    """Exactly the twelve documented entities exist.
 
     Covers both platforms, so the select is held to the same table as the
     sensors rather than being checked somewhere looser.
@@ -132,7 +144,7 @@ def test_no_entity_is_missing_or_extra(hass: HomeAssistant) -> None:
         if entity.platform == DOMAIN
     }
     assert created == set(CONTRACT)
-    assert len(created) == len(CONTRACT) == 11
+    assert len(created) == len(CONTRACT) == 12
 
 
 #: The entity surface, phase by phase. Named rather than counted, so a new
@@ -166,6 +178,14 @@ PHASE_FOUR_ENTITIES = {
 PHASE_FOUR_SELECTS = {
     "select.alpha_ems_control_mode",
 }
+#: Phase 7 adds exactly one. The two counterfactuals the requirement is
+#: bracketed by, the peak requirement, the per-interval trajectory, the
+#: constraint tallies and the provenance the calculation deliberately does not
+#: consult are all diagnostics-only: a requirement with six ways of being wrong
+#: must not become six rows on a dashboard.
+PHASE_SEVEN_ENTITIES = {
+    "sensor.alpha_ems_dynamic_battery_reserve",
+}
 
 
 def test_phase_two_added_exactly_two_entities(hass: HomeAssistant) -> None:
@@ -176,7 +196,11 @@ def test_phase_two_added_exactly_two_entities(hass: HomeAssistant) -> None:
     health, lifecycle counts -- is diagnostics-only by design.
     """
     assert (
-        set(CONTRACT) - PHASE_ONE_ENTITIES - PHASE_THREE_ENTITIES - PHASE_FOUR_ENTITIES
+        set(CONTRACT)
+        - PHASE_ONE_ENTITIES
+        - PHASE_THREE_ENTITIES
+        - PHASE_FOUR_ENTITIES
+        - PHASE_SEVEN_ENTITIES
         == PHASE_TWO_ENTITIES
     )
 
@@ -191,7 +215,11 @@ def test_phase_three_added_exactly_three_entities(hass: HomeAssistant) -> None:
     entity.
     """
     assert (
-        set(CONTRACT) - PHASE_ONE_ENTITIES - PHASE_TWO_ENTITIES - PHASE_FOUR_ENTITIES
+        set(CONTRACT)
+        - PHASE_ONE_ENTITIES
+        - PHASE_TWO_ENTITIES
+        - PHASE_FOUR_ENTITIES
+        - PHASE_SEVEN_ENTITIES
         == PHASE_THREE_ENTITIES
     )
     assert len(PHASE_THREE_ENTITIES) == 3
@@ -208,7 +236,11 @@ def test_phase_four_added_exactly_one_sensor_and_one_select(
     the event trail -- is in attributes and diagnostics.
     """
     assert (
-        set(CONTRACT) - PHASE_ONE_ENTITIES - PHASE_TWO_ENTITIES - PHASE_THREE_ENTITIES
+        set(CONTRACT)
+        - PHASE_ONE_ENTITIES
+        - PHASE_TWO_ENTITIES
+        - PHASE_THREE_ENTITIES
+        - PHASE_SEVEN_ENTITIES
         == PHASE_FOUR_ENTITIES
     )
     assert len(PHASE_FOUR_ENTITIES) == 2

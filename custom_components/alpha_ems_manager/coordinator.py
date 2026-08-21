@@ -42,6 +42,7 @@ from .battery import INTERVAL_HOURS, sanitize_soc_percent
 from .confidence import ConfidenceBreakdown, compute_confidence
 from .const import (
     BALANCE_MAX_SOURCE_AGE_SECONDS,
+    BATTERY_MAX_SOC_PERCENT,
     CONF_BATTERY_CAPACITY_KWH,
     CONF_BATTERY_MAX_CHARGE_KW,
     CONF_BATTERY_MAX_DISCHARGE_KW,
@@ -177,6 +178,11 @@ from .quarter import (
     sanitize_load_w,
     sanitize_pv_w,
 )
+from .reserve import (
+    ReserveProjection,
+    build_reserve_snapshot,
+    fingerprint_battery_config,
+)
 from .safety import (
     ControlContext,
     ExecutionDecision,
@@ -193,6 +199,7 @@ from .storage import (
     LearningStore,
     expected_quarters_for,
     index_for_start_utc,
+    interval_start_utc,
     utc_midnight,
 )
 
@@ -254,6 +261,10 @@ _CONTROL_LOG = "control"
 #: silence a control warning or the other way round.
 _PV_LOG = "pv_forecast"
 _PRICE_LOG = "price_forecast"
+#: Throttle key for the reserve evidence layer, for the same reason as the four
+#: above it: a storage fault while recording a requirement must not silence a
+#: Solcast, price or control warning, and must not cost the refresh.
+_RESERVE_LOG = "reserve"
 
 #: The statement every control surface in this release repeats, because it is the
 #: single most important fact about it.
@@ -430,6 +441,40 @@ def _capacity_total(values: Iterable[float | None]) -> float | None:
     if not present:
         return None
     return round(sum(present), 4)
+
+
+def _reserve_horizon_edges(
+    projection: ReserveProjection,
+    *,
+    today: date,
+    tomorrow: date,
+    today_interval_count: int,
+    tz: tzinfo,
+) -> tuple[datetime | None, datetime | None]:
+    """Return the absolute instants a reserve horizon spans.
+
+    The requirement is indexed by the plan's continuous chronological index,
+    which runs through today and straight on into tomorrow, so an index at or
+    beyond today's real length names an interval of tomorrow. Resolving that
+    needs the civil day and its real length -- 92, 96 or 100 -- which is exactly
+    the calendar knowledge the reserve module deliberately does not have, so it is
+    done here and handed in.
+
+    Absolute UTC throughout, and the end is the *start of the interval after* the
+    last one, so a horizon reports the instant it stops covering rather than the
+    beginning of its final quarter.
+    """
+    if not projection.intervals:
+        return None, None
+
+    def moment(index: int) -> datetime:
+        if index < today_interval_count:
+            return interval_start_utc(today, index, tz)
+        return interval_start_utc(tomorrow, index - today_interval_count, tz)
+
+    first = projection.intervals[0].index
+    last = projection.intervals[-1].index
+    return moment(first), moment(last) + timedelta(minutes=QUARTER_MINUTES)
 
 
 def _tally(counts: dict[str, int], key: str) -> None:
@@ -1528,6 +1573,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             absorb_surplus=absorb_surplus,
         )
 
+        await self._async_record_reserve_evidence_safely(
+            plan=plan,
+            now=now,
+            today=today,
+            tomorrow=tomorrow,
+            tz=tz,
+            today_interval_count=baseline_today.interval_count,
+            absorption_modelled=absorb_surplus,
+            absorption_reason=absorption_reason,
+        )
+
         control = self._build_control_report_safely(
             plan=plan,
             now=now,
@@ -1558,6 +1614,121 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "price_today": price_forecasts.get(today),
             "price_tomorrow": price_forecasts.get(tomorrow),
         }
+
+    async def _async_record_reserve_evidence_safely(
+        self,
+        *,
+        plan: BatteryPlan | None,
+        now: datetime,
+        today: date,
+        tomorrow: date,
+        tz: tzinfo,
+        today_interval_count: int,
+        absorption_modelled: bool,
+        absorption_reason: str,
+    ) -> None:
+        """Record what reserve was believed necessary, or say why it could not be.
+
+        Wrapped like every evidence step beside it: the learning history is the
+        irreplaceable half, so a fault here must never cost a refresh.
+        """
+        try:
+            await self._async_record_reserve_evidence(
+                plan=plan,
+                now=now,
+                today=today,
+                tomorrow=tomorrow,
+                tz=tz,
+                today_interval_count=today_interval_count,
+                absorption_modelled=absorption_modelled,
+                absorption_reason=absorption_reason,
+            )
+        except Exception:
+            self._log.warning(
+                _RESERVE_LOG,
+                (
+                    "Reserve evidence could not be recorded this refresh. The "
+                    "requirement itself and every other layer are unaffected; "
+                    "the record for this issuance is simply not stored"
+                ),
+            )
+            _LOGGER.debug("reserve evidence recording failed", exc_info=True)
+
+    async def _async_record_reserve_evidence(
+        self,
+        *,
+        plan: BatteryPlan | None,
+        now: datetime,
+        today: date,
+        tomorrow: date,
+        tz: tzinfo,
+        today_interval_count: int,
+        absorption_modelled: bool,
+        absorption_reason: str,
+    ) -> None:
+        """Store the requirement, and the configuration it was computed against.
+
+        **The configuration fingerprint is the whole reason this exists.** Both
+        forecasts are already persisted, so the arithmetic is reproducible -- but
+        capacity, the floor, the power limits and the efficiency live in the
+        config entry, which keeps no history. Without this, a user raising their
+        minimum state of charge would make every earlier belief unverifiable.
+
+        Change-triggered by content fingerprint, so ninety-six refreshes a day
+        against unchanged forecasts do not store ninety-six identical documents.
+        The absorption pair is stored verbatim and reaches no figure: the
+        projection below never saw it.
+        """
+        projection = None if plan is None else plan.reserve_projection
+        if projection is None:
+            return
+
+        try:
+            await self.history.async_ensure_days([today])
+        except Exception:
+            _LOGGER.debug("reserve evidence partitions unavailable", exc_info=True)
+            return
+
+        load_snapshots = self.history.snapshots(today)
+        pv_snapshot = self.history.latest_pv_snapshot(today)
+        start, end = _reserve_horizon_edges(
+            projection,
+            today=today,
+            tomorrow=tomorrow,
+            today_interval_count=today_interval_count,
+            tz=tz,
+        )
+        snapshot = build_reserve_snapshot(
+            projection,
+            issued_at=now,
+            target_day=today,
+            tz_key=str(tz),
+            floor_soc_percent=plan.reserve.configured_min_soc_percent,
+            config_fingerprint=fingerprint_battery_config(
+                capacity_kwh=self.config.battery_capacity_kwh,
+                min_soc_percent=self.config.battery_min_soc_percent,
+                max_charge_kw=self.config.battery_max_charge_kw,
+                max_discharge_kw=self.config.battery_max_discharge_kw,
+                round_trip_efficiency_percent=(
+                    self.config.battery_round_trip_efficiency_percent
+                ),
+                max_soc_percent=BATTERY_MAX_SOC_PERCENT,
+            ),
+            horizon_start=start,
+            horizon_end=end,
+            same_interval_only=plan.reserve_same_interval_only,
+            pv_blind=plan.reserve_pv_blind,
+            load_fingerprint=(
+                load_snapshots[-1].fingerprint if load_snapshots else None
+            ),
+            pv_fingerprint=None if pv_snapshot is None else pv_snapshot.fingerprint,
+            pv_absorption_modelled=absorption_modelled,
+            pv_absorption_reason=absorption_reason,
+        )
+        if self.history.add_reserve_snapshot(snapshot):
+            # Debounced, like the three evidence layers beside it. Ninety-odd
+            # refreshes a day must not each force a document write.
+            self.history.schedule_save()
 
     async def _async_record_price_evidence_safely(
         self,

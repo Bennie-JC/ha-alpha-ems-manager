@@ -35,6 +35,8 @@ from .const import (
     MIN_DAY_COMPLETENESS,
     MIN_QUARTER_COVERAGE,
     PRICE_MAPPING_VERSION,
+    RESERVE_REPLENISHMENT_ASSUMPTION,
+    RESERVE_UNAVAILABLE_FORECAST,
     SLOTS_PER_DAY,
     STORAGE_VERSION,
 )
@@ -56,6 +58,7 @@ from .plan import plan_as_dict
 from .policy import DEFAULT_POLICY, SHIPPED_POLICIES
 from .price_forecast import PriceForecast
 from .pv_forecast import PvForecast, pv_error_metrics
+from .reserve import reserve_as_dict
 from .solcast_source import SolcastFacts
 from .solcast_source import discover as discover_solcast
 from .storage import DayRecord, elapsed_quarters_for, expected_quarters_for
@@ -477,6 +480,73 @@ async def _forecast_history_report(
         },
         "storage": storage,
     }
+
+
+def _reserve_report(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Summarise the Phase-7 requirement, and everything it rests on.
+
+    A dict rather than a list entry, deliberately: the eighteen-section ceiling
+    the payload is held to counts top-level *sections*, and Phases 5 and 6 both
+    grew by a key for the same reason.
+
+    Bounded by construction. ``reserve_as_dict`` publishes counts, totals, edges
+    and status only -- never the per-interval requirement, which would be a
+    hundred and ninety-two values against a sixteen-entry ceiling.
+    """
+    plan = coordinator.battery_plan
+    if plan is None or plan.reserve_projection is None:
+        return {
+            "available": False,
+            "unavailable_reason": RESERVE_UNAVAILABLE_FORECAST,
+            "note": (
+                "no reserve was calculated this refresh: the battery plan is "
+                "absent, so there were no limits and no horizon to walk. "
+                "Learning, both forecasts and every published sensor other than "
+                "Dynamic Battery Reserve are unaffected"
+            ),
+            "decides_nothing": (
+                "Phase 7 calculates a requirement. It never enforces it, never "
+                "charges or discharges because of it, and never consults a price"
+            ),
+        }
+
+    data = coordinator.data or {}
+    absorption = data.get("pv_absorption") or {}
+    window = coordinator.last_record.window
+
+    return reserve_as_dict(
+        plan.reserve_projection,
+        same_interval_only=plan.reserve_same_interval_only,
+        pv_blind=plan.reserve_pv_blind,
+        state=plan.state,
+        comparison=plan.reserve_comparison,
+        provenance={
+            "replenishment_assumption": RESERVE_REPLENISHMENT_ASSUMPTION,
+            # Recorded, and read by nothing. The live installation flipped this
+            # from true to false inside fifteen minutes because a dispatch began,
+            # while the load and production forecasts did not move at all -- so a
+            # requirement that consulted it would have jumped for no physical
+            # reason, and yesterday's requirement would not be reproducible.
+            "pv_absorption_modelled": absorption.get("modelled"),
+            "pv_absorption_reason": absorption.get("reason"),
+            # Also read by nothing. Reported because the requirement carries no
+            # margin for forecast error, and a *negative* bias means the load
+            # model is under-predicting, which biases the requirement low. Naming
+            # the direction is Phase 7's obligation; correcting for it is Phase 9.
+            # Read through the window's own reporting form rather than rounded
+            # again here, so this figure and the one in ``forecast_history``
+            # cannot drift to different precisions.
+            "forecast_bias_kwh_per_interval": window.as_dict()["bias_kwh_per_interval"],
+            "forecast_days_compared": window.days_compared,
+            "forecast_basis": (
+                "required_reserve_kwh is a point estimate over the published "
+                "load and production forecasts. No forecast-error margin is "
+                "applied. Where the measured load bias above is negative the "
+                "load model is under-predicting, so the requirement may be "
+                "biased low. Nothing here is consumed by the calculation"
+            ),
+        },
+    )
 
 
 def _battery_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any]:
@@ -993,6 +1063,11 @@ async def async_get_config_entry_diagnostics(
         # concluded, which limit bound it, and what would have happened. Nothing
         # here is ever executed.
         "battery_plan": _battery_report(coordinator, tz),
+        # Phase 7. How much stored energy the forecast says must remain
+        # available, the two counterfactuals it is bracketed by, where the
+        # projected trajectory would fall below it, and the provenance the
+        # calculation deliberately does not consult. Nothing enforces it.
+        "reserve": _reserve_report(coordinator),
         # Phase 4. What the control pipeline made of that decision: which parts
         # of the control surface were found, what the inverter is doing, the
         # intent, the quantised command, the exact ordered command list, the

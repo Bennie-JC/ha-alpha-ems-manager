@@ -40,7 +40,19 @@ from .test_price_capability import TOMORROW, drive
 COMPONENT_DIR = Path("custom_components/alpha_ems_manager")
 
 #: The modules that decide what the battery does. None of them may know a price.
-DECISION_MODULES = ("plan", "policy", "simulation", "battery", "control", "safety")
+DECISION_MODULES = (
+    "plan",
+    "policy",
+    "simulation",
+    "battery",
+    "control",
+    "safety",
+    # Phase 7. It computes a physical requirement and nothing else, so it belongs
+    # on this list for the same reason the six above it do -- and the guard
+    # existed before the module did, which is a stronger statement than a
+    # behavioural comparison could make.
+    "reserve",
+)
 
 #: The price layer.
 PRICE_MODULES = {"price_forecast", "frank_source"}

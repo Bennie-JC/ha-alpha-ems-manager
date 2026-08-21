@@ -1,8 +1,8 @@
 """Sensor platform for Alpha EMS Manager.
 
-Ten sensors: the four Phase-1 forecast and learning ones, the two Phase-2
-forecast-error ones, the three Phase-3 battery ones, and the single Phase-4
-control state. Every other quantity
+Eleven sensors: the four Phase-1 forecast and learning ones, the two Phase-2
+forecast-error ones, the three Phase-3 battery ones, the single Phase-4
+control state, and the single Phase-7 dynamic reserve. Every other quantity
 the integration computes -- per-slot profiles, window means, balance residuals,
 coverage statistics, per-horizon error breakdowns, the snapshot inventory, the
 simulated battery trajectory -- is available through diagnostics instead.
@@ -62,6 +62,7 @@ from .const import (
     SENSOR_BATTERY_RECOMMENDATION,
     SENSOR_BATTERY_USABLE_ENERGY,
     SENSOR_CONTROL_STATE,
+    SENSOR_DYNAMIC_RESERVE,
     SENSOR_EXPECTED_LOAD_TODAY,
     SENSOR_EXPECTED_LOAD_TOMORROW,
     SENSOR_FORECAST_ERROR_WINDOW,
@@ -71,6 +72,7 @@ from .const import (
 )
 from .coordinator import AlphaEmsCoordinator
 from .plan import BatteryPlan
+from .reserve import RESERVE_BASIS, shortfall
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -441,6 +443,67 @@ def _usable_energy_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any
     }
 
 
+def _dynamic_reserve_value(coordinator: AlphaEmsCoordinator) -> float | None:
+    """Return the calculated requirement, in DC kWh.
+
+    An **energy**, because that is the quantity the model conserves and the one a
+    person compares against ``Usable Battery Energy``. The state of charge it
+    implies is derived and travels as an attribute, never the other way round.
+
+    ``None`` -- published as ``unknown`` -- whenever the recursion could not
+    reach the present: no forecast, an unforecast interval inside the horizon, or
+    no usable battery configuration. Never a fabricated zero, which would read as
+    "nothing is needed" rather than "nothing is known".
+    """
+    plan = _plan(coordinator)
+    if plan is None or plan.reserve_projection is None:
+        return None
+    return _round(plan.reserve_projection.required_now_dc_kwh, BATTERY_KWH_PRECISION)
+
+
+def _dynamic_reserve_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return the eight flat values behind the requirement.
+
+    Eight, which is the cap. The counterfactuals this figure is bracketed by, the
+    peak, the per-interval detail, the constraint tallies and the provenance are
+    all in diagnostics: a requirement with six ways of being wrong has no
+    business unpacking all six into an entity.
+
+    ``replenishment_dependency_kwh`` earns its slot because it is the one number
+    a user can act on -- how much of the reduction rests on forecast sunshine
+    arriving. On a sunny midday it is large, and that is the signal that the
+    figure beside it is optimistic.
+    """
+    plan = _plan(coordinator)
+    if plan is None or plan.reserve_projection is None:
+        return {"basis": RESERVE_BASIS}
+    projection = plan.reserve_projection
+    required = projection.required_now_dc_kwh
+    same = (
+        None
+        if plan.reserve_same_interval_only is None
+        else plan.reserve_same_interval_only.required_now_dc_kwh
+    )
+    return {
+        "required_reserve_soc_percent": _round(
+            projection.required_now_soc_percent, BATTERY_SOC_PRECISION
+        ),
+        "configured_min_soc_percent": plan.reserve.configured_min_soc_percent,
+        "reserve_shortfall_kwh": shortfall(projection, plan.state)[
+            "reserve_shortfall_kwh"
+        ],
+        "reserve_reachable": projection.reachable,
+        "replenishment_dependency_kwh": (
+            None
+            if same is None or required is None
+            else _round(same - required, BATTERY_KWH_PRECISION)
+        ),
+        "lower_bound_reason": projection.lower_bound_reason,
+        "intervals_evaluated": projection.intervals_evaluated,
+        "basis": RESERVE_BASIS,
+    }
+
+
 _SIGN_CONVENTION: str = (
     "positive is energy into the battery; this is the plan's own convention and "
     "is unrelated to the configured battery power sign, which describes the "
@@ -605,6 +668,19 @@ SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=_usable_energy_value,
         attributes_fn=_usable_energy_attributes,
+    ),
+    AlphaEmsSensorDescription(
+        key=SENSOR_DYNAMIC_RESERVE,
+        name="Dynamic Battery Reserve",
+        icon="mdi:battery-lock",
+        # A stored-energy level, exactly like Usable Battery Energy, and
+        # deliberately not ENERGY: a requirement is not consumption and has no
+        # business on the Energy dashboard.
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=_dynamic_reserve_value,
+        attributes_fn=_dynamic_reserve_attributes,
     ),
     AlphaEmsSensorDescription(
         key=SENSOR_CONTROL_STATE,

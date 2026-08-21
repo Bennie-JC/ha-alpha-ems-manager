@@ -7,19 +7,21 @@
 A Home Assistant custom integration that learns how much electricity your
 household **actually** uses, and forecasts what it will use today and tomorrow.
 
-This is **Phase 4**. It observes, learns, predicts, keeps a record of how wrong
-its predictions turned out to be, works out what the battery *should* do, and now
-builds the complete path from that decision to an inverter command — and stops one
-step short of walking it. **Nothing in this integration sends a command to your
-battery.** The final step is unreachable, not merely switched off.
+It observes, learns, predicts, keeps a record of how wrong its predictions turned
+out to be, works out what the battery *should* do, reads what the sun and the
+market are expected to offer, and now works out how much energy the battery ought
+to be holding — then builds the complete path from that decision to an inverter
+command and stops one step short of walking it. **Nothing in this integration
+sends a command to your battery.** The final step is unreachable, not merely
+switched off.
 
 ---
 
 ## Project status
 
-> **Current release: `1.0.0-beta.12` — a public beta.**
+> **Current release: `1.0.0-beta.13` — a public beta.**
 >
-> The integration is feature-complete for Phase 6 and covered by 2087 automated
+> The integration is feature-complete for Phase 7 and covered by 2256 automated
 > tests, but the learning and forecast model has **not** yet been validated
 > across enough real-world complete days to be called stable. Treat it as
 > something to run and observe, not yet as something to depend on.
@@ -59,7 +61,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.12` is not offered.
+     dialog if `1.0.0-beta.13` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -318,10 +320,61 @@ The `price` block in a diagnostics download carries the counts, coverage, the
 horizon, both cross-checks against Frank's own current-interval figures, and the
 reason the next day is absent. It never carries the series itself.
 
+### Battery reserve (new in Phase 7)
+
+`sensor.alpha_ems_dynamic_battery_reserve` answers one physical question, in kWh:
+
+> How much stored energy must be present so the battery never runs short of the
+> net demand it can physically serve, over the forecast horizon?
+
+**It is calculated, published, and obeyed by nothing.** Your configured minimum
+state of charge is still the one hard floor, and the planner still discharges to
+it. If this sensor reads higher than the floor, that is a *report* — Alpha EMS
+does not hold energy back to satisfy it, does not buy energy to reach it, and
+issues no command either way. Deciding what to do about a shortfall is Phase 8.
+
+**Sunshine lowers it; a dark forecast raises it.** There is no season, no month
+check and no summer or winter mode — the behaviour falls out of load and
+production alone. On a summer night with a sunny day forecast, the battery does
+not need to carry energy the sun is expected to supply before the evening needs
+it. In midwinter with little production forecast, there is nothing to credit and
+the figure rises.
+
+Three things are worth understanding before you rely on it.
+
+**It is not a maximum.** The requirement is low while replenishment is imminent
+and high once it has passed, so it rises and falls through the day rather than
+decaying. At midday on a sunny day it can read as low as your configured floor —
+correctly, because this afternoon's production is expected to refill the pack long
+before tonight draws on it. The largest requirement anywhere in the horizon is
+reported separately in diagnostics as `peak_required_reserve_kwh`, and it is
+deliberately *not* what the sensor shows: holding the peak now would reserve
+energy the sun is about to supply.
+
+**It assumes forecast surplus reaches the battery.** That assumption is what makes
+the figure useful rather than degenerate, and it is a forecast rather than an
+observation. The `replenishment_dependency_kwh` attribute says how much of the
+reduction rests on it: when it is large, the figure beside it is optimistic. If
+you run with Excess Export or Peak Shaving permanently enabled, surplus never
+reaches your battery at all — read `required_same_interval_only_kwh` in
+diagnostics instead, which is the same calculation with that assumption removed.
+
+**It carries no margin for being wrong.** It is a point estimate over the load and
+production forecasts, with no allowance for forecast error. Where the measured load
+bias is negative — the model under-predicting — the requirement may be low. Both
+figures are in the `reserve` diagnostics block. Learning from measured error is
+Phase 9.
+
+`lower_bound_reason` says when the figure understates: `truncated` means demand
+continues past the last interval anyone forecast, and `headroom_limited` means some
+requirement in the horizon exceeds the whole pack. Detected and reported, never
+silently corrected.
+
 ## What it does **not** do yet
 
 - ❌ No automatic battery control. It never writes to your inverter.
-- ❌ No charge or discharge decisions, no reserve calculation.
+- ❌ No charge or discharge decisions. A reserve is now *calculated* (Phase 7)
+  and nothing obeys it.
 - ❌ No energy arbitrage or price-based trading.
 - ❌ No EV charge scheduling. Phase 1 only *separates* EV consumption from the
   baseline; it never starts, stops or plans charging.
@@ -336,12 +389,17 @@ reason the next day is absent. It never carries the series itself.
   service call reaches your inverter, and that is enforced by a build-time
   constant rather than by a setting.
 - ❌ No price-aware or economic battery planning, and no automatic charging. No
-  cheap-hour buying, no reserve sized for tomorrow's weather, no overnight
-  carry-over, no arbitrage. Expected production is an input to the plan, never a
-  reason to buy or sell.
+  cheap-hour buying, no overnight carry-over, no arbitrage. Expected production is
+  an input to the plan, never a reason to buy or sell.
+- ❌ **No enforcement of the calculated reserve.** Phase 7 works out how much
+  energy the battery ought to be holding and publishes it. The planner still
+  discharges to the *configured* minimum state of charge, which remains the one
+  hard floor, so a requirement above it is reported and not obeyed. Acting on it
+  is Phase 8.
 - ❌ **No economic behaviour from prices, even though prices are now known.**
   Phase 6 reads, normalises, cross-checks, reports and stores them. Nothing ranks
-  an interval, picks a cheapest window, sizes a reserve or expresses an objective.
+  an interval, picks a cheapest window or expresses an objective, and the reserve
+  Phase 7 calculates is a physical figure that no price can move.
   The price layer is not reachable from any module that decides what the battery
   does, and that is enforced structurally rather than by a behavioural comparison
   — see [Prices, and why they change nothing yet](#prices-and-why-they-change-nothing-yet).
@@ -578,7 +636,10 @@ accuracy percentage is claimed, because none has been measured yet.
 
 ## Entities
 
-Exactly six. Everything else lives in diagnostics.
+Exactly twelve — eleven sensors and one control. Everything else lives in
+diagnostics: per-slot profiles, window means, the simulated trajectory, the
+per-interval reserve curve, the constraint tallies and the whole evidence layer.
+Ninety-six quarter sensors would be technically easy and practically awful.
 
 | Entity | Unit | Meaning |
 |---|---|---|
@@ -588,6 +649,17 @@ Exactly six. Everything else lives in diagnostics.
 | `sensor.alpha_ems_learning_days` | — | Calendar days with sufficient valid baseline data |
 | `sensor.alpha_ems_forecast_error_yesterday` | kWh | Yesterday's forecast minus what was measured |
 | `sensor.alpha_ems_forecast_error_7_days` | % | Rolling forecast error over the last 7 days |
+| `sensor.alpha_ems_battery_recommendation` | — | What the battery *should* do this interval. Advisory |
+| `sensor.alpha_ems_planned_battery_power` | kW | The advised interval-average power. Positive is charging |
+| `sensor.alpha_ems_usable_battery_energy` | kWh | Energy deliverable above the configured minimum |
+| `sensor.alpha_ems_dynamic_battery_reserve` | kWh | Energy that *ought* to remain available. Obeyed by nothing |
+| `sensor.alpha_ems_control_state` | — | What the control pipeline made of the recommendation |
+| `select.alpha_ems_control_mode` | — | `off`, `shadow` or `active`. Nothing executes in any of them |
+
+The three battery sensors and the control pair describe a plan that is never
+carried out, and `Dynamic Battery Reserve` describes a requirement nothing
+enforces. They are published so all of it can be watched for weeks before
+anything is allowed to act on any of it.
 
 Neither forecast sensor declares a `state_class`. They carry `device_class:
 energy` so the UI formats them properly, but a *prediction* must not become a

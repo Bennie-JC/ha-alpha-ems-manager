@@ -9,6 +9,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.13] - 2026-08-21
+
+**Alpha EMS now works out how much energy the battery ought to be holding, and
+still does nothing differently because of it.** A new sensor reports the
+requirement; the recommendation, the planned power, the usable energy and the
+control state are exactly what beta.12 published for the same inputs.
+
+If your battery recommendation changes after this upgrade, that is a bug. Phase 7
+identifies need. Deciding what to do about it — buying at a cheap hour, holding,
+selling, or a safety buy — is Phase 8, and none of it is in this release.
+
+### Added
+
+- **Dynamic Battery Reserve**, one new sensor, in **kWh**. It answers a single
+  physical question: how much stored energy must be present so the battery never
+  runs short of the net demand it can physically serve, over the forecast horizon.
+  The state of charge that implies travels as an attribute, because energy is the
+  quantity the model conserves and a percentage is a reading of it.
+
+  Entity count goes from eleven to twelve. Nothing else moved.
+
+- **A backward recursion with the configured minimum as its base case.**
+  `R[n] = floor`, then `R[i] = max(floor, R[i+1] + demand(i) − credit(i))`. Both
+  terms are read as the energy difference `battery.apply_request` produced, so the
+  module performs **no efficiency arithmetic at all** — the AC-to-DC direction is
+  not merely tested but unrepresentable, and the discharge power limit is applied
+  by the clamp rather than copied.
+
+  Demand above what the inverter could deliver in a quarter-hour raises no
+  requirement, because it is grid demand whatever the state of charge. It is
+  reported separately instead.
+
+- **The requirement is not monotone, and it is not the peak.** It is low while
+  replenishment is imminent and high once it has passed. At midday on a sunny day
+  the answer is the floor and the *peak* is the coming night — publishing the peak
+  would reserve energy the sun is about to supply, and at a cheap overnight hour it
+  would tell a later phase to buy kilowatt-hours it does not need.
+  `peak_required_reserve_kwh` is kept as a diagnostic and is never the reserve.
+
+- **Two counterfactuals, published every refresh**, so the one assumption this
+  phase makes is measured rather than argued:
+  `required_same_interval_only_kwh` (the requirement if forecast surplus cannot
+  replenish the battery across intervals) and `required_pv_blind_kwh` (no
+  production at all). `replenishment_dependency_kwh` is the difference between the
+  first and the authoritative figure — on a sunny midday it is large, and that is
+  the signal the figure beside it is optimistic.
+
+- **A `reserve` diagnostics section**, the nineteenth. A dict key rather than a
+  list entry, so the sixteen-entry ceiling every list in the payload is held to is
+  untouched. No per-interval array appears anywhere: a hundred and ninety-two
+  requirements truncated to sixteen would read as a short horizon rather than as a
+  clipped payload.
+
+- **Reserve evidence**, a fourth change-fingerprinted snapshot family. Scalars
+  only. It exists for one reason: both forecasts are already persisted, so the
+  arithmetic is reproducible — but capacity, the floor, the power limits and the
+  efficiency live in the config entry, which keeps no history. Raising a minimum
+  state of charge would otherwise make every earlier belief unverifiable.
+
+### Changed
+
+- **The "same-interval PV netting only" decision is superseded.** Forecast surplus
+  may now offset accumulated deficit across intervals, capped by the inverter's
+  charge power, converted at the charge boundary, floored so it can never exceed
+  the deficit it repays, and flagged when capacity would have prevented it.
+
+  This is arithmetically equivalent to assuming forecast surplus becomes usable
+  future battery energy, and it is a **forecast rather than an observation** — it
+  does not prove the real inverter will store that surplus. It is documented as
+  superseded rather than quietly replaced, because without it the requirement
+  degenerates to *all* remaining net demand to the end of the forecast: a figure
+  that grows when the forecast horizon lengthens, and therefore a property of the
+  forecast rather than of the battery. On the reference installation that
+  degenerate figure is 21.3 kWh against a 22 kWh pack, on a sunny August day with
+  30 kWh of production forecast.
+
+  `pv_absorption.modelled` is recorded beside the requirement and read by nothing.
+  On the reference installation it flipped from true to false inside fifteen
+  minutes because a dispatch began, while both forecasts stood still — so a
+  requirement that consulted it would have jumped for no physical reason, and an
+  earlier belief would not be reproducible.
+
+- **Forecast-history storage minor version 1.3 → 1.4**, additive. Partitions gain
+  `rsv` and index rows gain `rsvfp`. A document written by any earlier release
+  reads unchanged, and an installation without battery planning writes neither.
+
+### Fixed
+
+- **A pre-existing test defect, not a product one.**
+  `test_solcast_capability_recovery` read diagnostics on the real clock after
+  driving a refresh on a frozen one, so `pv.forecast_today` was looked up by a date
+  the driven refresh had never produced a forecast for. The two agreed only while
+  the real date happened to be the driven one: the file passed on the day it was
+  written and began failing two days later. Both clocks are now pinned to one
+  instant. No assertion was weakened.
+
+### Verification
+
+- Tests **2087 → 2256**. Five new files: the reserve model and its oracle, the
+  published surface, the evidence layer, the mutations and the phase boundaries.
+
+- **The definition is proved against an independent oracle rather than restated.**
+  For six horizon shapes, starting at the requirement is handed to the Phase-3
+  simulator — which applies every limit through the clamp and imports nothing from
+  the reserve — and the pack touches its floor without crossing it while the only
+  grid import is the demand the inverter could never have delivered in time. One
+  step below the requirement, import strictly increases. Those tests pass only
+  with surplus absorption modelled, and needing that flag *is* the proof of what
+  the figure assumes.
+
+- **Twenty-three mutation tests**, each a plausible refactor rather than an
+  absurdity. Three of them were real mistakes made and caught while building this
+  phase: publishing the peak as the requirement, measuring the capacity bound as a
+  cumulative excursion (which labelled a correct answer a lower bound), and
+  fingerprinting the answer instead of the inputs (which stored a document every
+  quarter-hour and broke the rule that an unchanged refresh costs no I/O).
+
+- **The blindness contract is enforced in three layers**: the signature of
+  `build_reserve` is pinned to limits, a floor and demands; no identifier naming a
+  price, a control mode, a dispatch state, absorption, Excess Export or Peak
+  Shaving appears anywhere in the calculation; and `reserve` is now on the
+  price-neutrality module list, a guard that existed before this module did.
+
+### Unchanged
+
+- `CONTROL_EXECUTION_AVAILABLE` is still `False`. Zero new service callers, and a
+  reserve shortfall in `active` mode still issues no command at all.
+
+- **`battery.py` is not modified.** The tripwire asserting that `dynamic_reserve`
+  does not exist is still green, so this phase is structurally incapable of raising
+  the floor the policy obeys. `build_plan` still calls `static_reserve`, and
+  `effective_min_soc_percent` still equals the user's configured minimum.
+
+- No config-entry version change, so nothing to migrate. No new configuration
+  option: the existing minimum state of charge remains the one hard floor.
+
+- The learning store is untouched at schema 2.3.
+
+### Known limitations
+
+- **The requirement is a point estimate with no margin for forecast error.**
+  `ForecastUncertainty` exists and stays deliberately unread — widening a plan by
+  measured error is Phase 9. On the reference installation the measured load bias
+  is currently *negative*, meaning the model under-predicts, so the requirement may
+  be biased low. The figure and the diagnostics both say so.
+
+- **On a persistently non-absorbing installation** — Excess Export or Peak Shaving
+  left enabled — the authoritative figure is indefinitely optimistic, because
+  forecast surplus structurally never reaches the battery.
+  `required_same_interval_only_kwh` is the applicable figure there. Phase 7 never
+  substitutes it automatically: doing so would make the requirement depend on a
+  live control flag and stop it being reproducible.
+
+- **Winter behaviour is designed and labelled but unobserved.** With no surplus to
+  credit the requirement is the whole horizon's net demand, `horizon_basis` reads
+  `truncated`, and the figure is a lower bound. That is honest and it cannot be
+  confirmed against a real December before December.
+
+- The forecast and the measured production still sit on different, undeclared
+  electrical boundaries. The requirement inherits that ambiguity; it is recorded,
+  not corrected.
+
+- Unrelated and retained rather than fixed here: the `pv.mapping` block reports
+  `rows_received 96`, `rows_mapped 48` and `rows_out_of_range 96`, which looks like
+  a merged per-day counter double-counting across two days. It is a report rather
+  than a calculation, affects no value, and belongs to Phase 5.
+
 ## [1.0.0-beta.12] - 2026-08-20
 
 **Alpha EMS now knows what electricity costs, and does nothing differently

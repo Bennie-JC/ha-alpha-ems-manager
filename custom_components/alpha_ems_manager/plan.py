@@ -72,6 +72,13 @@ from .const import (
     REASON_MISSING_SOC,
 )
 from .policy import DEFAULT_POLICY, BatteryPolicy, HoldPolicy
+from .reserve import (
+    ReserveProjection,
+    build_reserve,
+    build_reserve_pv_blind,
+    build_reserve_same_interval_only,
+    compare_to_trajectory,
+)
 from .simulation import (
     IntervalDemand,
     SimulatedTrajectory,
@@ -216,6 +223,17 @@ class BatteryPlan:
     start_index: int | None = None
     #: What the plan was built against, for diagnostics.
     forecast: dict[str, Any] = field(default_factory=dict)
+    #: Phase 7's requirement over the same horizon, and its two counterfactuals.
+    #:
+    #: Carried on the plan because they are built from the same demands, so one
+    #: refresh cannot end up with a requirement and a trajectory describing
+    #: different horizons. **Nothing here is enforced**: the decision above was
+    #: taken against ``reserve``, the static one, and is unaffected by these.
+    reserve_projection: ReserveProjection | None = None
+    reserve_same_interval_only: ReserveProjection | None = None
+    reserve_pv_blind: ReserveProjection | None = None
+    #: Where the projected trajectory would fall below the requirement.
+    reserve_comparison: dict[str, Any] | None = None
 
     # -- what the sensors read -------------------------------------------
 
@@ -372,6 +390,16 @@ def build_plan(
         state, demands, chosen.provider(), absorb_surplus=absorb_surplus
     )
 
+    # Phase 7, over the same horizon and from the same demands. The floor is the
+    # user's configured minimum expressed as energy -- the recursion's terminal
+    # condition and the lowest value its answer can take. It is read here rather
+    # than in ``reserve`` so that module never touches either floor name, and so
+    # the requirement cannot be computed against anything but the hard floor.
+    floor_energy_kwh = limits.energy_for_soc(reserve.configured_min_soc_percent)
+    requirement = build_reserve(
+        limits=limits, floor_energy_kwh=floor_energy_kwh, demands=demands
+    )
+
     return BatteryPlan(
         decision=decision,
         state=state,
@@ -383,6 +411,14 @@ def build_plan(
         target_day=today,
         start_index=min(elapsed_intervals + 1, _count(today_forecast)),
         forecast=_forecast_report(today_forecast, tomorrow_forecast),
+        reserve_projection=requirement,
+        reserve_same_interval_only=build_reserve_same_interval_only(
+            limits=limits, floor_energy_kwh=floor_energy_kwh, demands=demands
+        ),
+        reserve_pv_blind=build_reserve_pv_blind(
+            limits=limits, floor_energy_kwh=floor_energy_kwh, demands=demands
+        ),
+        reserve_comparison=compare_to_trajectory(requirement, candidate),
     )
 
 

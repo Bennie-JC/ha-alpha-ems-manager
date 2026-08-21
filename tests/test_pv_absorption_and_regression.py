@@ -435,6 +435,7 @@ async def test_the_entity_set_is_unchanged(
         "select.alpha_ems_control_mode",
         "sensor.alpha_ems_battery_recommendation",
         "sensor.alpha_ems_control_state",
+        "sensor.alpha_ems_dynamic_battery_reserve",
         "sensor.alpha_ems_expected_house_load_today",
         "sensor.alpha_ems_expected_house_load_tomorrow",
         "sensor.alpha_ems_forecast_error_7_days",

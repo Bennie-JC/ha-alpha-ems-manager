@@ -374,13 +374,17 @@ FORECAST_STORAGE_VERSION: Final = 1
 #: * **1.3** -- v1.0.0-beta.12. Partitions gained ``prs``, the price issuances,
 #:   and index rows gained ``prfp``, their fingerprints. A document without
 #:   either reads unchanged.
+#: * **1.4** -- v1.0.0-beta.13. Partitions gained ``rsv``, the reserve
+#:   requirements, and index rows gained ``rsvfp``, their fingerprints. A
+#:   document without either reads unchanged, and an installation without
+#:   battery planning writes neither.
 #:
 #: One honest note for anyone diffing stored documents: photovoltaic snapshots
 #: (``pvs``/``pvo``) arrived in v1.0.0-beta.9 **without** a minor bump, so a
 #: document stamped 1.2 may or may not carry them. The reader tolerates both,
 #: which is why that omission is recorded here rather than papered over by
 #: restamping documents that were written correctly.
-FORECAST_STORAGE_MINOR_VERSION: Final = 3
+FORECAST_STORAGE_MINOR_VERSION: Final = 4
 
 #: Index document: schema version, the month partitions that exist, and the
 #: small daily summary rows. Always loaded.
@@ -1022,6 +1026,15 @@ SENSOR_BATTERY_RECOMMENDATION: Final = "battery_recommendation"
 SENSOR_BATTERY_PLANNED_POWER: Final = "battery_planned_power"
 SENSOR_BATTERY_USABLE_ENERGY: Final = "battery_usable_energy"
 
+# Phase 7. One, and only one. The counterfactuals beside it -- the
+# same-interval-only requirement, the PV-blind requirement, the peak and the two
+# dependency figures -- are diagnostics, because a user acts on the requirement
+# and reads the rest only when asking why it moved. Its state is an **energy**:
+# the state of charge it implies is derived and travels as an attribute, matching
+# the rest of the project, where energy is the conserved quantity and a
+# percentage is a reading of it.
+SENSOR_DYNAMIC_RESERVE: Final = "dynamic_battery_reserve"
+
 # --- Logging ------------------------------------------------------------------
 
 #: Minimum seconds between two repetitions of the same aggregated warning.
@@ -1423,3 +1436,73 @@ PRICE_MAPPING_VERSION: Final = 1
 #: source publishes fifteen-minute blocks and Frank supports an hourly fallback;
 #: both are whole multiples, and anything else is refused rather than rounded.
 PRICE_SOURCE_PERIOD_STEP_MINUTES: Final = QUARTER_MINUTES
+
+# --- Phase 7: dynamic battery reserve -----------------------------------------
+
+#: Bumped when the reserve recursion itself changes, so a requirement recorded
+#: under an older rule is identifiable rather than pooled with a newer one -- the
+#: same role ``FORECAST_MODEL_VERSION`` and ``PRICE_MAPPING_VERSION`` play.
+RESERVE_MODEL_VERSION: Final = 1
+
+#: Hex characters kept from a reserve digest. Sixteen, as everywhere else in the
+#: evidence layer: enough that a collision is not a practical concern, short
+#: enough to read in a diagnostics download.
+RESERVE_FINGERPRINT_CHARS: Final = 16
+
+#: Whether the last drawdown window ended inside the forecast horizon.
+#:
+#: ``CLOSED`` means the requirement is a complete answer. ``TRUNCATED`` means the
+#: deficit was still climbing at the last interval anybody forecast, so demand
+#: continues past the horizon and the requirement is a **lower bound**. The
+#: distinction is not cosmetic: a backward recursion from a cut-off horizon
+#: always understates, and publishing that without saying so would be the same
+#: mistake the PV-blind disclaimer exists to prevent.
+RESERVE_HORIZON_CLOSED: Final = "closed"
+RESERVE_HORIZON_TRUNCATED: Final = "truncated"
+
+#: Why the published requirement is a lower bound, or absent when it is not.
+#:
+#: Two independent causes, and a consumer needs to know which. A truncated
+#: horizon understates because unforecast demand follows. A headroom-limited
+#: projection understates because surplus was credited that the pack could not
+#: have retained. Both are detected and reported; neither is ever corrected, and
+#: neither ever selects a different reserve model.
+RESERVE_BOUND_TRUNCATED: Final = "truncated"
+RESERVE_BOUND_HEADROOM: Final = "headroom_limited"
+RESERVE_BOUND_TRUNCATED_HEADROOM: Final = "truncated_headroom_limited"
+
+RESERVE_BOUND_REASONS: Final = (
+    RESERVE_BOUND_TRUNCATED,
+    RESERVE_BOUND_HEADROOM,
+    RESERVE_BOUND_TRUNCATED_HEADROOM,
+)
+
+#: Why no requirement could be calculated. A bounded vocabulary, like every other
+#: ``*_UNAVAILABLE_*`` key space in this project.
+#:
+#: ``HORIZON_INCOMPLETE`` is the one worth reading twice: it means an interval
+#: inside the horizon carried no load forecast, so the recursion could not reach
+#: the present. Unknown is never bridged and never read as zero, so the honest
+#: answer is that there is no requirement rather than a smaller one.
+RESERVE_UNAVAILABLE_FORECAST: Final = "reserve_forecast_unavailable"
+RESERVE_UNAVAILABLE_HORIZON_INCOMPLETE: Final = "reserve_horizon_incomplete"
+RESERVE_UNAVAILABLE_LIMITS: Final = "reserve_limits_unavailable"
+
+RESERVE_UNAVAILABLE_REASONS: Final = (
+    RESERVE_UNAVAILABLE_FORECAST,
+    RESERVE_UNAVAILABLE_HORIZON_INCOMPLETE,
+    RESERVE_UNAVAILABLE_LIMITS,
+)
+
+#: The single replenishment assumption the reserve rests on, named so it can be
+#: recorded on every snapshot and compared across releases.
+#:
+#: It supersedes an earlier "same-interval netting only" rule, which was withdrawn
+#: because without cross-interval credit the requirement degenerates to the whole
+#: remaining net demand of the forecast -- a figure that grows when the forecast
+#: horizon lengthens, and therefore a property of the forecast rather than of the
+#: battery. The superseded definition is still computed every refresh as a
+#: counterfactual, so the cost of the relaxation is measured rather than argued.
+RESERVE_REPLENISHMENT_ASSUMPTION: Final = (
+    "forecast_surplus_credited_within_charge_power_and_headroom"
+)
