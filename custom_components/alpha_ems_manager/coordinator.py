@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta, tzinfo
@@ -38,11 +39,13 @@ from homeassistant.util import dt as dt_util
 from .alphaess_adapter import discover, read_snapshot
 from .alphaess_device import build_command, plan_commands
 from .api import load_forecast_from
-from .battery import INTERVAL_HOURS, sanitize_soc_percent
+from .battery import INTERVAL_HOURS, BatteryLimits, sanitize_soc_percent
 from .confidence import ConfidenceBreakdown, compute_confidence
 from .const import (
     BALANCE_MAX_SOURCE_AGE_SECONDS,
     BATTERY_MAX_SOC_PERCENT,
+    CONF_ALLOW_BATTERY_EXPORT,
+    CONF_ALLOW_GRID_CHARGING,
     CONF_BATTERY_CAPACITY_KWH,
     CONF_BATTERY_MAX_CHARGE_KW,
     CONF_BATTERY_MAX_DISCHARGE_KW,
@@ -61,6 +64,7 @@ from .const import (
     CONF_GRID_POWER_SIGN,
     CONF_HAS_PV,
     CONF_HOUSE_LOAD_ENTITY,
+    CONF_MINIMUM_TRADE_GAIN_EUR,
     CONF_PV_POWER_ENTITY,
     CONF_SELECTED_SOLCAST_SITE_IDS,
     CONF_SOLCAST_ENTRY_ID,
@@ -72,6 +76,8 @@ from .const import (
     CONTROL_STATE_IDLE,
     CONTROL_STATE_INHIBITED,
     CONTROL_STATE_OFF,
+    DEFAULT_ALLOW_BATTERY_EXPORT,
+    DEFAULT_ALLOW_GRID_CHARGING,
     DEFAULT_BATTERY_MIN_SOC_PERCENT,
     DEFAULT_BATTERY_POWER_SIGN,
     DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
@@ -79,6 +85,8 @@ from .const import (
     DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
     DEFAULT_CONTROL_HORIZON_MINUTES,
     DEFAULT_GRID_POWER_SIGN,
+    DEFAULT_MINIMUM_TRADE_GAIN_EUR,
+    ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     INHIBIT_NO_DECISION,
     INHIBIT_NO_PLAN,
     INHIBIT_PLAN_UNAVAILABLE,
@@ -113,6 +121,15 @@ from .const import (
     SELECT_INVERTER_AC_LIMIT,
 )
 from .control import translate
+from .economic import (
+    EconomicOutcome,
+    IntervalPrice,
+    build_economic_snapshot,
+    build_horizon,
+    build_outcome,
+    build_physics_table,
+    fingerprint_settings,
+)
 from .energy_balance import (
     OUTCOME_SKIPPED_INCOHERENT,
     BalanceMonitor,
@@ -191,6 +208,7 @@ from .safety import (
     authorize,
     evaluate,
 )
+from .simulation import IntervalDemand
 from .soc_coherence import SocCoherenceMonitor
 from .solcast_source import SolcastCapability, SolcastFacts, read_facts, read_forecast
 from .solcast_source import discover as discover_solcast
@@ -265,6 +283,10 @@ _PRICE_LOG = "price_forecast"
 #: above it: a storage fault while recording a requirement must not silence a
 #: Solcast, price or control warning, and must not cost the refresh.
 _RESERVE_LOG = "reserve"
+#: Throttle key for the economic layer. Its own, for the same reason as the
+#: five above: the optimizer is the newest thing in the refresh and a fault in
+#: it must not silence a Solcast, price, reserve or control warning.
+_ECONOMIC_LOG = "economic"
 
 #: The statement every control surface in this release repeats, because it is the
 #: single most important fact about it.
@@ -354,6 +376,12 @@ class SourceConfig:
     #: Read, and deliberately absent from the options form while the release
     #: barrier makes it unable to change anything.
     control_execution_enabled: bool
+    #: Phase-8 economic settings. One threshold and two opt-ins, and all three
+    #: are in the form because all three change the *published plan* -- unlike
+    #: the execution flag above, which cannot change anything in this release.
+    minimum_trade_gain_eur: float
+    allow_grid_charging: bool
+    allow_battery_export: bool
 
     @classmethod
     def from_entry(cls, entry: ConfigEntry) -> SourceConfig:
@@ -416,6 +444,16 @@ class SourceConfig:
                     DEFAULT_CONTROL_EXECUTION_ENABLED,
                 )
             ),
+            minimum_trade_gain_eur=_number(
+                value(CONF_MINIMUM_TRADE_GAIN_EUR),
+                DEFAULT_MINIMUM_TRADE_GAIN_EUR,
+            ),
+            allow_grid_charging=bool(
+                value(CONF_ALLOW_GRID_CHARGING, DEFAULT_ALLOW_GRID_CHARGING)
+            ),
+            allow_battery_export=bool(
+                value(CONF_ALLOW_BATTERY_EXPORT, DEFAULT_ALLOW_BATTERY_EXPORT)
+            ),
         )
 
 
@@ -441,6 +479,53 @@ def _capacity_total(values: Iterable[float | None]) -> float | None:
     if not present:
         return None
     return round(sum(present), 4)
+
+
+def _solve_economic(
+    limits: BatteryLimits,
+    floor_energy_kwh: float,
+    start_energy_kwh: float,
+    terminal_floor_kwh: float,
+    demands: tuple[IntervalDemand, ...],
+    prices: tuple[IntervalPrice, ...],
+    raw_reserve: tuple[float | None, ...],
+    reserve_above_capacity_kwh: float,
+    minimum_trade_gain_eur: float,
+    allow_grid_charging: bool,
+    allow_battery_export: bool,
+) -> EconomicOutcome | None:
+    """Build the physics table and run the three solves. Executor-side.
+
+    Positional rather than keyword because ``async_add_executor_job`` passes
+    positionally, and a module-level function rather than a method so nothing
+    about the coordinator's state can be read from another thread.
+    """
+    started = time.perf_counter()
+    table = build_physics_table(limits, floor_energy_kwh=floor_energy_kwh)
+    if table is None:  # pragma: no cover - build_limits precludes it
+        return None
+    table_ms = (time.perf_counter() - started) * 1000.0
+
+    horizon = build_horizon(
+        demands=demands,
+        prices=prices,
+        required_reserve_kwh=raw_reserve,
+        table=table,
+    )
+    if not horizon.intervals:
+        return None
+    return build_outcome(
+        table=table,
+        horizon=horizon,
+        start_energy_kwh=start_energy_kwh,
+        terminal_floor_kwh=terminal_floor_kwh,
+        floor_energy_kwh=floor_energy_kwh,
+        minimum_trade_gain_eur=minimum_trade_gain_eur,
+        allow_grid_charging=allow_grid_charging,
+        allow_battery_export=allow_battery_export,
+        reserve_above_capacity_kwh=reserve_above_capacity_kwh,
+        table_ms=table_ms,
+    )
 
 
 def _reserve_horizon_edges(
@@ -574,6 +659,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: additive evidence: it can never reject an interval or change a learned
         #: baseline, which is what keeps ``test_pv_independence.py`` true.
         self._pv_accumulator: QuarterAccumulator | None = None
+        #: Grid import and export, integrated separately. Two accumulators rather
+        #: than one signed series, because the canonical convention resolves the
+        #: source's sign once at the edge and nothing downstream should have to
+        #: reason about it again -- the same rule ``PowerFlows`` exists to enforce.
+        self._grid_import_accumulator: QuarterAccumulator | None = None
+        self._grid_export_accumulator: QuarterAccumulator | None = None
         self._log = _ThrottledLogger()
         self.last_balance: BalanceSample | None = None
         #: Session-scoped balance tally and debounce state. Not persisted:
@@ -670,6 +761,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pv_accumulator = (
             QuarterAccumulator(tz, sanitizer=sanitize_pv_w)
             if self.config.has_pv and self.config.pv_power_entity
+            else None
+        )
+        # Both sides carry the load sanitiser: after the sign is resolved each is
+        # a plain non-negative power with the same plausibility band, and a
+        # separate one would be a second opinion about the same question.
+        self._grid_import_accumulator = (
+            QuarterAccumulator(tz, sanitizer=sanitize_load_w)
+            if self.config.grid_power_entity
+            else None
+        )
+        self._grid_export_accumulator = (
+            QuarterAccumulator(tz, sanitizer=sanitize_load_w)
+            if self.config.grid_power_entity
             else None
         )
 
@@ -918,7 +1022,27 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 moment, self._read_pv_power_w()
             )
 
-        self._ingest(house_results, ev_results, pv_results)
+        grid_import_results: list[QuarterResult] = []
+        grid_export_results: list[QuarterResult] = []
+        if (
+            self._grid_import_accumulator is not None
+            and self._grid_export_accumulator is not None
+        ):
+            flows = self.read_flows()
+            grid_import_results = self._grid_import_accumulator.add_sample(
+                moment, None if flows is None else flows.grid_import_w
+            )
+            grid_export_results = self._grid_export_accumulator.add_sample(
+                moment, None if flows is None else flows.grid_export_w
+            )
+
+        self._ingest(
+            house_results,
+            ev_results,
+            pv_results,
+            grid_import_results,
+            grid_export_results,
+        )
 
     @callback
     def _read_house_load_w(self) -> float | None:
@@ -1104,6 +1228,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         house_results: list[QuarterResult],
         ev_results: list[QuarterResult],
         pv_results: list[QuarterResult] | None = None,
+        grid_import_results: list[QuarterResult] | None = None,
+        grid_export_results: list[QuarterResult] | None = None,
     ) -> None:
         """Persist finalised intervals that carry enough coverage.
 
@@ -1137,6 +1263,20 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         pv_by_start = {
             result.start_utc: result for result in (pv_results or []) if result.accepted
         }
+        # Same pairing idiom again, and the same isolation: a missing or
+        # under-covered grid interval stores no grid value and touches nothing
+        # else. It is evidence for a later phase, so it must never be able to
+        # invalidate a baseline it has no opinion about.
+        grid_import_by_start = {
+            result.start_utc: result
+            for result in (grid_import_results or [])
+            if result.accepted
+        }
+        grid_export_by_start = {
+            result.start_utc: result
+            for result in (grid_export_results or [])
+            if result.accepted
+        }
 
         changed = False
         for result in house_results:
@@ -1166,6 +1306,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
 
             pv_result = pv_by_start.get(result.start_utc)
+            grid_import_result = grid_import_by_start.get(result.start_utc)
+            grid_export_result = grid_export_by_start.get(result.start_utc)
 
             if not record.record_interval(
                 index,
@@ -1174,6 +1316,16 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ev_expected=ev_expected,
                 soc_percent=soc_percent if result.start_utc == latest_start else None,
                 pv_kwh=None if pv_result is None else pv_result.energy_kwh,
+                grid_import_kwh=(
+                    None
+                    if grid_import_result is None
+                    else grid_import_result.energy_kwh
+                ),
+                grid_export_kwh=(
+                    None
+                    if grid_export_result is None
+                    else grid_export_result.energy_kwh
+                ),
             ):
                 # The index fell outside the day. Unreachable under a stable
                 # timezone, so reaching it means the stored day's shape and the
@@ -1584,6 +1736,23 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             absorption_reason=absorption_reason,
         )
 
+        economic = await self._async_economic_outcome_safely(
+            plan=plan,
+            today=today,
+            tomorrow=tomorrow,
+            tz=tz,
+            today_interval_count=baseline_today.interval_count,
+            price_forecasts=price_forecasts,
+        )
+
+        await self._async_record_economic_evidence_safely(
+            outcome=economic,
+            plan=plan,
+            now=now,
+            today=today,
+            tz=tz,
+        )
+
         control = self._build_control_report_safely(
             plan=plan,
             now=now,
@@ -1604,6 +1773,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "forecast_yesterday_error": record.yesterday,
             "forecast_error_window": record.window,
             "battery_plan": plan,
+            "economic": economic,
             "control": control,
             "pv_today": pv_forecasts.get(today),
             "pv_tomorrow": pv_forecasts.get(tomorrow),
@@ -1614,6 +1784,241 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "price_today": price_forecasts.get(today),
             "price_tomorrow": price_forecasts.get(tomorrow),
         }
+
+    async def _async_economic_outcome_safely(
+        self,
+        *,
+        plan: BatteryPlan | None,
+        today: date,
+        tomorrow: date,
+        tz: tzinfo,
+        today_interval_count: int,
+        price_forecasts: dict[date, PriceForecast],
+    ) -> EconomicOutcome | None:
+        """Solve the economic plan, or say nothing and keep the refresh.
+
+        Wrapped like every additive layer since Phase 2, with its own throttle
+        key: the optimizer is the newest and least proven thing in the refresh,
+        and a fault in it must not cost the learning history, the forecasts, the
+        reserve or the control report.
+        """
+        try:
+            return await self._async_economic_outcome(
+                plan=plan,
+                today=today,
+                tomorrow=tomorrow,
+                tz=tz,
+                today_interval_count=today_interval_count,
+                price_forecasts=price_forecasts,
+            )
+        except Exception:
+            self._log.warning(
+                _ECONOMIC_LOG,
+                (
+                    "The economic plan could not be built this refresh. Every "
+                    "other layer is unaffected, and nothing was going to be "
+                    "executed in any case"
+                ),
+            )
+            _LOGGER.debug("economic plan failed", exc_info=True)
+            return None
+
+    async def _async_economic_outcome(
+        self,
+        *,
+        plan: BatteryPlan | None,
+        today: date,
+        tomorrow: date,
+        tz: tzinfo,
+        today_interval_count: int,
+        price_forecasts: dict[date, PriceForecast],
+    ) -> EconomicOutcome | None:
+        """Return this refresh's economic plan, or ``None``.
+
+        Runs in the executor. The solve is pure and CPU-bound -- three backward
+        inductions over a lattice -- and Home Assistant's event loop must not wait
+        on it, however fast it is on this machine.
+        """
+        if plan is None or plan.state is None or plan.reserve_projection is None:
+            return None
+        limits = plan.state.limits
+        floor_energy = limits.energy_for_soc(plan.reserve.configured_min_soc_percent)
+        demands = tuple(plan.reserve_projection.demands)
+        if not demands:
+            return None
+
+        prices = self._economic_prices(
+            demands=demands,
+            today=today,
+            tomorrow=tomorrow,
+            tz=tz,
+            today_interval_count=today_interval_count,
+            price_forecasts=price_forecasts,
+        )
+        raw_reserve = tuple(
+            entry.required_dc_kwh for entry in plan.reserve_projection.intervals
+        )
+        ceiling = plan.reserve_projection.ceiling_energy_kwh
+        above_capacity = max(
+            (value - ceiling for value in raw_reserve if value is not None),
+            default=0.0,
+        )
+        # The hold trajectory's end energy is the terminal condition. It carries
+        # no price, so it forecasts nothing -- it only stops the optimizer
+        # emptying the pack in the last priced interval because the data ran out.
+        terminal = (
+            plan.state.energy_kwh
+            if plan.reference is None
+            else plan.reference.end_energy_kwh
+        )
+
+        return await self.hass.async_add_executor_job(
+            _solve_economic,
+            limits,
+            floor_energy,
+            plan.state.energy_kwh,
+            terminal,
+            demands,
+            prices,
+            raw_reserve,
+            max(0.0, above_capacity),
+            self.config.minimum_trade_gain_eur,
+            self.config.allow_grid_charging,
+            self.config.allow_battery_export,
+        )
+
+    @callback
+    def _economic_prices(
+        self,
+        *,
+        demands: tuple[IntervalDemand, ...],
+        today: date,
+        tomorrow: date,
+        tz: tzinfo,
+        today_interval_count: int,
+        price_forecasts: dict[date, PriceForecast],
+    ) -> tuple[IntervalPrice, ...]:
+        """Align the price series onto the plan's own interval identity.
+
+        By absolute instant, never by position. The plan indexes a continuous
+        chronological run through today and on into tomorrow, while the source
+        files prices under a *market* day that need not share either boundary --
+        so an interval is priced by looking up the instant it begins, and an
+        instant nobody priced yields an unknown rather than a neighbour's figure.
+        """
+        by_start: dict[datetime, IntervalPrice] = {}
+        for forecast in price_forecasts.values():
+            for interval in forecast.intervals:
+                by_start[interval.start_utc] = IntervalPrice(
+                    import_eur_kwh=interval.import_price_eur_kwh,
+                    export_eur_kwh=interval.export_price_eur_kwh,
+                )
+
+        aligned: list[IntervalPrice] = []
+        for demand in demands:
+            if demand.index < today_interval_count:
+                start = interval_start_utc(today, demand.index, tz)
+            else:
+                start = interval_start_utc(
+                    tomorrow, demand.index - today_interval_count, tz
+                )
+            aligned.append(by_start.get(start, IntervalPrice()))
+        return tuple(aligned)
+
+    async def _async_record_economic_evidence_safely(
+        self,
+        *,
+        outcome: EconomicOutcome | None,
+        plan: BatteryPlan | None,
+        now: datetime,
+        today: date,
+        tz: tzinfo,
+    ) -> None:
+        """Record what Phase 8 believed, or say why it could not be recorded."""
+        try:
+            await self._async_record_economic_evidence(
+                outcome=outcome, plan=plan, now=now, today=today, tz=tz
+            )
+        except Exception:
+            self._log.warning(
+                _ECONOMIC_LOG,
+                (
+                    "Economic evidence could not be recorded this refresh. The "
+                    "plan itself and every other layer are unaffected; the "
+                    "record for this issuance is simply not stored"
+                ),
+            )
+            _LOGGER.debug("economic evidence recording failed", exc_info=True)
+
+    async def _async_record_economic_evidence(
+        self,
+        *,
+        outcome: EconomicOutcome | None,
+        plan: BatteryPlan | None,
+        now: datetime,
+        today: date,
+        tz: tzinfo,
+    ) -> None:
+        """Store the plan, and the settings and capability it was computed under.
+
+        **The settings fingerprint is why this exists.** Prices, load, production
+        and the reserve are all persisted already, so the arithmetic is
+        reproducible -- but a threshold the user changed, or an opt-in they turned
+        on, would otherwise make every earlier plan unverifiable.
+
+        Change-triggered by *input* fingerprint, so ninety-six refreshes against
+        unchanged inputs store one document. The plan itself differs every
+        quarter-hour, which is exactly why it is not what the digest is over.
+        """
+        if outcome is None or plan is None:
+            return
+
+        try:
+            await self.history.async_ensure_days([today])
+        except Exception:
+            _LOGGER.debug("economic evidence partitions unavailable", exc_info=True)
+            return
+
+        load_snapshots = self.history.snapshots(today)
+        pv_snapshot = self.history.latest_pv_snapshot(today)
+        price_snapshot = self.history.latest_price_snapshot(today)
+        reserve_snapshot = self.history.latest_reserve_snapshot(today)
+        snapshot = build_economic_snapshot(
+            outcome,
+            issued_at=now,
+            target_day=today,
+            tz_key=str(tz),
+            execution_blocked_reason=ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+            config_fingerprint=fingerprint_battery_config(
+                capacity_kwh=self.config.battery_capacity_kwh,
+                min_soc_percent=self.config.battery_min_soc_percent,
+                max_charge_kw=self.config.battery_max_charge_kw,
+                max_discharge_kw=self.config.battery_max_discharge_kw,
+                round_trip_efficiency_percent=(
+                    self.config.battery_round_trip_efficiency_percent
+                ),
+                max_soc_percent=BATTERY_MAX_SOC_PERCENT,
+            ),
+            settings_fingerprint=fingerprint_settings(
+                minimum_trade_gain_eur=self.config.minimum_trade_gain_eur,
+                allow_grid_charging=self.config.allow_grid_charging,
+                allow_battery_export=self.config.allow_battery_export,
+                bucket_kwh=outcome.bucket_kwh,
+            ),
+            price_fingerprint=(
+                None if price_snapshot is None else price_snapshot.fingerprint
+            ),
+            load_fingerprint=(
+                load_snapshots[-1].fingerprint if load_snapshots else None
+            ),
+            pv_fingerprint=None if pv_snapshot is None else pv_snapshot.fingerprint,
+            reserve_fingerprint=(
+                None if reserve_snapshot is None else reserve_snapshot.fingerprint
+            ),
+        )
+        if self.history.add_economic_snapshot(snapshot):
+            # Debounced, like the four evidence layers beside it.
+            self.history.schedule_save()
 
     async def _async_record_reserve_evidence_safely(
         self,

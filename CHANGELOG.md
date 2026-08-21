@@ -9,6 +9,264 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.14] - 2026-08-21
+
+**Alpha EMS now works out what it would do with your battery to save money, and
+still does nothing.** A new sensor reports the action it wants, the action
+implemented actuators could produce, and the reason nothing is sent. Every figure
+beta.13 published for the same inputs is unchanged.
+
+If your battery recommendation, planned power, usable energy, dynamic reserve or
+control state changes after this upgrade, that is a bug. Phase 8 Stage A decides;
+executing a decision is Stage B, and none of it is in this release.
+
+### Added
+
+- **Economic Action**, one new sensor. Its state is the **desired** action —
+  `hold`, `charge`, `discharge`, `export`, `curtail_pv` or `safety_buy` — and
+  `capability_action` beside it is what actuators that actually exist could
+  produce. Both, always: a state reading `export` with no way to tell whether
+  anything could happen would be worse than no state at all.
+  `execution_blocked_reason` is the third fact, and while the release barrier
+  stands it is the only value it can take.
+
+  Sensor count goes from eleven to twelve; entity count from twelve to thirteen.
+  Nothing else moved.
+
+- **A finite-horizon optimizer**, solved by backward induction over
+  `(interval, energy bucket, run state)`. The objective is the pair
+  `(reserve violation, economic cost)` compared **lexicographically**, so reserve
+  feasibility dominates economics without a second mechanism and without a mode
+  switch: when no violation is avoidable the first term ties and the order becomes
+  pure cost. There is no fallback, and that is the point — an earlier draft
+  degraded to a profit solve once the reserve was unreachable, which meant a
+  deficit made the optimizer *freer* rather than more careful.
+
+- **Two solves, not one solve and a downgrade.** `desired` optimises over every
+  action the physics allows, including export and photovoltaic curtailment, for
+  which no actuator exists at all. `capability` is a separately computed plan over
+  the actions that do have a primitive. Keeping them apart is what lets the
+  optimum stay undistorted by which actuators happen to exist, and what makes
+  `economic_value_forgone_eur` — the euro cost of the missing primitives —
+  meaningful rather than tautological.
+
+- **Safety buy is a label, not a mechanism.** A third solve, with the reserve
+  relaxed to the configured floor, is compared against the desired plan: the
+  charging that disappears is the charging the reserve was responsible for. No
+  price threshold could make that distinction, because a cheap interval and a
+  reserve deadline coincide constantly.
+
+- **A terminal condition that forecasts nothing.** `E(n) >= E_hold(n)`, where
+  `E_hold` is the Phase-3 hold trajectory — the plan may not leave the battery
+  worse off than doing nothing would have. Stored energy is assigned **no price**,
+  so no claim is made about prices after the horizon; the bound exists only to
+  stop the optimizer emptying the pack into the last priced interval because the
+  data ran out. It is a bound rather than a prohibition: the action space is
+  continuous in buckets, so the evening sale still happens and only its final
+  depth is limited.
+
+- **A precomputed physics table, measured from the clamp.** Every reachable
+  transition is built once per refresh by asking `battery.apply_request`, so the
+  optimizer performs **no efficiency arithmetic at all** and no hardware limit is
+  ever compared against a second time. The two conversion ratios are *measured*
+  from a calibration probe rather than derived from
+  `round_trip_efficiency_percent`, which is why they agree with the simulator to
+  fourteen decimal places instead of to within a modelling assumption.
+
+- **Every euro figure comes from grid AC energy, without exception.**
+  `import_price × grid_import_kwh − export_price × grid_export_kwh`, with the
+  residual split supplied by `battery.split_grid_energy` and by nothing else. Each
+  interval and each run carries all six energies separately — one DC, two
+  battery-side AC, two grid-side AC and the curtailment — because a euro figure is
+  only meaningful against the boundary it was measured at.
+
+- **`minimum_trade_gain_eur`, the single economic knob.** Charged once per
+  discretionary battery-action *run* inside the objective, which is why the run
+  state is a dimension of the search. It suppresses the micro-cycle a per-kWh cost
+  cannot — a tenth of a kilowatt-hour at a wide margin still earns only a few
+  cents — and it is emphatically **not** a degradation model. Reserve-protection
+  charging still happens below it, with no exemption rule, because reserve
+  feasibility already has priority.
+
+- **Two explicit opt-ins, both default off**: charging from the grid, and selling
+  from the battery. Unlike the execution enable, both are offered in the options
+  form, and the difference is that both change the *published plan*: turning grid
+  charging on moves the action, the value forgone and every per-run figure, in a
+  release that sends nothing.
+
+- **An `economics` options page**, the fourth. Three fields, flat keys, and the
+  same merge-from-existing-options rule as its three siblings, so editing a
+  threshold never disturbs a source selection.
+
+- **An `economic_plan` diagnostics section**, the twentieth. A dict key rather
+  than a list entry, so the sixteen-entry ceiling every list in the payload is
+  held to is untouched. At most eight planned runs, each with all five energy
+  boundaries; never the per-interval trajectory, which would be a hundred and
+  ninety-two rows and which, truncated, would read as a short horizon rather than
+  as a clipped payload.
+
+- **Grid limits, stated as unknown.** The integration has no way to learn a
+  connection or contractual limit, so the advisory peaks in provenance are bounded
+  by the inverter and the battery only, and the payload says out loud that a
+  reported peak may exceed what the connection can carry. Executing nothing is
+  what makes that safe.
+
+- **An Activity surface**, one logbook line per material change. Filed against the
+  entity as well as the domain, so it appears on the sensor's own history.
+  Change-triggered on a *coarse* fingerprint — the action, the window, and the
+  power and energy rounded to material thresholds — so ninety-six refreshes
+  against an unchanged answer produce one line and a plan that shifts by a watt
+  produces none. It is **write-only**: nothing in the integration subscribes, no
+  figure is derived from it, and an installation without the recorder produces
+  identical numbers.
+
+  The four kinds it can emit all describe *advice*: `planned`, `changed`, `ended`
+  and `refused`. The two that describe execution, `started` and `cancelled`, are
+  refused outright while the barrier stands — a line reading "charge started" on a
+  release that sends no command would be a lie about the hardware, and that is the
+  one failure mode this surface must not have.
+
+- **Economic evidence**, a fifth change-fingerprinted snapshot family. Scalars
+  only, and it exists for one reason: prices, load, production and the reserve are
+  already persisted, so the arithmetic is reproducible — but a threshold the user
+  changed, or an opt-in they turned on, lives in the config entry, which keeps no
+  history. Turning grid charging off would otherwise make every earlier plan
+  unverifiable.
+
+- **Measured grid import and export are now recorded per interval** in the
+  learning store, alongside load, production and state of charge. Read by nothing
+  in this release. Phase 9 needs measured grid flows to score a plan against what
+  actually happened, and a scoring pass cannot be built retroactively over history
+  that was never kept.
+
+### Changed
+
+- **`charge` means buying from the grid.** The economic action `charge` and the
+  `allow_grid_charging` opt-in refer specifically to Alpha EMS *choosing to
+  purchase* energy. They are not about energy moving into the pack.
+
+  **Physical battery charging from ambient production is not an economic charge
+  action.** A charge whose grid import does not exceed the idle baseline draws
+  nothing from the meter — it is the same ambient behaviour the Phase-5 simulator
+  models as `absorb_surplus` — so when production naturally enters the battery
+  while Alpha EMS takes no economic action, `Economic Action` reads **`hold`**. It
+  creates no economic action run, pays no `minimum_trade_gain_eur` switching cost,
+  needs no opt-in, remains part of the physical trajectory, and can still create
+  future economic value through the energy it stored.
+
+  The permission is now measured against the idle baseline in **both** directions,
+  exactly as the export side already was. This is a ratified refinement of the
+  approved Phase-8 contract, not a preference: see *Fixed* below, where the
+  direction-only reading made the release non-functional in its default
+  configuration.
+
+- **The terminal bound is reproduced on the solver's own state space.** HoldPolicy
+  remains the conceptual counterfactual, but the enforced bound is the
+  idle-with-absorption endpoint expressed on the same bucketed grid and physical
+  model the optimizer searches over, and reachable by construction. What is
+  published is what is enforced, and `terminal_basis` reads
+  `hold_trajectory_end_on_bucket_grid` so the continuous reference value can never
+  be silently confused with the bucketed constraint.
+
+  A ratified refinement of the approved Phase-8 contract, which specified the
+  continuous `plan.reference.end_energy_kwh` literally. A terminal requirement the
+  solver's state space cannot represent makes an otherwise valid sunny horizon
+  artificially infeasible; the regression proving both halves of that is retained.
+  The user's configured floor is unmodified either way.
+
+- **The reserve requirement is quantised *up* to a 0.25 kWh bucket** for planning,
+  and capped at the pack. Up, because protecting at most one bucket too much is
+  the safe error while ignoring up to one bucket of shortfall is not — and because
+  a requirement on a bucket boundary, with every state also on one, makes a
+  sub-bucket violation **unrepresentable** rather than merely ignored. The
+  measured state of charge snaps *down*, and the user's configured floor is
+  quantised **not at all**: it is enforced by the clamp, and moving it is exactly
+  what Phase 7 exists to refuse. `quantisation_margin_kwh` publishes the bound.
+
+- **Forecast-history storage minor version 1.4 → 1.5**, additive. Partitions gain
+  `eco` and index rows gain `ecofp`. **Learning-store minor version 2.3 → 2.4**,
+  additive: day records gain `gi` and `gx`. A document written by any earlier
+  release reads unchanged, and an installation without battery planning writes
+  neither.
+
+### Fixed
+
+- **Two defects found by this release's own test suite, both of which made the
+  default configuration non-functional on any sunny day.** They are two halves of
+  one mistake: the optimizer's "do nothing" and the simulator's "do nothing" were
+  not the same trajectory.
+
+  The charge permission was measured on *direction* alone, so absorbing production
+  the house could not use required the grid-charging opt-in — off by default. With
+  it off the model believed the pack never absorbs anything. The terminal bound,
+  meanwhile, came from the continuous hold trajectory, which does absorb. On a
+  four-interval sunny horizon the bound therefore sat above every reachable state,
+  every state was infeasible, and the whole plan reported `available: false` — under
+  the reason `economic_horizon_empty`, about a horizon that was four intervals
+  long. A wrong reason is worse than an unused one, so
+  `economic_terminal_unreachable` now exists as a named guard even though the clamp
+  makes it structurally unreachable.
+
+- **The export permission leaked into the capability plan.** Measured on direction
+  alone, unavoidable photovoltaic spill made every sunny state illegal, which
+  silently collapsed the desired plan onto the capability plan and reported a value
+  forgone of zero. Battery-caused export is now measured against the idle
+  baseline. On the eight-interval fixture the two plans separate correctly
+  afterwards: €2.0897 desired against €0.2741 achievable, €1.8156 forgone.
+
+- **`capability_gap_reason` reported a spurious `forecast_infeasible`** whenever
+  the desired action was labelled `safety_buy` and the capability action was a
+  plain `charge` — the same charge, in the same intervals, for the same reason.
+  The two are now compared on the underlying *direction*.
+
+- **A 670 ms solve.** `split_grid_energy` was called once per state transition,
+  roughly nine hundred thousand times for one refresh. The AC energies for a given
+  change in stored energy are identical from every bucket, because the clamp
+  rejects any move it had to reduce — so the per-interval outcomes are now
+  precomputed by bucket delta, thirty-four thousand calls instead. All three
+  solves over a full ninety-six-interval day now take about 185 ms, on top of a
+  14 ms table build, in the executor.
+
+### Verification
+
+- Tests **2256 → 2479**. Six new files: the model and its hand-computed
+  arithmetic, the action vocabulary, the published surface, the evidence layer, the
+  phase boundaries and the mutations.
+
+- **Every euro figure in the load-bearing tests is recomputed by hand.** The
+  eight-interval fixture is sized so the arithmetic can be done on paper: four
+  cheap intervals then four expensive ones, one kilowatt of house load, no
+  production. Doing nothing costs €0.50 exactly; buying and load-shifting costs
+  €0.2259; buying and selling earns €1.5897 — each asserted against a sum computed
+  from the per-interval grid energies rather than against the plan's own total.
+
+- **Thirty-four mutation tests**, each a plausible refactor rather than an
+  absurdity. Five of them were real mistakes made and caught while building this
+  phase: the charge permission on direction alone, the terminal bound left
+  unclamped, the export permission on direction alone, the reserve falling back to
+  a profit solve, and the capability gap compared on the raw action.
+
+- **The safety ordering is proved to be lexicographic rather than steep.** Avoiding
+  a one-bucket shortfall is made to cost over a thousand euros and is still
+  chosen, so no finite weight a reviewer might write can reproduce the behaviour.
+
+- **The boundary contract has a test that a plausible total cannot pass.** Changing
+  the round trip from 90 % to 80 % moves the DC movement behind a commanded AC
+  discharge and leaves the priced grid quantity alone; if the two were ever
+  confused, that test fails at 80 % while passing at 90 %.
+
+- **Stage A's zero-actuation promise is enforced statically**, in the same style as
+  the Phase-3, Phase-4 and Phase-7 boundary tests: neither Phase-8 module imports
+  Home Assistant, a source, a store or the control layer; neither calls a service;
+  neither names an inverter helper, a flash-backed register or a grid-rate
+  actuator; the permitted-service set is still exactly three; and
+  `next_activity`'s signature is pinned to three arguments so an execution event
+  cannot be logged without a visible decision.
+
+- **Performance is guarded.** A ninety-six-interval solve is asserted to complete
+  well inside the refresh budget, so the 670 ms regression cannot come back
+  silently.
+
 ## [1.0.0-beta.13] - 2026-08-21
 
 **Alpha EMS now works out how much energy the battery ought to be holding, and

@@ -38,6 +38,10 @@ async def test_diagnostics_report_every_documented_section(
         # enforces it, and the calculation reads none of the provenance beside
         # it.
         "reserve",
+        # Phase 8. The least-cost way through the known horizon: what the
+        # optimizer wants, what implemented actuators could achieve, and why
+        # nothing is sent. Nothing here is executed.
+        "economic_plan",
         "control",
         # Phase 5. Sixteen sections to seventeen: a dict key rather than a list
         # entry, so the sixteen-item list ceiling every payload is held to is

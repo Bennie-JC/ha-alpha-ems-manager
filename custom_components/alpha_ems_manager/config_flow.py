@@ -36,6 +36,8 @@ from homeassistant.helpers import selector
 from .const import (
     BATTERY_MAX_SOC_PERCENT,
     BATTERY_SIGN_OPTIONS,
+    CONF_ALLOW_BATTERY_EXPORT,
+    CONF_ALLOW_GRID_CHARGING,
     CONF_BATTERY_CAPACITY_KWH,
     CONF_BATTERY_MAX_CHARGE_KW,
     CONF_BATTERY_MAX_DISCHARGE_KW,
@@ -53,6 +55,7 @@ from .const import (
     CONF_GRID_POWER_SIGN,
     CONF_HAS_PV,
     CONF_HOUSE_LOAD_ENTITY,
+    CONF_MINIMUM_TRADE_GAIN_EUR,
     CONF_NAME,
     CONF_PV_POWER_ENTITY,
     CONF_SELECTED_SOLCAST_SITE_IDS,
@@ -60,6 +63,8 @@ from .const import (
     CONF_USE_PV_FORECAST,
     CONFIG_ENTRY_VERSION,
     CONTROL_DURATION_STEP_MINUTES,
+    DEFAULT_ALLOW_BATTERY_EXPORT,
+    DEFAULT_ALLOW_GRID_CHARGING,
     DEFAULT_BATTERY_MIN_SOC_PERCENT,
     DEFAULT_BATTERY_POWER_SIGN,
     DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
@@ -67,6 +72,7 @@ from .const import (
     DEFAULT_CONTROL_HORIZON_MINUTES,
     DEFAULT_GRID_POWER_SIGN,
     DEFAULT_INSTANCE_NAME,
+    DEFAULT_MINIMUM_TRADE_GAIN_EUR,
     DOMAIN,
     DOMAIN_FRANK,
     DOMAIN_SOLCAST,
@@ -76,11 +82,13 @@ from .const import (
     MAX_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     MAX_CONTROL_EXPORT_MARGIN_PERCENT,
     MAX_CONTROL_HORIZON_MINUTES,
+    MAX_MINIMUM_TRADE_GAIN_EUR,
     MIN_BATTERY_CAPACITY_KWH,
     MIN_BATTERY_POWER_KW,
     MIN_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     MIN_CONTROL_EXPORT_MARGIN_PERCENT,
     MIN_CONTROL_HORIZON_MINUTES,
+    MIN_MINIMUM_TRADE_GAIN_EUR,
 )
 from .solcast_source import discover as discover_solcast
 from .solcast_source import read_facts
@@ -218,6 +226,51 @@ def _control_schema(
                     DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
                 ),
             ): _EXPORT_MARGIN_SELECTOR,
+        }
+    )
+
+
+_TRADE_GAIN_SELECTOR = _number_selector(
+    minimum=MIN_MINIMUM_TRADE_GAIN_EUR,
+    maximum=MAX_MINIMUM_TRADE_GAIN_EUR,
+    step=0.01,
+    unit="EUR",
+)
+
+
+def _economics_schema(
+    current: Callable[[str, Any], Any],
+) -> vol.Schema:
+    """Return the economic-settings schema.
+
+    Three fields, all ``Required`` with a default, because all three always have a
+    usable value. Zero gain is allowed and means "take every trade the prices
+    justify" -- refusing it would be a policy this integration has no business
+    imposing, and the reserve keeps its lexicographic priority either way.
+
+    The two opt-ins default to **off** and both are offered, unlike the execution
+    enable. They earn their place because they change the *published* plan: a user
+    who turns grid charging on sees the economic action, the value forgone and the
+    per-run diagnostics move, all without a command being sent.
+    """
+    return vol.Schema(
+        {
+            vol.Required(
+                CONF_MINIMUM_TRADE_GAIN_EUR,
+                default=current(
+                    CONF_MINIMUM_TRADE_GAIN_EUR, DEFAULT_MINIMUM_TRADE_GAIN_EUR
+                ),
+            ): _TRADE_GAIN_SELECTOR,
+            vol.Required(
+                CONF_ALLOW_GRID_CHARGING,
+                default=current(CONF_ALLOW_GRID_CHARGING, DEFAULT_ALLOW_GRID_CHARGING),
+            ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_ALLOW_BATTERY_EXPORT,
+                default=current(
+                    CONF_ALLOW_BATTERY_EXPORT, DEFAULT_ALLOW_BATTERY_EXPORT
+                ),
+            ): selector.BooleanSelector(),
         }
     )
 
@@ -643,11 +696,12 @@ class AlphaEmsConfigFlow(ConfigFlow, domain=DOMAIN):
 class AlphaEmsOptionsFlow(OptionsFlow):
     """Lets every selection be changed without re-adding the entry.
 
-    Two pages behind a menu rather than one long form. The source selections and
-    the battery-planning figures are edited on different occasions and by
-    different reasoning -- one is "which sensor", the other is "what hardware" --
-    and appending five numeric fields to a form that already had thirteen would
-    have buried them at the bottom.
+    Four pages behind a menu rather than one long form. The source selections,
+    the battery-planning figures, the control settings and the economic settings
+    are edited on different occasions and by different reasoning -- "which
+    sensor", "what hardware", "how to behave", "what is worth trading" -- and
+    appending eight more fields to a form that already had thirteen would have
+    buried them at the bottom.
 
     The stored keys stay **flat**. Collapsible sections were the other candidate
     and would have delivered nested values, which the effective-configuration
@@ -660,7 +714,8 @@ class AlphaEmsOptionsFlow(OptionsFlow):
     ) -> ConfigFlowResult:
         """Offer the three groups of options."""
         return self.async_show_menu(
-            step_id="init", menu_options=["sources", "battery", "control"]
+            step_id="init",
+            menu_options=["sources", "battery", "control", "economics"],
         )
 
     async def async_step_control(
@@ -691,6 +746,33 @@ class AlphaEmsOptionsFlow(OptionsFlow):
             step_id="control",
             data_schema=self.add_suggested_values_to_schema(
                 _control_schema(current), user_input
+            ),
+        )
+
+    async def async_step_economics(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show and validate the economic settings.
+
+        Nothing here can be missing and nothing needs cross-field validation --
+        the selector's bounds are the whole rule -- so this is the shortest step
+        in the flow. It merges from the existing options like its siblings, so
+        editing an opt-in never disturbs a source selection.
+        """
+        entry = self.config_entry
+
+        def current(key: str, default: Any = None) -> Any:
+            return entry.options.get(key, entry.data.get(key, default))
+
+        if user_input is not None:
+            return self.async_create_entry(
+                title="", data={**entry.options, **user_input}
+            )
+
+        return self.async_show_form(
+            step_id="economics",
+            data_schema=self.add_suggested_values_to_schema(
+                _economics_schema(current), user_input
             ),
         )
 

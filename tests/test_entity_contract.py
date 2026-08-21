@@ -1,10 +1,10 @@
 """The exact entity surface Alpha EMS Manager is allowed to create.
 
-Twelve entities and nothing else: four from Phase 1, two from Phase 2, three
-from Phase 3, one sensor and one select from Phase 4, and one from Phase 7. This
-module freezes that promise, so an accidental extra entity, a changed unique id
-or a lost unit fails here rather than surprising a user whose dashboard silently
-gained a row.
+Thirteen entities and nothing else: four from Phase 1, two from Phase 2, three
+from Phase 3, one sensor and one select from Phase 4, one from Phase 7 and one
+from Phase 8. This module freezes that promise, so an accidental extra entity, a
+changed unique id or a lost unit fails here rather than surprising a user whose
+dashboard silently gained a row.
 
 The two Phase-2 sensors deliberately break the Phase-1 pattern in one respect
 and follow it in another. They carry a state class, because a measurement of
@@ -112,6 +112,17 @@ CONTRACT: dict[str, dict[str, object]] = {
         "state_class": "measurement",
         "icon": "mdi:battery-lock",
     },
+    # Phase 8. An enum like the recommendation and the control state, and for the
+    # same reason: it is categorical, so a long-term statistic over it means
+    # nothing.
+    "sensor.alpha_ems_economic_action": {
+        "unique_id_suffix": "economic_action",
+        "name": "Alpha EMS Economic Action",
+        "unit": None,
+        "device_class": "enum",
+        "state_class": None,
+        "icon": "mdi:cash-clock",
+    },
     "sensor.alpha_ems_control_state": {
         "unique_id_suffix": "control_state",
         "name": "Alpha EMS Control State",
@@ -132,7 +143,7 @@ CONTRACT: dict[str, dict[str, object]] = {
 
 
 def test_no_entity_is_missing_or_extra(hass: HomeAssistant) -> None:
-    """Exactly the twelve documented entities exist.
+    """Exactly the thirteen documented entities exist.
 
     Covers both platforms, so the select is held to the same table as the
     sensors rather than being checked somewhere looser.
@@ -144,7 +155,7 @@ def test_no_entity_is_missing_or_extra(hass: HomeAssistant) -> None:
         if entity.platform == DOMAIN
     }
     assert created == set(CONTRACT)
-    assert len(created) == len(CONTRACT) == 12
+    assert len(created) == len(CONTRACT) == 13
 
 
 #: The entity surface, phase by phase. Named rather than counted, so a new
@@ -186,6 +197,13 @@ PHASE_FOUR_SELECTS = {
 PHASE_SEVEN_ENTITIES = {
     "sensor.alpha_ems_dynamic_battery_reserve",
 }
+#: Phase 8 adds exactly one. Both counterfactual plans, every planned run, the
+#: solver figures, the reserve-protection cost and the provenance the calculation
+#: does not consult are diagnostics-only: an optimizer with six ways of being
+#: wrong must not become six rows.
+PHASE_EIGHT_ENTITIES = {
+    "sensor.alpha_ems_economic_action",
+}
 
 
 def test_phase_two_added_exactly_two_entities(hass: HomeAssistant) -> None:
@@ -201,6 +219,7 @@ def test_phase_two_added_exactly_two_entities(hass: HomeAssistant) -> None:
         - PHASE_THREE_ENTITIES
         - PHASE_FOUR_ENTITIES
         - PHASE_SEVEN_ENTITIES
+        - PHASE_EIGHT_ENTITIES
         == PHASE_TWO_ENTITIES
     )
 
@@ -220,6 +239,7 @@ def test_phase_three_added_exactly_three_entities(hass: HomeAssistant) -> None:
         - PHASE_TWO_ENTITIES
         - PHASE_FOUR_ENTITIES
         - PHASE_SEVEN_ENTITIES
+        - PHASE_EIGHT_ENTITIES
         == PHASE_THREE_ENTITIES
     )
     assert len(PHASE_THREE_ENTITIES) == 3
@@ -241,6 +261,7 @@ def test_phase_four_added_exactly_one_sensor_and_one_select(
         - PHASE_TWO_ENTITIES
         - PHASE_THREE_ENTITIES
         - PHASE_SEVEN_ENTITIES
+        - PHASE_EIGHT_ENTITIES
         == PHASE_FOUR_ENTITIES
     )
     assert len(PHASE_FOUR_ENTITIES) == 2

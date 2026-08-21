@@ -196,17 +196,19 @@ async def test_a_beta5_forecast_document_is_read_not_discarded(
     # The rows beta.5 wrote are recognised as first-generation matches.
     assert matcher_version(store.days[DAY_ONE].summary) == 1
 
-    # A beta.5 document carries no photovoltaic, price or reserve evidence, and
-    # reading it must not invent any of them. The minor version has moved on
-    # three times since -- it is pinned here so a *major* bump, which would
-    # decide the document is unreadable, cannot slip in as a minor one.
+    # A beta.5 document carries no photovoltaic, price, reserve or economic
+    # evidence, and reading it must not invent any of them. The minor version has
+    # moved on four times since -- it is pinned here so a *major* bump, which
+    # would decide the document is unreadable, cannot slip in as a minor one.
     assert FORECAST_STORAGE_VERSION == 1
-    assert FORECAST_STORAGE_MINOR_VERSION == 4
+    assert FORECAST_STORAGE_MINOR_VERSION == 5
     assert store.days[DAY_ONE].pv_fingerprints == []
     assert store.days[DAY_ONE].price_fingerprints == []
     assert store.price_snapshots(DAY_ONE) == []
     assert store.days[DAY_ONE].reserve_fingerprints == []
     assert store.reserve_snapshots(DAY_ONE) == []
+    assert store.days[DAY_ONE].economic_fingerprints == []
+    assert store.economic_snapshots(DAY_ONE) == []
 
 
 async def test_a_beta5_installation_keeps_every_entity_and_unique_id(
@@ -243,6 +245,7 @@ async def test_a_beta5_installation_keeps_every_entity_and_unique_id(
         "sensor.alpha_ems_dynamic_battery_reserve": (
             f"{entry_id}_dynamic_battery_reserve"
         ),
+        "sensor.alpha_ems_economic_action": f"{entry_id}_economic_action",
         "sensor.alpha_ems_control_state": f"{entry_id}_control_state",
         "select.alpha_ems_control_mode": f"{entry_id}_control_mode",
     }

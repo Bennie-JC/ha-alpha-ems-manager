@@ -51,7 +51,7 @@ EXPECTED_CONFIG_FIELDS: dict[str, list[str]] = {
 }
 
 #: The options flow is a menu of three pages. All are checked, in order.
-EXPECTED_OPTIONS_MENU = ("sources", "battery", "control")
+EXPECTED_OPTIONS_MENU = ("sources", "battery", "control", "economics")
 
 EXPECTED_OPTIONS_FIELDS: dict[str, list[str]] = {
     "sources": [
@@ -86,6 +86,15 @@ EXPECTED_OPTIONS_FIELDS: dict[str, list[str]] = {
     "control": [
         "control_horizon_minutes",
         "control_export_margin_percent",
+    ],
+    # Phase 8. Three fields, all with defaults. The two opt-ins *are* offered,
+    # unlike the execution enable, and the difference is that they change the
+    # published plan: turning grid charging on moves the economic action, the
+    # value forgone and the per-run diagnostics without a command being sent.
+    "economics": [
+        "minimum_trade_gain_eur",
+        "allow_grid_charging",
+        "allow_battery_export",
     ],
 }
 

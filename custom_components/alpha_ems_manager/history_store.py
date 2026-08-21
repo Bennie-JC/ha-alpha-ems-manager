@@ -59,6 +59,7 @@ from .const import (
     FORECAST_STORE_SAVE_DELAY,
     FORECAST_SUMMARY_RETENTION_DAYS,
 )
+from .economic import EconomicSnapshot
 from .forecast_history import DayOutcome, ForecastSnapshot
 from .price_forecast import PriceSnapshot
 from .pv_forecast import PvOutcome, PvSnapshot
@@ -163,6 +164,12 @@ class DayIndexRow:
     #: common answer is "nothing changed" and reaching it must not cost a
     #: partition load.
     reserve_fingerprints: list[str] = field(default_factory=list)
+    #: Content fingerprints of the economic plans recorded for this day. In the
+    #: index for the same reason as the four before it, and here the reason bites
+    #: hardest: the plan itself changes every quarter-hour because its horizon
+    #: starts at the next boundary, so the digest is over the *inputs* and the
+    #: common answer is "nothing changed".
+    economic_fingerprints: list[str] = field(default_factory=list)
 
     @property
     def snapshot_count(self) -> int:
@@ -188,6 +195,8 @@ class DayIndexRow:
             payload["prfp"] = list(self.price_fingerprints)
         if self.reserve_fingerprints:
             payload["rsvfp"] = list(self.reserve_fingerprints)
+        if self.economic_fingerprints:
+            payload["ecofp"] = list(self.economic_fingerprints)
         return payload
 
     @classmethod
@@ -231,6 +240,13 @@ class DayIndexRow:
                 if isinstance(raw.get("rsvfp"), list)
                 else []
             ),
+            # Absent on a document written before minor 5, which reads as "no
+            # plans recorded" rather than as an error.
+            economic_fingerprints=(
+                [str(value) for value in raw.get("ecofp")]
+                if isinstance(raw.get("ecofp"), list)
+                else []
+            ),
         )
 
 
@@ -266,6 +282,11 @@ class _Partition:
     #: interval -- but scoring one against the other is a later phase, and a
     #: verdict written here would be one this phase has no basis for.
     reserve_snapshots: dict[date, list[ReserveSnapshot]] = field(default_factory=dict)
+    #: Economic evidence, namespaced beside the other four and likewise with no
+    #: outcome half. What a plan *actually* cost needs the measured grid flows the
+    #: learning store began recording in the same release, and scoring one against
+    #: the other is Phase 9.
+    economic_snapshots: dict[date, list[EconomicSnapshot]] = field(default_factory=dict)
     #: Set when this partition could not be read. Writes to it are suspended for
     #: the session; the rest of the history keeps working.
     corrupt: bool = False
@@ -281,6 +302,7 @@ class _Partition:
             | set(self.pv_outcomes)
             | set(self.price_snapshots)
             | set(self.reserve_snapshots)
+            | set(self.economic_snapshots)
         )
         for day in sorted(known):
             entry: dict[str, Any] = {}
@@ -308,6 +330,11 @@ class _Partition:
             reserve_snapshots = self.reserve_snapshots.get(day)
             if reserve_snapshots:
                 entry["rsv"] = [snapshot.to_dict() for snapshot in reserve_snapshots]
+            # Omitted entirely where no plan was ever built, so an installation
+            # without prices or without battery planning stores nothing here.
+            economic_snapshots = self.economic_snapshots.get(day)
+            if economic_snapshots:
+                entry["eco"] = [snapshot.to_dict() for snapshot in economic_snapshots]
             if entry:
                 days[day.isoformat()] = entry
         return {"days": days}
@@ -479,6 +506,17 @@ class ForecastHistoryStore:
                 ]
                 if rebuilt_reserve:
                     partition.reserve_snapshots[day] = rebuilt_reserve
+            economic_raw = value.get("eco")
+            if isinstance(economic_raw, list):
+                rebuilt_economic = [
+                    snapshot
+                    for snapshot in (
+                        EconomicSnapshot.from_dict(day, entry) for entry in economic_raw
+                    )
+                    if snapshot is not None
+                ]
+                if rebuilt_economic:
+                    partition.economic_snapshots[day] = rebuilt_economic
         return partition
 
     async def async_ensure_days(self, days: list[date]) -> None:
@@ -593,6 +631,62 @@ class ForecastHistoryStore:
         partition.dirty = True
 
         row.price_fingerprints.append(snapshot.fingerprint)
+        self.months.add(month_key(day))
+        self._index_dirty = True
+        return True
+
+    def economic_snapshots(self, day: date) -> list[EconomicSnapshot]:
+        """Return the economic plans recorded for a target day."""
+        partition = self._partitions.get(month_key(day))
+        if partition is None:
+            return []
+        return list(partition.economic_snapshots.get(day, ()))
+
+    def latest_economic_snapshot(self, day: date) -> EconomicSnapshot | None:
+        """Return the most recent recorded plan, or ``None``."""
+        recorded = self.economic_snapshots(day)
+        return recorded[-1] if recorded else None
+
+    def has_economic_fingerprint(self, day: date, fingerprint: str) -> bool:
+        """Return whether a plan with these inputs is already recorded.
+
+        Answered from the index, so the ninety-odd refreshes a day that change
+        nothing never load a month of arrays to find that out.
+        """
+        row = self.days.get(day)
+        return row is not None and fingerprint in row.economic_fingerprints
+
+    def add_economic_snapshot(self, snapshot: EconomicSnapshot) -> bool:
+        """Persist an economic plan, unless its inputs are already recorded.
+
+        Change-triggered by input fingerprint, like all four families before it.
+        The plan itself moves every quarter-hour -- its horizon starts at the next
+        boundary -- so a digest over the *answer* would store ninety-six documents
+        a day and break the rule that an unchanged refresh costs no I/O.
+        """
+        day = snapshot.target_day
+        if not self.writable(day):
+            return False
+        if self.has_economic_fingerprint(day, snapshot.fingerprint):
+            return False
+
+        row = self.days.setdefault(day, DayIndexRow())
+        if len(row.economic_fingerprints) >= FORECAST_MAX_SNAPSHOTS_PER_TARGET:
+            self.snapshot_cap_hits += 1
+            _LOGGER.warning(
+                "Forecast history already holds %d economic snapshots for %s, "
+                "which is the per-day ceiling, so this plan is not being "
+                "recorded. The records already kept are unaffected",
+                len(row.economic_fingerprints),
+                day.isoformat(),
+            )
+            return False
+
+        partition = self._partitions[month_key(day)]
+        partition.economic_snapshots.setdefault(day, []).append(snapshot)
+        partition.dirty = True
+
+        row.economic_fingerprints.append(snapshot.fingerprint)
         self.months.add(month_key(day))
         self._index_dirty = True
         return True

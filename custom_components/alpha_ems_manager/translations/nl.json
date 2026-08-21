@@ -118,7 +118,8 @@
         "menu_options": {
           "sources": "Bronnen",
           "battery": "Accuplanning",
-          "control": "Regeling"
+          "control": "Regeling",
+          "economics": "Economie"
         }
       },
       "sources": {
@@ -185,6 +186,20 @@
         "data_description": {
           "control_horizon_minutes": "Hoe lang een opdracht de omvormer zou laten vasthouden, in minuten. Dit is een veiligheidstimer en geen levertijd: het plan wordt elk kwartier opnieuw opgesteld en elke opdracht vervangt de vorige, dus het telt alleen als Alpha EMS stopt -- dan gaat de omvormer na het verstrijken zelf terug naar normaal. Het moet langer zijn dan vijftien minuten, anders verloopt een opdracht voordat de volgende komt.",
           "control_export_margin_percent": "Hoeveel procent onder je huidige huisverbruik een ontlaadopdracht moet blijven. Een geforceerde ontlading stelt het vermogen van de batterij in, dus wat het huis niet gebruikt gaat naar het net -- en de teruglevergrens van de omvormer geldt daar niet voor. Zou een opdracht hierboven uitkomen, dan wordt de hele opdracht geweigerd in plaats van verkleind."
+        }
+      },
+      "economics": {
+        "title": "Economie",
+        "description": "Wat Alpha EMS de moeite waard moet vinden om met je accu te doen. Deze instellingen veranderen het plan dat het publiceert en de cijfers ernaast -- ze laten niets gebeuren. Deze versie stuurt geen enkele opdracht naar je omvormer, dus een economisch plan is hier een advies dat je kunt volgen, met je rekening kunt vergelijken en waar je het oneens mee mag zijn.",
+        "data": {
+          "minimum_trade_gain_eur": "Minimale opbrengst per handeling",
+          "allow_grid_charging": "Inkopen vanaf het net toestaan",
+          "allow_battery_export": "Verkopen uit de accu toestaan"
+        },
+        "data_description": {
+          "minimum_trade_gain_eur": "Hoeveel een enkele laad- of ontlaadbeweging moet opbrengen voordat die het plannen waard is, in euro's. Eenmaal per aaneengesloten reeks van dezelfde handeling gerekend, niet per kilowattuur -- dat is wat een plan vol handelingen van twee cent voorkomt die de accu voor niets belasten. Nul betekent: neem elke handeling die de prijzen rechtvaardigen. Dit is geen slijtagemodel, maar jouw antwoord op \"hoe klein is te klein\". Laden om de reserve te beschermen negeert deze grens, want het huis voorzien is geen handel -- en je eigen zon die de accu in gaat ook, want daar heeft niemand voor gekozen.",
+          "allow_grid_charging": "Of het plan energie mag **inkopen** van het net om in de accu te zetten. Standaard uit, want een accu die alleen je eigen zon opslaat kan geen geld verliezen op een prijsvoorspelling. Aanzetten laat het plan inkopen in goedkope uren -- en laat het een veiligheidsinkoop plannen als de reserve niet uit je panelen gehaald kan worden. Dit gaat alleen over inkopen: je panelen die de accu vullen is geen laden vanaf het net, vraagt geen toestemming, en verschijnt als \"hold\" en niet als \"charge\".",
+          "allow_battery_export": "Of het plan opgeslagen energie terug mag verkopen aan het net. Standaard uit. Aanzetten laat het plan je accu waarderen tegen de terugleverprijs in plaats van alleen tegen de inkoopprijs die het vermijdt, wat in de avondpiek meestal meer te doen vindt. Let op: een omvormeropdracht hiervoor bestaat in deze versie niet, dus het plan toont dit als gewenst en niet beschikbaar -- en dat is de bedoeling: je ziet wat het waard is voordat er iets gebouwd wordt dat het kan uitvoeren."
         }
       }
     }

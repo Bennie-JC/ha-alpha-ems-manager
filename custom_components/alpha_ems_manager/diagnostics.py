@@ -21,8 +21,16 @@ from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from . import AlphaEmsConfigEntry
+from .battery import INTERVAL_HOURS
 from .const import (
+    BATTERY_KW_PRECISION,
     CONFIG_ENTRY_VERSION,
+    ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+    ECONOMIC_MODEL_VERSION,
+    ECONOMIC_UNAVAILABLE_HORIZON_EMPTY,
+    ECONOMIC_UNAVAILABLE_NO_PRICES,
+    ECONOMIC_UNAVAILABLE_NO_RESERVE,
+    ECONOMIC_UNAVAILABLE_NO_SOC,
     FORECAST_MATCHER_VERSION,
     FORECAST_MAX_SNAPSHOTS_PER_TARGET,
     FORECAST_METRIC_WINDOWS,
@@ -35,12 +43,18 @@ from .const import (
     MIN_DAY_COMPLETENESS,
     MIN_QUARTER_COVERAGE,
     PRICE_MAPPING_VERSION,
+    QUARTER_MINUTES,
     RESERVE_REPLENISHMENT_ASSUMPTION,
     RESERVE_UNAVAILABLE_FORECAST,
     SLOTS_PER_DAY,
     STORAGE_VERSION,
 )
 from .coordinator import AlphaEmsCoordinator
+from .economic import (
+    ECONOMIC_DECIDES_NOTHING,
+    EconomicOutcome,
+    economic_as_dict,
+)
 from .forecast import REASON_NOT_BUILT, DayForecast
 from .forecast_history import (
     LIFECYCLE_PENDING,
@@ -61,7 +75,12 @@ from .pv_forecast import PvForecast, pv_error_metrics
 from .reserve import reserve_as_dict
 from .solcast_source import SolcastFacts
 from .solcast_source import discover as discover_solcast
-from .storage import DayRecord, elapsed_quarters_for, expected_quarters_for
+from .storage import (
+    DayRecord,
+    elapsed_quarters_for,
+    expected_quarters_for,
+    interval_start_utc,
+)
 
 
 def _source_report(hass: HomeAssistant, entity_id: str | None) -> dict[str, Any]:
@@ -480,6 +499,144 @@ async def _forecast_history_report(
         },
         "storage": storage,
     }
+
+
+def _economic_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any]:
+    """Summarise the Phase-8 economic plan, and everything it rests on.
+
+    A dict rather than a list entry, as Phases 5, 6 and 7 each were, so the
+    nineteen-section list ceiling is untouched.
+
+    Bounded by construction. ``economic_as_dict`` publishes counts, totals, edges,
+    status and at most eight planned runs -- never the per-interval trajectory,
+    which would be a hundred and ninety-two rows against a sixteen-entry ceiling.
+    """
+    outcome = (coordinator.data or {}).get("economic")
+    plan = coordinator.battery_plan
+    if not isinstance(outcome, EconomicOutcome):
+        return {
+            "available": False,
+            "unavailable_reason": _economic_absence(coordinator, plan),
+            "model_version": ECONOMIC_MODEL_VERSION,
+            "decides_nothing": ECONOMIC_DECIDES_NOTHING,
+        }
+
+    start, end = _economic_edges(coordinator, outcome, tz)
+    window = coordinator.last_record.window
+    config = coordinator.config
+    return economic_as_dict(
+        outcome,
+        execution_blocked_reason=ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+        horizon_start=start,
+        horizon_end=end,
+        provenance={
+            "settings": {
+                "minimum_trade_gain_eur": config.minimum_trade_gain_eur,
+                "allow_grid_charging": config.allow_grid_charging,
+                "allow_battery_export": config.allow_battery_export,
+                "threshold_rule": (
+                    "minimum expected economic value required to justify "
+                    "starting a new discretionary battery-action run. "
+                    "Reserve-protection charging may still occur below it, "
+                    "because reserve feasibility has lexicographic priority"
+                ),
+            },
+            "grid_limits": {
+                "connection_limit_kw": None,
+                "connection_limit_source": "unknown",
+                "export_limit_percent": _max_feed_percent(coordinator),
+                "export_limit_honoured_by_dispatch": False,
+                "advisory_peak_import_kw": _round_kw(
+                    _economic_peak(outcome, export=False)
+                ),
+                "advisory_peak_export_kw": _round_kw(
+                    _economic_peak(outcome, export=True)
+                ),
+                "basis": (
+                    "advisory grid flows are bounded by the inverter and the "
+                    "battery only, and every figure comes from the one grid "
+                    "residual model, so production is included. No grid "
+                    "connection or contractual limit is known to this "
+                    "integration, so a reported peak may exceed what the "
+                    "connection can carry -- this release executes nothing, so "
+                    "it cannot cause a real flow"
+                ),
+            },
+            # Read by nothing. Reported because the plan carries no margin for
+            # forecast error, and a negative bias means the load model is
+            # under-predicting -- which biases a charge decision late and a
+            # discharge decision early.
+            "forecast_bias_kwh_per_interval": window.as_dict()["bias_kwh_per_interval"],
+            "forecast_days_compared": window.days_compared,
+            "forecast_basis": (
+                "the plan is a point estimate over the published price, load "
+                "and production series. No forecast-error margin is applied, "
+                "and nothing here is consumed by the optimizer"
+            ),
+        },
+    )
+
+
+def _economic_absence(coordinator: AlphaEmsCoordinator, plan: Any) -> str:
+    """Return why no economic plan exists, as precisely as can be established."""
+    if plan is None or plan.state is None:
+        return ECONOMIC_UNAVAILABLE_NO_SOC
+    if plan.reserve_projection is None or not plan.reserve_projection.available:
+        return ECONOMIC_UNAVAILABLE_NO_RESERVE
+    if not coordinator.price_forecasts:
+        return ECONOMIC_UNAVAILABLE_NO_PRICES
+    return ECONOMIC_UNAVAILABLE_HORIZON_EMPTY
+
+
+def _economic_edges(
+    coordinator: AlphaEmsCoordinator, outcome: EconomicOutcome, tz: Any
+) -> tuple[Any, Any]:
+    """Return the absolute instants the economic horizon spans."""
+    plan = coordinator.battery_plan
+    if plan is None or plan.target_day is None or not outcome.horizon.demands:
+        return None, None
+    today = (plan.forecast or {}).get("today") or {}
+    count = today.get("interval_count")
+    if not isinstance(count, int) or count <= 0:
+        return None, None
+
+    def moment(index: int) -> Any:
+        if index < count:
+            return interval_start_utc(plan.target_day, index, tz)
+        return interval_start_utc(
+            plan.target_day + timedelta(days=1), index - count, tz
+        )
+
+    first = outcome.horizon.demands[0].index
+    last = outcome.horizon.demands[-1].index
+    return moment(first), moment(last) + timedelta(minutes=QUARTER_MINUTES)
+
+
+def _economic_peak(outcome: EconomicOutcome, *, export: bool) -> float:
+    """Return the plan's peak grid flow in kW, in one direction.
+
+    Derived from the plan's own per-interval residuals, which come from the one
+    grid residual model -- so production is in them by construction and the peak
+    cannot be understated by a formula that forgot it.
+    """
+    energies = [
+        entry.grid_export_kwh if export else entry.grid_import_kwh
+        for entry in outcome.desired.intervals
+    ]
+    return (max(energies) / INTERVAL_HOURS) if energies else 0.0
+
+
+def _max_feed_percent(coordinator: AlphaEmsCoordinator) -> float | None:
+    """Return the inverter's own feed-in limit, as already read for Phase 4."""
+    report = coordinator.control_report or {}
+    capability = report.get("capability") or {}
+    value = capability.get("max_feed_to_grid_percent")
+    return value if isinstance(value, (int, float)) else None
+
+
+def _round_kw(value: float | None) -> float | None:
+    """Round a power for reporting, preserving ``None``."""
+    return None if value is None else round(value, BATTERY_KW_PRECISION)
 
 
 def _reserve_report(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
@@ -1068,6 +1225,11 @@ async def async_get_config_entry_diagnostics(
         # projected trajectory would fall below it, and the provenance the
         # calculation deliberately does not consult. Nothing enforces it.
         "reserve": _reserve_report(coordinator),
+        # Phase 8. The least-cost way through the prices, load and production
+        # that are actually known: what the optimizer wants, what implemented
+        # actuators could achieve, what the difference costs, and why nothing is
+        # sent. Nothing here is executed.
+        "economic_plan": _economic_report(coordinator, tz),
         # Phase 4. What the control pipeline made of that decision: which parts
         # of the control surface were found, what the inverter is doing, the
         # intent, the quantised command, the exact ordered command list, the

@@ -23,6 +23,12 @@ error back into the model. Adaptive correction belongs to a much later phase, an
 keeping the boundary sharp is what makes the recorded evidence trustworthy: the
 history is a measurement of the model, not a product of it.
 
+Phase 8 Stage A decides what would be economically best to do with the battery
+and publishes it. It executes none of it: `CONTROL_EXECUTION_AVAILABLE` is still
+false, no service call reaches the inverter, and export and photovoltaic
+curtailment have no actuator at all — they are *modelled* so the strategy can be
+validated before anything is built to perform them.
+
 The previous 0.1.0 release contained an advisory battery and trading layer —
 `recommendation`, `reserve_satisfied`, a trade engine, a reserve model, a PV
 forecast correction and safety-buy logic. All of it was removed. It remains in
@@ -63,14 +69,21 @@ generic `ConfigEntry` typing and coordinator `config_entry` support. Keep
 | `api.py` | The frozen read-only interface later phases consume. |
 | `validation.py` | Entity validation used by the config and options flows. |
 | `coordinator.py` | Runtime orchestration: listeners, timers, both accumulators, ingest, derived values. |
-| `config_flow.py` | Five-step config flow and a single-page options flow. |
-| `sensor.py` | The four sensors. |
+| `config_flow.py` | Five-step config flow, and a four-page options flow behind a menu: sources, battery planning, control, economics. |
+| `sensor.py` | The twelve sensors, and the one description that also files a logbook line. |
 | `diagnostics.py` | Everything that does not justify an entity. |
 | `__init__.py` | Entry lifecycle, config-entry migration guard, missing-source guard. |
 
 The pure modules carry the interesting logic deliberately: they can be tested
 against synthetic timelines without a Home Assistant instance, which is why the
 DST and forecast tests are fast and exhaustive.
+
+### Phase-8 modules
+
+| Module | Role |
+|---|---|
+| `economic.py` | the physics table, the horizon, the solver, the three solves, the labels, the bounded payload and the stored snapshot. Pure |
+| `activity.py` | the sentence one logbook line says, and the guard that refuses to say the battery moved. Pure |
 
 ### Phase-6 modules
 
@@ -2293,18 +2306,425 @@ netting AC load against a possibly-DC production figure is a few per cent in an
 unknown direction. Recorded, not corrected.
 
 
+## Phase 8 Stage A: economic optimisation
+
+Phase 7 identifies *need*. Phase 8 decides the *action* — and Stage A publishes
+that decision without executing any part of it. `CONTROL_EXECUTION_AVAILABLE` is
+still false, `PERMITTED_SERVICES` is still exactly three, and neither Phase-8
+module imports the control layer, names an inverter helper or calls a service.
+`tests/test_phase_eight_boundaries.py` enforces all of that statically.
+
+### The objective, and why it has no fallback
+
+Backward induction over `(interval, energy bucket, run state)`. The value of a
+state is the pair
+
+```
+(reserve violation, economic cost)
+```
+
+compared **lexicographically**. Both terms are additive over intervals and the
+order is monotone, so Bellman optimality holds and the search is a plain dynamic
+program rather than a constrained one.
+
+The consequence that matters: there is no mode switch and no fallback. When some
+shortfall is unavoidable everywhere, the first term ties and the order degenerates
+to pure cost — which minimises cost *while holding the shortfall at its
+unavoidable minimum*. An earlier draft instead dropped the reserve term once it
+became unsatisfiable, which meant a deficit **unlocked** the export: the emptier
+the battery, the freer the optimizer. That is precisely backwards, and the
+lexicographic order is what makes it unwritable rather than merely discouraged.
+
+`reserve_protection_cost_eur` is published beside the plan: the difference between
+the lexicographic optimum and the same solve with the reserve relaxed to the
+configured floor. A lexicographic order needs that number visible rather than
+argued, because it is the only thing that would expose a reserve being defended at
+an absurd price.
+
+### The state space, and the three quantisation directions
+
+`bucket_kwh` is a constant 0.25, so solve cost scales with pack capacity rather
+than precision varying by installation. `N = ceil(ceiling / bucket)` and the top
+state is the ceiling exactly.
+
+| quantity | direction | why |
+|---|---|---|
+| reserve requirement | **up** | protecting one bucket too much is the safe error; ignoring one bucket of shortfall is not |
+| measured state of charge | **down** | never assume the pack holds energy it might not |
+| configured floor | **not at all** | it is the user's setting, enforced by the clamp; quantising it would move it |
+
+The first two together do more than either alone. Both sides of
+`energy − requirement` land on the grid, so a violation is an exact bucket
+multiple and a sub-bucket shortfall is **unrepresentable** rather than merely
+ignored. That is a property of the state space, not of a rounding rule, and it is
+what bounds the worst over-payment: the marginal value of one bucket plus at most
+one `minimum_trade_gain_eur`, about €0.21 at a peak price of 0.45.
+
+`quantisation_margin_kwh` publishes the bound rather than leaving it to be
+inferred.
+
+### The physics table
+
+Every reachable transition is precomputed once per refresh by asking
+`battery.apply_request`, because `apply_request` depends only on state and request
+and never on the interval. Roughly seventeen thousand clamp calls, about fourteen
+milliseconds, reused by all three solves.
+
+The consequence is the point: the optimizer performs **no efficiency arithmetic at
+all** and compares against **no hardware limit**. There is no `math.sqrt`, no
+reference to `round_trip_efficiency_percent`, and no `min`/`max` against a power
+or headroom figure — a second copy of a safety limit is a second thing to keep in
+step, and the first time the two disagreed it would be the copy that got believed.
+
+The two conversion ratios are **measured** from a calibration probe rather than
+read off `BatteryLimits`, which is why they agree with the simulator to fourteen
+decimal places instead of to within a modelling assumption.
+
+### `charge` means buying — the ratified action semantics
+
+**`ECONOMIC_ACTION_CHARGE` and `allow_grid_charging` refer specifically to
+discretionary economic *grid* charging.** They are not about energy moving into
+the pack. The distinction is user-facing and it is the right one:
+
+> physical battery charging from ambient production
+> **≠**
+> Alpha EMS economically choosing to buy energy from the grid
+
+So **ambient production absorption is not an economic charge action.** When
+surplus naturally enters the battery while Alpha EMS takes no economic battery
+action, `Economic Action` reads **`hold`**. That absorption:
+
+- creates no economic action run;
+- pays no `minimum_trade_gain_eur` switching cost;
+- does not require `allow_grid_charging`;
+- remains part of the physical trajectory;
+- can still create future economic value through the energy it stored.
+
+This is a ratified refinement of the approved Phase-8 plan, which stated the
+charge permission in terms of direction. It was approved because the
+direction-only reading made the release non-functional in its **default**
+configuration: with `allow_grid_charging` off, the model believed a battery never
+absorbs its own solar.
+
+### Permission is measured against the idle baseline, in both directions
+
+The mechanism that implements the above, and the invariant this phase got wrong
+twice in mirror image — both caught by its own tests.
+
+The idle case for an interval is computed first. Only what the battery causes
+*beyond* it counts as a choice the optimizer made:
+
+- **Export.** Production exceeding house load spills to the grid whatever the
+  battery does. Measured on direction alone, unavoidable spill made every sunny
+  state illegal, which silently collapsed the desired plan onto the capability
+  plan and reported a value forgone of zero.
+- **Import.** Storing production the house cannot use draws nothing from the grid.
+  It is **ambient physical behaviour, never intent** — the same thing
+  `simulation.simulate` models as `absorb_surplus` — so it is always permitted,
+  labelled `hold`, and charged no switching fee.
+
+A charge that *does* draw grid import is a purchase and needs
+`allow_grid_charging`. A discharge that *does* export beyond the baseline is a
+sale and needs `allow_battery_export`. Both default to off.
+
+Because the run state is derived from this economic classification rather than
+from the move's physical mode, ambient absorption earns no run and no switching
+fee. Reading the mode instead would have reported the sun arriving as a trade the
+optimizer decided to make — and, worse, a high enough gain threshold would then
+have had the battery decline free energy to save money nobody pays.
+
+### The terminal condition
+
+`E(n) >= E_hold(n)`, where `E_hold` is the Phase-3 hold trajectory's endpoint. The
+project's existing counterfactual becomes the terminal bound: `plan.reference` is
+already built every refresh, so this costs nothing to compute.
+
+Stored energy is assigned **no price**. That is what keeps the objective free of
+any claim about prices after the horizon, and the distinction is worth stating
+explicitly:
+
+> **Known-horizon economic value** is the objective over `[0, n)`: import cost,
+> export revenue and switching cost at known prices.
+>
+> **Terminal inventory protection** is the constraint `E(n) >= E_hold(n)`. It
+> asserts only that a plan may not leave the battery worse off than doing nothing
+> would have — a statement about the known horizon, not about the future.
+
+Without it, and with the reserve at the last interval as the floor by
+construction, the optimizer sells everything above the floor in the final priced
+interval whenever the export price is positive. That is not economics; it is an
+artefact of where the data stops.
+
+It is a **bound, not a prohibition.** The action space is continuous in buckets,
+so the optimizer sells *down to* the endpoint rather than choosing between selling
+everything and selling nothing. The summer trade still happens and only its final
+depth is limited. And it applies to the endpoint **only**, so mid-horizon headroom
+creation — sell into the evening peak, let tomorrow's production refill — is
+entirely unconstrained.
+
+Three further properties make it the right shape rather than merely a working one:
+it is loose exactly when energy is scarce (in winter the hold trajectory drains to
+the reserve, which is when load-shifting needs freedom); it is tight exactly when
+there is a lot to dump; and it consults no price at all.
+
+**And it is reproduced on the solver's own state space.** This is the ratified
+contract, and it differs from the approved Revision 4, which named the continuous
+`plan.reference.end_energy_kwh` literally:
+
+- HoldPolicy remains the conceptual counterfactual;
+- the **economic** horizon is the horizon being optimised;
+- terminal inventory protection is reproduced on the bucketed solver grid, using
+  the same physical model the DP searches over;
+- the bound is **reachable by construction** — it is the endpoint of a feasible
+  path, namely the bucketed idle-with-absorption walk;
+- the user's configured floor remains unmodified;
+- the continuous reference value is never silently confused with the bucketed
+  constraint, which is why `terminal_basis` reads
+  `hold_trajectory_end_on_bucket_grid` rather than `hold_trajectory_end`.
+
+Why the literal reading was approved away: the requested figure is continuous, and
+bucketed absorption loses up to one bucket per interval against it, so on a sunny
+horizon the request can sit above every reachable state. Enforcing it then makes an
+otherwise valid horizon artificially infeasible — a bound nobody can satisfy is not
+a bound, it is a refusal to plan. `test_economic_model.py` retains the regression
+proving both halves: that the literal bound collapses the sunny default
+configuration, and that the corrected bound produces a valid plan.
+
+What is published is what is enforced. Publishing a bound the solver quietly
+relaxed would be worse than either alternative.
+
+The reproduction has a second, incidental benefit. `plan.reference` is simulated
+over the *plan's* horizon, which is usually longer than the economic one; the hold
+trajectory is monotone non-decreasing, so the request is always at or above the
+correct figure and the bucketed walk brings it back to the endpoint over the
+horizon actually being optimised.
+
+### Desired versus capability — two solves, not one and a downgrade
+
+`desired` optimises over every action the physics allows. `capability` is a
+*separately computed* plan over `IMPLEMENTED_ACTIONS` — charge and discharge; export
+and photovoltaic curtailment have no primitive at all.
+
+Keeping them apart is what lets the optimum stay undistorted by which actuators
+happen to exist, and it is what makes `economic_value_forgone_eur` meaningful. A
+filtered copy would have kept the desired plan's charge *window*, chosen to feed a
+sale that no longer happens, and would therefore have reported a capability the
+actuators do not have.
+
+`capability_action` is computed **before** the global execution barrier, and that
+is the whole contract: it is not a claim that anything was or could be executed in
+this release, only that the actuators which exist could have produced it.
+`execution_blocked_reason` is the separate fact, and while the barrier stands it is
+the only value that field can take — no per-action reason may mask the fact that
+the release sends nothing.
+
+`capability_gap_reason` compares the two on the underlying **direction**, with
+`safety_buy` normalised back to the charge it is. Otherwise a desired charge
+attributed to the reserve and a capability charge that was not would read as a
+capability gap while both plans did the same thing in the same intervals for the
+same reason.
+
+### Safety buy is a label, not a mechanism
+
+A third solve, identical except that the reserve is relaxed to the configured
+floor, is compared against the desired plan. A charge run whose charging shrinks
+by more than one bucket in the relaxed plan is a charge the reserve was
+responsible for.
+
+Attribution by comparison rather than by inspection of prices, because a cheap
+interval and a reserve deadline coincide constantly — no price threshold could
+separate them. The relaxed plan is never published as a plan and never acted on.
+
+Note that the relaxed solve still respects the *configured* floor. It is the
+reserve that is relaxed, never the user's own setting.
+
+### Every euro is grid AC energy
+
+```
+cost = import_price × grid_import_kwh − export_price × grid_export_kwh
+```
+
+with the residual split supplied by `battery.split_grid_energy` and by nothing
+else. Two formulas for a residual is one too many, and the one that got it wrong
+omitted production entirely: a five-kilowatt discharge against a one-kilowatt load
+with five kilowatts of sun exports nine, not four.
+
+Each interval and each run carries six energies separately, each from an existing
+primitive:
+
+| quantity | source | boundary |
+|---|---|---|
+| `battery_delta_dc_kwh` | `apply_request` | DC |
+| `battery_charge_ac_kwh` | `apply_request` | AC, battery side |
+| `battery_discharge_ac_kwh` | `apply_request` | AC, battery side |
+| `grid_import_kwh` | `split_grid_energy` | AC, meter |
+| `grid_export_kwh` | `split_grid_energy` | AC, meter |
+| `pv_curtailed_kwh` | the closed-form curtailment | AC |
+
+`Economic Action.energy_kwh` is **the AC energy of the flow the action
+controls**, which is a different field per action: the charge for `charge` and
+`safety_buy`, the discharge for `discharge`, the *grid export* for `export`, and
+the production declined for `curtail_pv`. `export` is deliberately the one
+grid-side figure — the commanded quantity is still a battery rate and exceeds the
+export by the house load, and both are in the per-run diagnostics, but a user
+reading "export 4.5 kWh" means the meter.
+
+`price_eur_kwh` follows the same boundary: the import price for a charge, the
+export price for an export, and for a load-serving discharge the import price it
+*avoids*, which is the price that makes load-shifting worth anything.
+
+### `minimum_trade_gain_eur`
+
+One knob, charged once per **discretionary economic action run** inside the
+objective — which is why the run state is a dimension of the search. Ambient
+production absorption is not a discretionary action, so it is never charged; see
+*`charge` means buying* above. Charging the fee per interval would suppress exactly
+the wrong trades: a long profitable window pays it once per interval and dies,
+while a single-interval micro-cycle pays it once and survives.
+
+It is **not** a degradation model. It is the user's answer to "how small is too
+small", and it suppresses the micro-cycle a per-kWh cost cannot — a tenth of a
+kilowatt-hour at a wide margin still earns only a few cents.
+
+Reserve-protection charging happens below it with **no exemption rule**, because
+reserve feasibility already outranks cost. A special case would be a thing that
+can be applied in the wrong place.
+
+`expected_net_value_eur` is `hold_cost − cost`, **plus** the switching cost added
+back. Nobody pays the switching cost; it is a notional device for suppressing
+pointless action, so reporting a gain net of it would understate what the plan
+actually earns. Both terms are published separately.
+
+### Curtailment, in closed form
+
+If the export price is negative, decline exactly the energy that would otherwise
+have been exported, and no more. Declining past that point forces import at a
+positive price to cover load that free production was about to meet.
+
+Curtailment has no actuator, so it only ever appears in the desired plan.
+
+### Grid limits are unknown, and say so
+
+The integration has no way to learn a connection or contractual limit. The
+advisory peaks in provenance are derived from the plan's own per-interval
+residuals — so production is in them by construction and the peak cannot be
+understated by a formula that forgot it — and they are bounded by the inverter and
+the battery only. `connection_limit_kw` is `None`,
+`connection_limit_source` is `"unknown"`, and the payload states out loud that a
+reported peak may exceed what the connection can carry. Executing nothing is what
+makes that safe.
+
+### Activity
+
+One logbook line per material change, via `EVENT_LOGBOOK_ENTRY` with both `domain`
+and `entity_id` set — the domain alone files the line under the integration but
+attaches it to nothing, which is not where a user looking at the economic action
+will look.
+
+Three properties, each enforced by the shape of the code:
+
+- **Strictly observational.** `next_activity` receives the previous entry, the
+  economic outcome and a preformatted clock window, and nothing else. It cannot see
+  the plan, the control report, the safety state or the recovery machinery because
+  they are not arguments, so a later phase that wants to log an execution event has
+  to change the signature.
+- **Write-only.** Nothing subscribes, no figure is derived from a line, and an
+  installation without the recorder produces identical numbers.
+- **It cannot claim the battery did anything.** The six event kinds partition into
+  four about *advice* — `planned`, `changed`, `ended`, `refused` — and two about
+  *execution*, `started` and `cancelled`. The execution pair is refused outright
+  while `CONTROL_EXECUTION_AVAILABLE` is false, and every advice line carries the
+  advisory qualifier. A line reading "charge started" on a release that sends no
+  command would be a lie about the hardware, which is the one failure mode this
+  surface must not have.
+
+Change-triggered on a **coarse** fingerprint: the action, the capability action,
+the window and the power and energy rounded to `ECONOMIC_MATERIAL_POWER_KW` and
+`ECONOMIC_MATERIAL_ENERGY_KWH`. Ninety-six unchanged refreshes must be silent, and
+the only way to guarantee that is for the fingerprint not to notice noise.
+
+The state is held on the entity and reset by a reload, which costs one redundant
+`planned` line and buys not persisting a logbook cursor — storing it would make an
+observational surface a thing that can be restored wrong.
+
+### Evidence, and why the fingerprint is over the inputs
+
+A fifth change-fingerprinted snapshot family, scalars only. It exists because the
+*economic settings and the actuator capability* a plan was computed under are not
+recoverable afterwards: prices, load, production and the reserve are all persisted
+already, so the arithmetic is reproducible, but a threshold the user changed or an
+opt-in they turned on would otherwise make every earlier plan unverifiable.
+
+The digest is over the six input fingerprints and the model version, **never** over
+the plan. A plan's horizon starts at the next boundary, so the answer differs every
+quarter-hour even when nothing has changed — digesting it would store ninety-six
+documents a day and break the rule that an unchanged refresh costs no I/O. Phase 7
+shipped that defect once; it is pinned here from both sides.
+
+There is no outcome half. What a plan *actually* cost needs measured grid flows,
+which this release begins recording per interval and which Phase 9 will score
+against.
+
+### Solve cost
+
+Three solves per refresh over a horizon of up to ninety-six intervals and
+eighty-nine buckets. The first working version took 670 ms, because
+`split_grid_energy` was called once per state transition — roughly nine hundred
+thousand times.
+
+The AC energies for a given change in stored energy are identical from every
+bucket, because the clamp rejects any move it had to reduce and every surviving
+move is therefore exactly linear. So the per-interval outcomes are precomputed by
+bucket delta: about a hundred and seventy-seven entries per interval instead of one
+per state, thirty-four thousand calls instead of nine hundred thousand. All three
+solves over a full ninety-six-interval day now take about 185 ms, on top of a 14 ms
+table build, inside a fifteen-minute refresh, in the executor.
+
+`test_economic_model.py` guards a full-day solve against the refresh budget so the
+regression cannot come back silently.
+
+### Known open items — Phase 8 Stage A
+
+**No actuator exists for export or for photovoltaic curtailment.** They are
+modelled so the strategy can be validated before anything is built to perform
+them, and `economic_value_forgone_eur` is the number that would justify building
+one. Until then a desired `export` shows a capability of `discharge` or `hold`,
+and that gap is reported rather than smoothed over.
+
+**No connection or contractual grid limit is known.** Recorded as unknown, with
+the advisory peaks beside it. A Stage-B blocker: a plan that could actually be
+executed must not be able to command a flow the connection cannot carry.
+
+**`device_cutoff_percent` rounds up**, which is wrong for a charge ceiling and
+harmless while nothing charges. Carried forward from Phase 4, still a Stage-B
+blocker, still with its own test.
+
+**The requirement carries no margin for forecast error**, and the optimizer
+inherits that. `ForecastUncertainty.interval_margin_kwh` stays deliberately unread:
+widening a plan by measured error is optimisation under uncertainty, which is
+Phase 9.
+
+**No outcome is scored.** Measured grid import and export are now recorded per
+interval and read by nothing. Whether a plan was right is Phase 9's question, and
+a verdict written here would be one this phase has no basis for.
+
 ## Entity contract
 
-Exactly eleven sensors and one select — four from Phase 1, two from Phase 2,
-three from Phase 3, one sensor and the select from Phase 4, one from Phase 7.
-Phases 5 and 6 add **none**: expected production and price both reach the plan or
+Exactly twelve sensors and one select — four from Phase 1, two from Phase 2,
+three from Phase 3, one sensor and the select from Phase 4, one from Phase 7, one
+from Phase 8. Phases 5 and 6 add **none**: expected production and price both reach the plan or
 the diagnostics without becoming published state, and a price entity would
 duplicate one the source already publishes. Phase 7 adds one, because the
 requirement it computes is invisible in every existing entity — `Usable Battery
 Energy` is measured against the *configured* floor, so without a sensor the whole
 phase would be a diagnostics download from the user's chair. Its two
 counterfactuals, the peak, the constraint tallies and the provenance stay in
-diagnostics. Unique IDs
+diagnostics. Phase 8 adds one for the same reason: the action it
+computes appears in no existing entity, and without a sensor the whole phase would
+be a diagnostics download from the user's chair. Its eight attributes are capped as
+a *set* rather than a count, so a useful one cannot be swapped for a useless one;
+both plans' totals, the per-run detail, the counterfactuals, the solver figures and
+the provenance stay in diagnostics. Unique IDs
 `{entry_id}_{key}`, all on one service device named from the entry title. Names
 are literal English with **no** `translation_key`: Home Assistant derives the
 entity ID from the translated name, so a translation key would give a Dutch user
@@ -2312,8 +2732,9 @@ Dutch entity IDs. This matches the sibling Frank Quarter Prices integration, and
 it is why the two new sensors carry no translation entries either.
 
 Neither forecast sensor sets `state_class` — a prediction must not become a
-long-term statistic. Nor does `Battery Recommendation`: a device class of `enum`
-permits none, and a long-term statistic over a category means nothing.
+long-term statistic. Nor do `Battery Recommendation` or `Economic Action`: a
+device class of `enum` permits none, and a long-term statistic over a category
+means nothing.
 
 The two Phase-2 error sensors invert both halves of that rule, deliberately. They
 **do** set `state_class`, because they measure error that has already happened
@@ -2339,7 +2760,13 @@ the config-entry registry, and nothing else. No HTTP client is imported,
 Exactly two modules call a service — `alphaess_adapter` and `solcast_source` — and
 that set is asserted as an exact list. Phase 6 did not extend it: prices are read
 from published state, so "Alpha EMS cannot make the price source fetch" is a
-property of there being no call site rather than of a name being avoided.
+property of there being no call site rather than of a name being avoided. Phase 8
+did not extend it either, and `PERMITTED_SERVICES` is still exactly three.
+
+Phase 8 fires one event, `EVENT_LOGBOOK_ENTRY`, and subscribes to none. Firing it
+is harmless on an installation without the logbook — the event simply goes unheard
+— so `dependencies` stays absent from the manifest rather than turning a
+decoration into a setup requirement.
 
 ## Future phases
 
@@ -2354,7 +2781,7 @@ What each next phase needs, and where it plugs in:
 | ~~**5** Solcast PV~~ | *shipped in beta.9* | production is a second series on the same index; the stepper still takes a sequence of demands. Asymmetric efficiency remains available and unused |
 | ~~**6** Frank prices~~ | *shipped in beta.12* | the series exists, normalised and stored, and is reachable from no module that decides anything. Phase 8 adds a cost function over the trajectories what-if already compares |
 | ~~**7** Dynamic reserve~~ | *shipped in beta.13, calculation only* | the requirement is computed and published; nothing obeys it. `dynamic_reserve` is deliberately **unwritten** and its tripwire test is still green, so this phase is structurally incapable of raising the floor. `interval_margin_kwh` remains unread, and the P10/P90 series remains unused — read `percentile_aggregation` first: a per-site sum is not a calibrated band |
-| **8** Economic optimisation, automatic buy and sell, **safety buy** | replace the objective, keep the simulator | the policy interface; `HoldPolicy` is already the counterfactual to price against, and the soft reserve is what makes “dip but never below the floor” expressible. `dynamic_reserve` goes beside `static_reserve`, computing `max(configured, dynamic)` **inside** the factory. Phase 7 identifies need; this phase decides the action, which is why safety buy belongs here and not there |
+| ~~**8** Economic optimisation, automatic buy and sell, **safety buy**~~ | *Stage A shipped in beta.14, calculation only* | the plan is computed and published; nothing executes it, and export and photovoltaic curtailment have no actuator at all. `HoldPolicy` turned out to serve twice — as the counterfactual every euro is measured against *and* as the terminal bound. `dynamic_reserve` is still **unwritten** and its Phase-3 tripwire is still green: the optimizer plans subject to the reserve without raising the floor. Stage B is the actuators and the execution path |
 | **9** Adaptive feedback | provenance and joins | recorded state of charge joins the Phase-2 snapshot by chronological index and target day; plans are recomputable; `policy_version` prevents pooling generations; separate efficiency fields let them be learned |
 | **10** Multi-day | a longer horizon | the simulator is horizon-agnostic and already walks today plus tomorrow |
 

@@ -158,7 +158,15 @@ STORAGE_VERSION: Final = 2
 #:   measured PV array, on exactly the same terms: absent on every earlier
 #:   document, read as "no samples" rather than as zeros, and read by nothing on
 #:   the learning path.
-STORAGE_MINOR_VERSION: Final = 3
+#: * **2.4** -- v1.0.0-beta.14. Day records gained optional per-interval measured
+#:   grid import and export arrays, on exactly the same terms again. They exist
+#:   because **what an economic plan actually cost is irrecoverable afterwards**:
+#:   Phase 8 can compute what a plan should cost from prices it holds, but the
+#:   realised flows exist nowhere else, and every day without them is a day whose
+#:   economics can never be reconstructed. Read by nothing that decides anything,
+#:   including the optimizer -- an optimizer learning from its own recorded
+#:   outcomes would be Phase 9 wearing Phase 8's clothes.
+STORAGE_MINOR_VERSION: Final = 4
 STORAGE_KEY_TEMPLATE: Final = f"{DOMAIN}.{{entry_id}}.learning"
 
 #: Config-entry schema version. v1 was the previous integration's source model,
@@ -378,13 +386,18 @@ FORECAST_STORAGE_VERSION: Final = 1
 #:   requirements, and index rows gained ``rsvfp``, their fingerprints. A
 #:   document without either reads unchanged, and an installation without
 #:   battery planning writes neither.
+#: * **1.5** -- v1.0.0-beta.14. Partitions gained ``eco``, the economic plans,
+#:   and index rows gained ``ecofp``, their fingerprints. Keyed on the plan's
+#:   *inputs* rather than on the plan, because the plan itself moves every
+#:   quarter-hour. A document without either reads unchanged, and an installation
+#:   without prices writes neither.
 #:
 #: One honest note for anyone diffing stored documents: photovoltaic snapshots
 #: (``pvs``/``pvo``) arrived in v1.0.0-beta.9 **without** a minor bump, so a
 #: document stamped 1.2 may or may not carry them. The reader tolerates both,
 #: which is why that omission is recorded here rather than papered over by
 #: restamping documents that were written correctly.
-FORECAST_STORAGE_MINOR_VERSION: Final = 4
+FORECAST_STORAGE_MINOR_VERSION: Final = 5
 
 #: Index document: schema version, the month partitions that exist, and the
 #: small daily summary rows. Always loaded.
@@ -1506,3 +1519,214 @@ RESERVE_UNAVAILABLE_REASONS: Final = (
 RESERVE_REPLENISHMENT_ASSUMPTION: Final = (
     "forecast_surplus_credited_within_charge_power_and_headroom"
 )
+
+# --- Phase 8: economic optimisation -------------------------------------------
+
+#: Bumped when the optimiser itself changes, so a plan recorded under an older
+#: rule is identifiable rather than pooled with a newer one -- the same role
+#: ``RESERVE_MODEL_VERSION`` and ``PRICE_MAPPING_VERSION`` play.
+ECONOMIC_MODEL_VERSION: Final = 1
+
+#: Hex characters kept from an economic digest, as everywhere else in the
+#: evidence layer.
+ECONOMIC_FINGERPRINT_CHARS: Final = 16
+
+#: Resolution of the optimiser's stored-energy grid, in DC kWh.
+#:
+#: The grid is an interpolation-free lattice: every candidate transition lands
+#: exactly on a bucket, so a run of charges cannot accumulate a rounding. Two
+#: things are measured against it and both are stated rather than inferred: the
+#: reserve requirement is quantised **up** to a bucket, so at most one bucket too
+#: much reserve is protected; and a measured state of charge is snapped **down**,
+#: so the plan never assumes more stored energy than the pack holds.
+#:
+#: It is also the reason the lexicographic objective is sound. With the
+#: requirement on a bucket boundary and every state on one, a violation is an
+#: exact multiple of this value -- so a shortfall of a thousandth of a
+#: kilowatt-hour is not ignored, it is unrepresentable, and reserve protection
+#: cannot cost real money to defend an imaginary quantity.
+ECONOMIC_BUCKET_KWH: Final = 0.25
+
+#: Decimal places for reported money and power.
+ECONOMIC_EUR_PRECISION: Final = 4
+ECONOMIC_POWER_PRECISION: Final = 3
+
+#: Planned runs described individually in diagnostics, soonest first.
+#:
+#: Eight rather than sixteen: a run is a ten-field mapping, and eight of those is
+#: already a substantial payload against a ceiling written for flat lists. The
+#: complete count sits beside it, because a truncated list that reads as complete
+#: is worse than a count.
+MAX_ECONOMIC_RUNS_REPORTED: Final = 8
+
+#: What the optimiser wants to do. ``export`` and ``curtail_pv`` are economic
+#: identities read off the grid residual rather than separate commands: a
+#: discharge whose surplus reaches the meter is an export, and declined
+#: production is a curtailment. Neither has an actuator in this release.
+#: Take no economic battery action. Also the value published when production
+#: naturally enters the battery: absorbing your own surplus is ambient physical
+#: behaviour, not a decision, so it is reported as ``hold`` rather than as a
+#: charge. See ``ECONOMIC_ACTION_CHARGE``.
+ECONOMIC_ACTION_HOLD: Final = "hold"
+#: **Buy** energy from the grid to put in the battery.
+#:
+#: This action, and ``CONF_ALLOW_GRID_CHARGING`` beside it, refer specifically to
+#: discretionary economic *grid purchase*. Neither is about energy moving into the
+#: pack:
+#:
+#:     physical battery charging from ambient production
+#:         is not
+#:     Alpha EMS economically choosing to buy from the grid
+#:
+#: Absorbed production therefore creates no action run, is charged no
+#: ``CONF_MINIMUM_TRADE_GAIN_EUR``, and needs no opt-in. It remains part of the
+#: physical trajectory and can still create value later through the energy it
+#: stored -- it simply is not a trade anybody chose.
+ECONOMIC_ACTION_CHARGE: Final = "charge"
+ECONOMIC_ACTION_DISCHARGE: Final = "discharge"
+ECONOMIC_ACTION_EXPORT: Final = "export"
+ECONOMIC_ACTION_CURTAIL: Final = "curtail_pv"
+ECONOMIC_ACTION_SAFETY_BUY: Final = "safety_buy"
+
+ECONOMIC_ACTION_OPTIONS: Final = (
+    ECONOMIC_ACTION_HOLD,
+    ECONOMIC_ACTION_CHARGE,
+    ECONOMIC_ACTION_DISCHARGE,
+    ECONOMIC_ACTION_EXPORT,
+    ECONOMIC_ACTION_CURTAIL,
+    ECONOMIC_ACTION_SAFETY_BUY,
+)
+
+#: Why the optimiser wants what it wants. A bounded vocabulary, like every other
+#: reason space in this project.
+ECONOMIC_REASON_CHEAP_WINDOW: Final = "cheap_window"
+ECONOMIC_REASON_EXPENSIVE_WINDOW: Final = "expensive_window"
+ECONOMIC_REASON_SAFETY_BUY: Final = "safety_buy"
+ECONOMIC_REASON_MAKE_HEADROOM: Final = "make_headroom"
+ECONOMIC_REASON_NEGATIVE_EXPORT: Final = "negative_export"
+ECONOMIC_REASON_RESERVE_RECOVERY: Final = "reserve_recovery"
+ECONOMIC_REASON_NO_ACTION: Final = "no_profitable_action"
+
+#: Why nothing could be planned.
+ECONOMIC_UNAVAILABLE_LIMITS: Final = "economic_limits_unavailable"
+ECONOMIC_UNAVAILABLE_NO_SOC: Final = "economic_soc_unavailable"
+ECONOMIC_UNAVAILABLE_NO_PRICES: Final = "economic_prices_unavailable"
+ECONOMIC_UNAVAILABLE_NO_RESERVE: Final = "economic_reserve_unavailable"
+ECONOMIC_UNAVAILABLE_HORIZON_EMPTY: Final = "economic_horizon_empty"
+#: The terminal condition could not be met from anywhere. Structurally
+#: unreachable now that the bound is clamped to the bucketed hold trajectory, and
+#: kept as a named guard rather than deleted: an earlier version reported this
+#: case as ``economic_horizon_empty``, which was a lie about a horizon that was
+#: four intervals long, and a wrong reason is worse than an unused one.
+ECONOMIC_UNAVAILABLE_TERMINAL_UNREACHABLE: Final = "economic_terminal_unreachable"
+
+ECONOMIC_UNAVAILABLE_REASONS: Final = (
+    ECONOMIC_UNAVAILABLE_LIMITS,
+    ECONOMIC_UNAVAILABLE_NO_SOC,
+    ECONOMIC_UNAVAILABLE_NO_PRICES,
+    ECONOMIC_UNAVAILABLE_NO_RESERVE,
+    ECONOMIC_UNAVAILABLE_HORIZON_EMPTY,
+    ECONOMIC_UNAVAILABLE_TERMINAL_UNREACHABLE,
+)
+
+#: Why the action the optimiser wants cannot be carried out.
+#:
+#: Precedence-ordered, most fundamental first. In this release the global barrier
+#: always applies, so every action reports ``execution_unavailable`` -- which is
+#: not low information, it is the single most important fact about the release,
+#: present on every reading rather than in prose.
+ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE: Final = "execution_unavailable"
+ECONOMIC_BLOCKED_NOT_ENABLED: Final = "execution_not_enabled"
+ECONOMIC_BLOCKED_MODE_NOT_ACTIVE: Final = "mode_not_active"
+ECONOMIC_BLOCKED_NO_PRIMITIVE_EXPORT: Final = "no_primitive_export"
+ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL: Final = "no_primitive_curtail"
+
+#: Why the capability plan differs from the desired one. Diagnostics only: the
+#: entity shows the two actions and lets them speak for themselves.
+ECONOMIC_GAP_NO_PRIMITIVE: Final = "no_primitive"
+ECONOMIC_GAP_FORECAST_INFEASIBLE: Final = "forecast_infeasible"
+ECONOMIC_GAP_NONE: Final = "none"
+
+#: The one economic setting.
+#:
+#: Charged once per discretionary battery-action *run* inside the objective, which
+#: is what makes it a single mechanism rather than a threshold bolted on
+#: afterwards. It suppresses the micro-cycle a per-kWh cost cannot -- a tenth of a
+#: kilowatt-hour at a wide margin still earns only a few cents -- and it is
+#: emphatically **not** a degradation model.
+#:
+#: Charged only against **discretionary economic action runs**. Ambient production
+#: absorption is not one, so it never pays the fee -- charging it would have the
+#: optimizer decline free energy to save money nobody pays.
+#:
+#: Reserve-protection charging can still happen below it, with no exemption rule,
+#: because reserve feasibility has lexicographic priority in the objective.
+CONF_MINIMUM_TRADE_GAIN_EUR: Final = "minimum_trade_gain_eur"
+DEFAULT_MINIMUM_TRADE_GAIN_EUR: Final = 0.10
+MIN_MINIMUM_TRADE_GAIN_EUR: Final = 0.0
+MAX_MINIMUM_TRADE_GAIN_EUR: Final = 5.0
+
+#: Explicit opt-ins for the two behaviours a user would be surprised by. Both
+#: change the *published plan*, so they are meaningful in shadow and belong in
+#: the form -- unlike ``CONF_CONTROL_EXECUTION_ENABLED``, which cannot change
+#: anything in this release and is therefore withheld from it.
+#:
+#: ``CONF_ALLOW_GRID_CHARGING`` permits **buying**, and nothing else. Storing
+#: production the house cannot use is permitted unconditionally, because it draws
+#: nothing from the meter. See ``ECONOMIC_ACTION_CHARGE``.
+CONF_ALLOW_GRID_CHARGING: Final = "allow_grid_charging"
+CONF_ALLOW_BATTERY_EXPORT: Final = "allow_battery_export"
+DEFAULT_ALLOW_GRID_CHARGING: Final = False
+DEFAULT_ALLOW_BATTERY_EXPORT: Final = False
+
+#: Entity key. One, and only one: the counterfactual plans, the per-run detail,
+#: the solver figures and the provenance are all diagnostics.
+SENSOR_ECONOMIC_ACTION: Final = "economic_action"
+
+#: Activity event kinds. Observational only: nothing in this integration
+#: subscribes to them, no planner or execution state is derived from them, and
+#: losing the recorder changes no figure.
+ECONOMIC_EVENT_PLANNED: Final = "planned"
+ECONOMIC_EVENT_CHANGED: Final = "changed"
+ECONOMIC_EVENT_STARTED: Final = "started"
+ECONOMIC_EVENT_ENDED: Final = "ended"
+ECONOMIC_EVENT_CANCELLED: Final = "cancelled"
+ECONOMIC_EVENT_REFUSED: Final = "refused"
+
+ECONOMIC_EVENT_KINDS: Final = (
+    ECONOMIC_EVENT_PLANNED,
+    ECONOMIC_EVENT_CHANGED,
+    ECONOMIC_EVENT_STARTED,
+    ECONOMIC_EVENT_ENDED,
+    ECONOMIC_EVENT_CANCELLED,
+    ECONOMIC_EVENT_REFUSED,
+)
+
+#: The kinds that describe *advice*: it appeared, it changed materially, it went
+#: away, or it asked for something no actuator can perform. Every one of them is
+#: a statement about what the optimizer wants, and none is a statement about the
+#: battery.
+ECONOMIC_ADVICE_EVENT_KINDS: Final = (
+    ECONOMIC_EVENT_PLANNED,
+    ECONOMIC_EVENT_CHANGED,
+    ECONOMIC_EVENT_ENDED,
+    ECONOMIC_EVENT_REFUSED,
+)
+
+#: The kinds that describe *execution*: a command went out and began, or a
+#: command in flight was withdrawn. They are unreachable while
+#: ``CONTROL_EXECUTION_AVAILABLE`` is false, and the emitter refuses them rather
+#: than trusting that no caller will ask -- an Activity line reading "started"
+#: while the integration sends nothing would be a lie about the battery, which is
+#: the one thing this surface must never say. The vocabulary is fixed here so
+#: Stage B inherits it rather than inventing it.
+ECONOMIC_EXECUTION_EVENT_KINDS: Final = (
+    ECONOMIC_EVENT_STARTED,
+    ECONOMIC_EVENT_CANCELLED,
+)
+
+#: Below this, a change in a planned run's power or energy is not worth an
+#: Activity entry. Material change, not any change: a plan that shifts by a watt
+#: has not done anything a person needs to read about.
+ECONOMIC_MATERIAL_POWER_KW: Final = 0.2
+ECONOMIC_MATERIAL_ENERGY_KWH: Final = 0.2

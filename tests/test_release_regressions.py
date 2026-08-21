@@ -420,7 +420,12 @@ async def test_the_options_flow_still_opens_normally(
 
     menu = await hass.config_entries.options.async_init(setup_integration.entry_id)
     assert menu["type"] is FlowResultType.MENU
-    assert set(menu["menu_options"]) == {"sources", "battery", "control"}
+    assert set(menu["menu_options"]) == {
+        "sources",
+        "battery",
+        "control",
+        "economics",
+    }
 
     for page in ("sources", "battery", "control"):
         result = await open_options(hass, setup_integration.entry_id, page)

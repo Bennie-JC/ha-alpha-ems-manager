@@ -118,7 +118,8 @@
         "menu_options": {
           "sources": "Sources",
           "battery": "Battery planning",
-          "control": "Control"
+          "control": "Control",
+          "economics": "Economics"
         }
       },
       "sources": {
@@ -185,6 +186,20 @@
         "data_description": {
           "control_horizon_minutes": "How long a command would tell the inverter to hold, in minutes. This is a safety timeout rather than a delivery time: the plan is rebuilt every fifteen minutes and each command replaces the last, so it only matters if Alpha EMS stops running -- then the inverter returns to normal by itself once this expires. It has to be longer than fifteen minutes or a command would lapse before the next one arrived.",
           "control_export_margin_percent": "How far below your current house load a discharge command must stay, in percent. A forced discharge sets the battery's rate, so anything the house cannot use goes out to the grid -- and the inverter's own feed-in limit does not apply to it. If a command would exceed this, the whole command is refused rather than made smaller."
+        }
+      },
+      "economics": {
+        "title": "Economics",
+        "description": "What Alpha EMS should consider worth doing with your battery. These settings change the plan it publishes and the figures beside it -- they do not make anything happen. This release sends no command to your inverter, so an economic plan here is a recommendation you can watch, compare against your bill and disagree with.",
+        "data": {
+          "minimum_trade_gain_eur": "Minimum gain per trade",
+          "allow_grid_charging": "Allow buying from the grid",
+          "allow_battery_export": "Allow selling from the battery"
+        },
+        "data_description": {
+          "minimum_trade_gain_eur": "How much a single charge or discharge has to earn before it is worth planning, in euros. Charged once per stretch of one action, not per kilowatt-hour, which is what stops a plan full of two-cent trades that wear the battery for nothing. Zero means take every trade the prices justify. This is not a wear model: it is your answer to \"how small is too small\". Charging to protect the reserve ignores it, because keeping the house supplied is not a trade -- and so does your own solar entering the battery, because nobody chose to do that.",
+          "allow_grid_charging": "Whether the plan may **buy** energy from the grid to put in the battery. Off by default, because a battery that only ever stores your own solar cannot lose money on a price forecast. Turning it on lets the plan buy in cheap hours -- and lets it plan a safety purchase when the reserve cannot be met from your panels. This is about buying only: your panels filling the battery is not grid charging, needs no permission, and shows as \"hold\" rather than \"charge\".",
+          "allow_battery_export": "Whether the plan may sell stored energy back to the grid. Off by default. Turning it on lets the plan value your battery at the export price rather than only at the import price it avoids, which usually finds more to do in the evening peak. Note that no inverter command for this exists in this release, so the plan will show it as wanted and unavailable -- which is the point: you can see what it is worth before anything is built to do it."
         }
       }
     }

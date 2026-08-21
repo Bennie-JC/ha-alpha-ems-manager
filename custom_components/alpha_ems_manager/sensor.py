@@ -1,19 +1,22 @@
 """Sensor platform for Alpha EMS Manager.
 
-Eleven sensors: the four Phase-1 forecast and learning ones, the two Phase-2
+Twelve sensors: the four Phase-1 forecast and learning ones, the two Phase-2
 forecast-error ones, the three Phase-3 battery ones, the single Phase-4
-control state, and the single Phase-7 dynamic reserve. Every other quantity
-the integration computes -- per-slot profiles, window means, balance residuals,
-coverage statistics, per-horizon error breakdowns, the snapshot inventory, the
-simulated battery trajectory -- is available through diagnostics instead.
-Ninety-six quarter sensors and five window averages would be technically easy and
-practically awful.
+control state, the single Phase-7 dynamic reserve, and the single Phase-8
+economic action. Every other quantity the integration computes -- per-slot
+profiles, window means, balance residuals, coverage statistics, per-horizon error
+breakdowns, the snapshot inventory, the simulated battery trajectory, the
+per-interval reserve curve, the economic counterfactuals and every planned run --
+is available through diagnostics instead. Ninety-six quarter sensors and five
+window averages would be technically easy and practically awful.
 
-The three Phase-3 sensors describe a plan that is never executed, and the
-Phase-4 one describes what the control pipeline made of that plan -- including
-whether it would have been safe to carry out. Nothing in this integration issues
-a command to a battery: the recommendation and the verdict are published so both
-can be watched for weeks before anything is allowed to act on either.
+The three Phase-3 sensors describe a plan that is never executed, the Phase-4 one
+describes what the control pipeline made of that plan -- including whether it
+would have been safe to carry out -- and the Phase-8 one describes what the
+optimizer would *want* to do, beside what implemented actuators could achieve and
+why nothing is sent. Nothing in this integration issues a command to a battery:
+all of it is published so it can be watched for weeks before anything is allowed
+to act on any of it.
 
 The two Phase-2 sensors measure error that has already happened, so unlike the
 forecast sensors they do carry a state class: a record of how wrong last week
@@ -32,8 +35,10 @@ override in the UI anyway.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -42,20 +47,38 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfPower
-from homeassistant.core import HomeAssistant
+from homeassistant.const import (
+    EVENT_LOGBOOK_ENTRY,
+    PERCENTAGE,
+    UnitOfEnergy,
+    UnitOfPower,
+)
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from . import AlphaEmsConfigEntry
+from .activity import ActivityEntry, ActivityState, logbook_payload, next_activity
 from .const import (
     BATTERY_ACTION_OPTIONS,
     BATTERY_KW_PRECISION,
     BATTERY_KWH_PRECISION,
     BATTERY_SOC_PRECISION,
+    CONTROL_EXECUTION_AVAILABLE,
+    CONTROL_MODE_ACTIVE,
     CONTROL_STATE_OPTIONS,
     DOMAIN,
+    ECONOMIC_ACTION_CURTAIL,
+    ECONOMIC_ACTION_EXPORT,
+    ECONOMIC_ACTION_OPTIONS,
+    ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+    ECONOMIC_BLOCKED_MODE_NOT_ACTIVE,
+    ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL,
+    ECONOMIC_BLOCKED_NO_PRIMITIVE_EXPORT,
+    ECONOMIC_BLOCKED_NOT_ENABLED,
+    ECONOMIC_EUR_PRECISION,
     FORECAST_ERROR_WINDOW_DAYS,
     NAME,
     SENSOR_BATTERY_PLANNED_POWER,
@@ -63,6 +86,7 @@ from .const import (
     SENSOR_BATTERY_USABLE_ENERGY,
     SENSOR_CONTROL_STATE,
     SENSOR_DYNAMIC_RESERVE,
+    SENSOR_ECONOMIC_ACTION,
     SENSOR_EXPECTED_LOAD_TODAY,
     SENSOR_EXPECTED_LOAD_TOMORROW,
     SENSOR_FORECAST_ERROR_WINDOW,
@@ -71,8 +95,12 @@ from .const import (
     SENSOR_LEARNING_DAYS,
 )
 from .coordinator import AlphaEmsCoordinator
+from .economic import EconomicOutcome
 from .plan import BatteryPlan
 from .reserve import RESERVE_BASIS, shortfall
+from .storage import interval_start_utc
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -81,6 +109,14 @@ class AlphaEmsSensorDescription(SensorEntityDescription):
 
     value_fn: Callable[[AlphaEmsCoordinator], float | int | str | None]
     attributes_fn: Callable[[AlphaEmsCoordinator], dict[str, Any]] | None = None
+    #: Optional, and set on exactly one sensor. Given the previous entry, returns
+    #: the Activity line this refresh deserves -- or ``None``, which is the
+    #: overwhelmingly common answer. Declared on the description rather than
+    #: subclassing the entity so the twelve sensors stay one class.
+    activity_fn: (
+        Callable[[AlphaEmsCoordinator, ActivityState | None], ActivityEntry | None]
+        | None
+    ) = None
 
 
 def _round(value: float | None, digits: int = 2) -> float | None:
@@ -461,6 +497,156 @@ def _dynamic_reserve_value(coordinator: AlphaEmsCoordinator) -> float | None:
     return _round(plan.reserve_projection.required_now_dc_kwh, BATTERY_KWH_PRECISION)
 
 
+def _economic_outcome(coordinator: AlphaEmsCoordinator) -> EconomicOutcome | None:
+    """Return this refresh's economic plan, or ``None``."""
+    outcome = (coordinator.data or {}).get("economic")
+    return outcome if isinstance(outcome, EconomicOutcome) else None
+
+
+def _economic_action_value(coordinator: AlphaEmsCoordinator) -> str | None:
+    """Return the action the optimizer economically wants.
+
+    The **desired** action, not what would be executed -- and this release
+    executes nothing at all. What implemented actuators could achieve is the
+    ``capability_action`` attribute beside it, and whether anything is sent is
+    ``execution_blocked_reason``, which reads ``execution_unavailable`` on every
+    reading while the release barrier stands.
+
+    ``unknown`` rather than ``hold`` when no plan could be built: "nothing is
+    worth doing" and "nothing could be worked out" are different answers, and a
+    reassuring ``hold`` derived from absent prices would be the second wearing the
+    first's clothes.
+    """
+    outcome = _economic_outcome(coordinator)
+    if outcome is None or not outcome.available:
+        return None
+    action = outcome.action
+    return action if action in ECONOMIC_ACTION_OPTIONS else None
+
+
+def _economic_action_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return the eight flat values behind the economic action.
+
+    Eight, which is the cap, and chosen to answer one question each: what would
+    implemented actuators do, why can nothing be sent, what would it do *now* and
+    at what power, over how much energy and when, why, at what price, and for
+    what gain. Everything else -- the capability plan's own totals, the per-run
+    detail, the counterfactuals, the solver figures and the provenance -- is in
+    diagnostics.
+
+    ``power_kw`` is the **first actionable interval's** power, never the run
+    average. A multi-interval run varies with load, production, headroom, the
+    reserve trajectory and the clamp, so an average would describe none of its
+    intervals; the average is published per run in diagnostics where it belongs.
+    """
+    outcome = _economic_outcome(coordinator)
+    if outcome is None or not outcome.available:
+        return {"execution_blocked_reason": ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE}
+    run = outcome.desired.published_run
+    return {
+        "capability_action": outcome.capability_action,
+        "execution_blocked_reason": _economic_blocked_reason(coordinator),
+        "power_kw": _round(outcome.desired.power_kw, BATTERY_KW_PRECISION),
+        "energy_kwh": _round(
+            0.0 if run is None else run.energy_kwh, BATTERY_KWH_PRECISION
+        ),
+        "window": _economic_window(coordinator, run),
+        "reason": outcome.reason,
+        "price_eur_kwh": outcome.price_eur_kwh,
+        "expected_net_value_eur": _round(
+            outcome.desired.expected_net_value_eur, ECONOMIC_EUR_PRECISION
+        ),
+    }
+
+
+def _economic_activity(
+    coordinator: AlphaEmsCoordinator, previous: ActivityState | None
+) -> ActivityEntry | None:
+    """Return the Activity line this refresh deserves, or ``None`` for silence.
+
+    The one place the clock window is rendered for a logbook line, and it reuses
+    the same helper the attribute does -- so an entry can never disagree with the
+    entity it is filed against.
+    """
+    outcome = _economic_outcome(coordinator)
+    run = (
+        None
+        if outcome is None or not outcome.available
+        else outcome.desired.published_run
+    )
+    return next_activity(
+        previous=previous,
+        outcome=outcome,
+        window=_economic_window(coordinator, run),
+    )
+
+
+def _economic_blocked_reason(coordinator: AlphaEmsCoordinator) -> str:
+    """Return why nothing is sent, most fundamental reason first.
+
+    The global barrier wins. While ``CONTROL_EXECUTION_AVAILABLE`` is false this
+    is the only value the field can take, and that is the point: no per-action
+    reason may mask the fact that the release sends nothing.
+    """
+    if not CONTROL_EXECUTION_AVAILABLE:
+        return ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE
+    if not coordinator.config.control_execution_enabled:  # pragma: no cover
+        return ECONOMIC_BLOCKED_NOT_ENABLED
+    if coordinator.control_mode != CONTROL_MODE_ACTIVE:  # pragma: no cover
+        return ECONOMIC_BLOCKED_MODE_NOT_ACTIVE
+    outcome = _economic_outcome(coordinator)  # pragma: no cover
+    if outcome is not None:  # pragma: no cover
+        if outcome.action == ECONOMIC_ACTION_EXPORT:
+            return ECONOMIC_BLOCKED_NO_PRIMITIVE_EXPORT
+        if outcome.action == ECONOMIC_ACTION_CURTAIL:
+            return ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL
+    return ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE  # pragma: no cover
+
+
+def _economic_window(coordinator: AlphaEmsCoordinator, run: Any) -> str | None:
+    """Return the planned run's local clock window as one string.
+
+    One attribute rather than two, because a start without an end says nothing
+    useful and the pair costs a slot the capability action needs more.
+    """
+    if run is None:
+        return None
+    plan = _plan(coordinator)
+    if plan is None or plan.target_day is None:
+        return None
+    tz = dt_util.get_default_time_zone()
+    count = 0 if plan.forecast is None else _today_interval_count(plan)
+    start = _economic_instant(plan.target_day, run.start_index, count, tz)
+    end = _economic_instant(plan.target_day, run.end_index + 1, count, tz)
+    if start is None or end is None:
+        return None
+    return f"{start:%H:%M}-{end:%H:%M}"
+
+
+def _today_interval_count(plan: BatteryPlan) -> int:
+    """Return today's real interval count, as the plan recorded it."""
+    today = plan.forecast.get("today") or {}
+    count = today.get("interval_count")
+    return count if isinstance(count, int) else 0
+
+
+def _economic_instant(day: Any, index: int, today_count: int, tz: Any) -> Any:
+    """Return the local instant a chronological index begins at.
+
+    The plan indexes a continuous run through today and on into tomorrow, so an
+    index at or beyond today's real length names an interval of tomorrow -- and
+    the length is 92, 96 or 100 depending on the civil day, which is why it is
+    read rather than assumed.
+    """
+    if today_count <= 0:
+        return None
+    if index < today_count:
+        return dt_util.as_local(interval_start_utc(day, index, tz))
+    return dt_util.as_local(
+        interval_start_utc(day + timedelta(days=1), index - today_count, tz)
+    )
+
+
 def _dynamic_reserve_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
     """Return the eight flat values behind the requirement.
 
@@ -683,6 +869,19 @@ SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
         attributes_fn=_dynamic_reserve_attributes,
     ),
     AlphaEmsSensorDescription(
+        key=SENSOR_ECONOMIC_ACTION,
+        name="Economic Action",
+        icon="mdi:cash-clock",
+        # An enum, like Battery Recommendation and Control State, and for the
+        # same reason: it is categorical, so a long-term statistic over it would
+        # mean nothing.
+        device_class=SensorDeviceClass.ENUM,
+        options=list(ECONOMIC_ACTION_OPTIONS),
+        value_fn=_economic_action_value,
+        attributes_fn=_economic_action_attributes,
+        activity_fn=_economic_activity,
+    ),
+    AlphaEmsSensorDescription(
         key=SENSOR_CONTROL_STATE,
         name="Control State",
         icon="mdi:shield-check-outline",
@@ -723,6 +922,10 @@ class AlphaEmsSensor(CoordinatorEntity[AlphaEmsCoordinator], SensorEntity):
         """Bind the sensor to its coordinator and description."""
         super().__init__(coordinator)
         self.entity_description = description
+        # Reset by a reload, which costs one redundant "planned" line and buys
+        # not persisting a logbook cursor. The alternative -- storing it -- would
+        # make an observational surface a thing that can be restored wrong.
+        self._activity: ActivityState | None = None
         entry = coordinator.entry
         # Config-entry scoped, so two Alpha EMS instances never collide.
         self._attr_unique_id = f"{entry.entry_id}_{description.key}"
@@ -745,3 +948,44 @@ class AlphaEmsSensor(CoordinatorEntity[AlphaEmsCoordinator], SensorEntity):
         if self.entity_description.attributes_fn is None:
             return {}
         return self.entity_description.attributes_fn(self.coordinator)
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe, then file the opening Activity line if one is due.
+
+        Here as well as on every update, because a plan that already exists at
+        startup would otherwise go unrecorded until it next changed -- and the
+        line a user most wants after a restart is the one saying what the
+        integration currently intends.
+        """
+        await super().async_added_to_hass()
+        self._file_activity()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Write the new state, and file an Activity line if one is due."""
+        self._file_activity()
+        super()._handle_coordinator_update()
+
+    @callback
+    def _file_activity(self) -> None:
+        """Fire one logbook entry, or nothing.
+
+        Wrapped, because Activity is decoration. A refresh that cannot render a
+        sentence must still publish its state: the entry is what is lost, never
+        the figure.
+        """
+        activity_fn = self.entity_description.activity_fn
+        if activity_fn is None:
+            return
+        try:
+            entry = activity_fn(self.coordinator, self._activity)
+            if entry is None:
+                return
+            payload = logbook_payload(entry, domain=DOMAIN, entity_id=self.entity_id)
+        except Exception:
+            _LOGGER.debug("activity entry could not be built", exc_info=True)
+            return
+        # Advanced only once the payload is built, so a failure retries rather
+        # than swallowing the transition it failed on.
+        self._activity = entry.state
+        self.hass.bus.async_fire(EVENT_LOGBOOK_ENTRY, payload)

@@ -220,6 +220,24 @@ class DayRecord:
     #: house load and the flexible load, and is subject to the same coverage
     #: threshold, so a partially observed interval is missing rather than short.
     pv: list[float | None] = field(default_factory=list)
+    #: Measured grid import and export per chronological interval, in kWh, or
+    #: ``None`` where there was no usable reading.
+    #:
+    #: Additive evidence on exactly the same terms as ``soc`` and ``pv``: nothing
+    #: in the learning, forecast, reserve or economic path reads either array.
+    #: ``test_economic_evidence.py`` pins that, and it matters more here than for
+    #: the two before it -- an optimizer that learned from its own recorded
+    #: outcomes would be Phase 9 wearing Phase 8's clothes.
+    #:
+    #: They are recorded because **what a plan actually cost is irrecoverable
+    #: afterwards.** Phase 8 can compute what a plan *should* cost from prices it
+    #: has, but the realised flows at 18:15 last Tuesday exist nowhere else, and
+    #: every day without them is a day whose economics can never be reconstructed.
+    #: Integrated rather than sampled, because both are flows: they go through
+    #: ``QuarterAccumulator`` like house load, the flexible load and generation,
+    #: and are subject to the same coverage threshold.
+    grid_import: list[float | None] = field(default_factory=list)
+    grid_export: list[float | None] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Size the parallel lists to the day's real interval count."""
@@ -235,6 +253,8 @@ class DayRecord:
             ("ev_expected", False),
             ("soc", None),
             ("pv", None),
+            ("grid_import", None),
+            ("grid_export", None),
         ):
             values = list(getattr(self, name))
             if len(values) < count:
@@ -282,6 +302,18 @@ class DayRecord:
     def soc_sample_count(self) -> int:
         """Return how many intervals carry a state-of-charge sample."""
         return sum(1 for value in self.soc if value is not None)
+
+    def grid_import_at(self, index: int) -> float | None:
+        """Return the measured grid import of one interval, or ``None``."""
+        if not 0 <= index < self.interval_count:
+            return None
+        return self.grid_import[index]
+
+    def grid_export_at(self, index: int) -> float | None:
+        """Return the measured grid export of one interval, or ``None``."""
+        if not 0 <= index < self.interval_count:
+            return None
+        return self.grid_export[index]
 
     def pv_at(self, index: int) -> float | None:
         """Return the measured PV energy of one interval, or ``None``."""
@@ -363,6 +395,8 @@ class DayRecord:
         ev_expected: bool,
         soc_percent: float | None = None,
         pv_kwh: float | None = None,
+        grid_import_kwh: float | None = None,
+        grid_export_kwh: float | None = None,
     ) -> bool:
         """Store one finalised interval by chronological index.
 
@@ -385,6 +419,10 @@ class DayRecord:
             self.soc[index] = round(soc_percent, _SOC_PRECISION)
         if pv_kwh is not None:
             self.pv[index] = round(pv_kwh, _KWH_PRECISION)
+        if grid_import_kwh is not None:
+            self.grid_import[index] = round(grid_import_kwh, _KWH_PRECISION)
+        if grid_export_kwh is not None:
+            self.grid_export[index] = round(grid_export_kwh, _KWH_PRECISION)
         return True
 
     # -- serialisation ---------------------------------------------------
@@ -414,6 +452,13 @@ class DayRecord:
             # arrays are. The document does not grow for a user this evidence
             # cannot help.
             payload["p"] = self.pv
+        if any(value is not None for value in self.grid_import):
+            # Omitted entirely until a usable reading exists, exactly as the
+            # three arrays above are. A document written before minor 2.4 has
+            # neither key, and reads as no samples rather than as zeros.
+            payload["gi"] = self.grid_import
+        if any(value is not None for value in self.grid_export):
+            payload["gx"] = self.grid_export
         return payload
 
     @classmethod
@@ -468,6 +513,12 @@ class DayRecord:
         # without PV. Read as missing samples rather than as zeros, which is the
         # difference between "the panels produced nothing" and "nobody looked".
         record.pv = _numeric_list(raw.get("p"), count)
+        # Absent on every document written before beta.14. Missing samples, never
+        # zeros: "the house exported nothing" and "nobody measured" are different
+        # facts, and the second must not be able to look like the first in a
+        # dataset a later phase will price.
+        record.grid_import = _numeric_list(raw.get("gi"), count)
+        record.grid_export = _numeric_list(raw.get("gx"), count)
         flags_raw = raw.get("x")
         if isinstance(flags_raw, list):
             record.ev_expected = [bool(flag) for flag in flags_raw[:count]] + [

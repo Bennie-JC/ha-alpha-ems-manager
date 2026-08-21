@@ -19,10 +19,10 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.13` — a public beta.**
+> **Current release: `1.0.0-beta.14` — a public beta.**
 >
-> The integration is feature-complete for Phase 7 and covered by 2256 automated
-> tests, but the learning and forecast model has **not** yet been validated
+> The integration is feature-complete for Phase 8 Stage A and covered by 2479
+> automated tests, but the learning and forecast model has **not** yet been validated
 > across enough real-world complete days to be called stable. Treat it as
 > something to run and observe, not yet as something to depend on.
 >
@@ -61,7 +61,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.13` is not offered.
+     dialog if `1.0.0-beta.14` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -370,12 +370,93 @@ continues past the last interval anyone forecast, and `headroom_limited` means s
 requirement in the horizon exceeds the whole pack. Detected and reported, never
 silently corrected.
 
+### Economic plan (new in Phase 8)
+
+`sensor.alpha_ems_economic_action` answers a different question from every sensor
+before it:
+
+> Given the prices, the load and the production that are actually known, and
+> subject to the reserve, what is the cheapest thing to do with the battery?
+
+Its state is what Alpha EMS **wants** to do — `hold`, `charge`, `discharge`,
+`export`, `curtail_pv` or `safety_buy`. Two attributes sit beside it and both
+matter more than the state:
+
+- `capability_action` is what actuators that actually exist could produce. Export
+  and photovoltaic curtailment have **no** primitive in this release, so a desired
+  `export` will regularly show a capability of `discharge` or `hold`.
+- `execution_blocked_reason` is why nothing is sent. While the release barrier
+  stands it reads `execution_unavailable`, and no per-action reason may mask it.
+
+**It is calculated, published, and executed by nothing.** No service call reaches
+your inverter. There is no cheap-hour buying, no selling, no curtailment — the
+plan is a recommendation you can watch, compare against your bill, and disagree
+with.
+
+Three things are worth understanding before you read it.
+
+**The optimum is not shaped by what can be built yet.** Two plans are computed
+independently: one over every action the physics allows, and one over the actions
+with a primitive. `economic_value_forgone_eur` in diagnostics is the euro
+difference — that is, what building the missing actuator would be worth. Letting
+the absence of a primitive distort the optimum would have made that number
+impossible to state.
+
+**Safety always wins, at any price.** The objective compares reserve feasibility
+*before* cost, so a shortfall can never unlock a profitable export. There is no
+fallback and no mode switch: when a shortfall cannot be avoided at all, the first
+comparison simply ties and the plan minimises cost while holding the shortfall at
+its unavoidable minimum. A `safety_buy` is a charge the reserve is responsible
+for, identified by re-solving with the reserve relaxed rather than by guessing
+from the price.
+
+**Two behaviours are off until you turn them on.** Charging from the grid and
+selling from the battery are both opt-ins on the new **Economics** options page,
+and both default to off. They change what the plan says, not what happens — a
+battery that may only store its own sunshine has far less to decide, which is why
+the sensor often reads `hold` out of the box.
+
+**Your solar filling the battery is not "charging from the grid".** This is the
+distinction the sensor is built around:
+
+> your battery physically charging from surplus production
+> **is not**
+> Alpha EMS choosing to buy energy from the grid
+
+`charge` as a state, and the *Allow charging from the grid* opt-in, both mean the
+second thing only. When your panels fill the battery while Alpha EMS is not
+economically doing anything, the sensor reads **`hold`** — that absorption creates
+no action, costs no minimum gain, needs no opt-in, and is still part of the
+trajectory the plan is computed over. It can absolutely create value later,
+through the energy it put in the pack; it is just not a decision anybody made.
+
+So a sunny afternoon with both opt-ins off will show `hold` while the battery
+fills. That is correct, not a fault.
+
+`minimum_trade_gain_eur` on the same page is the one economic knob: how much a
+single charge or discharge must earn before it is worth planning, charged once per
+stretch of one action rather than per kilowatt-hour, and **only** for actions
+Alpha EMS actually chose — never for absorbed sunshine. It is not a wear model. It
+is your answer to "how small is too small".
+
+Every planned run appears in the `economic_plan` block of a diagnostics download
+with all five energy boundaries stated separately — the two battery-side AC
+figures, the two grid-side ones, and the curtailment — because every euro in the
+payload is priced on grid energy and a reader has to be able to check that.
+
+A material change to the plan also files one line in the **logbook**, on the
+sensor's own history. Nothing reads those lines back, and every one of them says
+it is advisory.
+
 ## What it does **not** do yet
 
 - ❌ No automatic battery control. It never writes to your inverter.
 - ❌ No charge or discharge decisions. A reserve is now *calculated* (Phase 7)
   and nothing obeys it.
-- ❌ No energy arbitrage or price-based trading.
+- ❌ **No energy arbitrage or price-based trading is carried out.** Phase 8
+  Stage A *computes* one — including buying, selling and curtailment — and
+  executes none of it. No service call reaches the inverter, and export and
+  photovoltaic curtailment have no actuator at all.
 - ❌ No EV charge scheduling. Phase 1 only *separates* EV consumption from the
   baseline; it never starts, stops or plans charging.
 - ❌ No Solcast-driven *optimisation*. The forecast reduces what the battery is
@@ -392,17 +473,19 @@ silently corrected.
   cheap-hour buying, no overnight carry-over, no arbitrage. Expected production is
   an input to the plan, never a reason to buy or sell.
 - ❌ **No enforcement of the calculated reserve.** Phase 7 works out how much
-  energy the battery ought to be holding and publishes it. The planner still
-  discharges to the *configured* minimum state of charge, which remains the one
-  hard floor, so a requirement above it is reported and not obeyed. Acting on it
-  is Phase 8.
-- ❌ **No economic behaviour from prices, even though prices are now known.**
-  Phase 6 reads, normalises, cross-checks, reports and stores them. Nothing ranks
-  an interval, picks a cheapest window or expresses an objective, and the reserve
-  Phase 7 calculates is a physical figure that no price can move.
-  The price layer is not reachable from any module that decides what the battery
-  does, and that is enforced structurally rather than by a behavioural comparison
-  — see [Prices, and why they change nothing yet](#prices-and-why-they-change-nothing-yet).
+  energy the battery ought to be holding and publishes it; Phase 8 optimises
+  *subject to* it. The planner still discharges to the *configured* minimum state
+  of charge, which remains the one hard floor, so a requirement above it shapes
+  the published plan and is obeyed by nothing.
+- ❌ **No safety buy is ever made.** Phase 8 identifies one, labels it, and prices
+  it. Buying energy needs a command, and there is none.
+- ❌ **No economic *action* from prices, even though a plan is now computed from
+  them.** Phase 8 ranks intervals, picks windows and expresses an objective — and
+  publishes the answer. The reserve Phase 7 calculates is still a physical figure
+  no price can move, the price layer is still unreachable from the reserve, and
+  the optimizer still cannot reach a price source: prices arrive as a value, not
+  as something it can query. See
+  [Prices, and why they change nothing yet](#prices-and-why-they-change-nothing-yet).
 - ❌ No self-learning PV correction. Forecast and actual are both recorded raw;
   nothing is adjusted in response to error.
 - ❌ No stopping or continuing a dispatch. Nothing in the AlphaESS control
@@ -636,10 +719,11 @@ accuracy percentage is claimed, because none has been measured yet.
 
 ## Entities
 
-Exactly twelve — eleven sensors and one control. Everything else lives in
+Exactly thirteen — twelve sensors and one control. Everything else lives in
 diagnostics: per-slot profiles, window means, the simulated trajectory, the
-per-interval reserve curve, the constraint tallies and the whole evidence layer.
-Ninety-six quarter sensors would be technically easy and practically awful.
+per-interval reserve curve, the economic counterfactuals, every planned run, the
+constraint tallies and the whole evidence layer. Ninety-six quarter sensors would
+be technically easy and practically awful.
 
 | Entity | Unit | Meaning |
 |---|---|---|
@@ -653,13 +737,18 @@ Ninety-six quarter sensors would be technically easy and practically awful.
 | `sensor.alpha_ems_planned_battery_power` | kW | The advised interval-average power. Positive is charging |
 | `sensor.alpha_ems_usable_battery_energy` | kWh | Energy deliverable above the configured minimum |
 | `sensor.alpha_ems_dynamic_battery_reserve` | kWh | Energy that *ought* to remain available. Obeyed by nothing |
+| `sensor.alpha_ems_economic_action` | — | What it *wants* to do with the battery, and what could actually be done |
 | `sensor.alpha_ems_control_state` | — | What the control pipeline made of the recommendation |
 | `select.alpha_ems_control_mode` | — | `off`, `shadow` or `active`. Nothing executes in any of them |
 
 The three battery sensors and the control pair describe a plan that is never
-carried out, and `Dynamic Battery Reserve` describes a requirement nothing
-enforces. They are published so all of it can be watched for weeks before
-anything is allowed to act on any of it.
+carried out, `Dynamic Battery Reserve` describes a requirement nothing enforces,
+and `Economic Action` describes a trade nobody makes. They are published so all of
+it can be watched for weeks before anything is allowed to act on any of it.
+
+`Economic Action` carries `device_class: enum` and no state class, for the same
+reason `Battery Recommendation` does: a long-term statistic over a category means
+nothing.
 
 Neither forecast sensor declares a `state_class`. They carry `device_class:
 energy` so the UI formats them properly, but a *prediction* must not become a
