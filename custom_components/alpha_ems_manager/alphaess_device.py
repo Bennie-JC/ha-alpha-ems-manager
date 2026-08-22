@@ -35,7 +35,7 @@ ones used here by a single word.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .const import (
@@ -46,6 +46,7 @@ from .const import (
     CONTROL_DURATION_STEP_MINUTES,
     CONTROL_MAX_DURATION_MINUTES,
     CONTROL_MIN_DURATION_MINUTES,
+    CONTROL_MIN_POWER_KW,
     CONTROL_POWER_DECIMALS,
     CONTROL_POWER_STEP_KW,
 )
@@ -290,6 +291,25 @@ class DeviceCommand:
     #: The energy this command is allowed to deliver, and what it actually will.
     allowed_energy_ac_kwh: float
     commanded_energy_ac_kwh: float
+    #: How long the energy figures above are measured over, in hours. Carried so
+    #: :func:`limit_command` can recompute them from a reduced power without
+    #: dividing one by the other, which would be undefined at zero power and
+    #: lossy everywhere else.
+    interval_hours: float = 0.0
+    #: The power quantisation alone produced, before any safety clamp. Equal to
+    #: ``power_kw`` unless a clamp reduced it, which is what
+    #: :attr:`safety_limited` reads.
+    requested_power_kw: float = 0.0
+
+    @property
+    def safety_limited(self) -> bool:
+        """Return whether a safety bound reduced this command's power.
+
+        A reduction, never a substitution: the action, the cutoff and the
+        duration are untouched, and only the power and the energy that follows
+        from it move -- downwards.
+        """
+        return self.power_kw < self.requested_power_kw - 1e-12
 
     @property
     def moves_battery(self) -> bool:
@@ -313,11 +333,20 @@ class DeviceCommand:
             "allowed_energy_ac_kwh": round(self.allowed_energy_ac_kwh, 4),
             "commanded_energy_ac_kwh": round(self.commanded_energy_ac_kwh, 4),
             "undelivered_energy_ac_kwh": round(self.undelivered_energy_ac_kwh, 4),
+            "requested_power_kw": self.requested_power_kw,
+            "safety_limited": self.safety_limited,
             "moves_battery": self.moves_battery,
             "quantisation_rule": (
                 "power floored to the helper step so commanded energy never "
                 "exceeds allowed energy; cutoff raised one percent because the "
                 "device register truncates"
+            ),
+            "safety_limit_rule": (
+                "a non-exporting discharge is clamped down to the largest step "
+                "at or below the safely absorbable power, then its commanded "
+                "energy is recomputed from the reduced power over the same "
+                "duration; the duration and the cutoff are never changed to "
+                "compensate"
             ),
             "hold_flag_note": (
                 "device_hold_flag is the inverter's post-cutoff behaviour and is "
@@ -343,6 +372,8 @@ def build_command(intent: ControlIntent) -> DeviceCommand:
             energy_limit_bound=intent.energy_limit_bound,
             allowed_energy_ac_kwh=intent.energy_ac_kwh,
             commanded_energy_ac_kwh=0.0,
+            interval_hours=intent.interval_hours,
+            requested_power_kw=0.0,
         )
 
     power = device_power_kw(intent.energy_ac_kwh, intent.interval_hours)
@@ -355,6 +386,60 @@ def build_command(intent: ControlIntent) -> DeviceCommand:
         energy_limit_bound=intent.energy_limit_bound,
         allowed_energy_ac_kwh=intent.energy_ac_kwh,
         commanded_energy_ac_kwh=power * intent.interval_hours,
+        interval_hours=intent.interval_hours,
+        requested_power_kw=power,
+    )
+
+
+def limit_command(command: DeviceCommand, max_power_kw: float) -> DeviceCommand:
+    """Return the command reduced to at most ``max_power_kw``, or unchanged.
+
+    Pure and total, and it can only ever **subtract**: the returned power is at
+    most the power that went in, and the ceiling is applied through the same
+    :func:`device_power_kw` contract that quantises everything else, so it is
+    floored to a helper step and never rounded up past the bound.
+
+    Only a discharge is limited. Only a discharge can export, and clamping a
+    charge on an export bound would refuse to store energy for a reason that
+    cannot apply to it.
+
+    **Refusing is preferred to rounding up.** When nothing representable
+    survives -- no capacity, or a safe power below :data:`CONTROL_MIN_POWER_KW`
+    -- the command is returned *unchanged* rather than reduced to zero or raised
+    to the minimum step. That is deliberate on both counts: the gate then refuses
+    the original request whole, with the original ``would_export`` reason and the
+    original figures, so nothing about the failure path or its wording changed in
+    beta.15. Reducing it to zero here would have moved the refusal into this
+    module and reported the wrong reason.
+
+    The energy figures are recomputed from the reduced power over the **same**
+    duration. The duration is never extended to make up the difference: this
+    architecture has no delivery guarantee to preserve, each refresh supersedes
+    the last, and stretching a command to compensate would be this module
+    inventing a schedule. ``allowed_energy_ac_kwh`` is untouched, so the energy
+    given up simply appears in ``undelivered_energy_ac_kwh``.
+    """
+    if command.action != ACTION_DISCHARGE or command.power_kw <= 0.0:
+        return command
+    if not math.isfinite(max_power_kw):
+        # No provable bound is not a licence to send the request. Left for the
+        # gate, which refuses it.
+        return command
+    if max_power_kw >= command.power_kw:
+        return command
+
+    hours = command.interval_hours
+    if hours <= 0.0 or not math.isfinite(hours):  # pragma: no cover - build sets it
+        return command
+
+    limited = device_power_kw(max(0.0, max_power_kw) * hours, hours)
+    if limited < CONTROL_MIN_POWER_KW or limited >= command.power_kw:
+        return command
+
+    return replace(
+        command,
+        power_kw=limited,
+        commanded_energy_ac_kwh=limited * hours,
     )
 
 

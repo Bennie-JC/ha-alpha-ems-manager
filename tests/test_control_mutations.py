@@ -16,6 +16,7 @@ its parameters match what we would have sent.
 
 from __future__ import annotations
 
+import ast
 from contextlib import contextmanager
 from datetime import UTC, datetime
 
@@ -31,8 +32,10 @@ from custom_components.alpha_ems_manager.alphaess_device import (
 from custom_components.alpha_ems_manager.battery import INTERVAL_HOURS
 from custom_components.alpha_ems_manager.const import (
     ACTION_DISCHARGE,
+    CONTROL_MIN_POWER_KW,
     CONTROL_MODE_ACTIVE,
     CONTROL_MODE_SHADOW,
+    CONTROL_POWER_STEP_KW,
     INHIBIT_DISPATCH_ACTIVE,
     INHIBIT_GRID_STALE,
     INHIBIT_GRID_UNUSABLE,
@@ -700,6 +703,415 @@ def test_recomputing_the_energy_from_the_request_is_caught() -> None:
         assert not surviving(guard)
 
 
+# ===========================================================================
+# 11. the beta.15 safe-discharge clamp
+# ===========================================================================
+#
+# Sixteen mutations on one small function, because it sits between the decision
+# layer and the inverter and every one of these would either send a command that
+# exports or silently lose the refusal that stops one.
+#
+# The harness is a local reimplementation rather than a monkeypatch wherever the
+# mutation is arithmetic: reimplementing shows the broken rule in full, which is
+# what makes the test readable a year from now.
+
+
+CLAMP_REQUESTED_KW = 1.1
+CLAMP_CAPACITY_KW = 0.99
+CLAMP_MARGIN_PERCENT = 10.0
+
+
+def clamp_pieces(
+    *,
+    capacity_kw: float = CLAMP_CAPACITY_KW,
+    requested_kw: float = CLAMP_REQUESTED_KW,
+    margin_percent: float = CLAMP_MARGIN_PERCENT,
+    **context_overrides,
+):
+    """Return ``(requested, context, safe_kw)`` for one clamp scenario."""
+    from .test_control_pipeline import make_context, make_intent
+
+    intent = make_intent(energy_ac_kwh=requested_kw * INTERVAL_HOURS)
+    requested = build_command(intent)
+    readings = {
+        "grid_import_w": capacity_kw * 1000.0,
+        "grid_export_w": 0.0,
+        "battery_power_w": 0.0,
+        "house_load_w": max(50.0, capacity_kw * 1000.0),
+        "export_margin_percent": margin_percent,
+        **context_overrides,
+    }
+    context = make_context(device_power_kw=requested.power_kw, **readings)
+    return intent, requested, context, safety.safe_discharge_power_kw(context)
+
+
+def clamped_gate(intent, command, context):
+    """Return the verdict the gate reaches on an already-clamped command."""
+    import dataclasses
+
+    return safety.evaluate(
+        intent, dataclasses.replace(context, device_power_kw=command.power_kw)
+    )
+
+
+def test_removing_the_safety_margin_is_caught() -> None:
+    """Mutation: clamp to the raw absorbing capacity.
+
+    The margin exists because house load can change after the meter sample, and
+    dropping it is the single most tempting way to make more commands eligible.
+    It moves the live case from 0.8 kW to 0.9 kW -- above the 0.891 kW bound the
+    margin creates, which is exactly the band the race can eat.
+    """
+    _, requested, _, safe_kw = clamp_pieces()
+
+    honest = alphaess_device.limit_command(requested, safe_kw)
+    broken = alphaess_device.limit_command(requested, CLAMP_CAPACITY_KW)
+
+    assert honest.power_kw == pytest.approx(0.8)
+    assert broken.power_kw == pytest.approx(0.9)
+    assert broken.power_kw > safe_kw
+
+
+def test_applying_the_margin_to_the_command_instead_of_the_capacity_is_caught() -> None:
+    """Mutation: reduce the *request* by the margin and compare to the capacity.
+
+    A plausible reading of "apply a ten percent margin", and it leaves the
+    command sitting at the capacity itself with no margin at all. 1.1 kW less ten
+    percent is 0.99 kW -- precisely the measured capacity, and the whole point of
+    the margin was not to be there.
+    """
+    _, requested, _, safe_kw = clamp_pieces()
+
+    honest = alphaess_device.limit_command(requested, safe_kw)
+    margined_command = CLAMP_REQUESTED_KW * (1.0 - CLAMP_MARGIN_PERCENT / 100.0)
+    broken = alphaess_device.limit_command(requested, margined_command)
+
+    assert margined_command == pytest.approx(CLAMP_CAPACITY_KW)
+    assert honest.power_kw == pytest.approx(0.8)
+    assert broken.power_kw == pytest.approx(0.9)
+    assert broken.power_kw > safe_kw
+
+
+def test_rounding_the_safe_command_upward_is_caught() -> None:
+    """Mutation: ``ceil`` to the helper step instead of ``floor``.
+
+    Rounding up past the bound is the one direction that turns a safety limit
+    into a safety hazard: 0.891 kW becomes 0.9 kW, which is above it.
+    """
+    import math
+
+    _, requested, _, safe_kw = clamp_pieces()
+
+    honest = alphaess_device.limit_command(requested, safe_kw)
+    ceiled = math.ceil(safe_kw / CONTROL_POWER_STEP_KW - 1e-9) * CONTROL_POWER_STEP_KW
+
+    assert honest.power_kw <= safe_kw
+    assert ceiled > safe_kw
+    assert honest.power_kw < ceiled
+
+
+def test_rounding_the_safe_command_to_nearest_is_caught() -> None:
+    """Mutation: ``round`` to the nearest helper step.
+
+    Unsafe half the time, and 0.891 kW is in the unsafe half: it rounds to
+    0.9 kW. There is no direction argument that makes nearest-rounding correct in
+    a bound whose whole purpose is not to be exceeded.
+    """
+    _, requested, _, safe_kw = clamp_pieces()
+
+    honest = alphaess_device.limit_command(requested, safe_kw)
+    nearest = round(safe_kw / CONTROL_POWER_STEP_KW) * CONTROL_POWER_STEP_KW
+
+    assert honest.power_kw == pytest.approx(0.8)
+    assert nearest == pytest.approx(0.9)
+    assert nearest > safe_kw
+
+
+def test_skipping_the_clamp_entirely_is_caught() -> None:
+    """Mutation: never call ``limit_command``.
+
+    The pre-beta.15 behaviour, and it must now be visible as a *lost capability*
+    rather than as a silent equivalence: the request is refused whole where a
+    0.8 kW command was available.
+    """
+    intent, requested, context, safe_kw = clamp_pieces()
+
+    clamped = alphaess_device.limit_command(requested, safe_kw)
+    assert clamped_gate(intent, clamped, context).safe is True
+
+    # Skipping it: the gate sees the unreduced request.
+    assert clamped_gate(intent, requested, context).inhibit_reason == (
+        INHIBIT_WOULD_EXPORT
+    )
+
+
+def test_clamping_above_the_requested_power_is_caught() -> None:
+    """Mutation: ``max`` where ``min`` belongs, so a generous bound raises the command.
+
+    The invariant this breaks is the one the whole safety layer rests on: it may
+    only subtract. With 4 kW of absorption a 1.1 kW request must stay 1.1 kW, not
+    become 3.6 kW.
+    """
+    _, requested, _, safe_kw = clamp_pieces(capacity_kw=4.0)
+
+    honest = alphaess_device.limit_command(requested, safe_kw)
+
+    assert safe_kw == pytest.approx(3.6)
+    assert honest is requested
+    assert honest.power_kw == pytest.approx(CLAMP_REQUESTED_KW)
+    assert honest.power_kw < safe_kw
+
+
+def test_raising_a_sub_minimum_command_to_the_device_minimum_is_caught() -> None:
+    """Mutation: emit ``CONTROL_MIN_POWER_KW`` when nothing smaller is representable.
+
+    It reads like graceful degradation and it sends a command above the bound.
+    With 0.15 kW of capacity the safe power is 0.135 kW, and the device minimum is
+    0.2 kW -- so the "graceful" answer exports.
+    """
+    intent, requested, context, safe_kw = clamp_pieces(capacity_kw=0.15)
+
+    honest = alphaess_device.limit_command(requested, safe_kw)
+
+    assert safe_kw == pytest.approx(0.135)
+    assert safe_kw < CONTROL_MIN_POWER_KW
+    # Refused, not floored up to the minimum.
+    assert honest is requested
+    assert clamped_gate(intent, honest, context).inhibit_reason == INHIBIT_WOULD_EXPORT
+
+
+def test_keeping_the_old_commanded_energy_after_lowering_the_power_is_caught() -> None:
+    """Mutation: reduce the power and leave ``commanded_energy_ac_kwh`` alone.
+
+    The command would then claim to deliver 0.275 kWh at 0.8 kW over a quarter
+    hour, which is 0.2 kWh of energy and 0.075 kWh of fiction. Every downstream
+    read-back comparison would be measured against a number nothing produces.
+    """
+    import dataclasses
+
+    _, requested, _, safe_kw = clamp_pieces()
+
+    honest = alphaess_device.limit_command(requested, safe_kw)
+    stale = dataclasses.replace(honest, commanded_energy_ac_kwh=0.275)
+
+    assert honest.commanded_energy_ac_kwh == pytest.approx(0.2)
+    assert honest.commanded_energy_ac_kwh == pytest.approx(
+        honest.power_kw * honest.interval_hours
+    )
+    assert stale.commanded_energy_ac_kwh != pytest.approx(
+        stale.power_kw * stale.interval_hours
+    )
+    assert stale.undelivered_energy_ac_kwh < honest.undelivered_energy_ac_kwh
+
+
+def test_letting_the_commanded_energy_exceed_the_allowance_is_caught() -> None:
+    """Mutation: recompute energy from the *requested* power after clamping.
+
+    The bound that must never break, whatever else does.
+    """
+    _, requested, _, safe_kw = clamp_pieces()
+
+    honest = alphaess_device.limit_command(requested, safe_kw)
+
+    assert honest.commanded_energy_ac_kwh <= honest.allowed_energy_ac_kwh
+    assert honest.undelivered_energy_ac_kwh > 0.0
+    # And the requested figure really was larger, so this is not vacuous.
+    assert requested.commanded_energy_ac_kwh > honest.commanded_energy_ac_kwh
+
+
+def test_extending_the_duration_to_compensate_is_caught() -> None:
+    """Mutation: stretch the command so the reduced power delivers the same energy.
+
+    It looks like preserving the decision and it is this module inventing a
+    schedule: a 27-minute command outlives its planning interval, so the next
+    refresh cannot supersede it cleanly. The duration is a dead-man margin, not a
+    delivery window.
+    """
+    _, requested, _, safe_kw = clamp_pieces()
+
+    honest = alphaess_device.limit_command(requested, safe_kw)
+    stretched = requested.duration_minutes * (requested.power_kw / honest.power_kw)
+
+    assert honest.duration_minutes == requested.duration_minutes
+    assert stretched > requested.duration_minutes
+
+
+def test_clamping_with_a_missing_grid_reading_is_caught() -> None:
+    """Mutation: treat an absent meter as unlimited absorption.
+
+    A missing reading is not evidence of capacity. The authoritative formula
+    reads ``None`` as zero, so the bound collapses and the request is refused --
+    and the gate's own ``grid_unusable`` condition fires first anyway, which is
+    the belt to that braces.
+    """
+    intent, requested, context, safe_kw = clamp_pieces(grid_import_w=None)
+
+    honest = alphaess_device.limit_command(requested, safe_kw)
+
+    assert safe_kw == pytest.approx(0.0)
+    assert honest is requested
+    assert clamped_gate(intent, honest, context).inhibit_reason == (
+        INHIBIT_GRID_UNUSABLE
+    )
+    # And an "unlimited" bound would have sent the whole request.
+    assert alphaess_device.limit_command(requested, float("inf")) is requested
+
+
+def test_disabling_would_export_entirely_is_caught() -> None:
+    """Mutation: delete the condition now that commands are clamped.
+
+    The clamp does not replace the gate. When nothing representable survives the
+    clamp deliberately hands the *unreduced* request on, so removing the
+    condition would send exactly the command it was refusing.
+    """
+    intent, requested, context, safe_kw = clamp_pieces(capacity_kw=0.05)
+
+    honest = alphaess_device.limit_command(requested, safe_kw)
+    verdict = clamped_gate(intent, honest, context)
+
+    assert honest is requested
+    assert verdict.safe is False
+    assert verdict.inhibit_reason == INHIBIT_WOULD_EXPORT
+    assert INHIBIT_WOULD_EXPORT in dict(verdict.checks)
+    assert dict(verdict.checks)[INHIBIT_WOULD_EXPORT] is False
+
+
+def test_bounding_the_clamp_by_the_forecast_house_load_is_caught() -> None:
+    """Mutation: clamp to the house-load sensor instead of the meter.
+
+    The beta.8 mistake, resurrected in a new place. On a site with production the
+    house-load figure says nothing about export: 2 kW of load under 3.1 kW of sun
+    is already exporting a kilowatt, and a clamp to 1.8 kW would add to it.
+    """
+    from .test_control_pipeline import make_context, make_intent
+
+    intent = make_intent(energy_ac_kwh=CLAMP_REQUESTED_KW * INTERVAL_HOURS)
+    requested = build_command(intent)
+    # Sunny midday: 2 kW of load, 3.1 kW of PV, exporting ~1.1 kW.
+    context = make_context(
+        house_load_w=2000.0,
+        grid_import_w=0.0,
+        grid_export_w=1100.0,
+        battery_power_w=0.0,
+        device_power_kw=requested.power_kw,
+        export_margin_percent=CLAMP_MARGIN_PERCENT,
+    )
+
+    honest_bound = safety.safe_discharge_power_kw(context)
+    load_bound = 2.0 * (1.0 - CLAMP_MARGIN_PERCENT / 100.0)
+
+    assert honest_bound == pytest.approx(0.0)
+    assert load_bound == pytest.approx(1.8)
+    assert alphaess_device.limit_command(requested, honest_bound) is requested
+    assert clamped_gate(intent, requested, context).inhibit_reason == (
+        INHIBIT_WOULD_EXPORT
+    )
+
+
+def test_bounding_the_clamp_by_a_planned_residual_is_caught() -> None:
+    """Mutation: clamp to the Phase-8 plan's own predicted grid export headroom.
+
+    A forecast is not a measurement. The safety bound has to come from the
+    instrument that defines export at the instant the command would be sent, and
+    the clamp reads nothing from the optimizer -- asserted from the source, so a
+    later refactor cannot thread one in.
+    """
+    import inspect
+
+    source = inspect.getsource(alphaess_device.limit_command)
+
+    for forbidden in ("economic", "forecast", "plan", "pv_kwh", "baseline"):
+        assert forbidden not in source, forbidden
+
+    tree = ast.parse(inspect.getsource(alphaess_device))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0] if node.level else node.module)
+    assert "economic" not in imported
+    assert "plan" not in imported
+    assert "simulation" not in imported
+
+
+def test_treating_the_desired_export_action_as_executable_is_caught() -> None:
+    """Mutation: map the Phase-8 ``export`` action onto the clamped discharge path.
+
+    Two opposite intentions. The clamp exists so grid export does *not* occur, so
+    it can never be the vehicle for an action that wants it. There is no helper
+    family for an export at all, which is what makes this structural.
+    """
+    from custom_components.alpha_ems_manager.const import (
+        ECONOMIC_ACTION_CURTAIL,
+        ECONOMIC_ACTION_EXPORT,
+    )
+
+    assert ECONOMIC_ACTION_EXPORT not in alphaess_device.FAMILIES
+    assert ECONOMIC_ACTION_CURTAIL not in alphaess_device.FAMILIES
+    assert set(alphaess_device.FAMILIES) == {ACTION_DISCHARGE, "charge"}
+
+    # And a command built for an unmapped action moves nothing, clamp or no clamp.
+    from .test_control_pipeline import make_intent
+
+    intent = make_intent(action=ECONOMIC_ACTION_EXPORT, energy_ac_kwh=1.0)
+    command = build_command(intent)
+
+    assert command.power_kw == 0.0
+    assert command.moves_battery is False
+    assert alphaess_device.limit_command(command, 5.0) is command
+
+
+def test_letting_the_clamp_reach_back_into_the_planner_is_caught() -> None:
+    """Mutation: have the clamp adjust the intent, or the plan, it came from.
+
+    The layers must stay one-way. ``limit_command`` takes a command and a number
+    and returns a command: it has no reference to an intent, a plan or a decision,
+    so it cannot write to one.
+    """
+    import inspect
+
+    signature = inspect.signature(alphaess_device.limit_command)
+
+    assert list(signature.parameters) == ["command", "max_power_kw"]
+
+    _, requested, _, safe_kw = clamp_pieces()
+    before = requested.as_dict()
+    alphaess_device.limit_command(requested, safe_kw)
+
+    # The input command is untouched: the clamp returns a new one.
+    assert requested.as_dict() == before
+
+
+def test_making_execution_available_is_caught() -> None:
+    """Mutation: flip the release barrier now that clamped commands are eligible.
+
+    beta.15 makes ``eligible`` reachable far more often, which makes this the most
+    consequential constant in the repository. Two independent refusals stand
+    behind it, and both are asserted.
+    """
+    assert safety.CONTROL_EXECUTION_AVAILABLE is False
+
+    intent, requested, context, safe_kw = clamp_pieces()
+    command = alphaess_device.limit_command(requested, safe_kw)
+    verdict = clamped_gate(intent, command, context)
+
+    assert verdict.safe is True
+    for mode in (CONTROL_MODE_SHADOW, CONTROL_MODE_ACTIVE):
+        import dataclasses
+
+        decision = safety.authorize(
+            verdict,
+            dataclasses.replace(
+                context,
+                mode=mode,
+                device_power_kw=command.power_kw,
+                execution_enabled=True,
+            ),
+            commands_planned=6,
+            starts_or_increases=False,
+        )
+        assert decision.authorized is False
+
+
 def test_every_mutation_in_this_file_is_reverted() -> None:
     """The suite must not be left holding a broken implementation.
 
@@ -718,3 +1130,11 @@ def test_every_mutation_in_this_file_is_reverted() -> None:
 
     assert control.translate.__module__.endswith("control")
     assert alphaess_device.device_cutoff_percent.__module__.endswith("alphaess_device")
+    assert alphaess_device.limit_command.__module__.endswith("alphaess_device")
+    assert safety.safe_discharge_power_kw.__module__.endswith("safety")
+    # The clamp still reduces the live case to the same figure it always did.
+    _, requested, _, safe_kw = clamp_pieces()
+    assert safe_kw == pytest.approx(0.891)
+    assert alphaess_device.limit_command(requested, safe_kw).power_kw == pytest.approx(
+        0.8
+    )

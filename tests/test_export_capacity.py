@@ -11,8 +11,18 @@ The rule is::
 
     capacity = max(0, grid_import - grid_export + battery_discharge)
 
-and the command is refused whole whenever it exceeds that capacity less the
-configured margin. It is never scaled to fit.
+and **the gate** refuses a command whole whenever it exceeds that capacity less
+the configured margin. The gate still never scales anything, and every test below
+drives it directly, so every assertion here is about the gate alone and is
+unchanged by beta.15.
+
+What beta.15 changed is what the *pipeline* does with these three samples before
+the gate sees them: two of them now arrive as a safely reduced command and pass,
+because a lower discharge really was available. That is an intentional change to
+historical behaviour and it is pinned at the bottom of this file rather than left
+to be discovered -- the discharge each one is reduced to is strictly below the
+measured absorbing capacity, so none of them exports, which is the property that
+made the wholesale refusal safe and keeps the reduction safe.
 """
 
 from __future__ import annotations
@@ -62,13 +72,13 @@ def sample_context(
     **overrides: object,
 ) -> ControlContext:
     """Return a context describing one live sample."""
+    overrides.setdefault("device_power_kw", LIVE_COMMAND_KW)
     return make_context(
         house_load_w=house_w,
         # Positive for charging, so a discharge is negative.
         battery_power_w=-battery_discharge_w,
         grid_import_w=grid_import_w,
         grid_export_w=0.0,
-        device_power_kw=LIVE_COMMAND_KW,
         export_margin_percent=10.0,
         **overrides,
     )
@@ -294,3 +304,82 @@ def test_the_margin_reduces_the_capacity_and_never_the_command(
 
     assert verdict_at(round(allowed - 0.01, 4)).safe is True
     assert verdict_at(round(allowed + 0.01, 4)).inhibit_reason == INHIBIT_WOULD_EXPORT
+
+
+# --- what beta.15 does with the same three samples --------------------------
+
+
+#: The command each live sample is reduced to by the beta.15 clamp, and whether
+#: the gate then passes it. Derived from the real device contract in the test
+#: below rather than trusted from here: these are the *expected* figures, and the
+#: assertion recomputes them.
+#:
+#: ``15:33`` had 22 W of absorption -- a site already exporting a kilowatt of
+#: sunshine -- so nothing representable survives and it is still refused, with the
+#: same reason it had in beta.14. The other two had real absorption that beta.14
+#: threw away.
+BETA15_OUTCOMES: tuple[tuple[str, float | None], ...] = (
+    ("15:33", None),
+    ("16:13", 0.3),
+    ("16:18", 0.6),
+)
+
+
+@pytest.mark.parametrize(
+    ("label", "house_w", "pv_w", "discharge_w", "import_w", "capacity_w"),
+    LIVE_SAMPLES,
+    ids=[sample[0] for sample in LIVE_SAMPLES],
+)
+def test_the_pipeline_now_reduces_two_of_the_three_instead_of_refusing_them(
+    label: str,
+    house_w: float,
+    pv_w: float,
+    discharge_w: float,
+    import_w: float,
+    capacity_w: float,
+) -> None:
+    """The beta.15 behaviour change, recorded against the cases that motivated it.
+
+    Each sample is put through the whole command path -- quantise, clamp, gate --
+    rather than handed to the gate directly. The safety property is asserted
+    alongside the outcome: whatever command survives is strictly below the
+    measured absorbing capacity, so it cannot export, and the one that survives
+    nothing is refused with the reason it always had.
+    """
+    from custom_components.alpha_ems_manager.alphaess_device import (
+        build_command,
+        limit_command,
+    )
+    from custom_components.alpha_ems_manager.battery import INTERVAL_HOURS
+    from custom_components.alpha_ems_manager.safety import safe_discharge_power_kw
+
+    expected = dict(BETA15_OUTCOMES)[label]
+
+    probe = sample_context(house_w, discharge_w, import_w)
+    safe_kw = safe_discharge_power_kw(probe)
+    intent = make_intent(energy_ac_kwh=LIVE_COMMAND_KW * INTERVAL_HOURS)
+    requested = build_command(intent)
+    command = limit_command(requested, safe_kw)
+    context = sample_context(
+        house_w, discharge_w, import_w, device_power_kw=command.power_kw
+    )
+    verdict = evaluate(intent, context)
+
+    assert absorbing_capacity_kw(probe) == pytest.approx(capacity_w / 1000.0)
+
+    if expected is None:
+        # Still refused, and by the same rule with the same wording.
+        assert command is requested
+        assert command.safety_limited is False
+        assert verdict.safe is False
+        assert verdict.inhibit_reason == INHIBIT_WOULD_EXPORT
+        return
+
+    assert command.safety_limited is True
+    assert command.power_kw == pytest.approx(expected)
+    assert verdict.safe is True
+    # The property that makes the reduction as safe as the refusal was: the
+    # command sits below the measured capacity, with the margin still to spare.
+    assert command.power_kw <= safe_kw
+    assert command.power_kw < capacity_w / 1000.0
+    assert command.power_kw < LIVE_COMMAND_KW

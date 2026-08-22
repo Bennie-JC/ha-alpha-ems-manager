@@ -9,6 +9,170 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.15] - 2026-08-22
+
+**A discharge that is too big for the house is now made smaller instead of
+refused.** Before this release, a recommendation to discharge 1.1 kW into a house
+absorbing 0.99 kW produced `inhibited` / `would_export` and no discharge at all.
+It now produces a 0.8 kW command — the largest the meter says can be absorbed
+without pushing energy onto the grid.
+
+Nothing about export safety was weakened, and nothing became executable.
+`CONTROL_EXECUTION_AVAILABLE` remains **False**.
+
+### Changed
+
+- **`would_export` clamps a non-exporting discharge instead of refusing it
+  whole.** The order is fixed and each step matters: measure the absorbing
+  capacity at the meter, take the configured margin off the **capacity**, clamp
+  the requested command to what remains, quantise **downwards** to a helper step,
+  then recompute the commanded energy. On the live case that is
+  `0.99 → 0.891 → 0.8 kW`; the 0.9 kW step is rejected because it would exceed
+  the margined bound.
+
+  The clamp lives *upstream* of the gate rather than inside it. The gate still
+  never scales a command — it is handed one that is already safe, and passes it.
+  That keeps the one rule this layer has had since Phase 4: the safety layer may
+  only ever **subtract**.
+
+- **`would_export` still refuses, and refuses exactly as it did.** When no
+  representable command survives the clamp, the *original unreduced request* is
+  passed to the gate, which refuses it whole with the same reason and the same
+  figures as beta.14. Reducing it to zero inside the clamp would have moved the
+  refusal into the wrong module and reported the wrong cause.
+
+  Nothing representable survives when the site has no absorption, when it is
+  already exporting, when the safe power falls below the device's two-step
+  minimum, when the meter is missing or stale, or when any other gate condition
+  refuses first.
+
+- **`eligible` now means "a safe command remains", not "the requested command was
+  safe".** A safely reduced command is `eligible`, not `inhibited`. That is the
+  semantic change, and it is the one worth reading twice: the state answers
+  *would something safe happen*, and the diagnostics say how much it was reduced.
+
+- **The safety bound has exactly one definition.** `safe_discharge_power_kw` is
+  what the clamp reduces to *and* what the gate checks, so the number a command
+  was reduced to and the number it is judged against cannot drift apart. Two
+  expressions of one safety bound is one too many — the same reasoning that made
+  `split_grid_energy` the sole grid-residual authority in Phase 8.
+
+- **The commanded energy is recomputed from the reduced power**, over the same
+  duration. `allowed_energy_ac_kwh` is untouched, so the energy given up appears
+  in `undelivered_energy_ac_kwh` — 0.075 kWh on the live case. The duration is
+  **not** extended to compensate: it is a dead-man margin rather than a delivery
+  window, and stretching it would outlive the planning interval the next refresh
+  supersedes it in. The cutoff, the action and the energy-limit flag are all
+  untouched: this is a reduction, never a substitution.
+
+- **The export-check diagnostics report every stage.** `requested_power_kw`,
+  `absorbing_capacity_kw`, `safety_margin_percent`, `safe_capacity_kw`,
+  `safety_limited`, `limited_power_kw`, `final_command_power_kw`, the three meter
+  readings the bound came from, the `inhibit_reason`, and the ordering rule
+  spelled out. Three powers rather than one, because a single
+  `commanded_power_kw` could not distinguish a command that was never limited
+  from one reduced to exactly the bound. `DeviceCommand` gains
+  `requested_power_kw` and `safety_limited` beside it.
+
+### Fixed
+
+- **A Phase-4 safety *policy* that was deliberately conservative, not a beta.14
+  defect.** The wholesale refusal has been the behaviour since Phase 4 shipped in
+  beta.8. Phase 8 made its practical cost visible: a `make_headroom`
+  recommendation — sell or discharge now to leave room for forecast production —
+  was repeatedly refused outright whenever household load was modest, which with
+  low load could persist for hours.
+
+  Two of the three real diagnostics samples recorded in `test_export_capacity.py`
+  now yield a safe reduced command (0.3 kW and 0.6 kW) where beta.14 refused them
+  outright. The third, taken while the site was already exporting a kilowatt of
+  sunshine, is still refused. That change of historical behaviour is intentional
+  and is pinned in that file rather than left to be discovered: each surviving
+  command sits strictly below the *measured* absorbing capacity, which is the
+  property that made the refusal safe and keeps the reduction safe.
+
+- **The export-check diagnostics block had no test at all.** A pre-existing gap,
+  and the reason a rename inside it could have shipped silently. Its key set is
+  now pinned.
+
+- **Changing the control mode is re-evaluated immediately again.** Selecting a
+  mode used the *debounced* refresh, which carries a ten-second cooldown. Once
+  that timer was armed — by a quarter-hour tick, say — a mode change applied the
+  mode but deferred the re-evaluation to the end of the cooldown, so the published
+  Control State could sit up to ten seconds behind the control the user had just
+  operated.
+
+  Now the undebounced `async_refresh`, for exactly the reason
+  `AlphaEmsCoordinator._handle_started` already gave for the startup path: a user
+  pressing a control is the last thing that should be rate-limited against a
+  background timer. The mode was never lost — only its re-evaluation was late.
+
+  This surfaced as an intermittent test failure rather than a report, because the
+  symptom depends on whether the cooldown happened to be armed. The regression
+  now arms it deliberately, so it fails every time against the debounced form
+  instead of once in a while: verified 10/10 failing before the fix and 100/100
+  passing after.
+
+### Unchanged
+
+- **The Phase-8 optimizer.** The desired plan, the capability plan, the reason,
+  the capability gap and every euro figure are byte-identical across two refreshes
+  whose absorbing capacity differs by more than a kilowatt. The safety layer may
+  subtract capability; it does not reach backwards into the planner.
+- **The Phase-8 `export` action is still advisory and still has no actuator.**
+  The clamp exists so grid export does *not* occur, so it cannot be the vehicle
+  for an action that wants it. `gap_reason` still reports `no_primitive`, and
+  `economic_value_forgone_eur` still reflects the missing export primitive
+  honestly. No Force Export, no Force Import, no PV Switch, no new service caller
+  — `PERMITTED_SERVICES` is still exactly three and the two callers are unchanged.
+- **The reserve and the floor.** The configured minimum state of charge, the
+  cutoff, `allowed_energy_ac_kwh` and every Phase-4 device constraint bound a
+  clamped command exactly as they bound an unclamped one. `would_export` is the
+  last condition evaluated, so every higher-priority refusal still wins.
+- **The 10 % export margin**, its default, and its absence from the options form.
+  No new setting. The margin was audited and found to be applied in the right
+  place — to the capacity, before any rounding.
+- **Entity count: 13.** No new entity, no new attribute, no new Activity line.
+  Activity remains about economic-plan changes and reads nothing from the safety
+  layer.
+- **Both storage versions.** `DeviceCommand` is diagnostics-only; nothing here is
+  persisted, and no migration is involved.
+
+### Verification
+
+- Tests **2479 → 2628**. One new file, `test_safe_discharge_clamp.py`, with 113
+  tests: the bound's single definition, the live case and its companion, the
+  only-ever-subtract invariants swept over a grid of capacities and requests, the
+  energy bookkeeping, every surviving refusal, the low-load ladder, meter-noise
+  stability, and the whole pipeline driven through the real coordinator.
+
+- **Sixteen new mutation tests**, all killed. Removing the margin, applying it to
+  the command instead of the capacity, rounding the safe command up, rounding it
+  to nearest, skipping the clamp, clamping above the request, raising a
+  sub-minimum command to the device minimum, keeping the stale commanded energy,
+  extending the duration to compensate, clamping on an absent meter, deleting
+  `would_export`, bounding the clamp by forecast house load, bounding it by a
+  planned residual, treating the desired export as executable, letting the clamp
+  reach back into the planner, and flipping the release barrier.
+
+- **The sign question was asked directly** rather than reasoned about: the same
+  magnitude presented as export never yields a larger bound than as import, and a
+  *charging* battery is never credited as absorption.
+
+- **Cost: 2.3 microseconds per refresh** — 0.16 µs for the bound and 2.2 µs for
+  the clamp, against a 185 ms Phase-8 solve. No second solve, no I/O, no
+  event-loop work. The control context is now assembled once and the single
+  changed field replaced, so the bound and the gate provably describe the same
+  instant.
+
+- **No hysteresis mechanism was added, and the measurements say none is needed.**
+  ±150 W of noise around the live working point moves the command between four
+  adjacent steps, every one of them below the bound. The `eligible`/`inhibited`
+  boundary sits at 222 W of absorption — 768 W below that working point — so
+  flipping across it takes a load switching off, not meter noise. And the existing
+  write cooldown already rate-limits any restart to one planning interval while
+  exempting every reduction.
+
 ## [1.0.0-beta.14] - 2026-08-21
 
 **Alpha EMS now works out what it would do with your battery to save money, and

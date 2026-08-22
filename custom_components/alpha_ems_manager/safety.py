@@ -19,9 +19,23 @@ Both functions are pure. Every fact they need arrives on a
 :class:`ControlContext` as a plain value, so the entire gate is exercisable
 against synthetic state with no Home Assistant instance in sight.
 
-The gate **never scales a command.** If a request cannot be sent safely it is
-refused whole, with one precise reason. A gate that reduced a request to make it
-fit would have made a decision of its own, and deciding is not its job.
+The gate **never scales a command**, and it still does not. If a request reaches
+it and cannot be sent safely it is refused whole, with one precise reason. A gate
+that reduced a request to make it fit would have made a decision of its own, and
+deciding is not its job.
+
+What changed in beta.15 is *upstream* of the gate, not inside it. A non-exporting
+discharge is now clamped to the largest safely absorbable power **before** the
+command is built, by :func:`safe_discharge_power_kw` here and
+:func:`alphaess_device.limit_command` there. The gate then sees an already-safe
+command and passes it. If no representable command survives the clamp, the
+original request reaches the gate untouched and is refused whole exactly as
+before -- so ``would_export`` keeps both its meaning and its wording, and the
+failure path is unchanged.
+
+The distinction is worth keeping sharp: this module supplies a *bound* and
+answers yes or no. Choosing a smaller command against that bound is the command
+layer's job, and it can only ever subtract.
 
 Export protection is measured at the meter, not reconstructed. The absorbing
 capacity a discharge is checked against is ``grid_import - grid_export +
@@ -164,7 +178,8 @@ class ControlContext:
     device_cutoff_percent: int = 0
     device_duration_minutes: int = 0
     #: How far below the measured absorbing capacity a discharge must stay, in
-    #: percent. Applied to the capacity, never to the command.
+    #: percent. Applied to the capacity, never to the command -- the command is
+    #: then clamped to what remains. See :func:`safe_discharge_power_kw`.
     export_margin_percent: float = 0.0
 
     # -- rate limiting --------------------------------------------------------
@@ -281,6 +296,34 @@ def absorbing_capacity_kw(context: ControlContext) -> float:
     # counting it would credit the battery for load it is itself creating.
     discharge_now_w = max(0.0, -(context.battery_power_w or 0.0))
     return max(0.0, net_import_w + discharge_now_w) / 1000.0
+
+
+def safe_discharge_power_kw(context: ControlContext) -> float:
+    """Return the largest discharge power that cannot push energy onto the grid.
+
+    The measured absorbing capacity with the configured margin taken off it, and
+    the **single** definition of that bound: :func:`evaluate` compares against
+    this, and :func:`alphaess_device.limit_command` clamps against it, so the
+    number a command is reduced to and the number the gate checks cannot drift
+    apart. Two expressions of one safety bound is one too many.
+
+    Ordering is load-bearing and is fixed here: the capacity is measured first,
+    the margin reduces the **capacity**, and only afterwards may a caller
+    quantise downwards. Applying the margin to the command instead would leave
+    the command at the capacity itself, and rounding before the margin would put
+    a command back above the bound the margin exists to create.
+
+    Independent of ``context.device_power_kw`` by construction -- it reads only
+    the meter, the battery power and the margin. That is what lets the caller
+    build one context from the *requested* command, take this bound from it, and
+    then replace the one field with the limited power.
+
+    Returns kW, never negative. Zero means no discharge is safe at all, which a
+    site that is already exporting produces immediately.
+    """
+    capacity_kw = absorbing_capacity_kw(context)
+    headroom = 1.0 - (context.export_margin_percent / 100.0)
+    return max(0.0, capacity_kw * max(0.0, headroom))
 
 
 def evaluate(intent: ControlIntent | None, context: ControlContext) -> SafetyVerdict:
@@ -450,14 +493,17 @@ def evaluate(intent: ControlIntent | None, context: ControlContext) -> SafetyVer
     # -- would this push energy onto the grid? ------------------------------
     # A forced discharge sets the *battery* rate, so whatever the house cannot
     # absorb leaves through the meter -- and the dispatch path does not honour
-    # the configured feed-in limit, so nothing downstream will catch it. The
-    # whole command is refused rather than trimmed to fit: trimming it would be
-    # this module choosing a different energy than the decision layer allowed.
+    # the configured feed-in limit, so nothing downstream will catch it.
+    #
+    # Still a refusal and still whole. Since beta.15 the command layer clamps a
+    # discharge to :func:`safe_discharge_power_kw` before it gets here, so in the
+    # ordinary case this condition passes on an already-reduced command. It fires
+    # when the clamp could not produce anything representable -- no capacity at
+    # all, or a safe power below the device minimum -- and then the request that
+    # arrives is the original one, refused exactly as it was before.
     export_ok = True
     if intent.action == ACTION_DISCHARGE:
-        capacity_kw = absorbing_capacity_kw(context)
-        headroom = 1.0 - (context.export_margin_percent / 100.0)
-        export_ok = context.device_power_kw <= capacity_kw * max(0.0, headroom)
+        export_ok = context.device_power_kw <= safe_discharge_power_kw(context)
     if not check(INHIBIT_WOULD_EXPORT, export_ok):
         return SafetyVerdict(False, INHIBIT_WOULD_EXPORT, tuple(checks))
 

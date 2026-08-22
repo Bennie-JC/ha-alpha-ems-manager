@@ -37,7 +37,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .alphaess_adapter import discover, read_snapshot
-from .alphaess_device import build_command, plan_commands
+from .alphaess_device import build_command, limit_command, plan_commands
 from .api import load_forecast_from
 from .battery import INTERVAL_HOURS, BatteryLimits, sanitize_soc_percent
 from .confidence import ConfidenceBreakdown, compute_confidence
@@ -207,6 +207,7 @@ from .safety import (
     absorbing_capacity_kw,
     authorize,
     evaluate,
+    safe_discharge_power_kw,
 )
 from .simulation import IntervalDemand
 from .soc_coherence import SocCoherenceMonitor
@@ -526,6 +527,62 @@ def _solve_economic(
         reserve_above_capacity_kwh=reserve_above_capacity_kwh,
         table_ms=table_ms,
     )
+
+
+def _export_check(
+    context: ControlContext,
+    *,
+    requested: Any,
+    command: Any,
+    safe_power_kw: float,
+    inhibit_reason: str | None,
+) -> dict[str, Any]:
+    """Return the export bound as the gate saw it, and what it did to the command.
+
+    Reported at the instant the gate ran rather than at download time. Without
+    that a ``would_export`` verdict could not be reconstructed from a diagnostics
+    download, because the flow block elsewhere in the payload is read later and
+    describes a different instant -- which is exactly how a correct inhibit came
+    to look arithmetically wrong beside the readings printed next to it.
+
+    Every field is a bounded scalar, and the three powers are reported separately
+    on purpose: what was asked for, what was safe, and what would be sent. A
+    single ``commanded_power_kw`` could not distinguish a command that was never
+    limited from one that was reduced to exactly the bound.
+    """
+    capacity_kw = absorbing_capacity_kw(context)
+    requested_kw = 0.0 if requested is None else requested.power_kw
+    final_kw = 0.0 if command is None else command.power_kw
+    limited = bool(command is not None and command.safety_limited)
+    return {
+        # The three powers verbatim: ``device_power_kw`` already rounds to the
+        # helper's own decimals, so these are the exact figures that would be
+        # written. Rounding again here could only make the report disagree with
+        # the command.
+        "requested_power_kw": requested_kw,
+        "absorbing_capacity_kw": round(capacity_kw, 4),
+        "safety_margin_percent": context.export_margin_percent,
+        "safe_capacity_kw": round(safe_power_kw, 4),
+        "safety_limited": limited,
+        "limited_power_kw": final_kw if limited else None,
+        "final_command_power_kw": final_kw,
+        "grid_import_w": context.grid_import_w,
+        "grid_export_w": context.grid_export_w,
+        "battery_power_w": context.battery_power_w,
+        "inhibit_reason": inhibit_reason,
+        "basis": (
+            "capacity = max(0, grid_import - grid_export + battery discharge), "
+            "measured at the meter; the margin reduces the capacity, never the "
+            "command. non-export discharge is clamped down to the maximum safely "
+            "absorbable measured household/grid demand; if no representable safe "
+            "command remains, the command is refused"
+        ),
+        "ordering": (
+            "measure capacity, apply the margin to the capacity, clamp the "
+            "requested command to what remains, quantise downwards to a helper "
+            "step, then recompute the commanded energy"
+        ),
+    }
 
 
 def _reserve_horizon_edges(
@@ -3068,10 +3125,122 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         intent = translate(
             plan, now=now, horizon_minutes=self.config.control_horizon_minutes
         )
-        command = build_command(intent) if intent is not None else None
+        requested = build_command(intent) if intent is not None else None
+
+        # One context, read once, describing the *requested* command. The export
+        # bound is taken from it, the command is clamped to fit, and the single
+        # field that changed is replaced.
+        #
+        # ``replace`` rather than a second assembly, deliberately. Every other
+        # field is a live reading, and re-reading them would let the two contexts
+        # describe different instants -- the exact defect that once made a correct
+        # inhibit look arithmetically wrong beside the figures printed next to it.
+        # This way the gate provably evaluates the same world the bound came from.
+        #
+        # Sound because ``safe_discharge_power_kw`` reads only the meter, the
+        # battery power and the margin, never ``device_power_kw``: the bound is
+        # the same whichever power the context carries, so taking it before the
+        # clamp cannot be circular. ``test_safe_discharge_clamp`` pins that.
+        context = self._control_context(
+            mode=mode,
+            capability=capability,
+            snapshot=snapshot,
+            flows_now=flows_now,
+            problem=problem,
+            now=now,
+            today=today,
+            elapsed=elapsed,
+            today_interval_count=today_interval_count,
+            command=requested,
+        )
+        safe_power_kw = safe_discharge_power_kw(context)
+        command = None if requested is None else limit_command(requested, safe_power_kw)
+        if command is not None and command is not requested:
+            context = replace(context, device_power_kw=command.power_kw)
         commands = plan_commands(command) if command is not None else ()
 
-        context = ControlContext(
+        verdict = evaluate(intent, context)
+        starts_or_increases = (
+            command is not None
+            and command.moves_battery
+            and (
+                self._last_control_power_kw is None
+                or command.power_kw > self._last_control_power_kw
+            )
+        )
+        decision = authorize(
+            verdict,
+            context,
+            commands_planned=len(commands),
+            starts_or_increases=starts_or_increases,
+        )
+
+        state = CONTROL_STATE_INHIBITED
+        if verdict.safe:
+            state = CONTROL_STATE_ELIGIBLE if commands else CONTROL_STATE_IDLE
+
+        self._record_control_event(now, state, verdict, decision)
+
+        return {
+            "mode": mode,
+            "state": state,
+            "execution_available": CONTROL_EXECUTION_AVAILABLE,
+            "execution_enabled": self.config.control_execution_enabled,
+            "capability": capability.as_dict(),
+            "device": snapshot.as_dict(),
+            "intent": None if intent is None else intent.as_dict(),
+            "command": None if command is None else command.as_dict(),
+            "commands": [step.as_dict() for step in commands],
+            "commands_planned": len(commands),
+            "safety": verdict.as_dict(),
+            "export_check": _export_check(
+                context,
+                requested=requested,
+                command=command,
+                safe_power_kw=safe_power_kw,
+                inhibit_reason=verdict.inhibit_reason,
+            ),
+            "authorization": decision.as_dict(),
+            "last_write": (
+                None
+                if self._last_control_write is None
+                else self._last_control_write.isoformat()
+            ),
+            "events": list(self._control_events),
+            "soc_coherence": self.soc_coherence.as_dict(),
+            "shadow_basis": (
+                "the safety verdict and the command list above are computed by "
+                "the same functions the active path uses, so what shadow reports "
+                "is what active would have attempted -- including the export "
+                "clamp, so a safely reduced power in shadow is the power active "
+                "would have sent"
+            ),
+            "controls_nothing": _CONTROLS_NOTHING,
+        }
+
+    @callback
+    def _control_context(
+        self,
+        *,
+        mode: str,
+        capability: Any,
+        snapshot: Any,
+        flows_now: Any,
+        problem: str | None,
+        now: datetime,
+        today: date,
+        elapsed: int,
+        today_interval_count: int,
+        command: Any,
+    ) -> ControlContext:
+        """Assemble every live fact the gate needs, around one command.
+
+        Every reading is taken from the snapshot and flow pair passed in, so two
+        contexts built in the same refresh differ **only** in the command they
+        describe. That is what makes it sound to take the export bound from one
+        and evaluate the other.
+        """
+        return ControlContext(
             mode=mode,
             execution_enabled=self.config.control_execution_enabled,
             missing_entities=capability.missing,
@@ -3118,76 +3287,6 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 else (now - self._last_control_write).total_seconds()
             ),
         )
-
-        verdict = evaluate(intent, context)
-        starts_or_increases = (
-            command is not None
-            and command.moves_battery
-            and (
-                self._last_control_power_kw is None
-                or command.power_kw > self._last_control_power_kw
-            )
-        )
-        decision = authorize(
-            verdict,
-            context,
-            commands_planned=len(commands),
-            starts_or_increases=starts_or_increases,
-        )
-
-        state = CONTROL_STATE_INHIBITED
-        if verdict.safe:
-            state = CONTROL_STATE_ELIGIBLE if commands else CONTROL_STATE_IDLE
-
-        self._record_control_event(now, state, verdict, decision)
-
-        return {
-            "mode": mode,
-            "state": state,
-            "execution_available": CONTROL_EXECUTION_AVAILABLE,
-            "execution_enabled": self.config.control_execution_enabled,
-            "capability": capability.as_dict(),
-            "device": snapshot.as_dict(),
-            "intent": None if intent is None else intent.as_dict(),
-            "command": None if command is None else command.as_dict(),
-            "commands": [step.as_dict() for step in commands],
-            "commands_planned": len(commands),
-            "safety": verdict.as_dict(),
-            # The export bound as the gate actually saw it, at the instant the
-            # gate saw it. Without this a ``would_export`` verdict could not be
-            # reconstructed from a diagnostics download, because the flow block
-            # elsewhere in the payload is read at download time and describes a
-            # different instant -- which is exactly how a correct inhibit came to
-            # look arithmetically wrong beside the readings printed next to it.
-            "export_check": {
-                "absorbing_capacity_kw": round(absorbing_capacity_kw(context), 4),
-                "grid_import_w": context.grid_import_w,
-                "grid_export_w": context.grid_export_w,
-                "battery_power_w": context.battery_power_w,
-                "margin_percent": context.export_margin_percent,
-                "commanded_power_kw": context.device_power_kw,
-                "basis": (
-                    "capacity = max(0, grid_import - grid_export + battery "
-                    "discharge), measured at the meter; the margin reduces the "
-                    "capacity and never the command, and the command is refused "
-                    "whole rather than scaled to fit"
-                ),
-            },
-            "authorization": decision.as_dict(),
-            "last_write": (
-                None
-                if self._last_control_write is None
-                else self._last_control_write.isoformat()
-            ),
-            "events": list(self._control_events),
-            "soc_coherence": self.soc_coherence.as_dict(),
-            "shadow_basis": (
-                "the safety verdict and the command list above are computed by "
-                "the same functions the active path uses, so what shadow reports "
-                "is what active would have attempted"
-            ),
-            "controls_nothing": _CONTROLS_NOTHING,
-        }
 
     @callback
     def _record_control_event(

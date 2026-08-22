@@ -243,6 +243,106 @@ async def test_selecting_a_mode_re_evaluates_immediately(
     assert hass.states.get(CONTROL_STATE).state != CONTROL_STATE_OFF
 
 
+async def test_selecting_a_mode_re_evaluates_even_inside_the_refresh_cooldown(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, control_surface: None
+) -> None:
+    """Regression: the mode change must not be swallowed by the debouncer.
+
+    ``async_request_refresh`` is debounced on a ten-second cooldown. Once its
+    timer is armed, a further request is *deferred to the end of that timer* --
+    and the timer is a raw ``loop.call_later``, which neither
+    ``async_block_till_done`` nor a frozen clock advances. So a mode change
+    arriving inside the window applied the mode but left the re-evaluation
+    pending, and the published state stayed ``off``.
+
+    That is exactly the hazard ``AlphaEmsCoordinator._handle_started`` already
+    documents for the startup path, and it is why the select now uses the
+    undebounced ``async_refresh``: a user pressing a control is the last thing
+    that should be rate-limited against a background quarter-hour tick.
+
+    This test arms the cooldown deliberately, so it fails **every** time against
+    the debounced form rather than once in a while. The previous version passed
+    or failed depending on whether anything had happened to arm the timer first,
+    which is how it read as a flake.
+    """
+    coordinator = setup_integration.runtime_data
+
+    # Arm the cooldown, then prove it is armed -- otherwise this test could pass
+    # for the wrong reason on a future HA whose debouncer behaves differently.
+    await coordinator.async_request_refresh()
+    await hass.async_block_till_done()
+    assert coordinator._debounced_refresh._timer_task is not None
+    assert hass.states.get(CONTROL_STATE).state == CONTROL_STATE_OFF
+
+    await set_mode(hass, CONTROL_MODE_SHADOW)
+
+    # The mode is applied *and* re-evaluated, with no clock advanced and no wait.
+    assert coordinator.control_mode == CONTROL_MODE_SHADOW
+    assert hass.states.get(CONTROL_STATE).state != CONTROL_STATE_OFF
+    assert coordinator.control_report["mode"] == CONTROL_MODE_SHADOW
+
+
+async def test_the_select_uses_the_undebounced_refresh(
+    hass: HomeAssistant, setup_integration: MockConfigEntry
+) -> None:
+    """The mechanism, pinned so a tidy-up cannot swap it back.
+
+    ``async_request_refresh`` reads as the more considerate call -- it is the one
+    most integrations use -- so the substitution is an easy one to make in good
+    faith. Asserted at the call site rather than through behaviour, because the
+    behavioural symptom only appears when the cooldown happens to be armed.
+    """
+    import ast
+    import inspect
+
+    from custom_components.alpha_ems_manager import select as select_module
+
+    # The *calls*, not the mentions: the docstring names the debounced form in
+    # order to explain why it is not used, so a substring check would fire on the
+    # explanation. Only an actual call site matters.
+    tree = ast.parse(inspect.getsource(select_module.AlphaEmsControlModeSelect))
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+
+    assert "async_refresh" in called
+    assert "async_request_refresh" not in called
+
+
+@pytest.mark.parametrize(
+    "mode", [CONTROL_MODE_OFF, CONTROL_MODE_SHADOW, CONTROL_MODE_ACTIVE]
+)
+async def test_every_mode_re_evaluates_immediately_inside_the_cooldown(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    control_surface: None,
+    mode: str,
+) -> None:
+    """All three options, each with the cooldown armed against them.
+
+    ``off`` is included deliberately: it is the one a user reaches for when they
+    want the integration to stop trying, so it is the one that must least be left
+    pending. Its published state is ``off`` by design, so the assertion is that
+    the report describes the selected mode rather than that the state changed.
+    """
+    coordinator = setup_integration.runtime_data
+
+    await coordinator.async_request_refresh()
+    await hass.async_block_till_done()
+    assert coordinator._debounced_refresh._timer_task is not None
+
+    await set_mode(hass, mode)
+
+    assert coordinator.control_mode == mode
+    assert coordinator.control_report["mode"] == mode
+    if mode == CONTROL_MODE_OFF:
+        assert hass.states.get(CONTROL_STATE).state == CONTROL_STATE_OFF
+    else:
+        assert hass.states.get(CONTROL_STATE).state != CONTROL_STATE_OFF
+
+
 async def test_an_unknown_option_is_refused_by_the_entity(
     hass: HomeAssistant, setup_integration: MockConfigEntry
 ) -> None:

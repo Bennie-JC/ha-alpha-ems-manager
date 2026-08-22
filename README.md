@@ -19,9 +19,9 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.14` — a public beta.**
+> **Current release: `1.0.0-beta.15` — a public beta.**
 >
-> The integration is feature-complete for Phase 8 Stage A and covered by 2479
+> The integration is feature-complete for Phase 8 Stage A and covered by 2628
 > automated tests, but the learning and forecast model has **not** yet been validated
 > across enough real-world complete days to be called stable. Treat it as
 > something to run and observe, not yet as something to depend on.
@@ -61,7 +61,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.14` is not offered.
+     dialog if `1.0.0-beta.15` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -448,6 +448,53 @@ A material change to the plan also files one line in the **logbook**, on the
 sensor's own history. Nothing reads those lines back, and every one of them says
 it is advisory.
 
+### Export safety, and why a discharge gets smaller (changed in beta.15)
+
+A forced discharge sets the **battery's** rate, so whatever the house cannot use
+leaves through your meter — and the inverter's own feed-in limit does not apply to
+a dispatch. Alpha EMS therefore measures how much your site can absorb, at the
+meter:
+
+> `capacity = grid import − grid export + battery discharge already flowing`
+
+measured rather than reconstructed from house load and PV, because the meter is
+the instrument that *defines* export. A configured margin (10 %, not adjustable)
+comes off that capacity, because your load can change after the reading was taken.
+
+**Until beta.15 a discharge larger than that was refused outright.** A
+recommendation to discharge 1.1 kW into a house absorbing 0.99 kW produced
+`inhibited` with `would_export`, and nothing happened — even though 0.8 kW would
+have been perfectly safe. With modest household load that could persist for hours,
+and it made "discharge to the house" close to unusable.
+
+**Since beta.15 the command is made smaller instead.** The order is:
+
+1. measure the absorbing capacity at the meter;
+2. take the margin off the **capacity** (0.99 → 0.891 kW);
+3. clamp the request to what remains;
+4. round **down** to a step the inverter accepts (→ 0.8 kW);
+5. recompute the energy the command will deliver.
+
+The 0.9 kW step is rejected, because it would exceed the margined bound. Nothing
+is ever rounded up, and the final command can never be larger than what was
+requested.
+
+**It is still refused when nothing useful survives.** `would_export` has not gone
+away and means what it always meant. You will still see it when your site has no
+spare absorption, when it is already exporting, when the safe power falls below
+the smallest command the inverter accepts (0.2 kW), or when the grid meter is
+missing or stale. Fail closed is unchanged.
+
+**`eligible` now means "something safe remains"** rather than "the request was
+safe as asked". A reduced command reads `eligible`, and the `export_check` block
+of a diagnostics download says by how much: `requested_power_kw`,
+`safe_capacity_kw`, `safety_limited` and `final_command_power_kw`.
+
+None of this makes anything executable. This release still sends no command, and
+the Phase-8 `export` action — which deliberately *wants* grid export — remains
+advisory with no actuator at all. The clamp exists so export does not happen; it
+cannot be the thing that performs one.
+
 ## What it does **not** do yet
 
 - ❌ No automatic battery control. It never writes to your inverter.
@@ -466,9 +513,10 @@ it is advisory.
 - ❌ No self-correction. Phase 2 *records* forecast error; it does not feed it
   back into the model. Nothing adjusts itself in response to being wrong.
 - ❌ **No battery control, still.** Phase 4 builds the entire control path --
-  translation, safety checks, the exact command -- and cannot execute it. No
-  service call reaches your inverter, and that is enforced by a build-time
-  constant rather than by a setting.
+  translation, safety checks, the export clamp, the exact command -- and cannot
+  execute it. No service call reaches your inverter, and that is enforced by a
+  build-time constant rather than by a setting. beta.15 makes `eligible` reachable
+  far more often; it does not make it executable.
 - ❌ No price-aware or economic battery planning, and no automatic charging. No
   cheap-hour buying, no overnight carry-over, no arbitrage. Expected production is
   an input to the plan, never a reason to buy or sell.

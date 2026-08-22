@@ -1380,14 +1380,107 @@ two is lossless. It is kept so the promise does not quietly depend on that.
 
 ### Export safety
 
+Since beta.15 this is a **clamp with a refusal behind it** rather than a refusal
+alone. The two halves are in different modules on purpose:
+
+| stage | where | what it owns |
+|---|---|---|
+| the bound | `safety.safe_discharge_power_kw` | measured capacity, less the margin |
+| the reduction | `alphaess_device.limit_command` | quantisation and energy bookkeeping |
+| the refusal | `safety.evaluate` | `would_export`, unchanged |
+
+`safe_discharge_power_kw` is the **single** definition of the bound: the clamp
+reduces to it and the gate checks against it, so the number a command was reduced
+to and the number it is judged against cannot drift apart. The same reasoning that
+makes `split_grid_energy` the sole grid-residual authority — two expressions of one
+safety bound is one too many.
+
+**The ordering is fixed and every step of it matters:**
+
+```
+measure capacity at the meter          0.99 kW
+apply the margin to the CAPACITY       0.891 kW      (never to the command)
+clamp the request to what remains      min(1.1, 0.891)
+quantise DOWNWARDS to a helper step    0.8 kW        (0.9 would exceed the bound)
+recompute the commanded energy         0.2 kWh
+```
+
+Applying the margin to the command instead would leave it sitting at the capacity
+itself, with no margin at all — `1.1 × 0.9 = 0.99`, precisely the measured figure.
+Rounding before the margin, or rounding up, would put a command back above the
+bound the margin exists to create. All four wrong orders have mutation tests.
+
+**The gate still never scales anything.** The clamp is upstream; the gate is handed
+an already-safe command and passes it. That preserves the rule this layer has had
+since Phase 4: safety may only ever **subtract**, and `final_power <= requested_power`
+holds unconditionally.
+
+**Refusing is preferred to rounding up.** When nothing representable survives —
+no capacity, an already-exporting site, or a safe power below the two-step device
+minimum — `limit_command` returns the command **unchanged** and the gate refuses
+the original request whole, with the original reason and the original figures.
+Reducing it to zero inside the clamp would have moved the refusal into the wrong
+module and reported the wrong cause.
+
+**Energy bookkeeping follows the power, not the request.**
+`commanded_energy_ac_kwh` is recomputed from the reduced power over the *same*
+duration; `allowed_energy_ac_kwh` is the decision layer's own clamped figure and
+is untouched, so what the reduction gave up appears in
+`undelivered_energy_ac_kwh`. The duration is deliberately **not** extended to
+compensate: it is a dead-man margin, not a delivery window, and a stretched
+command would outlive the planning interval that is supposed to supersede it. The
+next refresh issues its own command, which is the architecture's answer.
+
+**`eligible` changed meaning, narrowly.** It now means *a safe command remains*
+rather than *the requested command was safe*. A safely reduced command is
+`eligible`; only "nothing safe remains, or another rule refused" is `inhibited`.
+
+**One context, read once.** The bound is taken from a context describing the
+*requested* command and the single changed field is then `replace`d, rather than
+reassembling the context around the reduced command. Every other field is a live
+reading, and re-reading them would let the bound and the gate describe different
+instants — the exact defect that once made a correct inhibit look arithmetically
+wrong beside the figures printed next to it. This is sound because
+`safe_discharge_power_kw` reads only the meter, the battery power and the margin,
+never `device_power_kw`, and a test pins that independence.
+
+**Meter noise needs no hysteresis, measured rather than assumed.** ±150 W around a
+0.99 kW working point moves the command between four adjacent steps, every one
+below the bound. The `eligible`/`inhibited` boundary sits at 222 W of absorption,
+768 W below that working point, so crossing it takes a load switching off rather
+than noise. And `CONTROL_COOLDOWN_SECONDS` already rate-limits any *restart* to one
+planning interval while exempting every reduction — reducing cannot increase risk.
+No stateful mechanism was added.
+
+#### What this is not
+
+It is **not** an export primitive. The Phase-8 `export` action deliberately wants
+grid export; this clamp exists so grid export does not occur, so it can never be
+the vehicle for one. There is no helper family for an export at all, `gap_reason`
+still reports `no_primitive`, and `economic_value_forgone_eur` still reflects the
+missing actuator honestly. `limit_command` names no grid-rate actuator and imports
+nothing from the planner — both asserted from the source.
+
+It is also **not** a planner change. The optimizer plans its economic ideal; the
+safety layer bounds what would be sent. Two refreshes whose absorbing capacity
+differs by more than a kilowatt produce identical desired plans, capability plans
+and euro figures.
+
+#### Why it has to be software at all
+
 A forced discharge sets the **battery** rate, so whatever the house cannot absorb
 leaves through the meter — and the dispatch path does not honour the inverter's
 configured feed-in limit. That limit is read and reported; it is never written,
-because it is a flash-backed grid-safety setting.
+because it is a flash-backed grid-safety setting. `Max Feed to Grid` appears in
+diagnostics so a reader can see the limit the dispatch path ignores.
 
-So export is prevented in software: a discharge above the live house load, less a
-configurable margin, is refused whole. Not trimmed to fit. `Max Feed to Grid`
-appears in diagnostics so a reader can see the limit the dispatch path ignores.
+So there is nothing downstream to catch an over-large discharge, which is why the
+bound above is enforced here and why it is measured at the meter rather than
+inferred. Two earlier versions of this rule are worth remembering: beta.8 compared
+the command against the **house load** alone, which read 2 kW of capacity on a
+sunny site that was already exporting a kilowatt; and every release up to beta.14
+refused the whole command rather than reducing it, which was safe and cost the user
+every partially-available discharge.
 
 ### Charge is a battery rate, not a grid rate
 

@@ -105,9 +105,22 @@ class AlphaEmsControlModeSelect(
         it a mode change would sit unreflected for up to fifteen minutes -- and a
         control that appears to have done nothing for a quarter of an hour is one
         a user reasonably stops trusting.
+
+        ``async_refresh`` rather than ``async_request_refresh``, for exactly the
+        reason ``AlphaEmsCoordinator._handle_started`` gives for the startup path:
+        the requesting form is debounced on a ten-second cooldown, so a quarter-
+        hour tick and a user action arriving inside that window collapse into one
+        deferred refresh. The mode is applied either way -- it is set before the
+        refresh is asked for -- but the *re-evaluation* then waits out the
+        remainder of the cooldown, and "immediately" stops being true.
+
+        A user pressing a control is the last thing that should be rate-limited
+        against a background timer. This is a human-speed action, and it is the
+        one path where collapsing two refreshes into the earlier one is precisely
+        wrong.
         """
         if option not in CONTROL_MODE_OPTIONS:
             raise ValueError(f"unknown control mode: {option}")
         self.coordinator.set_control_mode(option)
         self.async_write_ha_state()
-        await self.coordinator.async_request_refresh()
+        await self.coordinator.async_refresh()
