@@ -60,7 +60,16 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
 from . import AlphaEmsConfigEntry
-from .activity import ActivityEntry, ActivityState, logbook_payload, next_activity
+from .activity import (
+    ActivityEntry,
+    ActivityState,
+    PlannedRun,
+    RunContent,
+    RunIdentity,
+    direction_of,
+    logbook_payload,
+    next_activity,
+)
 from .const import (
     BATTERY_ACTION_OPTIONS,
     BATTERY_KW_PRECISION,
@@ -73,12 +82,14 @@ from .const import (
     ECONOMIC_ACTION_CURTAIL,
     ECONOMIC_ACTION_EXPORT,
     ECONOMIC_ACTION_OPTIONS,
+    ECONOMIC_ACTION_SAFETY_BUY,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     ECONOMIC_BLOCKED_MODE_NOT_ACTIVE,
     ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL,
     ECONOMIC_BLOCKED_NO_PRIMITIVE_EXPORT,
     ECONOMIC_BLOCKED_NOT_ENABLED,
     ECONOMIC_EUR_PRECISION,
+    ECONOMIC_GAP_NONE,
     FORECAST_ERROR_WINDOW_DAYS,
     NAME,
     SENSOR_BATTERY_PLANNED_POWER,
@@ -559,25 +570,88 @@ def _economic_action_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, A
     }
 
 
+def _planned_runs(coordinator: AlphaEmsCoordinator) -> tuple[PlannedRun, ...]:
+    """Return every planned run with its instants resolved to absolute time.
+
+    This is the boundary where the calendar lives. The optimizer indexes a
+    continuous chronological run through today and on into tomorrow; only here is
+    the civil day and its real length -- 92, 96 or 100 intervals -- available to
+    turn an index into an instant. Handing ``activity`` plain instants is what
+    lets the whole announcement policy be exercised against values, with no plan
+    and no clock.
+
+    Every run is offered, not just the published one. The announcement policy
+    decides which is imminent; that is not a decision this function should
+    pre-empt by only showing it the first.
+    """
+    outcome = _economic_outcome(coordinator)
+    if outcome is None or not outcome.available:
+        return ()
+    plan = _plan(coordinator)
+    if plan is None or plan.target_day is None or plan.forecast is None:
+        return ()
+    count = _today_interval_count(plan)
+    if count <= 0:
+        return ()
+
+    tz = dt_util.get_default_time_zone()
+    refused = outcome.capability_gap_reason != ECONOMIC_GAP_NONE
+    runs: list[PlannedRun] = []
+    for run in outcome.desired.runs:
+        start = _economic_instant(plan.target_day, run.start_index, count, tz)
+        end = _economic_instant(plan.target_day, run.end_index + 1, count, tz)
+        if start is None or end is None:
+            continue
+        action = (
+            ECONOMIC_ACTION_SAFETY_BUY
+            if run.start_index in outcome.safety_buy_runs
+            else run.action
+        )
+        runs.append(
+            PlannedRun(
+                identity=RunIdentity(
+                    direction=direction_of(action),
+                    start_utc=dt_util.as_utc(start),
+                ),
+                content=RunContent(
+                    action=action,
+                    capability_action=outcome.capability_action,
+                    reason=outcome.reason,
+                    energy_kwh=run.energy_kwh,
+                    power_kw=run.first_power_kw,
+                    end_utc=dt_util.as_utc(end),
+                    charge_source=run.charge_source,
+                    price_eur_kwh=run.average_price_eur_kwh,
+                    value_eur=-run.marginal_cost_eur,
+                    refused=refused,
+                    window=f"{start:%H:%M}-{end:%H:%M}",
+                ),
+            )
+        )
+    return tuple(runs)
+
+
 def _economic_activity(
     coordinator: AlphaEmsCoordinator, previous: ActivityState | None
 ) -> ActivityEntry | None:
     """Return the Activity line this refresh deserves, or ``None`` for silence.
 
-    The one place the clock window is rendered for a logbook line, and it reuses
-    the same helper the attribute does -- so an entry can never disagree with the
-    entity it is filed against.
+    ``value_eur`` is the run's **marginal** cost, sign-flipped -- what it saved
+    against leaving the battery alone through the same intervals. Not the raw cash
+    flow, which is negative for every charge by construction and zero for the most
+    valuable discharge there is.
+
+    ``now`` is the instant the coordinator published, not a fresh clock reading.
+    The announcement must describe the same moment the plan does, or a run could
+    be judged imminent against one clock and rendered against another.
     """
-    outcome = _economic_outcome(coordinator)
-    run = (
-        None
-        if outcome is None or not outcome.available
-        else outcome.desired.published_run
-    )
+    issued = (coordinator.data or {}).get("issued_at")
+    if issued is None:
+        return None
     return next_activity(
         previous=previous,
-        outcome=outcome,
-        window=_economic_window(coordinator, run),
+        runs=_planned_runs(coordinator),
+        now=dt_util.as_utc(issued),
     )
 
 

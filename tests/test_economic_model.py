@@ -462,7 +462,9 @@ def test_doing_nothing_costs_exactly_the_house_load_at_the_prices() -> None:
     expected = 4 * 0.25 * CHEAP_IMPORT + 4 * 0.25 * DEAR_IMPORT
 
     assert expected == pytest.approx(0.50)
-    assert hold_cost(horizon=horizon) == pytest.approx(0.50)
+    assert hold_cost(
+        horizon=horizon, table=table, start_energy_kwh=START_KWH
+    ) == pytest.approx(0.50)
 
 
 def test_load_shifting_without_a_grid_purchase_is_worth_nothing_here() -> None:
@@ -910,7 +912,9 @@ def test_a_high_enough_gain_threshold_suppresses_the_trade_entirely() -> None:
 
     assert cheap.runs != ()
     assert dear.runs == ()
-    assert dear.cost_eur == pytest.approx(hold_cost(horizon=horizon))
+    assert dear.cost_eur == pytest.approx(
+        hold_cost(horizon=horizon, table=table, start_energy_kwh=START_KWH)
+    )
 
 
 def test_reserve_protection_charging_happens_below_the_gain_threshold() -> None:
@@ -994,7 +998,7 @@ def test_the_published_energy_is_the_flow_the_action_controls(
         grid_export_kwh=4.0,
         pv_curtailed_kwh=5.0,
         first_power_kw=6.0,
-        expected_value_eur=0.0,
+        net_cash_flow_eur=0.0,
         min_price_eur_kwh=None,
         max_price_eur_kwh=None,
         average_price_eur_kwh=None,
@@ -1018,7 +1022,7 @@ def test_a_hold_reports_a_known_zero_rather_than_an_unknown() -> None:
         grid_export_kwh=1.0,
         pv_curtailed_kwh=1.0,
         first_power_kw=0.0,
-        expected_value_eur=0.0,
+        net_cash_flow_eur=0.0,
         min_price_eur_kwh=None,
         max_price_eur_kwh=None,
         average_price_eur_kwh=None,
@@ -1146,7 +1150,7 @@ def test_the_solver_never_raises_on_absurd_inputs() -> None:
 
 
 def test_a_full_day_horizon_solves_inside_the_refresh_budget() -> None:
-    """Ninety-six intervals, three solves' worth of work, well under a second.
+    """Ninety-six intervals, four solves' worth of work, well under a second.
 
     The guard exists because the first working version took 670 ms by calling the
     grid split once per transition. Precomputing the per-interval outcomes by
@@ -1372,7 +1376,11 @@ def test_a_terminal_floor_the_grid_can_express_is_left_alone() -> None:
 
 
 def test_the_terminal_bound_is_the_same_for_every_solve() -> None:
-    """All three solves must be bounded identically, or the comparison is unfair.
+    """Every compared solve must be bounded identically, or the comparison is
+    unfair.
+
+    The terminal-protection solve is the one deliberate exception, and it is
+    not compared against these: relaxing the bound is the whole point of it.
 
     It follows from the ambient walk consulting only the idle-run deltas, which no
     permission set can remove: absorbing production the house cannot use needs no

@@ -19,9 +19,9 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.15` — a public beta.**
+> **Current release: `1.0.0-beta.16` — a public beta.**
 >
-> The integration is feature-complete for Phase 8 Stage A and covered by 2628
+> The integration is feature-complete for Phase 8 Stage A and covered by 2715
 > automated tests, but the learning and forecast model has **not** yet been validated
 > across enough real-world complete days to be called stable. Treat it as
 > something to run and observe, not yet as something to depend on.
@@ -61,7 +61,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.15` is not offered.
+     dialog if `1.0.0-beta.16` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -439,14 +439,40 @@ stretch of one action rather than per kilowatt-hour, and **only** for actions
 Alpha EMS actually chose — never for absorbed sunshine. It is not a wear model. It
 is your answer to "how small is too small".
 
+Since beta.16 a sunny quarter in the middle of a charging campaign no longer ends
+that campaign. Absorbed sunshine still creates no action of its own, but it is now
+*transparent* to a charge that is already under way, so one afternoon of buying
+interrupted by cloud gaps pays the gain once rather than once per gap. A quarter
+where the battery genuinely does nothing still ends the run, exactly as before.
+
 Every planned run appears in the `economic_plan` block of a diagnostics download
 with all five energy boundaries stated separately — the two battery-side AC
 figures, the two grid-side ones, and the curtailment — because every euro in the
 payload is priced on grid energy and a reader has to be able to check that.
 
-A material change to the plan also files one line in the **logbook**, on the
-sensor's own history. Nothing reads those lines back, and every one of them says
-it is advisory.
+**A charge run's energy is not the same thing as energy bought.** "Charged
+4.48 kWh" can mean 1.5 kWh from the grid and the rest from the roof, and the
+`grid_import_kwh` beside it is *site* import including house load — a third
+quantity again. Since beta.16 each run also states what it caused on its own:
+`marginal_grid_import_kwh`, `marginal_grid_export_kwh`, and a `charge_source` of
+`production`, `mixed` or `grid`. These are differences against leaving the battery
+alone through the same quarters, not shares apportioned by a rule of thumb.
+
+Beside them, `marginal_cost_eur` is what the run cost compared with doing nothing,
+and **a negative figure means it saved money.** The older per-run figure was a
+cash flow, so every charge run read negative simply because buying costs money,
+and a discharge that exactly covered the house read `0.00` while wiping out the
+whole import bill. The cash flow is still there as `net_cash_flow_eur`; it is just
+no longer the only number.
+
+A run about to start files one line in the **logbook**, on the sensor's own
+history — once, when it is within a quarter of an hour of beginning, and then
+nothing while it runs. If it changes materially it says so once; if it is dropped
+before its window opens, or its window passes, it says that once too. Earlier
+releases re-announced whatever the plan currently said on every refresh, which
+buried the log in near-identical lines for a run already under way.
+
+Nothing reads those lines back, and every one of them says it is advisory.
 
 ### Export safety, and why a discharge gets smaller (changed in beta.15)
 

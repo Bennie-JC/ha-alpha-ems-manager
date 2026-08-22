@@ -318,7 +318,7 @@ async def test_the_stored_document_reloads_from_disk(
     assert reloaded.days[NORMAL].economic_fingerprints == [snapshot.fingerprint]
     assert reloaded.corrupt is False
     assert reloaded.reset_by_migration is False
-    assert FORECAST_STORAGE_MINOR_VERSION == 5
+    assert FORECAST_STORAGE_MINOR_VERSION == 6
 
 
 async def test_a_day_with_no_plan_carries_no_economic_keys(
@@ -415,3 +415,40 @@ async def test_a_changed_setting_does_record_a_second_document(
 
     assert len(snapshots) == 2
     assert snapshots[0].settings_fingerprint != snapshots[1].settings_fingerprint
+
+
+# --- beta.15 documents keep reading ----------------------------------------
+
+
+def test_a_beta15_economic_document_is_read_not_discarded() -> None:
+    """The storage bump is additive, and this is the proof.
+
+    A document written by beta.15 carries no ``tpc``, ``tpi`` or ``dc``. It must
+    read back with every other field intact and the three new ones at their
+    documented absences -- never be rejected, and never invent a figure it does
+    not have.
+    """
+    payload = snapshot_of().to_dict()
+    for added in ("tpc", "tpi", "dc"):
+        assert added in payload, added
+        del payload[added]
+
+    restored = EconomicSnapshot.from_dict(NORMAL, payload)
+
+    assert restored is not None
+    assert restored.desired_action == ECONOMIC_ACTION_CHARGE
+    assert restored.fingerprint == snapshot_of().fingerprint
+    assert restored.reserve_protection_cost_eur is not None
+    # Absent is absent. A zero cost would be a claim the document cannot support.
+    assert restored.terminal_protection_cost_eur is None
+    assert restored.terminal_protection_import_kwh is None
+    # A count, though, has an honest zero: no recorded changes.
+    assert restored.direction_changes == 0
+
+
+def test_the_new_scalars_round_trip_like_the_rest() -> None:
+    """Additive fields are still fields, and still have to survive the journey."""
+    snapshot = snapshot_of()
+
+    assert snapshot.terminal_protection_cost_eur is not None
+    assert EconomicSnapshot.from_dict(NORMAL, snapshot.to_dict()) == snapshot

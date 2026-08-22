@@ -82,8 +82,8 @@ DST and forecast tests are fast and exhaustive.
 
 | Module | Role |
 |---|---|
-| `economic.py` | the physics table, the horizon, the solver, the three solves, the labels, the bounded payload and the stored snapshot. Pure |
-| `activity.py` | the sentence one logbook line says, and the guard that refuses to say the battery moved. Pure |
+| `economic.py` | the physics table, the horizon, the solver, the four solves, the labels, the marginal attribution, the bounded payload and the stored snapshot. Pure |
+| `activity.py` | the sentence one logbook line says, the identity a run keeps while it runs, and the guard that refuses to say the battery moved. Pure |
 
 ### Phase-6 modules
 
@@ -2461,7 +2461,7 @@ inferred.
 Every reachable transition is precomputed once per refresh by asking
 `battery.apply_request`, because `apply_request` depends only on state and request
 and never on the interval. Roughly seventeen thousand clamp calls, about fourteen
-milliseconds, reused by all three solves.
+milliseconds, reused by all four solves.
 
 The consequence is the point: the optimizer performs **no efficiency arithmetic at
 all** and compares against **no hardware limit**. There is no `math.sqrt`, no
@@ -2586,6 +2586,21 @@ configuration, and that the corrected bound produces a valid plan.
 What is published is what is enforced. Publishing a bound the solver quietly
 relaxed would be worse than either alternative.
 
+**And since beta.16 what it costs is published too.** The bound is not free: it
+implies the battery may never end a horizon holding less than the idle walk would
+have left in it, which on a horizon ending in the overnight trough can force a
+maximum-power purchase in the final quarters purely to end full. A fourth solve
+with the terminal bound relaxed to the configured floor prices exactly that, into
+`terminal_protection_cost_eur` and `terminal_protection_import_kwh` -- mirroring
+the reserve's own protection cost, which is measured the same way for the same
+reason.
+
+The bound itself is **unchanged**, and the published plan is the bounded one. The
+distortion is in the far field -- the first run was byte-identical between a
+two-day and a three-day horizon on the shape that measured it, and each refresh
+commits only the near field -- so the figure exists to let a decision about the
+bound rest on live evidence rather than on a synthetic price curve.
+
 The reproduction has a second, incidental benefit. `plan.reference` is simulated
 over the *plan's* horizon, which is usually longer than the economic one; the hold
 trajectory is monotone non-decreasing, so the request is always at or above the
@@ -2671,7 +2686,24 @@ export price for an export, and for a load-serving discharge the import price it
 One knob, charged once per **discretionary economic action run** inside the
 objective — which is why the run state is a dimension of the search. Ambient
 production absorption is not a discretionary action, so it is never charged; see
-*`charge` means buying* above. Charging the fee per interval would suppress exactly
+*`charge` means buying* above.
+
+It is also, since beta.16, **transparent** to a charge campaign it interrupts. A
+sunny quarter inside a charging window draws nothing extra from the grid, so it
+was classified as plain idle — which ended the run, and made the next purchasing
+quarter pay the fee again. A partly-sunny cheap afternoon could pay several fees
+for one campaign, and that is a defect in the *plan*, not merely in the report.
+
+`_RUN_ABSORB` is the fix, and its narrowness is the whole design: it is a fourth
+*classification*, not a fourth dimension of the search, resolved by a single rule
+that carries an incoming charge forward and collapses to idle otherwise. So
+absorption continues a charge and can never continue a discharge — it *is* a
+charge, and letting it bridge a reversal would suppress the fee a genuine
+direction change owes. A quarter where the battery truly does nothing still ends
+a run. The first implementation of this got it wrong in exactly that way, and an
+existing regression caught it.
+
+Charging the fee per interval would suppress exactly
 the wrong trades: a long profitable window pays it once per interval and dies,
 while a single-interval micro-cycle pays it once and survives.
 
@@ -2687,6 +2719,76 @@ can be applied in the wrong place.
 back. Nobody pays the switching cost; it is a notional device for suppressing
 pointless action, so reporting a gain net of it would understate what the plan
 actually earns. Both terms are published separately.
+
+### The counterfactual has to be the same physical world
+
+`hold_cost` used to freeze the battery outright, and that made it the wrong
+baseline. A frozen battery *sells* the surplus production the plan is obliged by
+the terminal bound to *bank*, and stored energy carries no price -- so the
+baseline collected export revenue the plan could not, and the reported gain was
+understated by roughly the export value of everything absorbed.
+
+Since beta.16 both are priced on one ambient trajectory: `_ambient_walk`,
+promoted from the endpoint calculation the terminal bound already performed.
+There is now a single definition of "doing nothing", consumed by the bound and by
+the baseline, so the two cannot drift apart. `hold_cost` never enters the
+objective, so this changed no plan -- only what is said about one.
+
+### What a run caused, exactly rather than apportioned
+
+Three quantities were being read as one. Energy into the pack is not energy
+bought; `grid_import_kwh` is *site* import including house load; and neither is
+what a run caused. A run charging 4.48 kWh under a PV bell may have bought
+1.5 kWh.
+
+No heuristic is needed, because the DP already computes each interval's idle
+counterfactual -- `unavoidable_import`, `unavoidable_export`, `idle_cost_eur` --
+in order to decide whether a charge is discretionary at all. What a run caused is
+therefore a *difference*, summed per interval:
+
+```
+marginal_grid_import_kwh = sum(flows.import - idle.import)
+marginal_grid_export_kwh = sum(flows.export - idle.export)
+marginal_cost_eur        = sum(cost_eur     - idle.cost_eur)
+```
+
+`charge_source` follows from the first of these -- `production`, `mixed` or
+`grid` -- with the boundary at one state-space bucket, below which a grid
+contribution is unrepresentable and claiming one would over-state it.
+
+`marginal_cost_eur` also repairs the most misleading figure in the payload. The
+old per-run `expected_value_eur` was a negated cash flow with no counterfactual,
+so every charge run read negative *by construction*, and a discharge that exactly
+covered house load read `0.00` while avoiding the whole import bill -- the most
+valuable thing a battery does, reported as nothing. The cash flow survives,
+renamed `net_cash_flow_eur` to say what it is.
+
+### Run count is not switch count
+
+`runs_from` groups by the action *label*, and the label flips between `discharge`
+and `export` as house load rises and falls beneath a constant battery discharge.
+The run state does not flip, and the fee follows the state. Seven reported runs
+on the live shape were three direction changes.
+
+Neither number is wrong; reporting only the first invites the reader to conclude
+the optimizer is churning. Each run now states its `direction` and whether it
+`charged_switching_fee`, and each plan states `direction_changes`, which is the
+count the fee was charged on.
+
+### Peak power the state space cannot represent
+
+`max_representable_power_kw` is published in the solver block, and it is not a
+configured limit. With a 0.25 kWh DC bucket, a quarter-hour at 10 kW AC is
+2.3717 kWh DC -- 9.487 buckets. Nine buckets are reachable at 9.487 kW; ten need
+10.54 kW, which the clamp reduces, so the move is correctly discarded. Roughly
+five per cent of nameplate peak is unreachable in both directions, as a
+consequence of quantisation rather than of any fault in the clamp.
+
+It is published rather than fixed. Refining the bucket costs solve time as
+`1/bucket^2`, and the targeted alternative -- one clamped maximum-power move per
+state with a per-state AC override -- breaks the exact-linearity invariant the
+per-delta pricing table rests on, which is what the whole performance argument
+depends on. A test pins the figure so it cannot silently worsen.
 
 ### Curtailment, in closed form
 
@@ -2723,21 +2825,73 @@ Three properties, each enforced by the shape of the code:
   to change the signature.
 - **Write-only.** Nothing subscribes, no figure is derived from a line, and an
   installation without the recorder produces identical numbers.
-- **It cannot claim the battery did anything.** The six event kinds partition into
-  four about *advice* — `planned`, `changed`, `ended`, `refused` — and two about
-  *execution*, `started` and `cancelled`. The execution pair is refused outright
-  while `CONTROL_EXECUTION_AVAILABLE` is false, and every advice line carries the
-  advisory qualifier. A line reading "charge started" on a release that sends no
-  command would be a lie about the hardware, which is the one failure mode this
-  surface must not have.
+- **It cannot claim the battery did anything.** The six event kinds partition
+  into five about *advice* — `planned`, `changed`, `ended`, `refused`,
+  `cancelled` — and one about *execution*, `started`. The execution kind is
+  refused outright while `CONTROL_EXECUTION_AVAILABLE` is false, and every advice
+  line carries the advisory qualifier. A line reading "charge started" on a
+  release that sends no command would be a lie about the hardware, which is the
+  one failure mode this surface must not have.
 
-Change-triggered on a **coarse** fingerprint: the action, the capability action,
-the window and the power and energy rounded to `ECONOMIC_MATERIAL_POWER_KW` and
-`ECONOMIC_MATERIAL_ENERGY_KWH`. Ninety-six unchanged refreshes must be silent, and
-the only way to guarantee that is for the fingerprint not to notice noise.
+  `cancelled` sat on the execution side until beta.16, on the reading that
+  cancelling is something done to a command in flight. Withdrawing advice that
+  never began is advice, and a design that announces a run once has to be able to
+  retract that announcement or leave it standing as a falsehood. Reversing a
+  documented decision is worth stating plainly rather than slipping in.
 
-The state is held on the entity and reset by a reload, which costs one redundant
-`planned` line and buys not persisting a logbook cursor — storing it would make an
+#### Identity, content, and why the log used to repeat itself
+
+The first design keyed a run on `start_index` -- a horizon-relative index -- and
+hashed its bucketed figures. Every part of that is unstable in a way that has
+nothing to do with the plan changing:
+
+- the horizon starts at `elapsed + 1`, so a **run already under way loses its
+  leading interval on every refresh**: the index advances, the energy shrinks, the
+  first power becomes the next interval's. A `changed` line every quarter of an
+  hour, for a run doing exactly what it said it would;
+- **midnight rebases every index by a whole day** with no change in meaning;
+- bucket-and-hash **flaps at boundaries**: a hundredth of a kilowatt across one
+  speaks, a fifth inside one stays silent.
+
+So identity and content are now separate things.
+
+**Identity is `(direction, start instant)`** -- the run state rather than the
+label, and an absolute instant rather than an offset. Immune to horizon shifting,
+to midnight, and to a `discharge` relabelled `export` mid-run.
+
+**Content is compared against the announced value with deadbands**, never hashed.
+A deadband cannot flap at a boundary; bucketing can. Each is an existing constant
+rather than an invented percentage: `ECONOMIC_BUCKET_KWH` for energy, because
+smaller is unrepresentable; `CONTROL_MIN_POWER_KW` for power, because smaller is
+not a commandable difference; `QUARTER_MINUTES` for time, because smaller cannot
+change which quarter a run starts in.
+
+**A run is announced once, when it is about to happen.** The lead time decides:
+more than one planning interval away is silent, which is the change that removes
+the spam; within one interval announces, once, keyed on identity; already under
+way and never announced announces once in the in-progress form, which covers a
+reload. A run whose window has already *closed* is never announced
+retrospectively -- a log line about something that will not happen is worse than
+no line at all.
+
+Thereafter it is silent unless something is genuinely different: one `changed`
+past a deadband, one `cancelled` if it leaves the plan before its window opens,
+one `ended` when its window elapses. At most one entry per refresh,
+structurally -- the function returns a single optional entry, so it cannot flood
+by construction.
+
+Energy and power are compared only while a run has *not* started, because a
+running run's remaining energy shrinks for the honest reason that it is being
+consumed. Its end instant is still watched, since that genuinely can move.
+
+`next_activity` reads **no clock of its own** -- a structural test enforces it --
+and the instant it is given is the one the coordinator published for the whole
+refresh. One clock per refresh, or two surfaces could disagree about which
+quarter it is.
+
+The state is held on the entity and reset by a reload, bounded to
+`MAX_ECONOMIC_RUNS_TRACKED`. It costs at most one redundant line after a reload
+and buys not persisting a logbook cursor -- storing it would make an
 observational surface a thing that can be restored wrong.
 
 ### Evidence, and why the fingerprint is over the inputs
@@ -2874,7 +3028,7 @@ What each next phase needs, and where it plugs in:
 | ~~**5** Solcast PV~~ | *shipped in beta.9* | production is a second series on the same index; the stepper still takes a sequence of demands. Asymmetric efficiency remains available and unused |
 | ~~**6** Frank prices~~ | *shipped in beta.12* | the series exists, normalised and stored, and is reachable from no module that decides anything. Phase 8 adds a cost function over the trajectories what-if already compares |
 | ~~**7** Dynamic reserve~~ | *shipped in beta.13, calculation only* | the requirement is computed and published; nothing obeys it. `dynamic_reserve` is deliberately **unwritten** and its tripwire test is still green, so this phase is structurally incapable of raising the floor. `interval_margin_kwh` remains unread, and the P10/P90 series remains unused — read `percentile_aggregation` first: a per-site sum is not a calibrated band |
-| ~~**8** Economic optimisation, automatic buy and sell, **safety buy**~~ | *Stage A shipped in beta.14, calculation only* | the plan is computed and published; nothing executes it, and export and photovoltaic curtailment have no actuator at all. `HoldPolicy` turned out to serve twice — as the counterfactual every euro is measured against *and* as the terminal bound. `dynamic_reserve` is still **unwritten** and its Phase-3 tripwire is still green: the optimizer plans subject to the reserve without raising the floor. Stage B is the actuators and the execution path |
+| ~~**8** Economic optimisation, automatic buy and sell, **safety buy**~~ | *Stage A shipped in beta.14, calculation only; corrected in beta.16* | the plan is computed and published; nothing executes it, and export and photovoltaic curtailment have no actuator at all. `HoldPolicy` turned out to serve twice — as the counterfactual every euro is measured against *and* as the terminal bound, and beta.16 made both read the same ambient walk so they cannot drift apart. The first live horizon showed the decisions were sound and the figures published about them were not; beta.16 fixes the reporting, makes solar absorption transparent to a charge campaign, and prices the terminal bound instead of changing it. `dynamic_reserve` is still **unwritten** and its Phase-3 tripwire is still green: the optimizer plans subject to the reserve without raising the floor. Stage B is the actuators and the execution path |
 | **9** Adaptive feedback | provenance and joins | recorded state of charge joins the Phase-2 snapshot by chronological index and target day; plans are recomputable; `policy_version` prevents pooling generations; separate efficiency fields let them be learned |
 | **10** Multi-day | a longer horizon | the simulator is horizon-agnostic and already walks today plus tomorrow |
 

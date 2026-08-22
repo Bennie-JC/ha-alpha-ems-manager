@@ -527,6 +527,7 @@ def _economic_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any
     return economic_as_dict(
         outcome,
         execution_blocked_reason=ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+        table_max_power_kw=outcome.max_representable_power_kw,
         horizon_start=start,
         horizon_end=end,
         provenance={

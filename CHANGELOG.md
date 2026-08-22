@@ -9,6 +9,190 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.16] - 2026-08-22
+
+**The optimizer's decisions were right; the numbers it published about them were
+not.** A full-horizon diagnostics download made four things read as defects that
+were not defects at all — and hid two that were. beta.16 makes the reporting true
+and stops the Activity log repeating the same plan every quarter of an hour.
+
+The optimizer's objective is unchanged. **The terminal condition is deliberately
+unchanged**; what it costs is now measured and published instead.
+
+### Changed
+
+- **A charge run now says where its energy came from.** "charged 4.48 kWh" read as
+  "bought 4.48 kWh". It was not: most of it was the sun, and the
+  `grid_import_kwh` printed beside it was **site** import including house load —
+  a third quantity again. Every run now also reports
+  `marginal_grid_import_kwh`, `marginal_grid_export_kwh` and a `charge_source` of
+  `production`, `mixed` or `grid`.
+
+  Exact, not apportioned: the optimizer already computes each interval's idle
+  counterfactual, so what a run *caused* is a difference rather than an estimate.
+  The boundary for "production" is one state-space bucket, below which a grid
+  contribution is unrepresentable and claiming one would be over-claiming.
+
+- **`expected_value_eur` per run is now `net_cash_flow_eur`, and there is a real
+  economic figure beside it.** The old field was a negated cash flow with no
+  counterfactual, so every charge run was negative *by construction* — and a
+  discharge that exactly covered house load read `0.00` while avoiding the entire
+  import bill. `marginal_cost_eur` is what the run cost against leaving the
+  battery alone through the same intervals. **Negative means it saved money.**
+
+- **The hold baseline prices the same physical world the plan does.** It used to
+  freeze the battery, so the baseline *sold* the surplus production the plan was
+  held to *bank* by the terminal bound, and stored energy carries no price. The
+  published gain was understated by roughly the export value of everything
+  absorbed. Both are now priced on one ambient trajectory — the same walk the
+  terminal bound already used, so there is a single definition of "doing nothing".
+
+  The objective never read this figure, so no plan changes; only what is reported
+  about it.
+
+- **Run count and switch count are now both visible.** Seven runs read as seven
+  trades; the switching fee had been charged three times. One physical discharge
+  carries both the `discharge` and `export` labels as house load rises and falls
+  beneath it — the label flips, the direction does not. Each run now reports its
+  `direction` and whether it `charged_switching_fee`, and each plan reports
+  `direction_changes`.
+
+- **Solar absorption no longer splits one paid charging campaign.** A sunny
+  quarter inside a charging window draws nothing extra from the grid, so it is
+  ambient — but it used to count as plain idle, which **broke the run**, and the
+  next purchasing quarter paid `minimum_trade_gain_eur` again. On a partly-sunny
+  cheap afternoon a single campaign could pay several fees.
+
+  Absorption is now transparent to a charge campaign, and to nothing else: it *is*
+  a charge, so it cannot continue a discharge run, and a **true** idle interval
+  still breaks a run exactly as before.
+
+  This one does change the chosen plan, and it is the only change in this release
+  that does.
+
+- **Activity announces a run once, when it is about to happen.** This was the
+  worst of it. The live log showed:
+
+  ```
+  11:45 -> charge 11:45-15:00
+  12:00 -> charge 12:00-15:00
+  12:15 -> charge 12:15-15:30
+  ```
+
+  Technically honest and unreadable. Three causes, all fixed: the run's identity
+  was keyed on a horizon index that advances every refresh while a run is under
+  way; midnight rebased every index by a whole day with no change in meaning; and
+  the figures were bucketed and hashed, so a hundredth of a kilowatt across a
+  boundary spoke while a fifth inside one stayed silent.
+
+  A run is now identified by `(direction, start instant)` — immune to horizon
+  shifting, to midnight, and to a label flipping mid-discharge. It is announced on
+  the first refresh within **one planning interval** of starting, and then stays
+  silent. Content is compared against the announced value with deadbands taken
+  from existing constants rather than invented percentages: one state-space bucket
+  of energy, the smallest power the device accepts, one planning interval of time.
+
+  A run that materially changes gets one `changed`; one dropped before its window
+  opens gets one `cancelled`; one whose window elapses gets one `ended`. A run
+  whose window has already closed is **never** announced retrospectively. At most
+  one entry per refresh, and a run already under way after a reload gets exactly
+  one line.
+
+- **`cancelled` is now an advice event rather than an execution event.** beta.14
+  classified it as execution, on the reading that cancelling is something done to
+  a command in flight. Withdrawing *advice* that never began is plainly advice, and
+  the one-message-per-run design has to be able to retract an announcement or
+  leave it standing as a lie. `started` remains the sole execution kind and is
+  still refused outright.
+
+### Added
+
+- **`terminal_protection_cost_eur` and `terminal_protection_import_kwh`.** The
+  terminal condition — end the horizon no lower than doing nothing would have —
+  stops the optimizer emptying the pack in the last priced interval merely because
+  nothing after it is priced. It does that job. It is also not free: on a
+  synthetic two-day shape it cost €1.77 and forced 9.49 kWh of grid import that a
+  plan seeing one more day would not have bought, and its signature is a
+  maximum-power purchase in the final quarters.
+
+  A fourth solve with the bound relaxed to the configured floor now prices it,
+  exactly as the reserve's own protection cost has been priced since beta.14.
+  **The bound itself is unchanged and the published plan is the bounded one** — the
+  figure exists so a decision about it can rest on live evidence rather than on a
+  synthetic shape.
+
+- **`max_representable_power_kw` in the solver diagnostics.** Roughly five per cent
+  of nameplate peak power is unreachable in both directions: a 10 kW charge for a
+  quarter is 2.3717 kWh DC, which is 9.487 state-space buckets. Nine buckets need
+  9.487 kW and are reachable; ten need 10.54 kW, which the clamp reduces, so the
+  move is correctly discarded.
+
+  Quantisation, not a clamp fault and not a configured limit. Published so it is
+  visible and cannot silently worsen. **Not fixed in this release, deliberately:**
+  refining the grid costs solve time as the inverse square of the bucket, and the
+  targeted alternative breaks the linearity invariant the per-delta pricing table
+  rests on — for a few per cent of peak power in the rare case where power binds.
+
+- **`marginal_*` figures on every interval**, from which every run figure sums. No
+  apportioning anywhere.
+
+### Unchanged, and verified as such
+
+- **The optimizer's objective and its decisions.** Two behaviours that were in
+  doubt are now regression-tested rather than argued:
+  - with 20 kWh of forecast production arriving and 7 kWh of headroom, the plan
+    buys **nothing** from the grid at 0.10 EUR/kWh — and forbidding grid charging
+    changes the answer by **€0.0000**. Remove the production and it immediately
+    buys at 7.4 kW. No "reserve room for the sun" rule was added, because the cost
+    objective already expresses it exactly;
+  - given eight candidate cheap quarters of which only two are cheapest, it
+    exports first to *make* headroom and then buys at the largest representable
+    power in **exactly those two quarters**. Energy, power and quarter selection
+    are jointly optimal; no maximum-power rule, no single-window rule, no
+    one-trade-per-day rule, and no season rule.
+- **The terminal condition**, as above.
+- **Phase 7.** The dynamic reserve is consumed exactly as before.
+- **The beta.15 safe-discharge clamp** and the beta.15 immediate mode refresh.
+- **13 entities**, `Economic Action` with exactly 8 attributes, no new sensor and
+  no new setting.
+- **Zero actuation.** `CONTROL_EXECUTION_AVAILABLE` remains **False**,
+  `PERMITTED_SERVICES` is still three, the service callers are unchanged, and
+  there is still no export primitive, no PV Switch, no Force Export and no Force
+  Import.
+- **No publication-gap hedge was added.** No clock rule, no Frank-specific timer.
+  A horizon holding only today's prices already ends at the hold endpoint, so the
+  terminal condition is the hedge — now with its cost visible.
+- **Raw quarter prices remain the only economic input.** No derived zone or
+  optimal-period entity exists to consume, let alone is consumed.
+
+### Storage
+
+`FORECAST_STORAGE_MINOR_VERSION` **1.5 → 1.6**, additive: economic snapshots gain
+`tpc`, `tpi` and `dc`. A beta.15 document reads back with every other field intact
+and the new ones absent rather than invented. No config-entry migration, no
+learning history reset.
+
+### Verification
+
+Tests **2628 → 2715**. Two new files: the reporting corrections and the
+announcement policy. Fourteen new mutation tests, 139 across all four suites, zero
+survivors.
+
+Zero actuation is proved at runtime as well as structurally: eight consecutive
+quarter-hours with both opt-ins on, in `active` mode, with real registered
+handlers for all three permitted services — the plan available, Activity lines
+filed, no line repeated, and not one service call. A test that proved silence
+while the plan was unavailable would prove nothing, so the positive half is
+asserted first.
+
+The announcement policy is exercised against fixed instants — the module reads no
+clock of its own, and a structural test enforces that — so every case including the
+ten-refreshes-during-a-running-charge regression is deterministic.
+
+One implementation defect was found and fixed during the work, by an existing
+test: the first version of the absorption change let a sunny quarter continue a
+*discharge* run, which would have suppressed the fee a genuine reversal owes.
+
 ## [1.0.0-beta.15] - 2026-08-22
 
 **A discharge that is too big for the house is now made smaller instead of

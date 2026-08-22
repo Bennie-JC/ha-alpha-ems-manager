@@ -392,12 +392,18 @@ FORECAST_STORAGE_VERSION: Final = 1
 #:   quarter-hour. A document without either reads unchanged, and an installation
 #:   without prices writes neither.
 #:
+#: * **1.6** -- v1.0.0-beta.16. Economic snapshots gained
+#:   ``tpc``/``tpi`` (what the terminal condition cost, so its effect can be
+#:   judged from live evidence rather than argued) and ``dc`` (how many battery
+#:   direction changes the plan actually made, which the run count over-states).
+#:   Additive: a document without them reads unchanged.
+#:
 #: One honest note for anyone diffing stored documents: photovoltaic snapshots
 #: (``pvs``/``pvo``) arrived in v1.0.0-beta.9 **without** a minor bump, so a
 #: document stamped 1.2 may or may not carry them. The reader tolerates both,
 #: which is why that omission is recorded here rather than papered over by
 #: restamping documents that were written correctly.
-FORECAST_STORAGE_MINOR_VERSION: Final = 5
+FORECAST_STORAGE_MINOR_VERSION: Final = 6
 
 #: Index document: schema version, the month partitions that exist, and the
 #: small daily summary rows. Always loaded.
@@ -1683,6 +1689,43 @@ DEFAULT_ALLOW_BATTERY_EXPORT: Final = False
 #: the solver figures and the provenance are all diagnostics.
 SENSOR_ECONOMIC_ACTION: Final = "economic_action"
 
+#: What the battery actually did in a run, as the objective saw it.
+#:
+#: Distinct from the *action label* on purpose. One physical discharge carries
+#: both ``discharge`` and ``export`` as house load rises and falls beneath it, so
+#: the label changes while the direction does not -- which is why a reported run
+#: count is an upper bound on the number of switches and never the switches
+#: themselves. The switching fee is charged against the direction.
+ECONOMIC_DIRECTION_IDLE: Final = "idle"
+ECONOMIC_DIRECTION_CHARGE: Final = "charge"
+ECONOMIC_DIRECTION_DISCHARGE: Final = "discharge"
+
+ECONOMIC_DIRECTIONS: Final = (
+    ECONOMIC_DIRECTION_IDLE,
+    ECONOMIC_DIRECTION_CHARGE,
+    ECONOMIC_DIRECTION_DISCHARGE,
+)
+
+#: Where a charge run's energy came from, derived from the exact marginal grid
+#: import rather than guessed. The boundary is one state-space bucket: below that
+#: the grid contribution is unrepresentable, so calling it anything but
+#: production would be over-claiming.
+#:
+#: This exists because "charged 4.48 kWh" read as "bought 4.48 kWh", and on the
+#: live installation only 1.55 kWh of that was even site import -- the rest was
+#: the sun.
+ECONOMIC_CHARGE_SOURCE_NONE: Final = "not_charging"
+ECONOMIC_CHARGE_SOURCE_PRODUCTION: Final = "production"
+ECONOMIC_CHARGE_SOURCE_MIXED: Final = "mixed"
+ECONOMIC_CHARGE_SOURCE_GRID: Final = "grid"
+
+ECONOMIC_CHARGE_SOURCES: Final = (
+    ECONOMIC_CHARGE_SOURCE_NONE,
+    ECONOMIC_CHARGE_SOURCE_PRODUCTION,
+    ECONOMIC_CHARGE_SOURCE_MIXED,
+    ECONOMIC_CHARGE_SOURCE_GRID,
+)
+
 #: Activity event kinds. Observational only: nothing in this integration
 #: subscribes to them, no planner or execution state is derived from them, and
 #: losing the recorder changes no figure.
@@ -1702,31 +1745,60 @@ ECONOMIC_EVENT_KINDS: Final = (
     ECONOMIC_EVENT_REFUSED,
 )
 
-#: The kinds that describe *advice*: it appeared, it changed materially, it went
-#: away, or it asked for something no actuator can perform. Every one of them is
-#: a statement about what the optimizer wants, and none is a statement about the
-#: battery.
+#: The kinds that describe *advice*: it appeared, it changed materially, it was
+#: withdrawn before it began, its window elapsed, or it asked for something no
+#: actuator can perform. Every one of them is a statement about what the
+#: optimizer wants, and none is a statement about the battery.
+#:
+#: ``cancelled`` moved here in beta.16. beta.14 classified it as execution, on the
+#: reading that cancelling is something you do to a command in flight. But
+#: withdrawing *advice* that has not started is plainly an advice event, and the
+#: one-message-per-run design needs to say so: a run announced and then dropped
+#: before its window opened must be retracted, or the announcement is left
+#: standing as a lie. ``started`` remains the sole execution kind.
 ECONOMIC_ADVICE_EVENT_KINDS: Final = (
     ECONOMIC_EVENT_PLANNED,
     ECONOMIC_EVENT_CHANGED,
+    ECONOMIC_EVENT_CANCELLED,
     ECONOMIC_EVENT_ENDED,
     ECONOMIC_EVENT_REFUSED,
 )
 
-#: The kinds that describe *execution*: a command went out and began, or a
-#: command in flight was withdrawn. They are unreachable while
-#: ``CONTROL_EXECUTION_AVAILABLE`` is false, and the emitter refuses them rather
-#: than trusting that no caller will ask -- an Activity line reading "started"
-#: while the integration sends nothing would be a lie about the battery, which is
-#: the one thing this surface must never say. The vocabulary is fixed here so
-#: Stage B inherits it rather than inventing it.
-ECONOMIC_EXECUTION_EVENT_KINDS: Final = (
-    ECONOMIC_EVENT_STARTED,
-    ECONOMIC_EVENT_CANCELLED,
-)
+#: The kind that describes *execution*: a command went out and began. Unreachable
+#: while ``CONTROL_EXECUTION_AVAILABLE`` is false, and the emitter refuses it
+#: rather than trusting that no caller will ask -- an Activity line reading
+#: "started" while the integration sends nothing would be a lie about the
+#: battery, which is the one thing this surface must never say. The vocabulary is
+#: fixed here so Stage B inherits it rather than inventing it.
+ECONOMIC_EXECUTION_EVENT_KINDS: Final = (ECONOMIC_EVENT_STARTED,)
 
-#: Below this, a change in a planned run's power or energy is not worth an
-#: Activity entry. Material change, not any change: a plan that shifts by a watt
-#: has not done anything a person needs to read about.
-ECONOMIC_MATERIAL_POWER_KW: Final = 0.2
-ECONOMIC_MATERIAL_ENERGY_KWH: Final = 0.2
+#: How far an announced run must move before it is worth a second Activity entry.
+#:
+#: **Deadbands, not buckets.** Until beta.16 the fingerprint bucketed each figure
+#: and hashed it, so a value drifting across a bucket boundary fired while a
+#: larger drift inside one did not. A deadband measured against the *announced*
+#: value cannot flap at a boundary, which is the property that matters.
+#:
+#: Every threshold is an existing constant rather than a chosen percentage:
+#:
+#: * energy -- one state-space bucket. A smaller change is not representable in
+#:   the optimizer's own state space, so it cannot be a different decision.
+#: * power -- the smallest power the device will accept. A smaller change is not
+#:   a commandable difference.
+#: * time -- one planning interval. A smaller shift cannot change which quarter
+#:   the run begins in.
+ECONOMIC_DEADBAND_ENERGY_KWH: Final = ECONOMIC_BUCKET_KWH
+ECONOMIC_DEADBAND_POWER_KW: Final = CONTROL_MIN_POWER_KW
+ECONOMIC_DEADBAND_MINUTES: Final = QUARTER_MINUTES
+
+#: How close a run's start must be before it is announced, in minutes.
+#:
+#: One planning interval. The plan is rebuilt every quarter, so this is the last
+#: refresh before the run begins -- the first moment an announcement is about
+#: something imminent rather than about a moving forecast. Announcing earlier is
+#: what produced a fresh entry every fifteen minutes for a run eighteen hours out.
+ECONOMIC_ANNOUNCE_LEAD_MINUTES: Final = QUARTER_MINUTES
+
+#: How many announced runs to remember. The plan publishes at most this many, so
+#: remembering more could never be consulted.
+MAX_ECONOMIC_RUNS_TRACKED: Final = MAX_ECONOMIC_RUNS_REPORTED

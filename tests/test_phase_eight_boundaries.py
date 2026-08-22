@@ -314,20 +314,28 @@ def test_the_optimizer_does_not_plan_around_a_self_driving_feature(
     assert feature not in module_source("economic"), feature
 
 
-def test_the_activity_surface_sees_only_the_outcome() -> None:
+def test_the_activity_surface_sees_only_planned_runs_and_the_clock() -> None:
     """Strictly observational, enforced by the signature rather than by intent.
 
-    ``next_activity`` takes the previous entry, the economic outcome and a
-    preformatted window. It cannot see the plan, the control report, the safety
-    state or the recovery machinery, because they are not arguments -- so a later
-    phase that wants to log an execution event has to change this signature, which
-    is a visible act.
+    ``next_activity`` takes the runs already announced, the runs the plan now
+    holds, and the current instant. It cannot see the plan object, the control
+    report, the safety state or the recovery machinery, because they are not
+    arguments -- so a later phase that wants to log an execution event has to
+    change this signature, which is a visible act.
+
+    ``now`` arrived in beta.16 and is a *value*, not a clock: the module reads no
+    time of its own, which is what keeps the whole announcement policy testable
+    against fixed instants.
     """
     parameters = inspect.signature(activity_module.next_activity).parameters
 
-    assert set(parameters) == {"previous", "outcome", "window"}
+    assert set(parameters) == {"previous", "runs", "now"}
     for parameter in parameters.values():
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+    source = inspect.getsource(activity_module)
+    for forbidden in ("utcnow", "dt_util", "datetime.now", "time.time"):
+        assert forbidden not in source, forbidden
 
 
 def test_nothing_in_the_integration_subscribes_to_an_activity_event() -> None:
@@ -358,7 +366,12 @@ def test_the_event_kinds_partition_into_advice_and_execution() -> None:
 
     assert advice | execution == set(ECONOMIC_EVENT_KINDS)
     assert not advice & execution
-    assert execution == {ECONOMIC_EVENT_STARTED, ECONOMIC_EVENT_CANCELLED}
+    # ``started`` is the only claim about the battery. ``cancelled`` moved to the
+    # advice set in beta.16: withdrawing advice that never began is plainly an
+    # advice event, and the one-message-per-run design has to be able to retract
+    # an announcement or leave it standing as a lie.
+    assert execution == {ECONOMIC_EVENT_STARTED}
+    assert ECONOMIC_EVENT_CANCELLED in advice
 
 
 @pytest.mark.parametrize("kind", ECONOMIC_EXECUTION_EVENT_KINDS)
@@ -371,7 +384,7 @@ def test_an_execution_event_is_refused_while_the_barrier_stands(kind: str) -> No
     entry = activity_module.ActivityEntry(
         kind=kind,
         message="anything",
-        state=activity_module.ActivityState(fingerprint="x", action="charge"),
+        state=activity_module.ActivityState(),
     )
 
     with pytest.raises(ValueError, match="executes nothing"):
@@ -384,11 +397,11 @@ def test_an_execution_event_is_refused_while_the_barrier_stands(kind: str) -> No
 def test_an_advice_event_is_accepted_and_carries_the_advisory_qualifier(
     kind: str,
 ) -> None:
-    """The four kinds Stage A can produce, and the entity they attach to."""
+    """The five kinds Stage A can produce, and the entity they attach to."""
     entry = activity_module.ActivityEntry(
         kind=kind,
         message="plans to hold. Advisory only: this release sends no command.",
-        state=activity_module.ActivityState(fingerprint="x", action="hold"),
+        state=activity_module.ActivityState(),
     )
     payload = activity_module.logbook_payload(
         entry, domain="alpha_ems_manager", entity_id="sensor.alpha_ems_economic_action"
@@ -417,3 +430,96 @@ def test_phase_eight_added_no_dependency() -> None:
     assert manifest["requirements"] == []
     assert "dependencies" not in manifest
     assert manifest["iot_class"] == "calculated"
+
+
+# ===========================================================================
+# and the runtime half: the whole beta.16 surface, writing nothing
+# ===========================================================================
+
+
+@pytest.fixture
+def economic_service_calls(hass) -> list:
+    """Capture every call to a service this integration is permitted to make.
+
+    Registered as **real handlers**, so a write attempt would succeed and be
+    recorded rather than raising -- otherwise an attempted call could be mistaken
+    for an absent service and the test would pass for the wrong reason.
+    """
+    calls: list = []
+
+    async def record(call) -> None:
+        calls.append(call)
+
+    for domain, service in PERMITTED_SERVICES:
+        hass.services.async_register(domain, service, record)
+    assert len(set(PERMITTED_SERVICES)) == 3
+    return calls
+
+
+async def test_the_economic_surface_writes_nothing_in_active_mode(
+    hass,
+    setup_integration,
+    control_surface: None,
+    frank,
+    economic_service_calls: list,
+) -> None:
+    """Eight quarter-hours, in the most permissive mode the release can reach.
+
+    The static proofs above show that no Phase-8 module *names* a service. This
+    is the other half: the integration actually running, with real prices so the
+    optimizer produces a plan, in ``active`` mode, filing Activity lines -- and
+    not one service call leaving it.
+
+    Asserted positively as well as negatively. Silence while the plan was
+    unavailable and the logbook empty would prove nothing, so the plan must be
+    available with runs in it and at least one Activity line must have been filed
+    before the zero below is worth anything.
+    """
+    from homeassistant.const import EVENT_LOGBOOK_ENTRY
+
+    from custom_components.alpha_ems_manager.const import (
+        CONTROL_EXECUTION_AVAILABLE,
+        CONTROL_MODE_ACTIVE,
+    )
+
+    from .forecast_helpers import NORMAL, history_before, local, refresh_at, seed
+    from .frank_capture import synthetic_day
+    from .test_control_modes import set_mode
+    from .test_economic_published import allow_trading
+
+    logbook: list = []
+    hass.bus.async_listen(EVENT_LOGBOOK_ENTRY, lambda event: logbook.append(event.data))
+
+    coordinator = setup_integration.runtime_data
+    seed(coordinator, history_before(NORMAL))
+    frank.publish(today=synthetic_day(NORMAL), tomorrow=None)
+    # Both opt-ins on: the state that gives the optimizer something to advise,
+    # and therefore the state in which a write would actually be tempting.
+    allow_trading(coordinator, allow_grid_charging=True, allow_battery_export=True)
+    await set_mode(hass, CONTROL_MODE_ACTIVE)
+
+    outcomes = []
+    for quarter in range(8):
+        hour, minute = 10 + quarter // 4, 15 * (quarter % 4)
+        await refresh_at(coordinator, local(NORMAL, hour, minute))
+        outcomes.append(coordinator.data["economic"])
+
+    # The surface was live, or the zero below means nothing.
+    assert coordinator.control_mode == CONTROL_MODE_ACTIVE
+    assert all(o is not None and o.available for o in outcomes)
+    assert any(o.desired.runs for o in outcomes)
+    assert logbook, "no Activity line was filed, so silence proves nothing"
+
+    # And it wrote nothing.
+    assert economic_service_calls == []
+    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert (coordinator.control_report or {}).get("last_write") is None
+    for entry in logbook:
+        assert entry["name"] == activity_module.ACTIVITY_NAME
+        assert "Advisory only" in entry["message"]
+
+    # And it did not repeat itself. The live symptom was a near-identical line
+    # every quarter of an hour about a run already under way, so eight refreshes
+    # producing eight variations of one sentence is the failure this catches.
+    messages = [entry["message"] for entry in logbook]
+    assert len(messages) == len(set(messages)), messages

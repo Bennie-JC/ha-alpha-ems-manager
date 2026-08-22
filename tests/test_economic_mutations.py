@@ -33,6 +33,7 @@ inputs, so the real module is never modified and the last test proves it.
 
 from __future__ import annotations
 
+import ast
 import math
 
 import pytest
@@ -51,6 +52,7 @@ from custom_components.alpha_ems_manager.economic import (
     fingerprint_economic,
     hold_cost,
 )
+from custom_components.alpha_ems_manager.economic import solve as economic_solve
 from custom_components.alpha_ems_manager.simulation import IntervalDemand
 
 from .test_economic_actions import outcome_for, reserve_deadline_horizon
@@ -895,10 +897,392 @@ def test_spanning_a_price_gap_instead_of_stopping_at_it_is_caught() -> None:
 
     assert horizon.intervals == 5
     assert horizon.limited_by == "prices"
-    assert hold_cost(horizon=horizon) < hold_cost(horizon=eight_interval_horizon(table))
+    assert hold_cost(
+        horizon=horizon, table=table, start_energy_kwh=START_KWH
+    ) < hold_cost(
+        horizon=eight_interval_horizon(table),
+        table=table,
+        start_energy_kwh=START_KWH,
+    )
 
 
 # --- hygiene ----------------------------------------------------------------
+
+
+# --- H. the beta.16 reporting and model corrections --------------------------
+#
+# beta.16 changed what the plan says about itself far more than what it decides,
+# so most of these mutations break a *number a person reads* rather than a
+# decision. That makes them easy to reintroduce by accident and hard to notice --
+# which is exactly why each one is pinned.
+
+
+def beta16_arbitrage(table, *, pv_kwh=0.0, pv_only_at=None, load_kwh=0.10):
+    """Return a cheap-then-dear plan starting at the floor.
+
+    Local copy rather than an import, so a change to the reporting file's helper
+    cannot quietly change what these mutations are measured against.
+    """
+    from .test_economic_model import FLOOR_PERCENT, horizon_for
+
+    floor = table.limits.energy_for_soc(FLOOR_PERCENT)
+    total = 6
+    pvs = [
+        pv_kwh if (pv_only_at is None or i == pv_only_at) and i < 3 else 0.0
+        for i in range(total)
+    ]
+    horizon = horizon_for(
+        table,
+        demands=[
+            IntervalDemand(index=i, baseline_kwh=load_kwh, pv_kwh=pvs[i])
+            for i in range(total)
+        ],
+        prices=[
+            IntervalPrice(import_eur_kwh=0.05, export_eur_kwh=0.02)
+            if i < 3
+            else IntervalPrice(import_eur_kwh=0.60, export_eur_kwh=0.55)
+            for i in range(total)
+        ],
+    )
+    return economic_solve(
+        table=table,
+        horizon=horizon,
+        start_energy_kwh=floor,
+        terminal_floor_kwh=floor,
+        minimum_trade_gain_eur=0.10,
+        permitted=EVERYTHING,
+    )
+
+
+def test_letting_absorption_reset_a_charge_run_is_caught() -> None:
+    """Mutation: classify ambient absorption as plain idle again.
+
+    The beta.15 behaviour, and the reason it was wrong: a sunny quarter inside a
+    paid charging window broke the run, so the next purchasing quarter started a
+    second campaign and paid ``minimum_trade_gain_eur`` again. One decision, two
+    fees, on any partly-sunny cheap afternoon.
+    """
+    from custom_components.alpha_ems_manager.economic import (
+        _RUN_ABSORB,
+        _RUN_CHARGE,
+        _RUN_IDLE,
+        _resolved_run_state,
+    )
+
+    from .test_economic_model import reference_table
+
+    table = reference_table()
+    sunny = beta16_arbitrage(table, pv_kwh=2.5, pv_only_at=1)
+    dark = beta16_arbitrage(table, pv_kwh=0.0)
+
+    # Honest: the sun changes the cost, never the number of decisions charged.
+    assert sunny.switching_cost_eur == pytest.approx(dark.switching_cost_eur)
+    assert sunny.intervals[1].absorbing is True
+    assert sunny.intervals[2].run_start is False
+
+    # The mutation, applied to the rule itself.
+    assert _resolved_run_state(_RUN_ABSORB, _RUN_CHARGE) == _RUN_CHARGE
+    assert _RUN_IDLE != _RUN_CHARGE
+
+
+def test_letting_absorption_pay_a_fee_of_its_own_is_caught() -> None:
+    """Mutation: treat absorption as a charge that starts a run.
+
+    Then the sun arriving would be billed as a trade the optimizer chose, and a
+    high enough threshold would have the battery decline free energy.
+    """
+    from .test_economic_model import reference_table
+
+    table = reference_table()
+    plan = beta16_arbitrage(table, pv_kwh=2.5, pv_only_at=1)
+    absorbing = [e for e in plan.intervals if e.absorbing]
+
+    assert absorbing, "the fixture must actually absorb something"
+    for entry in absorbing:
+        assert entry.run_start is False
+        assert entry.marginal_grid_import_kwh == pytest.approx(0.0)
+
+
+def test_letting_absorption_continue_a_discharge_run_is_caught() -> None:
+    """Mutation: make absorption transparent to *any* run, not just a charge.
+
+    The bug my own first implementation had, caught by an existing test. Absorption
+    is a charge; letting it continue a discharge would claim the battery kept
+    discharging while it charged, and would suppress the fee a real reversal owes.
+    """
+    from custom_components.alpha_ems_manager.economic import (
+        _RUN_ABSORB,
+        _RUN_DISCHARGE,
+        _RUN_IDLE,
+        _resolved_run_state,
+    )
+
+    assert _resolved_run_state(_RUN_ABSORB, _RUN_DISCHARGE) == _RUN_IDLE
+    assert _resolved_run_state(_RUN_ABSORB, _RUN_DISCHARGE) != _RUN_DISCHARGE
+
+
+def test_pricing_the_hold_baseline_on_a_frozen_battery_is_caught() -> None:
+    """Mutation: revert the baseline to a battery that never moves.
+
+    Then the baseline *sells* every kilowatt-hour of surplus while the plan --
+    held to the ambient endpoint by the terminal bound -- banks it and is credited
+    nothing. The published gain is understated by the export value of everything
+    absorbed, which on a sunny horizon is most of it.
+    """
+    from .test_economic_model import (
+        flat_demands,
+        horizon_for,
+        reference_table,
+    )
+
+    table = reference_table()
+    pv, export_price = 2.5, 0.10
+    horizon = horizon_for(
+        table,
+        demands=flat_demands(8, load_kwh=0.0, pv_kwh=pv),
+        prices=[IntervalPrice(import_eur_kwh=0.20, export_eur_kwh=export_price)] * 8,
+    )
+
+    honest = hold_cost(horizon=horizon, table=table, start_energy_kwh=6.0)
+    frozen = -8 * pv * export_price
+
+    assert honest > frozen
+    assert honest - frozen > 1.0
+
+
+def test_reporting_the_cash_flow_as_the_marginal_cost_is_caught() -> None:
+    """Mutation: let ``marginal_cost_eur`` be the negated cash flow again.
+
+    They are different quantities and they disagree most where it matters most: a
+    discharge sized to house load has a cash flow of zero and has avoided the
+    whole import bill.
+    """
+    from .test_economic_model import (
+        FLOOR_PERCENT,
+        IMPLEMENTED,
+        flat_demands,
+        horizon_for,
+        reference_table,
+    )
+
+    table = reference_table()
+    per_quarter = 2.25 / ETA
+    horizon = horizon_for(
+        table,
+        demands=flat_demands(4, load_kwh=per_quarter),
+        prices=[IntervalPrice(import_eur_kwh=0.50, export_eur_kwh=0.45)] * 4,
+    )
+    plan = economic_solve(
+        table=table,
+        horizon=horizon,
+        start_energy_kwh=20.0,
+        terminal_floor_kwh=table.limits.energy_for_soc(FLOOR_PERCENT),
+        minimum_trade_gain_eur=0.10,
+        permitted=IMPLEMENTED,
+    )
+    run = next(r for r in plan.runs if r.battery_discharge_ac_kwh > 0.0)
+
+    assert run.net_cash_flow_eur == pytest.approx(0.0, abs=0.01)
+    assert run.marginal_cost_eur < -4.0
+    assert run.marginal_cost_eur != pytest.approx(-run.net_cash_flow_eur, abs=0.5)
+
+
+def test_attributing_site_import_to_the_battery_run_is_caught() -> None:
+    """Mutation: report ``grid_import_kwh`` as what the run bought.
+
+    Over-claims by the house load over the run, every time. This is the field that
+    made "charged 4.48 kWh" read as "bought 4.48 kWh" on the live installation,
+    where the site figure beside it was 1.55 kWh and the run's own share smaller
+    still.
+    """
+    from .test_economic_model import reference_table
+
+    table = reference_table()
+    load = 0.25
+    plan = beta16_arbitrage(table, pv_kwh=0.0, load_kwh=load)
+    run = next(r for r in plan.runs if r.battery_charge_ac_kwh > 0.0)
+
+    assert run.grid_import_kwh > run.marginal_grid_import_kwh
+    assert run.grid_import_kwh - run.marginal_grid_import_kwh == pytest.approx(
+        run.interval_count * load, abs=1e-9
+    )
+
+
+def test_reporting_a_zero_terminal_protection_cost_is_caught() -> None:
+    """Mutation: publish zero, or publish the bounded solve twice.
+
+    The whole point of the fourth solve is that the figure is a *difference*. A
+    constant zero would hide precisely the effect it exists to measure, and would
+    do so most on the shape where the bound costs most.
+    """
+    from .test_economic_actions import outcome_for
+    from .test_economic_model import reference_table
+    from .test_economic_reporting import two_day_case
+
+    table = reference_table()
+    horizon, hold_end = two_day_case(table)
+    outcome = outcome_for(
+        table, horizon, start_kwh=17.42, terminal_kwh=hold_end, gain=0.10
+    )
+
+    assert outcome.unbounded is not None
+    assert outcome.terminal_protection_cost_eur > 1.0
+    assert outcome.desired.cost_eur != pytest.approx(outcome.unbounded.cost_eur)
+    # And the production plan is still the bounded one.
+    assert outcome.desired.end_energy_dc_kwh > outcome.unbounded.end_energy_dc_kwh
+
+
+def test_relaxing_the_production_terminal_bound_is_caught() -> None:
+    """Mutation: hand the caller the unbounded plan.
+
+    beta.16 instruments the bound and does not change it. Serving the relaxed solve
+    would be a silent change to safety-relevant behaviour while claiming otherwise.
+    """
+    from .test_economic_actions import outcome_for
+    from .test_economic_model import reference_table
+    from .test_economic_reporting import two_day_case
+
+    table = reference_table()
+    horizon, hold_end = two_day_case(table)
+    outcome = outcome_for(
+        table, horizon, start_kwh=17.42, terminal_kwh=hold_end, gain=0.10
+    )
+
+    assert outcome.desired.terminal_binding is True
+    assert outcome.desired.end_energy_dc_kwh == pytest.approx(
+        outcome.desired.terminal_floor_kwh, abs=0.25
+    )
+    assert outcome.action == outcome.desired.published_run.action
+
+
+def test_keying_the_activity_identity_on_an_index_again_is_caught() -> None:
+    """Mutation: identify a run by its horizon index.
+
+    The beta.15 design and the root cause of the spam. An index advances every
+    refresh while a run is under way and rebases at midnight; an absolute instant
+    does neither.
+    """
+    import inspect
+
+    from custom_components.alpha_ems_manager import activity
+
+    fields = set(activity.RunIdentity.__dataclass_fields__)
+    assert fields == {"direction", "start_utc"}
+    # The prose explains why an index is wrong, so the check is on the *code*: no
+    # executable line may mention one.
+    tree = ast.parse(inspect.getsource(activity))
+    names = {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    } | {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    assert "start_index" not in names
+    assert "end_index" not in names
+
+
+def test_returning_to_bucket_and_hash_comparison_is_caught() -> None:
+    """Mutation: bucket the figures and hash them instead of using a deadband.
+
+    A bucket boundary fires on a hundredth of a kilowatt while a fifth inside one
+    stays silent. A deadband measured from the announced value cannot flap.
+    """
+    import inspect
+
+    from custom_components.alpha_ems_manager import activity
+
+    source = inspect.getsource(activity)
+    for forbidden in ("_digest", "hashlib", "fingerprint"):
+        assert forbidden not in source, forbidden
+    assert "ECONOMIC_DEADBAND_ENERGY_KWH" in source
+
+
+def test_announcing_a_distant_run_is_caught() -> None:
+    """Mutation: announce whenever a run exists.
+
+    Exactly the reported symptom: an entry every quarter about a run eighteen
+    hours out, whose far end moves every time the plan is rebuilt.
+    """
+    from custom_components.alpha_ems_manager.activity import next_activity
+
+    from .test_activity_announcements import NOW, make_run
+
+    assert (
+        next_activity(previous=None, runs=(make_run(start_minutes=180),), now=NOW)
+        is None
+    )
+    assert (
+        next_activity(previous=None, runs=(make_run(start_minutes=10),), now=NOW)
+        is not None
+    )
+
+
+def test_back_dating_an_elapsed_run_is_caught() -> None:
+    """Mutation: announce a run whose window has already closed.
+
+    A line describing a decision nobody could act on, written after the fact.
+    """
+    from custom_components.alpha_ems_manager.activity import next_activity
+
+    from .test_activity_announcements import NOW, make_run
+
+    finished = make_run(start_minutes=-120, duration_minutes=60)
+    running = make_run(start_minutes=-30, duration_minutes=120)
+
+    assert next_activity(previous=None, runs=(finished,), now=NOW) is None
+    # But one still under way is announced, once.
+    assert next_activity(previous=None, runs=(running,), now=NOW) is not None
+
+
+def test_emitting_an_execution_started_event_is_caught() -> None:
+    """Mutation: let the Activity surface claim the battery began.
+
+    The one thing it must never say while the release sends nothing.
+    """
+    from custom_components.alpha_ems_manager.activity import (
+        ActivityEntry,
+        ActivityState,
+        logbook_payload,
+    )
+    from custom_components.alpha_ems_manager.const import (
+        ECONOMIC_EVENT_STARTED,
+        ECONOMIC_EXECUTION_EVENT_KINDS,
+    )
+
+    assert ECONOMIC_EXECUTION_EVENT_KINDS == (ECONOMIC_EVENT_STARTED,)
+    with pytest.raises(ValueError, match="executes nothing"):
+        logbook_payload(
+            ActivityEntry(
+                kind=ECONOMIC_EVENT_STARTED,
+                message="x",
+                state=ActivityState(),
+            ),
+            domain="alpha_ems_manager",
+            entity_id="sensor.x",
+        )
+
+
+def test_the_structural_contracts_are_unchanged_by_beta16() -> None:
+    """Mutation: any of the release barriers moving.
+
+    Entity count, the execution flag, the service set and the helper families.
+    Grouped because a change to any one of them invalidates the whole release.
+    """
+    from custom_components.alpha_ems_manager.alphaess_device import (
+        FAMILIES,
+        PERMITTED_SERVICES,
+    )
+    from custom_components.alpha_ems_manager.const import (
+        ACTION_CHARGE,
+        ACTION_DISCHARGE,
+        CONTROL_EXECUTION_AVAILABLE,
+    )
+
+    from .test_entity_contract import CONTRACT
+
+    assert len(CONTRACT) == 13
+    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert len(PERMITTED_SERVICES) == 3
+    assert set(FAMILIES) == {ACTION_DISCHARGE, ACTION_CHARGE}
+    for forbidden in ("force_export", "force_import", "pv_switch"):
+        assert forbidden not in str(sorted(FAMILIES))
 
 
 def test_every_mutation_in_this_file_is_reverted() -> None:

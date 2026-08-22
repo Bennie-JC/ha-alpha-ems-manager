@@ -495,7 +495,7 @@ def _solve_economic(
     allow_grid_charging: bool,
     allow_battery_export: bool,
 ) -> EconomicOutcome | None:
-    """Build the physics table and run the three solves. Executor-side.
+    """Build the physics table and run the four solves. Executor-side.
 
     Positional rather than keyword because ``async_add_executor_job`` passes
     positionally, and a module-level function rather than a method so nothing
@@ -1831,6 +1831,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "forecast_error_window": record.window,
             "battery_plan": plan,
             "economic": economic,
+            # The instant this refresh describes. Published so a consumer that
+            # needs to know "now" reads the same one the plan, the reserve and the
+            # economic solve were all computed at, rather than taking a second
+            # clock reading of its own. A second clock is how a correct answer
+            # came to look wrong beside the figures printed next to it once
+            # already -- see the Phase-4 export check.
+            "issued_at": now,
             "control": control,
             "pv_today": pv_forecasts.get(today),
             "pv_tomorrow": pv_forecasts.get(tomorrow),

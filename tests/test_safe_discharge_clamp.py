@@ -1112,7 +1112,10 @@ def test_the_clamp_changed_no_persisted_schema() -> None:
     """``DeviceCommand`` is diagnostics-only, so the new fields persist nowhere.
 
     Both storage versions are pinned: a safety fix that bumped a schema would be
-    a migration nobody asked for.
+    a migration nobody asked for. The forecast minor moved to 6 in beta.16 for a
+    reason of its own -- additive economic reporting fields -- and the pin is
+    updated rather than loosened so this test keeps failing if the *clamp* ever
+    starts persisting something.
     """
     import inspect
 
@@ -1123,7 +1126,7 @@ def test_the_clamp_changed_no_persisted_schema() -> None:
     )
 
     assert STORAGE_MINOR_VERSION == 4
-    assert FORECAST_STORAGE_MINOR_VERSION == 5
+    assert FORECAST_STORAGE_MINOR_VERSION == 6
 
     for module in (storage, history_store):
         source = inspect.getsource(module)
@@ -1143,9 +1146,14 @@ def test_the_clamp_reaches_no_activity_entry() -> None:
     import inspect
 
     from custom_components.alpha_ems_manager import activity
-    from custom_components.alpha_ems_manager.economic import action_fingerprint
 
-    assert list(inspect.signature(action_fingerprint).parameters) == ["outcome"]
+    # The announcement policy reads planned runs and the clock, and nothing from
+    # the safety layer -- so a command reduced by 0.1 kW cannot produce a line.
+    assert set(inspect.signature(activity.next_activity).parameters) == {
+        "previous",
+        "runs",
+        "now",
+    }
 
     source = inspect.getsource(activity)
     for forbidden in (

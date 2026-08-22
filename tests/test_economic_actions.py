@@ -68,7 +68,7 @@ def outcome_for(
     battery_export: bool = True,
     above_capacity: float = 0.0,
 ) -> EconomicOutcome:
-    """Run the three solves the way the coordinator does."""
+    """Run every solve the way the coordinator does."""
     floor = table.limits.energy_for_soc(FLOOR_PERCENT)
     return build_outcome(
         table=table,
