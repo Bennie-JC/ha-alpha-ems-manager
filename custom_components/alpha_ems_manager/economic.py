@@ -109,7 +109,12 @@ from .const import (
     ECONOMIC_ACTION_EXPORT,
     ECONOMIC_ACTION_HOLD,
     ECONOMIC_ACTION_SAFETY_BUY,
+    ECONOMIC_BUCKET_BAND_KWH,
     ECONOMIC_BUCKET_KWH,
+    ECONOMIC_BUCKET_MAX_DIVISOR,
+    ECONOMIC_BUCKET_RULE_ALIGNED,
+    ECONOMIC_BUCKET_RULE_CONSTANT,
+    ECONOMIC_BUCKET_STATE_BUDGET,
     ECONOMIC_CHARGE_SOURCE_GRID,
     ECONOMIC_CHARGE_SOURCE_MIXED,
     ECONOMIC_CHARGE_SOURCE_NONE,
@@ -131,6 +136,7 @@ from .const import (
     ECONOMIC_REASON_NO_ACTION,
     ECONOMIC_REASON_RESERVE_RECOVERY,
     ECONOMIC_REASON_SAFETY_BUY,
+    ECONOMIC_TOMORROW_ABSENT,
     ECONOMIC_UNAVAILABLE_HORIZON_EMPTY,
     ECONOMIC_UNAVAILABLE_TERMINAL_UNREACHABLE,
     MAX_ECONOMIC_RUNS_REPORTED,
@@ -309,34 +315,50 @@ class PhysicsTable:
     discharge_dc_per_ac: float
     moves: tuple[tuple[_Move, ...], ...]
 
-    @property
-    def max_representable_power_kw(self) -> float:
-        """Return the largest AC power any single transition can express.
+    def _peak_power_kw(self, sign: int) -> float:
+        """Return the largest AC power representable in one direction.
 
-        Not the inverter's nameplate. The state space is quantised in **DC**
-        energy, and the nameplate limit is an **AC** power, so the two do not
-        generally align: on the reference pack a 10 kW charge for a quarter is
-        2.3717 kWh DC, which is 9.487 buckets. Nine buckets need 9.487 kW and are
-        reachable; ten need 10.54 kW and the clamp reduces them, so
-        :func:`_move_to` correctly discards that move.
-
-        So roughly five per cent of nameplate peak power is unreachable, in both
-        directions. That is a consequence of the discretisation, not a limit
-        anybody configured and not a clamp bug -- refining the grid barely helps
-        (solve cost scales as the inverse square of the bucket) and abandoning a
-        constant bucket would trade solve cost for precision per installation.
-
-        Published so the limitation is visible and cannot silently worsen. A fix
-        that admits one clamped maximum-power move per state is possible and is
-        deferred: it breaks the "every surviving move is exactly linear"
-        invariant the per-delta pricing table rests on, for a few per cent of
-        peak power in the rare case where power binds.
+        Separately per direction, because the two are **not** the same figure and
+        beta.16 published only their maximum. The state space is quantised in
+        **DC** energy while the nameplate limit is an **AC** power, and the DC
+        energy of a maximum-power quarter differs between charging and
+        discharging by the round-trip efficiency -- so a lattice that expresses
+        one exactly generally truncates the other. Reporting the larger of the
+        two hid losses of up to thirty per cent on the smaller side.
         """
         best = 0.0
-        for row in self.moves:
+        for source, row in enumerate(self.moves):
             for move in row:
-                best = max(best, move.power_kw)
+                delta = move.target - source
+                if (delta > 0 and sign > 0) or (delta < 0 and sign < 0):
+                    best = max(best, move.power_kw)
         return round(best, 4)
+
+    @property
+    def max_representable_charge_kw(self) -> float:
+        """Return the largest AC charge power a single transition can express."""
+        return self._peak_power_kw(1)
+
+    @property
+    def max_representable_discharge_kw(self) -> float:
+        """Return the largest AC discharge power a single transition can express."""
+        return self._peak_power_kw(-1)
+
+    @property
+    def max_representable_power_kw(self) -> float:
+        """Return the larger of the two directional peaks.
+
+        Kept because it is the figure beta.16 published, and because a single
+        headline number is still the right thing for a summary line. Read the
+        directional pair when the question is whether power binds: on the
+        reference pack with the beta.16 lattice both were 9.4868 kW, but on a
+        3 kW installation charging reached only 2.1082 kW -- **29.7 %** short --
+        while discharging reached 2.8460 kW, and one number cannot say that.
+        """
+        return round(
+            max(self.max_representable_charge_kw, self.max_representable_discharge_kw),
+            4,
+        )
 
     def energy(self, bucket: int) -> float:
         """Return the stored DC energy a bucket stands for."""
@@ -364,6 +386,92 @@ class PhysicsTable:
         if energy_kwh <= 0.0:
             return 0
         return min(self.buckets, math.ceil(energy_kwh / self.bucket_kwh - 1e-9))
+
+
+def _directional_peaks(table: PhysicsTable) -> tuple[float, float]:
+    """Return ``(charge, discharge)`` representable peak power for a table."""
+    return table.max_representable_charge_kw, table.max_representable_discharge_kw
+
+
+def select_bucket_kwh(
+    limits: BatteryLimits,
+    *,
+    floor_energy_kwh: float,
+) -> tuple[float, str]:
+    """Return the state-space bucket to solve on, and the rule that chose it.
+
+    **The bucket is a rounding, not a refinement, and that is the whole idea.**
+
+    A maximum-power quarter is a fixed amount of DC energy. If the bucket divides
+    it exactly, that power is representable; otherwise the lattice truncates and
+    the clamp correctly discards the over-large move. On the reference pack the
+    beta.16 constant bucket left 9.4868 kW of a configured 10 kW reachable --
+    five per cent unusable in both directions, and on a 3 kW installation nearly
+    thirty per cent unusable on the charge side.
+
+    So this searches integer ``k`` for ``bucket = quarter_dc / k``. Because the
+    bucket stays constant *within* a solve, every surviving move is still exactly
+    linear in its delta -- the invariant the per-delta pricing table and the
+    whole performance argument rest on is untouched. That is what makes this
+    cheap where refining the grid was not: on the reference pack it produces
+    **fewer** states and a **faster** solve than beta.16.
+
+    Three constraints, all hard, and a candidate failing any of them is
+    discarded rather than traded off:
+
+    * **No regression, in either direction.** Both representable peaks must be
+      greater than or equal to the ones the beta.16 bucket produced. A lattice
+      that gained charge power by losing discharge power would be a different
+      compromise, not an improvement -- measured on a 22 kWh / 5 kW pack a naive
+      alignment did exactly that, taking discharge from 5.13 % short to 10.0 %.
+    * **Energy resolution cannot collapse.** The bucket must stay inside
+      ``ECONOMIC_BUCKET_BAND_KWH``. Left unconstrained the search happily
+      proposed ten states for a 22 kWh pack: peak power exact, state of charge
+      resolved to 2.4 kWh, and every reserve and energy figure ruined.
+    * **Complexity must not grow for nothing.** The state count may exceed the
+      beta.16 count by at most ``ECONOMIC_BUCKET_STATE_BUDGET``.
+
+    When no candidate qualifies the beta.16 bucket is returned unchanged, so an
+    installation can only ever be left as it was or improved. Both the bucket and
+    the rule are published, because two installations may legitimately end up on
+    different lattices and a support question is unanswerable without knowing
+    which.
+    """
+    baseline = build_physics_table(
+        limits, floor_energy_kwh=floor_energy_kwh, bucket_kwh=ECONOMIC_BUCKET_KWH
+    )
+    if baseline is None:
+        return ECONOMIC_BUCKET_KWH, ECONOMIC_BUCKET_RULE_CONSTANT
+
+    base_charge, base_discharge = _directional_peaks(baseline)
+    budget = int(baseline.buckets * (1.0 + ECONOMIC_BUCKET_STATE_BUDGET)) + 1
+    quarter_dc = limits.max_charge_kw * INTERVAL_HOURS * limits.charge_efficiency
+    if quarter_dc <= 0.0:  # pragma: no cover - build_limits precludes it
+        return ECONOMIC_BUCKET_KWH, ECONOMIC_BUCKET_RULE_CONSTANT
+
+    low, high = ECONOMIC_BUCKET_BAND_KWH
+    best: tuple[float, int, float] | None = None
+    for k in range(1, ECONOMIC_BUCKET_MAX_DIVISOR + 1):
+        bucket = quarter_dc / k
+        if bucket < low - 1e-12 or bucket > high + 1e-12:
+            continue
+        candidate = build_physics_table(
+            limits, floor_energy_kwh=floor_energy_kwh, bucket_kwh=bucket
+        )
+        if candidate is None or candidate.buckets > budget:
+            continue
+        charge, discharge = _directional_peaks(candidate)
+        if charge < base_charge - 1e-9 or discharge < base_discharge - 1e-9:
+            continue
+        gain = (charge - base_charge) + (discharge - base_discharge)
+        # Most power recovered, then fewest states. Never the reverse: a lattice
+        # is chosen for what it can express, and only then for what it costs.
+        if best is None or (-gain, candidate.buckets) < (-best[0], best[1]):
+            best = (gain, candidate.buckets, bucket)
+
+    if best is None or best[0] <= 1e-9:
+        return ECONOMIC_BUCKET_KWH, ECONOMIC_BUCKET_RULE_CONSTANT
+    return best[2], ECONOMIC_BUCKET_RULE_ALIGNED
 
 
 def build_physics_table(
@@ -1540,7 +1648,7 @@ class EconomicOutcome:
     #: The same solve with the terminal bound dropped to the configured floor.
     #: Instrumentation only -- never published as a plan, never acted on. It
     #: exists so the terminal condition's price is a measurement rather than an
-    #: argument. See :attr:`terminal_protection_cost_eur`.
+    #: argument. See :attr:`terminal_plan_cost_eur`.
     unbounded: EconomicPlan | None
     horizon: EconomicHorizon
     reserve_above_capacity_kwh: float
@@ -1551,6 +1659,16 @@ class EconomicOutcome:
     max_representable_power_kw: float
     table_ms: float
     solve_ms: float
+    #: Per-direction peaks, and the configured limits they are measured against.
+    #: beta.16 published only the larger of the two, which hid an asymmetry that
+    #: reaches thirty per cent on a small-power installation.
+    max_representable_charge_kw: float = 0.0
+    max_representable_discharge_kw: float = 0.0
+    configured_charge_kw: float = 0.0
+    configured_discharge_kw: float = 0.0
+    #: Which rule chose the lattice. Two installations can legitimately differ:
+    #: one where alignment regressed a direction keeps the beta.16 bucket.
+    bucket_rule: str = ECONOMIC_BUCKET_RULE_CONSTANT
     safety_buy_runs: tuple[int, ...] = ()
 
     # -- what the entity reads --------------------------------------------
@@ -1699,33 +1817,38 @@ class EconomicOutcome:
         return self.desired.cost_eur - self.relaxed.cost_eur
 
     @property
-    def terminal_protection_cost_eur(self) -> float:
-        """Return what ending the horizon at the hold endpoint cost.
+    def terminal_plan_cost_eur(self) -> float:
+        """Return the **whole-horizon** cost of ending at the hold endpoint.
 
         The difference between the plan and the same solve with the terminal bound
-        dropped to the configured floor. Positive means the bound cost money.
+        dropped to the configured floor. Positive means the bound made the plan
+        more expensive.
 
-        Published prominently and deliberately. The bound exists to stop the
-        optimizer emptying the pack in the last priced interval merely because
-        nothing after it is priced, and it does that job -- but it is not free, and
-        on a horizon that ends in a cheap trough it can buy nothing at all. The
-        figure is the evidence a decision about it should rest on.
+        **This is not realised money, and beta.16 published it as though it
+        were.** The name says ``plan`` because that is its scope: a plan is
+        rebuilt every quarter-hour and only its *first* interval is ever
+        executed, so a difference concentrated in the tail is discarded before it
+        can happen. Measured against a rolling re-solve -- re-plan each quarter,
+        execute one interval, roll the state through the same physics -- the
+        realised difference between this bound and every alternative was
+        0.03-0.10 EUR per day, while this figure read 1.4-5.1 EUR. It overstated
+        by roughly fortyfold, and it was read as a reason to redesign the bound.
 
-        **beta.16 does not change the bound.** The plan the caller receives is the
-        bounded one.
+        Kept, because it is the right measure of *how tightly the bound binds*.
+        Read it beside :attr:`terminal_first_run_changed`, which is the part a
+        reader can act on.
         """
         if self.unbounded is None or not self.unbounded.available:
             return 0.0
         return self.desired.cost_eur - self.unbounded.cost_eur
 
     @property
-    def terminal_protection_import_kwh(self) -> float:
-        """Return the extra grid import the terminal bound is responsible for.
+    def terminal_plan_import_kwh(self) -> float:
+        """Return the whole-horizon extra grid import the bound is responsible for.
 
-        The euro figure alone understates how legible this is: on the synthetic
-        two-day case the bound's signature was a max-power purchase in the final
-        quarters, and it is the *kilowatt-hours* that make that recognisable in a
-        diagnostics download.
+        Same scope and the same caveat as :attr:`terminal_plan_cost_eur`. The
+        kilowatt-hours are what make the bound's signature recognisable in a
+        download: a maximum-power purchase in the final quarters.
         """
         if self.unbounded is None or not self.unbounded.available:
             return 0.0
@@ -1733,6 +1856,53 @@ class EconomicOutcome:
             self.desired.planned_grid_import_kwh
             - self.unbounded.planned_grid_import_kwh
         )
+
+    @property
+    def terminal_first_run_changed(self) -> bool:
+        """Return whether the terminal bound altered the run about to happen.
+
+        **The only part of the terminal condition a reader can act on**, and the
+        figure beta.16 should have led with. Everything else the bound does lies
+        further out than the next refresh, and is replaced by it.
+
+        Compared on identity and quantity rather than on the whole plan: the
+        action, the interval it starts in, and the first interval's battery
+        movement. A tail that differs is expected and uninteresting; a *first
+        run* that differs means the bound is shaping something that will actually
+        be executed, which on measurement happens only when the horizon is short
+        -- late in the day with tomorrow's prices still unpublished.
+        """
+        if self.unbounded is None or not self.unbounded.available:
+            return False
+        if not self.desired.available or not self.desired.intervals:
+            return False
+        if not self.unbounded.intervals:
+            return True
+        bounded, free = self.desired.intervals[0], self.unbounded.intervals[0]
+        if bounded.action != free.action:
+            return True
+        moved = bounded.battery_charge_ac_kwh - bounded.battery_discharge_ac_kwh
+        otherwise = free.battery_charge_ac_kwh - free.battery_discharge_ac_kwh
+        # One state-space bucket: below that the two plans are the same move as
+        # far as the lattice can tell, so calling them different would be noise.
+        return abs(moved - otherwise) > ECONOMIC_BUCKET_KWH
+
+    @property
+    def terminal_near_field_cost_eur(self) -> float:
+        """Return what the bound costs over the intervals that will be executed.
+
+        The first hour, because a refresh is a quarter and four of them is a
+        generous view of "about to happen". Bounded above by
+        :attr:`terminal_plan_cost_eur` and normally a small fraction of it -- and
+        when the two are close, the bound is binding *now* rather than at the far
+        end, which is the case worth investigating.
+        """
+        if self.unbounded is None or not self.unbounded.available:
+            return 0.0
+        near = 4
+        bounded = sum(e.cost_eur for e in self.desired.intervals[:near])
+        free = sum(e.cost_eur for e in self.unbounded.intervals[:near])
+        return bounded - free
 
     @property
     def safety_buy_ac_kwh(self) -> float:
@@ -1756,6 +1926,7 @@ def build_outcome(
     allow_battery_export: bool,
     reserve_above_capacity_kwh: float = 0.0,
     table_ms: float = 0.0,
+    bucket_rule: str = ECONOMIC_BUCKET_RULE_CONSTANT,
 ) -> EconomicOutcome:
     """Run both solves and the label solve, and derive everything published.
 
@@ -1834,6 +2005,11 @@ def build_outcome(
         buckets=table.buckets,
         bucket_kwh=table.bucket_kwh,
         max_representable_power_kw=table.max_representable_power_kw,
+        max_representable_charge_kw=table.max_representable_charge_kw,
+        max_representable_discharge_kw=table.max_representable_discharge_kw,
+        configured_charge_kw=table.limits.max_charge_kw,
+        configured_discharge_kw=table.limits.max_discharge_kw,
+        bucket_rule=bucket_rule,
         table_ms=table_ms,
         solve_ms=solve_ms,
         safety_buy_runs=_safety_buy_runs(desired, relaxed, table.bucket_kwh),
@@ -1965,6 +2141,15 @@ def economic_as_dict(
     *,
     execution_blocked_reason: str,
     table_max_power_kw: float = 0.0,
+    table_max_charge_kw: float = 0.0,
+    table_max_discharge_kw: float = 0.0,
+    configured_charge_kw: float = 0.0,
+    configured_discharge_kw: float = 0.0,
+    bucket_rule: str = ECONOMIC_BUCKET_RULE_CONSTANT,
+    tomorrow_prices: str = ECONOMIC_TOMORROW_ABSENT,
+    reserve_basis: str | None = None,
+    bridge_requirement_kwh: float | None = None,
+    pack_ceiling_kwh: float | None = None,
     horizon_start: Any = None,
     horizon_end: Any = None,
     provenance: dict[str, Any] | None = None,
@@ -2031,6 +2216,30 @@ def economic_as_dict(
             "end": None if horizon_end is None else horizon_end.isoformat(),
             "intervals": outcome.horizon.intervals,
             "limited_by": outcome.horizon.limited_by,
+            # Whether tomorrow is in the horizon at all, from what the source has
+            # actually published. Never from a clock: there is no publication
+            # time in this integration, and inventing one would turn a data
+            # question into a scheduling assumption.
+            "tomorrow_prices": tomorrow_prices,
+            # What Phase 7 says about its own tail. "truncated" means its final
+            # requirements are *lower bounds* because the drawdown window ran off
+            # the end of the forecast -- which is why the reserve alone cannot
+            # serve as a terminal condition, and why the bound above exists.
+            "reserve_basis": reserve_basis,
+            # The energy the same Phase-7 recursion asks for at the horizon's end
+            # when the forecast is extended a day, in kWh. Physics only: forecast
+            # load less usable production, through the same clamp. Published to
+            # be *measured*, and consumed by nothing -- on synthetic shapes it
+            # runs 15.7 kWh in summer and 33-61 kWh in winter against a 22 kWh
+            # pack, so it cannot be a bound, and pretending otherwise would make
+            # every winter horizon infeasible.
+            "bridge_requirement_kwh": _round_kwh(bridge_requirement_kwh),
+            "bridge_exceeds_pack": (
+                None
+                if bridge_requirement_kwh is None
+                else pack_ceiling_kwh is not None
+                and bridge_requirement_kwh > pack_ceiling_kwh
+            ),
         },
         "reserve": {
             "violation_kwh_intervals": _round_kwh(desired.violation_kwh),
@@ -2057,18 +2266,24 @@ def economic_as_dict(
             "floor_kwh": _round_kwh(desired.terminal_floor_kwh),
             "basis": TERMINAL_BASIS,
             "binding": desired.terminal_binding,
-            # What the bound cost, from a fourth solve with it relaxed to the
-            # configured floor. Instrumentation only: beta.16 deliberately does
-            # not change the bound, so the plan above is the bounded one. The
-            # figure exists so a decision about the bound can rest on live
-            # evidence rather than on argument.
-            "protection_cost_eur": _round_eur(outcome.terminal_protection_cost_eur),
-            "protection_import_kwh": _round_kwh(outcome.terminal_protection_import_kwh),
-            "protection_rule": (
-                "the difference between this plan and the same solve with the "
-                "terminal bound dropped to the configured floor. positive means "
-                "ending the horizon where the hold trajectory ends cost money. "
-                "the bound itself is unchanged in this release"
+            # What the bound does, from the fourth solve with it relaxed to
+            # the configured floor. Instrumentation only: the bound is unchanged
+            # in beta.17, on the evidence that under rolling re-solve every
+            # alternative is within 0.10 EUR/day of it and several are worse.
+            #
+            # The near-field pair leads, because it is the part that executes.
+            "first_run_changed": outcome.terminal_first_run_changed,
+            "near_field_cost_eur": _round_eur(outcome.terminal_near_field_cost_eur),
+            "plan_cost_eur": _round_eur(outcome.terminal_plan_cost_eur),
+            "plan_import_kwh": _round_kwh(outcome.terminal_plan_import_kwh),
+            "plan_cost_rule": (
+                "whole-horizon difference against the same solve with the bound "
+                "relaxed to the configured floor. NOT realised money: the plan "
+                "is rebuilt every quarter-hour and only its first interval is "
+                "ever executed, so a difference in the tail is discarded before "
+                "it happens. measured against a rolling re-solve this figure ran "
+                "about fortyfold above the realised difference. read "
+                "first_run_changed for the part that executes"
             ),
             "rule": (
                 "the plan may not leave the battery worse off than doing "
@@ -2087,15 +2302,23 @@ def economic_as_dict(
             "table_ms": round(outcome.table_ms, 1),
             "solve_ms": round(outcome.solve_ms, 1),
             "solves": 4,
-            # The largest AC power any single transition can express. Not the
-            # inverter's nameplate: the state space is quantised in DC energy and
-            # the limit is an AC power, so a few per cent of peak is unreachable.
-            # Published so the limitation is visible and cannot silently worsen.
+            # The largest AC power a single transition can express, per
+            # direction. beta.16 published only the larger of the two, which hid
+            # an asymmetry reaching thirty per cent on a small-power pack.
             "max_representable_power_kw": table_max_power_kw,
+            "max_representable_charge_kw": table_max_charge_kw,
+            "max_representable_discharge_kw": table_max_discharge_kw,
+            "configured_charge_kw": configured_charge_kw,
+            "configured_discharge_kw": configured_discharge_kw,
+            "bucket_rule": bucket_rule,
             "power_limit_rule": (
                 "quantisation, not a configured limit and not a clamp fault: the "
                 "next bucket up would need more AC power than the inverter "
-                "allows, so the clamp reduces it and the move is discarded"
+                "allows, so the clamp reduces it and the move is discarded. "
+                "beta.17 chooses the bucket to divide a maximum-power quarter "
+                "exactly where it can do so without regressing either direction, "
+                "without collapsing energy resolution and without growing the "
+                "state count; bucket_rule says which rule produced this lattice"
             ),
         },
         "runs": [
@@ -2231,8 +2454,20 @@ class EconomicSnapshot:
     #: was responsible for. Persisted for the same reason the reserve's own
     #: protection cost is: a constraint that can quietly cost money needs its
     #: price recoverable afterwards, or a later decision about it rests on memory.
-    terminal_protection_cost_eur: float | None = None
-    terminal_protection_import_kwh: float | None = None
+    terminal_plan_cost_eur: float | None = None
+    terminal_plan_import_kwh: float | None = None
+    terminal_first_run_changed: bool | None = None
+    #: The lattice this plan was solved on, beyond the bucket size already stored
+    #: above. beta.17 chooses the bucket per installation instead of fixing it, so
+    #: a figure recorded before the upgrade and one recorded after can differ by
+    #: up to one bucket for no reason other than the grid it was quantised on.
+    #: Persisting the rule and both directional peaks is what makes that
+    #: explicable from the document itself rather than by recomputation -- and
+    #: recomputation is exactly what is unavailable later, because the chosen
+    #: lattice depends on limits the user may since have changed.
+    bucket_rule: str | None = None
+    max_representable_charge_kw: float | None = None
+    max_representable_discharge_kw: float | None = None
     #: How many times the battery actually changed direction. Stored beside the
     #: plan because the run count over-states it and a later reader cannot
     #: recompute the difference from scalars alone.
@@ -2253,8 +2488,15 @@ class EconomicSnapshot:
             "cv": self.capability_value_eur,
             "fg": self.value_forgone_eur,
             "rp": self.reserve_protection_cost_eur,
-            "tpc": self.terminal_protection_cost_eur,
-            "tpi": self.terminal_protection_import_kwh,
+            # Renamed in beta.17 from ``tpc``/``tpi``. The old keys said
+            # "protection cost" for a figure that is a whole-horizon plan
+            # difference and not realised money, and it was read as the latter.
+            "tplc": self.terminal_plan_cost_eur,
+            "tpli": self.terminal_plan_import_kwh,
+            "tfrc": self.terminal_first_run_changed,
+            "br": self.bucket_rule,
+            "mrc": self.max_representable_charge_kw,
+            "mrd": self.max_representable_discharge_kw,
             "dc": self.direction_changes,
             "vi": self.violation_kwh,
             "sb": self.safety_buy_ac_kwh,
@@ -2302,8 +2544,24 @@ class EconomicSnapshot:
             capability_value_eur=_finite(raw.get("cv")),
             value_forgone_eur=_finite(raw.get("fg")),
             reserve_protection_cost_eur=_finite(raw.get("rp")),
-            terminal_protection_cost_eur=_finite(raw.get("tpc")),
-            terminal_protection_import_kwh=_finite(raw.get("tpi")),
+            # Both spellings, so a beta.16 document reads back with every
+            # figure intact rather than losing two of them to a rename.
+            terminal_plan_cost_eur=_finite(
+                raw.get("tplc") if "tplc" in raw else raw.get("tpc")
+            ),
+            terminal_plan_import_kwh=_finite(
+                raw.get("tpli") if "tpli" in raw else raw.get("tpi")
+            ),
+            terminal_first_run_changed=(
+                bool(raw["tfrc"]) if raw.get("tfrc") is not None else None
+            ),
+            # Absent in every document written before beta.17, and absent is the
+            # honest answer for them: those plans were solved on the constant
+            # bucket, but saying so here would be inferring it rather than
+            # reading it.
+            bucket_rule=raw.get("br") if isinstance(raw.get("br"), str) else None,
+            max_representable_charge_kw=_finite(raw.get("mrc")),
+            max_representable_discharge_kw=_finite(raw.get("mrd")),
             direction_changes=(raw["dc"] if isinstance(raw.get("dc"), int) else 0),
             violation_kwh=_finite(raw.get("vi")) or 0.0,
             safety_buy_ac_kwh=_finite(raw.get("sb")) or 0.0,
@@ -2382,11 +2640,25 @@ def build_economic_snapshot(
         reserve_protection_cost_eur=(
             _round_eur(outcome.reserve_protection_cost_eur) if available else None
         ),
-        terminal_protection_cost_eur=(
-            _round_eur(outcome.terminal_protection_cost_eur) if available else None
+        terminal_plan_cost_eur=(
+            _round_eur(outcome.terminal_plan_cost_eur) if available else None
         ),
-        terminal_protection_import_kwh=(
-            _round_kwh(outcome.terminal_protection_import_kwh) if available else None
+        terminal_plan_import_kwh=(
+            _round_kwh(outcome.terminal_plan_import_kwh) if available else None
+        ),
+        terminal_first_run_changed=(
+            outcome.terminal_first_run_changed if available else None
+        ),
+        bucket_rule=outcome.bucket_rule if available else None,
+        max_representable_charge_kw=(
+            round(outcome.max_representable_charge_kw, ECONOMIC_POWER_PRECISION)
+            if available
+            else None
+        ),
+        max_representable_discharge_kw=(
+            round(outcome.max_representable_discharge_kw, ECONOMIC_POWER_PRECISION)
+            if available
+            else None
         ),
         direction_changes=(outcome.desired.direction_changes if available else 0),
         violation_kwh=(

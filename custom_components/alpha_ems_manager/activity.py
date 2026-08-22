@@ -163,8 +163,20 @@ class RunContent:
     action: str
     capability_action: str
     reason: str
+    #: The flow the action controls, at the boundary the action is paid at:
+    #: battery AC for a charge or a discharge, **grid** export for an export,
+    #: production declined for a curtailment.
     energy_kwh: float
+    #: What the battery itself moved across the run, always at the battery. Held
+    #: separately because for an export these are different quantities at
+    #: different boundaries, and beta.16 put both in one sentence without saying
+    #: so: "0.95 kW, 0.27 kWh" read as arithmetic and was not.
+    battery_energy_kwh: float
+    #: First-interval battery power, which is what the entity publishes.
     power_kw: float
+    #: Mean battery power across the whole run. The figure that actually
+    #: multiplies out against ``battery_energy_kwh``.
+    average_power_kw: float
     end_utc: datetime
     charge_source: str
     price_eur_kwh: float | None
@@ -379,14 +391,34 @@ def _verb(action: str) -> str:
 
 
 def _quantity(content: RunContent) -> str:
-    """Return the figures worth stating, and only those.
+    """Return the figures worth stating, each with the boundary it belongs to.
 
-    A curtailment commands no battery power, so quoting ``0.00 kW`` beside it
-    would read as a fault rather than as an absence.
+    The live beta.16 line read ``export to the grid 0.95 kW, 0.27 kWh during
+    18:30-19:30``. Every figure in it was true and the sentence was still
+    misleading: 0.95 kW was the **battery** discharging in the first interval,
+    0.27 kWh was what reached the **meter** across the whole run, and the
+    remainder covered the house. A reader who multiplies gets nonsense, and a
+    reader who does not still cannot tell which quantity was which.
+
+    So: the mean power, because it is the one that multiplies out against the
+    battery energy; the battery movement; and, when the two differ, what actually
+    reached the grid. A curtailment commands no battery power at all, so quoting
+    ``0.00 kW`` beside it would read as a fault rather than as an absence.
     """
     if content.action == ECONOMIC_ACTION_CURTAIL:
-        return f"{content.energy_kwh:.2f} kWh"
-    return f"{content.power_kw:.2f} kW, {content.energy_kwh:.2f} kWh"
+        return f"{content.energy_kwh:.2f} kWh of production"
+    battery = (
+        f"{content.average_power_kw:.2f} kW average "
+        f"({content.battery_energy_kwh:.2f} kWh from the battery)"
+    )
+    if content.action != ECONOMIC_ACTION_EXPORT:
+        return battery
+    # An export is paid at the meter, so the meter figure has to be present --
+    # and named as the meter figure.
+    return (
+        f"{battery}, of which {content.energy_kwh:.2f} kWh reaches the grid"
+        " and the rest covers the house"
+    )
 
 
 def _source_clause(content: RunContent) -> str:
@@ -439,9 +471,12 @@ def _message(kind: str, run: PlannedRun, *, now: datetime) -> str:
     else:
         lead = "plans to"
 
-    parts = [f"{lead} {_verb(content.action)}", _quantity(content)]
+    parts = [f"{lead} {_verb(content.action)}"]
     if content.window:
-        parts.append(f"during {content.window}")
+        parts.append(f"during {content.window}:")
+    else:
+        parts.append("--")
+    parts.append(_quantity(content))
     sentence = " ".join(parts) + _source_clause(content)
     sentence += f", because {_REASONS.get(content.reason, 'unknown')}."
 

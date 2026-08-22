@@ -25,6 +25,7 @@ from custom_components.alpha_ems_manager.activity import ACTIVITY_NAME
 from custom_components.alpha_ems_manager.const import (
     ECONOMIC_ACTION_OPTIONS,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+    ECONOMIC_BUCKET_BAND_KWH,
     ECONOMIC_MODEL_VERSION,
 )
 from custom_components.alpha_ems_manager.diagnostics import (
@@ -362,7 +363,15 @@ async def test_the_reserve_and_terminal_rules_are_stated_in_the_payload(
     assert (
         "shortfall can never unlock a profitable export" in section["reserve"]["rule"]
     )
-    assert section["reserve"]["quantisation_margin_kwh"] == 0.25
+    # One state-space bucket, and since beta.17 the bucket is chosen per
+    # installation rather than fixed at 0.25 -- so this asserts the relationship,
+    # which is the actual contract, rather than a number that now depends on the
+    # configured power.
+    assert (
+        section["reserve"]["quantisation_margin_kwh"] == section["solver"]["bucket_kwh"]
+    )
+    low, high = ECONOMIC_BUCKET_BAND_KWH
+    assert low <= section["solver"]["bucket_kwh"] <= high
     assert section["terminal"]["basis"] == TERMINAL_BASIS
     assert "given no price" in section["terminal"]["rule"]
 

@@ -1113,9 +1113,10 @@ def test_the_clamp_changed_no_persisted_schema() -> None:
 
     Both storage versions are pinned: a safety fix that bumped a schema would be
     a migration nobody asked for. The forecast minor moved to 6 in beta.16 for a
-    reason of its own -- additive economic reporting fields -- and the pin is
-    updated rather than loosened so this test keeps failing if the *clamp* ever
-    starts persisting something.
+    reason of its own -- additive economic reporting fields in beta.16, and the
+    terminal-figure rename in beta.17 -- and the pin is updated rather than
+    loosened so this test keeps failing if the *clamp* ever starts persisting
+    something.
     """
     import inspect
 
@@ -1126,7 +1127,7 @@ def test_the_clamp_changed_no_persisted_schema() -> None:
     )
 
     assert STORAGE_MINOR_VERSION == 4
-    assert FORECAST_STORAGE_MINOR_VERSION == 6
+    assert FORECAST_STORAGE_MINOR_VERSION == 7
 
     for module in (storage, history_store):
         source = inspect.getsource(module)

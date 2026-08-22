@@ -554,11 +554,11 @@ def test_the_terminal_bound_publishes_what_it_cost() -> None:
     )
 
     assert outcome.desired.terminal_binding is True
-    assert outcome.terminal_protection_cost_eur > 1.0
-    assert outcome.terminal_protection_import_kwh > 5.0
+    assert outcome.terminal_plan_cost_eur > 1.0
+    assert outcome.terminal_plan_import_kwh > 5.0
     # Exactly the difference between the two solves, not an estimate.
     assert outcome.unbounded is not None
-    assert outcome.terminal_protection_cost_eur == pytest.approx(
+    assert outcome.terminal_plan_cost_eur == pytest.approx(
         outcome.desired.cost_eur - outcome.unbounded.cost_eur
     )
 
@@ -592,8 +592,12 @@ def test_a_bound_that_costs_nothing_reports_nothing() -> None:
     outcome = outcome_for(table, horizon, start_kwh=START_KWH, terminal_kwh=floor)
 
     assert outcome.desired.terminal_binding is False
-    assert outcome.terminal_protection_cost_eur == pytest.approx(0.0)
-    assert outcome.terminal_protection_import_kwh == pytest.approx(0.0)
+    assert outcome.terminal_plan_cost_eur == pytest.approx(0.0)
+    assert outcome.terminal_plan_import_kwh == pytest.approx(0.0)
+    # And the near-field pair agrees: a bound that costs nothing cannot be
+    # shaping the run that is about to happen.
+    assert outcome.terminal_first_run_changed is False
+    assert outcome.terminal_near_field_cost_eur == pytest.approx(0.0)
 
 
 def test_the_publication_gap_needs_no_hedge_of_its_own() -> None:

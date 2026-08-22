@@ -82,7 +82,7 @@ DST and forecast tests are fast and exhaustive.
 
 | Module | Role |
 |---|---|
-| `economic.py` | the physics table, the horizon, the solver, the four solves, the labels, the marginal attribution, the bounded payload and the stored snapshot. Pure |
+| `economic.py` | the lattice it solves on, the physics table, the horizon, the solver, the four solves, the labels, the marginal attribution, the bounded payload and the stored snapshot. Pure |
 | `activity.py` | the sentence one logbook line says, the identity a run keeps while it runs, and the guard that refuses to say the battery moved. Pure |
 
 ### Phase-6 modules
@@ -2560,6 +2560,22 @@ it is loose exactly when energy is scarce (in winter the hold trajectory drains 
 the reserve, which is when load-shifting needs freedom); it is tight exactly when
 there is a lot to dump; and it consults no price at all.
 
+**And there is a fourth property, which is the reason a terminal condition has to
+exist at all.** The Phase-7 requirement is a *within-horizon* figure: its backward
+recursion starts from zero deficit at its final interval, so it decays to the
+configured floor plus one interval's demand at whatever point the forecast stops --
+4.72 kWh against a 4.40 kWh floor, identically in summer and winter, on a one-day
+horizon and a two-day one. The projection reports `horizon_basis = truncated` to
+say exactly this: its tail requirements are lower bounds.
+
+So the reserve cannot double as a terminal condition. A requirement that asks for
+almost nothing at midnight cannot protect the night after midnight, which is
+precisely when the energy is needed. beta.17 publishes `reserve_basis` and a
+measured `bridge_requirement_kwh` beside the economic horizon so this is visible
+rather than a matter of reading the recursion -- and the bridge figure is published
+to be read, not obeyed, because at 33 to 61 kWh in winter it is larger than the
+pack.
+
 **And it is reproduced on the solver's own state space.** This is the ratified
 contract, and it differs from the approved Revision 4, which named the continuous
 `plan.reference.end_energy_kwh` literally:
@@ -2586,20 +2602,41 @@ configuration, and that the corrected bound produces a valid plan.
 What is published is what is enforced. Publishing a bound the solver quietly
 relaxed would be worse than either alternative.
 
-**And since beta.16 what it costs is published too.** The bound is not free: it
-implies the battery may never end a horizon holding less than the idle walk would
-have left in it, which on a horizon ending in the overnight trough can force a
-maximum-power purchase in the final quarters purely to end full. A fourth solve
-with the terminal bound relaxed to the configured floor prices exactly that, into
-`terminal_protection_cost_eur` and `terminal_protection_import_kwh` -- mirroring
-the reserve's own protection cost, which is measured the same way for the same
-reason.
+**And since beta.16 what it costs is published too -- but beta.16 published it
+in a way that could only be misread, and beta.17 fixes that.**
 
-The bound itself is **unchanged**, and the published plan is the bounded one. The
-distortion is in the far field -- the first run was byte-identical between a
-two-day and a three-day horizon on the shape that measured it, and each refresh
-commits only the near field -- so the figure exists to let a decision about the
-bound rest on live evidence rather than on a synthetic price curve.
+The bound is not free: it implies the battery may never end a horizon holding less
+than the idle walk would have left in it, which on a horizon ending in the
+overnight trough can force a maximum-power purchase in the final quarters purely
+to end full. A fourth solve with the bound relaxed to the configured floor prices
+exactly that.
+
+beta.16 called the result `terminal_protection_cost_eur`, the live installation
+reported about EUR 3.9 of it, and it read as EUR 3.9 of lost money. **It is not.**
+A plan is rebuilt every quarter-hour and only its *first interval* is ever
+executed, so a difference concentrated in the tail is discarded before it can
+happen. Rolling the horizon forward -- re-plan each quarter, execute one interval,
+roll the state through the same physics -- the released rule and every alternative
+land within **EUR 0.10 per day** of each other, in summer and winter, at high and
+low state of charge, with and without tomorrow's prices. The published figure
+overstated by roughly fortyfold.
+
+It is therefore renamed `terminal_plan_cost_eur`, with its scope in the payload,
+and two honest figures sit beside it: **`first_run_changed`**, whether the bound
+altered the interval about to be executed, and `near_field_cost_eur` over the
+first hour. That pair is the part a reader can act on. Note what beta.16 claimed
+here and could not support: that the first run was byte-identical between a two-day
+and a three-day horizon. It was, *on the one shape that measured it*. On others
+the bound does reach the next interval -- and when it does, `first_run_changed`
+says so instead of leaving it to be inferred from a number that cannot show it.
+
+The bound itself is **unchanged in beta.17**, and the published plan is the
+bounded one. Every alternative was measured and rejected: ending at or above the
+reserve is *provably identical* to having no bound at all, since the reserve is
+already enforced pointwise; a genuine bridge-to-production-recovery requirement is
+33 to 61 kWh against a 22 kWh pack and so cannot be a constraint; and a linear
+salvage value spans the entire answer space as its coefficient moves between the
+cheapest and the mean visible price, which makes it a knob rather than a rule.
 
 The reproduction has a second, incidental benefit. `plan.reference` is simulated
 over the *plan's* horizon, which is usually longer than the economic one; the hold
@@ -2775,20 +2812,63 @@ the optimizer is churning. Each run now states its `direction` and whether it
 `charged_switching_fee`, and each plan states `direction_changes`, which is the
 count the fee was charged on.
 
-### Peak power the state space cannot represent
+### Peak power, and the bucket chosen to reach it
 
-`max_representable_power_kw` is published in the solver block, and it is not a
-configured limit. With a 0.25 kWh DC bucket, a quarter-hour at 10 kW AC is
-2.3717 kWh DC -- 9.487 buckets. Nine buckets are reachable at 9.487 kW; ten need
-10.54 kW, which the clamp reduces, so the move is correctly discarded. Roughly
-five per cent of nameplate peak is unreachable in both directions, as a
-consequence of quantisation rather than of any fault in the clamp.
+**beta.16 got two things wrong here and beta.17 corrects both.** It published one
+figure where there are two, and it rejected the fix after costing the wrong
+candidate.
 
-It is published rather than fixed. Refining the bucket costs solve time as
-`1/bucket^2`, and the targeted alternative -- one clamped maximum-power move per
-state with a per-state AC override -- breaks the exact-linearity invariant the
-per-delta pricing table rests on, which is what the whole performance argument
-depends on. A test pins the figure so it cannot silently worsen.
+The quantisation itself was described correctly: the state space is quantised in
+**DC** energy while the nameplate limit is an **AC** power. With a 0.25 kWh
+bucket a quarter-hour at 10 kW is 2.3717 kWh DC, which is 9.487 buckets -- nine
+are reachable at 9.4868 kW, ten need 10.54 kW, and the clamp correctly discards
+them.
+
+**The first error: one figure for two quantities.** A maximum-power quarter is a
+*different* amount of DC energy charging than discharging -- they differ by the
+round-trip efficiency -- so a lattice that expresses one exactly generally
+truncates the other, and the loss is asymmetric. beta.16 published
+`max(charge, discharge)`. On a 15 kWh / 7.5 kW pack that reads 7.4620 kW, half a
+per cent short of nameplate and entirely reassuring, while the discharge side
+reaches 6.5666 kW. And "roughly five per cent" was this installation's number: on
+a 10 kWh / 3 kW pack the charge side reached **70.3 %** of nameplate. Both
+directions are now published, beside the configured limits.
+
+**The second error: the wrong fix was costed.** Refining the bucket does cost
+solve time as `1/bucket^2` -- 0.25 to 0.10 kWh reaches only 9.8663 kW and takes
+461 ms against 80 ms -- so rejecting *that* was right. But the fix is not a finer
+bucket, it is an **aligned** one: divide a maximum-power quarter into a whole
+number of buckets. That is a rounding, and it costs nothing. On the reference pack
+`bucket = 2.3717 / 9 = 0.26352` reaches **10.0000 kW in both directions** on
+**84** states instead of 88, slightly faster than before.
+
+Crucially it preserves the invariant beta.16 was right to protect: the bucket is
+still constant *within* a solve, so every surviving move is still exactly linear
+in its delta. The alternative beta.16 considered -- a per-state AC override for
+one clamped maximum-power move -- would have broken that, which is why it was
+correctly refused and why this is a different proposal rather than the same one
+reconsidered.
+
+`select_bucket_kwh` searches integer divisors under three **hard** constraints,
+and a candidate failing any is discarded rather than traded off:
+
+* **no regression in either direction.** Both representable peaks must be at least
+  what the beta.16 bucket produced. The obvious one-sided alignment fails this: on
+  a 22 kWh / 5 kW pack it takes charging to exactly 5 kW while pushing discharging
+  from 5.1 % short to 10.0 % short.
+* **energy resolution cannot collapse.** The bucket stays within
+  `ECONOMIC_BUCKET_BAND_KWH`. Unconstrained, the search proposed *ten states for a
+  22 kWh pack*: exact power, state of charge resolved to 2.4 kWh, every energy and
+  reserve figure ruined.
+* **complexity must buy something.** The state count may grow by at most
+  `ECONOMIC_BUCKET_STATE_BUDGET`.
+
+When nothing qualifies the beta.16 bucket is kept, so an installation is left as
+it was or improved and never compromised. Across a fourteen-configuration matrix
+twelve improve and two are unchanged. Both the bucket and the rule that chose it
+are published, because two installations can now legitimately run different
+lattices and a diagnostics reader cannot interpret the figures without knowing
+which.
 
 ### Curtailment, in closed form
 
@@ -3028,7 +3108,7 @@ What each next phase needs, and where it plugs in:
 | ~~**5** Solcast PV~~ | *shipped in beta.9* | production is a second series on the same index; the stepper still takes a sequence of demands. Asymmetric efficiency remains available and unused |
 | ~~**6** Frank prices~~ | *shipped in beta.12* | the series exists, normalised and stored, and is reachable from no module that decides anything. Phase 8 adds a cost function over the trajectories what-if already compares |
 | ~~**7** Dynamic reserve~~ | *shipped in beta.13, calculation only* | the requirement is computed and published; nothing obeys it. `dynamic_reserve` is deliberately **unwritten** and its tripwire test is still green, so this phase is structurally incapable of raising the floor. `interval_margin_kwh` remains unread, and the P10/P90 series remains unused — read `percentile_aggregation` first: a per-site sum is not a calibrated band |
-| ~~**8** Economic optimisation, automatic buy and sell, **safety buy**~~ | *Stage A shipped in beta.14, calculation only; corrected in beta.16* | the plan is computed and published; nothing executes it, and export and photovoltaic curtailment have no actuator at all. `HoldPolicy` turned out to serve twice — as the counterfactual every euro is measured against *and* as the terminal bound, and beta.16 made both read the same ambient walk so they cannot drift apart. The first live horizon showed the decisions were sound and the figures published about them were not; beta.16 fixes the reporting, makes solar absorption transparent to a charge campaign, and prices the terminal bound instead of changing it. `dynamic_reserve` is still **unwritten** and its Phase-3 tripwire is still green: the optimizer plans subject to the reserve without raising the floor. Stage B is the actuators and the execution path |
+| ~~**8** Economic optimisation, automatic buy and sell, **safety buy**~~ | *Stage A shipped in beta.14, calculation only; corrected in beta.16 and beta.17* | the plan is computed and published; nothing executes it, and export and photovoltaic curtailment have no actuator at all. `HoldPolicy` turned out to serve twice — as the counterfactual every euro is measured against *and* as the terminal bound, and beta.16 made both read the same ambient walk so they cannot drift apart. The first live horizon showed the decisions were sound and the figures published about them were not; beta.16 fixes the reporting, makes solar absorption transparent to a charge campaign, and prices the terminal bound instead of changing it. beta.17 then found that three of the four things the *second* live day made look wrong were also reporting defects -- and that the one real finding was a state-space rounding that had left five per cent of the inverter unreachable. `dynamic_reserve` is still **unwritten** and its Phase-3 tripwire is still green: the optimizer plans subject to the reserve without raising the floor. Stage B is the actuators and the execution path |
 | **9** Adaptive feedback | provenance and joins | recorded state of charge joins the Phase-2 snapshot by chronological index and target day; plans are recomputable; `policy_version` prevents pooling generations; separate efficiency fields let them be learned |
 | **10** Multi-day | a longer horizon | the simulator is horizon-agnostic and already walks today plus tomorrow |
 

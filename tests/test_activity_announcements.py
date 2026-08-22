@@ -78,6 +78,8 @@ def make_run(
     action: str = ECONOMIC_ACTION_CHARGE,
     energy_kwh: float = 6.5,
     power_kw: float = 8.7,
+    battery_energy_kwh: float | None = None,
+    average_power_kw: float | None = None,
     charge_source: str = ECONOMIC_CHARGE_SOURCE_MIXED,
     refused: bool = False,
     now: datetime = NOW,
@@ -92,7 +94,13 @@ def make_run(
             capability_action=(ECONOMIC_ACTION_DISCHARGE if refused else action),
             reason=ECONOMIC_REASON_CHEAP_WINDOW,
             energy_kwh=energy_kwh,
+            battery_energy_kwh=(
+                energy_kwh if battery_energy_kwh is None else battery_energy_kwh
+            ),
             power_kw=power_kw,
+            average_power_kw=(
+                power_kw if average_power_kw is None else average_power_kw
+            ),
             end_utc=end,
             charge_source=charge_source,
             price_eur_kwh=0.12,

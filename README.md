@@ -19,9 +19,9 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.16` — a public beta.**
+> **Current release: `1.0.0-beta.17` — a public beta.**
 >
-> The integration is feature-complete for Phase 8 Stage A and covered by 2715
+> The integration is feature-complete for Phase 8 Stage A and covered by 2817
 > automated tests, but the learning and forecast model has **not** yet been validated
 > across enough real-world complete days to be called stable. Treat it as
 > something to run and observe, not yet as something to depend on.
@@ -61,7 +61,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.16` is not offered.
+     dialog if `1.0.0-beta.17` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -388,6 +388,14 @@ matter more than the state:
 - `execution_blocked_reason` is why nothing is sent. While the release barrier
   stands it reads `execution_unavailable`, and no per-action reason may mask it.
 
+**It is a different question from `Control State`, and they will disagree.**
+`Economic Action` answers "what is the cheapest thing to do with the battery?";
+`Control State` answers "would the control pipeline presently allow a command at
+all?". So `export` beside `inhibited` is not a contradiction — it is the optimizer
+wanting something and the safety pipeline reporting that nothing is sendable, most
+often `power_below_device_minimum`, which simply means the intent is smaller than
+the 0.2 kW step the inverter accepts. Nothing is sent either way.
+
 **It is calculated, published, and executed by nothing.** No service call reaches
 your inverter. There is no cheap-hour buying, no selling, no curtailment — the
 plan is a recommendation you can watch, compare against your bill, and disagree
@@ -450,6 +458,15 @@ with all five energy boundaries stated separately — the two battery-side AC
 figures, the two grid-side ones, and the curtailment — because every euro in the
 payload is priced on grid energy and a reader has to be able to check that.
 
+**A note on upgrading to beta.17.** The optimizer now picks the size of its
+internal energy step to match your inverter's power, so the whole of it is
+usable. One consequence is visible: economic figures either side of the upgrade
+are rounded on slightly different steps, and can differ by up to one step —
+around 0.26 kWh on a 22 kWh, 10 kW installation — for no reason other than that.
+Older stored records are left exactly as they were rather than rewritten to match,
+and every diagnostics download records the step it used, so a figure can always be
+read in the terms it was computed under.
+
 **A charge run's energy is not the same thing as energy bought.** "Charged
 4.48 kWh" can mean 1.5 kWh from the grid and the rest from the roof, and the
 `grid_import_kwh` beside it is *site* import including house load — a third
@@ -464,6 +481,13 @@ cash flow, so every charge run read negative simply because buying costs money,
 and a discharge that exactly covered the house read `0.00` while wiping out the
 whole import bill. The cash flow is still there as `net_cash_flow_eur`; it is just
 no longer the only number.
+
+**A figure at the battery is not a figure at the meter.** An export run moves
+more energy out of the battery than it sends to the grid, because the house takes
+the difference — so since beta.17 an Activity line names both boundaries instead
+of putting one of each in the same sentence. "0.95 kW average (0.95 kWh from the
+battery), of which 0.27 kWh reaches the grid" is the same run beta.16 described as
+"0.95 kW, 0.27 kWh", which was true and read as arithmetic.
 
 A run about to start files one line in the **logbook**, on the sensor's own
 history — once, when it is within a quarter of an hour of beginning, and then

@@ -398,12 +398,28 @@ FORECAST_STORAGE_VERSION: Final = 1
 #:   direction changes the plan actually made, which the run count over-states).
 #:   Additive: a document without them reads unchanged.
 #:
+#: * **1.7** -- v1.0.0-beta.17. The two terminal-condition scalars were renamed
+#:   to say what they are: ``tpc``/``tpi`` became ``tplc``/``tpli`` (a
+#:   *whole-horizon plan* difference, not realised money), and ``tfrc`` records
+#:   whether the bound changed the first run -- the only part of it a reader can
+#:   act on. The reader accepts the old keys, so a beta.16 document loads with
+#:   every figure intact.
+#:
+#:   Also gained ``br``/``mrc``/``mrd``: which rule chose the state-space lattice
+#:   and the peak power it can represent in each direction. beta.17 selects the
+#:   bucket per installation rather than fixing it, so an economic figure recorded
+#:   before the upgrade and one recorded after can legitimately differ by up to
+#:   one bucket -- and these three make that explicable from the document rather
+#:   than by recomputing a lattice whose inputs may since have changed. Documents
+#:   written earlier simply lack them; they are **not** back-filled, because
+#:   making old and new figures look continuous would be a fabrication.
+#:
 #: One honest note for anyone diffing stored documents: photovoltaic snapshots
 #: (``pvs``/``pvo``) arrived in v1.0.0-beta.9 **without** a minor bump, so a
 #: document stamped 1.2 may or may not carry them. The reader tolerates both,
 #: which is why that omission is recorded here rather than papered over by
 #: restamping documents that were written correctly.
-FORECAST_STORAGE_MINOR_VERSION: Final = 6
+FORECAST_STORAGE_MINOR_VERSION: Final = 7
 
 #: Index document: schema version, the month partitions that exist, and the
 #: small daily summary rows. Always loaded.
@@ -1688,6 +1704,59 @@ DEFAULT_ALLOW_BATTERY_EXPORT: Final = False
 #: Entity key. One, and only one: the counterfactual plans, the per-run detail,
 #: the solver figures and the provenance are all diagnostics.
 SENSOR_ECONOMIC_ACTION: Final = "economic_action"
+
+#: The **target** state-space bucket, and the fallback when no better lattice
+#: qualifies. Until beta.17 this was the bucket, full stop; it is now the figure
+#: :func:`economic.select_bucket_kwh` aims at while it looks for a lattice that
+#: can express the configured peak power exactly. It remains the deadband for
+#: reported energy (:data:`ECONOMIC_DEADBAND_ENERGY_KWH`), because that is a
+#: statement about what a reader should notice rather than about the lattice.
+#:
+#: The band is a **hard** constraint on the chosen bucket, not a preference.
+#: Left unbounded, the search will happily buy exact peak power with a lattice of
+#: ten states for a twenty-two kilowatt-hour pack: the power becomes precise and
+#: the state of charge becomes useless.
+ECONOMIC_BUCKET_BAND_KWH: Final = (0.15, 0.40)
+
+#: How much the state count may grow to buy representable power, as a fraction.
+#: A tenth: enough to accept a slightly finer lattice that recovers real power,
+#: never enough to pay for complexity that recovers none.
+ECONOMIC_BUCKET_STATE_BUDGET: Final = 0.10
+
+#: The largest divisor the bucket search will consider. Bounded so the search is
+#: a fixed, small cost at setup rather than something that scales with the pack.
+ECONOMIC_BUCKET_MAX_DIVISOR: Final = 80
+
+#: Which rule produced the lattice actually in use. Published because two
+#: installations can legitimately end up on different lattices -- an installation
+#: where no candidate clears the no-regression test keeps the beta.16 bucket --
+#: and a diagnostics reader cannot interpret the figures without knowing which.
+ECONOMIC_BUCKET_RULE_CONSTANT: Final = "constant_bucket"
+ECONOMIC_BUCKET_RULE_ALIGNED: Final = "aligned_to_peak_power"
+
+#: Whether tomorrow's prices are in the horizon at all. Derived from what the
+#: source has actually published, never from a clock: there is no publication
+#: time anywhere in this integration, and adding one would make a data question
+#: into a scheduling assumption.
+ECONOMIC_TOMORROW_PRESENT: Final = "present"
+ECONOMIC_TOMORROW_ABSENT: Final = "absent"
+
+#: How far the remaining-production cross-check may differ from the source's own
+#: aggregate before it means something. The looser of a tenth and half a
+#: kilowatt-hour: a proportional test alone would cry wolf at dusk, when the
+#: remaining sum is a few hundred watt-hours and a rounding difference is a large
+#: fraction of it.
+PV_REMAINING_CROSS_CHECK_FRACTION: Final = 0.10
+PV_REMAINING_CROSS_CHECK_FLOOR_KWH: Final = 0.5
+
+#: How many consecutive refreshes a configured flexible-load entity may be absent
+#: before it is worth a warning. Home Assistant sets integrations up in an
+#: arbitrary order, so an entity this integration depends on is routinely missing
+#: for the first refresh or two after a restart -- and a warning then describes
+#: the startup sequence rather than the configuration. Learning is paused from
+#: the very first absence regardless: the grace period governs the *log*, never
+#: the safety rule, and a missing reading is never read as zero.
+EV_ABSENCE_GRACE_REFRESHES: Final = 3
 
 #: What the battery actually did in a run, as the objective saw it.
 #:

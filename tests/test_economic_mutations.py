@@ -35,22 +35,42 @@ from __future__ import annotations
 
 import ast
 import math
+from datetime import UTC, datetime
 
 import pytest
 
+from custom_components.alpha_ems_manager.activity import (
+    PlannedRun,
+    RunContent,
+    RunIdentity,
+    direction_of,
+    next_activity,
+)
+from custom_components.alpha_ems_manager.battery import (
+    INTERVAL_HOURS,
+    build_limits,
+)
 from custom_components.alpha_ems_manager.const import (
     ECONOMIC_ACTION_CHARGE,
     ECONOMIC_ACTION_DISCHARGE,
     ECONOMIC_ACTION_EXPORT,
     ECONOMIC_ACTION_HOLD,
+    ECONOMIC_BUCKET_BAND_KWH,
+    ECONOMIC_BUCKET_KWH,
+    ECONOMIC_BUCKET_RULE_CONSTANT,
+    ECONOMIC_BUCKET_STATE_BUDGET,
+    ECONOMIC_CHARGE_SOURCE_NONE,
     ECONOMIC_GAP_NO_PRIMITIVE,
     ECONOMIC_GAP_NONE,
+    ECONOMIC_REASON_EXPENSIVE_WINDOW,
 )
 from custom_components.alpha_ems_manager.economic import (
     IntervalPrice,
     build_horizon,
+    build_physics_table,
     fingerprint_economic,
     hold_cost,
+    select_bucket_kwh,
 )
 from custom_components.alpha_ems_manager.economic import solve as economic_solve
 from custom_components.alpha_ems_manager.simulation import IntervalDemand
@@ -72,6 +92,7 @@ from .test_economic_model import (
     sunny_horizon,
     two_tier_prices,
 )
+from .test_economic_reporting import two_day_case
 
 # --- A. quantisation ---------------------------------------------------------
 
@@ -1108,7 +1129,7 @@ def test_attributing_site_import_to_the_battery_run_is_caught() -> None:
     )
 
 
-def test_reporting_a_zero_terminal_protection_cost_is_caught() -> None:
+def test_reporting_a_zero_terminal_plan_cost_is_caught() -> None:
     """Mutation: publish zero, or publish the bounded solve twice.
 
     The whole point of the fourth solve is that the figure is a *difference*. A
@@ -1126,7 +1147,7 @@ def test_reporting_a_zero_terminal_protection_cost_is_caught() -> None:
     )
 
     assert outcome.unbounded is not None
-    assert outcome.terminal_protection_cost_eur > 1.0
+    assert outcome.terminal_plan_cost_eur > 1.0
     assert outcome.desired.cost_eur != pytest.approx(outcome.unbounded.cost_eur)
     # And the production plan is still the bounded one.
     assert outcome.desired.end_energy_dc_kwh > outcome.unbounded.end_energy_dc_kwh
@@ -1302,3 +1323,241 @@ def test_every_mutation_in_this_file_is_reverted() -> None:
     assert outcome.desired.permitted == EVERYTHING
     assert outcome.desired.terminal_floor_kwh == pytest.approx(START_KWH)
     assert outcome.desired.cost_eur == pytest.approx(-1.5897, abs=5e-5)
+
+
+# ===========================================================================
+# I. beta.17: the lattice, the honest terminal figure, and the Activity sentence
+# ===========================================================================
+#
+# Four of these guard the bucket selector, which is the only change in beta.17
+# that alters what the optimizer *decides*. The guarantee it ships with -- an
+# installation is left as it was or improved, never traded off -- is the sort of
+# claim that rots quietly, so each way of breaking it is written down as a
+# mutation rather than trusted to review.
+
+
+def test_reverting_to_the_beta16_bucket_is_caught() -> None:
+    """A selector that always returns the constant bucket has stopped working.
+
+    The mutation is the entire beta.16 behaviour, so nothing crashes and nothing
+    looks wrong -- the reference installation simply goes back to leaving five per
+    cent of its inverter unreachable in both directions.
+    """
+    limits = reference_table().limits
+    floor = limits.energy_for_soc(FLOOR_PERCENT)
+
+    def always_constant(_limits, *, floor_energy_kwh):
+        return ECONOMIC_BUCKET_KWH, ECONOMIC_BUCKET_RULE_CONSTANT
+
+    honest = select_bucket_kwh(limits, floor_energy_kwh=floor)
+    mutated = always_constant(limits, floor_energy_kwh=floor)
+
+    assert honest != mutated
+    real = build_physics_table(limits, floor_energy_kwh=floor, bucket_kwh=honest[0])
+    broken = build_physics_table(limits, floor_energy_kwh=floor, bucket_kwh=mutated[0])
+    assert real.max_representable_charge_kw > broken.max_representable_charge_kw
+    assert real.max_representable_discharge_kw > broken.max_representable_discharge_kw
+
+
+def test_a_bucket_that_lets_a_move_exceed_the_configured_power_is_caught() -> None:
+    """Representable is not the same as permitted, and the clamp decides.
+
+    The mutation: pick the bucket that makes the *nameplate* power land on a
+    lattice point while ignoring what ``apply_request`` will actually allow. If a
+    realigned lattice could smuggle a move past the clamp, this change would be
+    unsafe rather than merely wrong -- so the table is checked against the
+    configured limits directly.
+    """
+    limits = reference_table().limits
+    floor = limits.energy_for_soc(FLOOR_PERCENT)
+    bucket, _rule = select_bucket_kwh(limits, floor_energy_kwh=floor)
+    table = build_physics_table(limits, floor_energy_kwh=floor, bucket_kwh=bucket)
+
+    for source, row in enumerate(table.moves):
+        for move in row:
+            delta = move.target - source
+            allowed = limits.max_charge_kw if delta > 0 else limits.max_discharge_kw
+            assert move.power_kw <= allowed + 1e-9
+
+
+def test_improving_one_direction_while_degrading_the_other_is_caught() -> None:
+    """The no-regression rule is two-sided, and one-sided is the tempting bug.
+
+    ``quarter_dc / k`` is the obvious alignment and it is **not** safe on its own:
+    on a 22 kWh / 5 kW pack it takes the charge side to exactly 5 kW and the
+    discharge side from 5.1 % short to 10.0 % short. The released selector
+    declines that trade and keeps the beta.16 lattice; this mutation accepts it.
+    """
+    limits, why = build_limits(
+        capacity_kwh=22.0,
+        max_charge_kw=5.0,
+        max_discharge_kw=5.0,
+        round_trip_efficiency_percent=90.0,
+    )
+    assert limits is not None, why
+    floor = limits.energy_for_soc(FLOOR_PERCENT)
+    base = build_physics_table(
+        limits, floor_energy_kwh=floor, bucket_kwh=ECONOMIC_BUCKET_KWH
+    )
+
+    # The naive rule: align the charge quarter and accept whatever discharge does.
+    naive = (5.0 * INTERVAL_HOURS * limits.charge_efficiency) / 5
+    mutated = build_physics_table(limits, floor_energy_kwh=floor, bucket_kwh=naive)
+    assert mutated.max_representable_charge_kw > base.max_representable_charge_kw
+    assert mutated.max_representable_discharge_kw < base.max_representable_discharge_kw
+
+    # The released selector refuses it.
+    chosen, rule = select_bucket_kwh(limits, floor_energy_kwh=floor)
+    assert rule == ECONOMIC_BUCKET_RULE_CONSTANT
+    assert chosen == ECONOMIC_BUCKET_KWH
+
+
+def test_buying_representable_power_with_unbounded_complexity_is_caught() -> None:
+    """Exact power at any price is not a bargain.
+
+    Unconstrained, the search will take a lattice of ten states for a 22 kWh pack:
+    peak power exact, state of charge resolved to 2.4 kWh, and every energy and
+    reserve figure ruined. The band and the state budget are what stop it, and
+    this is the mutation they stop.
+    """
+    limits = reference_table().limits
+    floor = limits.energy_for_soc(FLOOR_PERCENT)
+    base = build_physics_table(
+        limits, floor_energy_kwh=floor, bucket_kwh=ECONOMIC_BUCKET_KWH
+    )
+
+    # k = 1: one bucket per maximum-power quarter. Power becomes exact.
+    reckless = 10.0 * INTERVAL_HOURS * limits.charge_efficiency
+    mutated = build_physics_table(limits, floor_energy_kwh=floor, bucket_kwh=reckless)
+    assert mutated.max_representable_charge_kw == pytest.approx(10.0, abs=5e-5)
+    assert mutated.buckets < 15
+
+    low, high = ECONOMIC_BUCKET_BAND_KWH
+    assert not low <= reckless <= high
+    chosen, _rule = select_bucket_kwh(limits, floor_energy_kwh=floor)
+    assert low <= chosen <= high
+    real = build_physics_table(limits, floor_energy_kwh=floor, bucket_kwh=chosen)
+    assert real.buckets <= int(base.buckets * (1.0 + ECONOMIC_BUCKET_STATE_BUDGET)) + 1
+
+
+def test_reporting_only_the_larger_directional_power_is_caught() -> None:
+    """beta.16's single figure, which hid an asymmetry reaching thirty per cent.
+
+    The mutation is publishing ``max(charge, discharge)`` alone. On a 15 kWh /
+    7.5 kW pack that reads 7.4620 kW -- half a per cent short of nameplate, and
+    entirely reassuring -- while the discharge side reaches only 6.5666 kW.
+    """
+    limits, why = build_limits(
+        capacity_kwh=15.0,
+        max_charge_kw=7.5,
+        max_discharge_kw=7.5,
+        round_trip_efficiency_percent=88.0,
+    )
+    assert limits is not None, why
+    floor = limits.energy_for_soc(FLOOR_PERCENT)
+    table = build_physics_table(
+        limits, floor_energy_kwh=floor, bucket_kwh=ECONOMIC_BUCKET_KWH
+    )
+
+    headline = table.max_representable_power_kw
+    assert headline == pytest.approx(7.4620, abs=5e-4)
+    assert (7.5 - headline) / 7.5 < 0.01
+    # And the figure it conceals.
+    assert (7.5 - table.max_representable_discharge_kw) / 7.5 > 0.12
+
+
+def test_calling_the_whole_horizon_figure_a_realised_cost_is_caught() -> None:
+    """The beta.16 reporting defect, written down so it cannot come back.
+
+    ``terminal_plan_cost_eur`` is a whole-horizon plan difference. The mutation is
+    presenting it as what the bound *costs*, which is what beta.16 did and what
+    made a EUR 3.9 tail look like EUR 3.9 of lost money. The near-field figure is
+    the honest one, and it must be the smaller of the two.
+    """
+    table = reference_table()
+    horizon, hold_end = two_day_case(table)
+    outcome = outcome_for(
+        table, horizon, start_kwh=17.42, terminal_kwh=hold_end, gain=0.10
+    )
+
+    assert outcome.terminal_plan_cost_eur > 1.0
+    assert abs(outcome.terminal_near_field_cost_eur) < outcome.terminal_plan_cost_eur
+    # The mutation -- reporting the plan figure as the near-field one -- would
+    # make these equal.
+    assert outcome.terminal_near_field_cost_eur != pytest.approx(
+        outcome.terminal_plan_cost_eur
+    )
+
+
+def test_an_activity_sentence_that_multiplies_out_wrongly_is_caught() -> None:
+    """First-interval battery power beside whole-run grid energy is the bug.
+
+    The live beta.16 line read ``0.95 kW, 0.27 kWh``: a battery power at one
+    boundary and a meter energy at another, in one sentence, with nothing saying
+    so. The mutation is quoting ``power_kw`` and ``energy_kwh`` together. The
+    released sentence quotes the *mean* power against the *battery* energy -- which
+    multiply out -- and names the meter figure separately.
+    """
+    content = RunContent(
+        action=ECONOMIC_ACTION_EXPORT,
+        capability_action=ECONOMIC_ACTION_EXPORT,
+        reason=ECONOMIC_REASON_EXPENSIVE_WINDOW,
+        energy_kwh=0.27,
+        battery_energy_kwh=0.95,
+        power_kw=0.95,
+        average_power_kw=0.95,
+        end_utc=datetime(2026, 8, 22, 17, 30, tzinfo=UTC),
+        charge_source=ECONOMIC_CHARGE_SOURCE_NONE,
+        price_eur_kwh=0.1496,
+        value_eur=0.04,
+        refused=False,
+        window="18:30-19:30",
+    )
+    run = PlannedRun(
+        identity=RunIdentity(
+            direction=direction_of(ECONOMIC_ACTION_EXPORT),
+            start_utc=datetime(2026, 8, 22, 16, 30, tzinfo=UTC),
+        ),
+        content=content,
+    )
+    entry = next_activity(
+        previous=None, runs=(run,), now=datetime(2026, 8, 22, 16, 20, tzinfo=UTC)
+    )
+
+    assert entry is not None
+    # The mean power times the run length is the battery energy, stated.
+    hours = 1.0
+    assert content.average_power_kw * hours == pytest.approx(
+        content.battery_energy_kwh, abs=0.01
+    )
+    assert "0.95 kWh from the battery" in entry.message
+    assert "0.27 kWh reaches the grid" in entry.message
+    # And the misleading pairing is absent: no bare "0.95 kW, 0.27 kWh".
+    assert "0.95 kW, 0.27 kWh" not in entry.message
+
+
+def test_inventing_a_price_for_an_absent_tomorrow_is_caught() -> None:
+    """A horizon that cannot see tomorrow must plan on today, not on a guess.
+
+    The mutation is extending the price series past what the source published --
+    with the last known price, an average, anything. The guard is structural:
+    ``build_horizon`` prices only the intervals it is given, so an unpriced
+    interval is *excluded* rather than filled, and the horizon reports how far it
+    actually reaches.
+    """
+    table = reference_table()
+    horizon = horizon_for(
+        table,
+        demands=flat_demands(48),
+        prices=[
+            IntervalPrice(import_eur_kwh=0.20, export_eur_kwh=0.10)
+            if index < 24
+            else IntervalPrice(import_eur_kwh=None, export_eur_kwh=None)
+            for index in range(48)
+        ],
+    )
+
+    # Half the day is unpriced, so half the day is not planned. A mutation that
+    # invented a price would give 48.
+    assert horizon.intervals == 24
+    assert horizon.limited_by is not None

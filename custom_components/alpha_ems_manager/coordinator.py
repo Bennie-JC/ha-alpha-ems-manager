@@ -87,6 +87,7 @@ from .const import (
     DEFAULT_GRID_POWER_SIGN,
     DEFAULT_MINIMUM_TRADE_GAIN_EUR,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+    EV_ABSENCE_GRACE_REFRESHES,
     INHIBIT_NO_DECISION,
     INHIBIT_NO_PLAN,
     INHIBIT_PLAN_UNAVAILABLE,
@@ -129,6 +130,7 @@ from .economic import (
     build_outcome,
     build_physics_table,
     fingerprint_settings,
+    select_bucket_kwh,
 )
 from .energy_balance import (
     OUTCOME_SKIPPED_INCOHERENT,
@@ -482,6 +484,25 @@ def _capacity_total(values: Iterable[float | None]) -> float | None:
     return round(sum(present), 4)
 
 
+#: Chosen lattice per battery configuration. The search builds up to eighty
+#: candidate transition tables and costs about 195 ms, which is fine once and
+#: absurd every quarter-hour -- so it is memoised on the only two inputs that can
+#: change it. Keyed rather than cached on the coordinator because the solve runs
+#: in an executor and must not read coordinator state from another thread. A
+#: benign race writes the same answer twice.
+_BUCKET_CHOICE: dict[tuple[BatteryLimits, int], tuple[float, str]] = {}
+
+
+def _bucket_for(limits: BatteryLimits, floor_energy_kwh: float) -> tuple[float, str]:
+    """Return the lattice for this configuration, choosing it at most once."""
+    key = (limits, round(floor_energy_kwh * 1000.0))
+    chosen = _BUCKET_CHOICE.get(key)
+    if chosen is None:
+        chosen = select_bucket_kwh(limits, floor_energy_kwh=floor_energy_kwh)
+        _BUCKET_CHOICE[key] = chosen
+    return chosen
+
+
 def _solve_economic(
     limits: BatteryLimits,
     floor_energy_kwh: float,
@@ -502,7 +523,10 @@ def _solve_economic(
     about the coordinator's state can be read from another thread.
     """
     started = time.perf_counter()
-    table = build_physics_table(limits, floor_energy_kwh=floor_energy_kwh)
+    bucket_kwh, bucket_rule = _bucket_for(limits, floor_energy_kwh)
+    table = build_physics_table(
+        limits, floor_energy_kwh=floor_energy_kwh, bucket_kwh=bucket_kwh
+    )
     if table is None:  # pragma: no cover - build_limits precludes it
         return None
     table_ms = (time.perf_counter() - started) * 1000.0
@@ -526,6 +550,7 @@ def _solve_economic(
         allow_battery_export=allow_battery_export,
         reserve_above_capacity_kwh=reserve_above_capacity_kwh,
         table_ms=table_ms,
+        bucket_rule=bucket_rule,
     )
 
 
@@ -746,6 +771,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: instead of being reported as bare insufficient coverage.
         self._house_problem: str | None = None
         self._ev_problem: str | None = None
+        #: Whether the configured flexible-load entity has ever been readable,
+        #: and how many refreshes in a row it has been absent. Home Assistant
+        #: brings integrations up in an arbitrary order, so an entity this one
+        #: depends on is routinely missing for the first refresh or two after a
+        #: restart -- and a warning then describes the startup sequence rather
+        #: than the configuration. **Learning is paused from the first absence
+        #: regardless:** these two fields govern the log line only.
+        self._ev_seen = False
+        self._ev_absences = 0
         #: The zone both accumulators label their buckets in. Compared against
         #: the live zone so a change can be acted on rather than silently
         #: splitting the write path across two calendars.
@@ -1223,15 +1257,29 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         state = self.hass.states.get(entity_id)
         if state is None:
+            # The safety rule first, and unconditionally: a missing reading is a
+            # missing reading, never a zero, and learning stops here whatever the
+            # log decides to say about it.
             self._ev_problem = REJECT_SOURCE_MISSING
-            self._log.warning(
-                "missing_ev",
-                (
-                    "EV charger entity %s does not exist; baseline learning is "
-                    "paused while measured house load keeps being recorded"
-                ),
-                entity_id,
-            )
+            self._ev_absences += 1
+            if self._ev_seen or self._ev_absences > EV_ABSENCE_GRACE_REFRESHES:
+                self._log.warning(
+                    "missing_ev",
+                    (
+                        "EV charger entity %s does not exist; baseline learning "
+                        "is paused while measured house load keeps being recorded"
+                    ),
+                    entity_id,
+                )
+            else:
+                _LOGGER.debug(
+                    (
+                        "EV charger entity %s not present yet (refresh %d of the "
+                        "startup grace); baseline learning is paused"
+                    ),
+                    entity_id,
+                    self._ev_absences,
+                )
             return None
 
         unit = state.attributes.get("unit_of_measurement")
@@ -1255,6 +1303,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         else:
             self._log.clear("invalid_ev")
             self._log.clear("missing_ev")
+            # Readable once means readable ever: a later disappearance is a real
+            # fault and warns immediately rather than spending the grace again.
+            self._ev_seen = True
+            self._ev_absences = 0
         return value_w
 
     @callback

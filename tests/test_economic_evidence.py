@@ -318,7 +318,7 @@ async def test_the_stored_document_reloads_from_disk(
     assert reloaded.days[NORMAL].economic_fingerprints == [snapshot.fingerprint]
     assert reloaded.corrupt is False
     assert reloaded.reset_by_migration is False
-    assert FORECAST_STORAGE_MINOR_VERSION == 6
+    assert FORECAST_STORAGE_MINOR_VERSION == 7
 
 
 async def test_a_day_with_no_plan_carries_no_economic_keys(
@@ -421,15 +421,15 @@ async def test_a_changed_setting_does_record_a_second_document(
 
 
 def test_a_beta15_economic_document_is_read_not_discarded() -> None:
-    """The storage bump is additive, and this is the proof.
+    """The storage bumps are additive, and this is the proof.
 
-    A document written by beta.15 carries no ``tpc``, ``tpi`` or ``dc``. It must
-    read back with every other field intact and the three new ones at their
-    documented absences -- never be rejected, and never invent a figure it does
-    not have.
+    A document written by beta.15 carries none of the terminal figures and no
+    ``dc``. It must read back with every other field intact and the new ones at
+    their documented absences -- never be rejected, and never invent a figure it
+    does not have.
     """
     payload = snapshot_of().to_dict()
-    for added in ("tpc", "tpi", "dc"):
+    for added in ("tplc", "tpli", "tfrc", "br", "mrc", "mrd", "dc"):
         assert added in payload, added
         del payload[added]
 
@@ -440,15 +440,55 @@ def test_a_beta15_economic_document_is_read_not_discarded() -> None:
     assert restored.fingerprint == snapshot_of().fingerprint
     assert restored.reserve_protection_cost_eur is not None
     # Absent is absent. A zero cost would be a claim the document cannot support.
-    assert restored.terminal_protection_cost_eur is None
-    assert restored.terminal_protection_import_kwh is None
+    assert restored.terminal_plan_cost_eur is None
+    assert restored.terminal_plan_import_kwh is None
+    assert restored.terminal_first_run_changed is None
+    assert restored.bucket_rule is None
+    assert restored.max_representable_charge_kw is None
+    assert restored.max_representable_discharge_kw is None
     # A count, though, has an honest zero: no recorded changes.
     assert restored.direction_changes == 0
+
+
+def test_a_beta16_document_is_read_through_the_rename() -> None:
+    """beta.17 renamed two keys. A rename must not lose the figures behind them.
+
+    beta.16 wrote ``tpc``/``tpi``; beta.17 writes ``tplc``/``tpli`` because the
+    old names claimed the number was protection *cost* when it is a whole-horizon
+    plan difference. The reader accepts both spellings, so the euro figure a
+    beta.16 installation recorded yesterday is still readable today -- which is
+    the whole point of an additive bump. ``tfrc`` did not exist then and must
+    come back absent rather than as a false ``False``.
+    """
+    current = snapshot_of()
+    payload = current.to_dict()
+    payload["tpc"] = payload.pop("tplc")
+    payload["tpi"] = payload.pop("tpli")
+    for absent in ("tfrc", "br", "mrc", "mrd"):
+        del payload[absent]
+
+    restored = EconomicSnapshot.from_dict(NORMAL, payload)
+
+    assert restored is not None
+    assert restored.terminal_plan_cost_eur == current.terminal_plan_cost_eur
+    assert restored.terminal_plan_import_kwh == current.terminal_plan_import_kwh
+    assert restored.terminal_first_run_changed is None
+    # The lattice provenance is absent rather than back-filled: a beta.16 plan
+    # really was solved on the constant bucket, but this document does not say so
+    # and inventing it would make old and new figures look continuous when they
+    # are not.
+    assert restored.bucket_rule is None
+    assert restored.max_representable_charge_kw is None
+    # The bucket size itself was always stored, and it is what actually explains
+    # a one-bucket difference across the upgrade.
+    assert restored.bucket_kwh == current.bucket_kwh
+    assert restored.fingerprint == current.fingerprint
+    assert restored.direction_changes == current.direction_changes
 
 
 def test_the_new_scalars_round_trip_like_the_rest() -> None:
     """Additive fields are still fields, and still have to survive the journey."""
     snapshot = snapshot_of()
 
-    assert snapshot.terminal_protection_cost_eur is not None
+    assert snapshot.terminal_plan_cost_eur is not None
     assert EconomicSnapshot.from_dict(NORMAL, snapshot.to_dict()) == snapshot

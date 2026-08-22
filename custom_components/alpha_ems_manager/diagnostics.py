@@ -27,6 +27,8 @@ from .const import (
     CONFIG_ENTRY_VERSION,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     ECONOMIC_MODEL_VERSION,
+    ECONOMIC_TOMORROW_ABSENT,
+    ECONOMIC_TOMORROW_PRESENT,
     ECONOMIC_UNAVAILABLE_HORIZON_EMPTY,
     ECONOMIC_UNAVAILABLE_NO_PRICES,
     ECONOMIC_UNAVAILABLE_NO_RESERVE,
@@ -43,6 +45,8 @@ from .const import (
     MIN_DAY_COMPLETENESS,
     MIN_QUARTER_COVERAGE,
     PRICE_MAPPING_VERSION,
+    PV_REMAINING_CROSS_CHECK_FLOOR_KWH,
+    PV_REMAINING_CROSS_CHECK_FRACTION,
     QUARTER_MINUTES,
     RESERVE_REPLENISHMENT_ASSUMPTION,
     RESERVE_UNAVAILABLE_FORECAST,
@@ -72,7 +76,8 @@ from .plan import plan_as_dict
 from .policy import DEFAULT_POLICY, SHIPPED_POLICIES
 from .price_forecast import PriceForecast
 from .pv_forecast import PvForecast, pv_error_metrics
-from .reserve import reserve_as_dict
+from .reserve import build_reserve, reserve_as_dict
+from .simulation import IntervalDemand
 from .solcast_source import SolcastFacts
 from .solcast_source import discover as discover_solcast
 from .storage import (
@@ -524,10 +529,24 @@ def _economic_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any
     start, end = _economic_edges(coordinator, outcome, tz)
     window = coordinator.last_record.window
     config = coordinator.config
+    bridge, basis = _economic_bridge(coordinator, plan)
     return economic_as_dict(
         outcome,
         execution_blocked_reason=ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
         table_max_power_kw=outcome.max_representable_power_kw,
+        table_max_charge_kw=outcome.max_representable_charge_kw,
+        table_max_discharge_kw=outcome.max_representable_discharge_kw,
+        configured_charge_kw=outcome.configured_charge_kw,
+        configured_discharge_kw=outcome.configured_discharge_kw,
+        bucket_rule=outcome.bucket_rule,
+        tomorrow_prices=_economic_tomorrow(coordinator, plan),
+        reserve_basis=basis,
+        bridge_requirement_kwh=bridge,
+        pack_ceiling_kwh=(
+            None
+            if plan is None or plan.reserve_projection is None
+            else plan.reserve_projection.ceiling_energy_kwh
+        ),
         horizon_start=start,
         horizon_end=end,
         provenance={
@@ -587,6 +606,114 @@ def _economic_absence(coordinator: AlphaEmsCoordinator, plan: Any) -> str:
     if not coordinator.price_forecasts:
         return ECONOMIC_UNAVAILABLE_NO_PRICES
     return ECONOMIC_UNAVAILABLE_HORIZON_EMPTY
+
+
+def _pv_remaining(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return the remaining production the optimizer is planning on.
+
+    Summed over the horizon's own demands up to the end of the civil day, so it
+    is exactly the figure in use rather than a re-derivation of it. The tolerance
+    is the looser of a tenth and half a kilowatt-hour: a purely proportional test
+    would cry wolf at dusk, when a few hundred watt-hours remain and a rounding
+    difference is a large fraction of them.
+    """
+    plan = coordinator.battery_plan
+    if plan is None or plan.reserve_projection is None or plan.target_day is None:
+        return {"kwh": None, "intervals": 0, "tolerance_kwh": None}
+    count = expected_quarters_for(plan.target_day, dt_util.get_default_time_zone())
+    remaining = [
+        demand
+        for demand in plan.reserve_projection.demands
+        if demand.index < count and demand.pv_kwh is not None
+    ]
+    total = sum(demand.pv_kwh or 0.0 for demand in remaining)
+    return {
+        "kwh": round(total, 3),
+        "intervals": len(remaining),
+        "tolerance_kwh": round(
+            max(
+                total * PV_REMAINING_CROSS_CHECK_FRACTION,
+                PV_REMAINING_CROSS_CHECK_FLOOR_KWH,
+            ),
+            3,
+        ),
+        "rule": (
+            "the sum of the remaining quarter forecasts this plan was built on. "
+            "compare it against the production source's own remaining-today "
+            "figure: a difference beyond tolerance_kwh points at the site "
+            "selection or the interval mapping, not at either forecast. the "
+            "quarter series stays authoritative because an aggregate cannot say "
+            "when the production arrives"
+        ),
+    }
+
+
+def _economic_tomorrow(coordinator: AlphaEmsCoordinator, plan: Any) -> str:
+    """Return whether tomorrow's prices are in the horizon at all.
+
+    From what the source has published, never from a clock. There is no
+    publication time anywhere in this integration and there must not be: the
+    question "can I see tomorrow?" is answered by the data, and answering it from
+    the hour of the day would turn a fact into an assumption that breaks the day
+    the source is late.
+    """
+    prices = coordinator.price_forecasts or {}
+    if plan is None or plan.target_day is None:
+        return ECONOMIC_TOMORROW_ABSENT
+    forecast = prices.get(plan.target_day + timedelta(days=1))
+    known = forecast is not None and forecast.available
+    return ECONOMIC_TOMORROW_PRESENT if known else ECONOMIC_TOMORROW_ABSENT
+
+
+def _economic_bridge(
+    coordinator: AlphaEmsCoordinator, plan: Any
+) -> tuple[float | None, str | None]:
+    """Return the bridge requirement at the horizon's end, and the reserve basis.
+
+    **Measured, consumed by nothing.** The Phase-7 requirement is a *within-
+    horizon* figure: its backward recursion starts from zero deficit at the last
+    interval, so it decays to the configured floor plus one interval's demand at
+    whatever point the forecast stops -- and it says so itself, by reporting
+    ``horizon_basis = truncated``. That is exactly why the reserve alone cannot
+    serve as a terminal condition.
+
+    This asks the *same* recursion what it would require at tonight's end if the
+    forecast ran a day longer. It is physics only -- forecast load less usable
+    production, through the same clamp -- and it invents no price. It is
+    published to be read, not obeyed: on synthetic shapes it runs 15.7 kWh in
+    summer and 33-61 kWh in winter against a 22 kWh pack, so it cannot be a bound
+    without making most of the year infeasible. beta.17 measures it so beta.18
+    can decide from live evidence instead of from synthetic curves.
+    """
+    if plan is None or plan.reserve_projection is None or plan.state is None:
+        return None, None
+    projection = plan.reserve_projection
+    demands = tuple(projection.demands)
+    if not demands:
+        return None, projection.horizon_basis
+    # Extend by one civil day of the same shape. The learned baseline is a
+    # diurnal profile, so repeating the horizon's own demands is the closest
+    # honest statement about a day we have no forecast for -- and it is only ever
+    # read, never enforced.
+    extension = tuple(
+        IntervalDemand(
+            index=demands[-1].index + 1 + position,
+            baseline_kwh=demand.baseline_kwh,
+            pv_kwh=demand.pv_kwh,
+        )
+        for position, demand in enumerate(demands)
+    )
+    extended = build_reserve(
+        limits=projection.limits,
+        floor_energy_kwh=projection.floor_energy_kwh,
+        demands=demands + extension,
+    )
+    if len(extended.intervals) <= len(demands) - 1:  # pragma: no cover
+        return None, projection.horizon_basis
+    return (
+        extended.intervals[len(demands) - 1].required_dc_kwh,
+        projection.horizon_basis,
+    )
 
 
 def _economic_edges(
@@ -1240,6 +1367,17 @@ async def async_get_config_entry_diagnostics(
         "control": coordinator.control_report,
         "pv": {
             "enabled": config.use_pv_forecast,
+            # What the optimizer thinks is still to come today, summed from the
+            # same per-quarter forecast it plans on.
+            #
+            # Published to be *compared*, not consumed. The source has its own
+            # remaining-today entity, and if the two disagree materially the fault
+            # is in the mapping or the site selection rather than in either
+            # forecast -- which is a question a reader can only answer if this
+            # figure is visible. The quarter-level series stays authoritative: an
+            # aggregate cannot say *when* production arrives, and when is most of
+            # what the optimizer needs to know.
+            "remaining_today": _pv_remaining(coordinator),
             # Probed **now**, not read from the last refresh. The two are not the
             # same thing, and printing a stale capability beside live source
             # readings is what made the beta.9 defect look like a contradiction:

@@ -198,10 +198,10 @@ async def test_a_beta5_forecast_document_is_read_not_discarded(
 
     # A beta.5 document carries no photovoltaic, price, reserve or economic
     # evidence, and reading it must not invent any of them. The minor version has
-    # moved on five times since -- it is pinned here so a *major* bump, which
+    # moved on six times since -- it is pinned here so a *major* bump, which
     # would decide the document is unreadable, cannot slip in as a minor one.
     assert FORECAST_STORAGE_VERSION == 1
-    assert FORECAST_STORAGE_MINOR_VERSION == 6
+    assert FORECAST_STORAGE_MINOR_VERSION == 7
     assert store.days[DAY_ONE].pv_fingerprints == []
     assert store.days[DAY_ONE].price_fingerprints == []
     assert store.price_snapshots(DAY_ONE) == []

@@ -9,6 +9,210 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.17] - 2026-08-22
+
+**beta.16's first live day produced four things that looked like defects in the
+optimizer. Measured properly, three were defects in what beta.16 said about
+itself, and the fourth was a number beta.16 had documented incorrectly.** The
+objective is unchanged, the terminal condition is unchanged, and no rule was added
+to any decision the search already makes.
+
+One thing does change what the optimizer decides: it can now use the whole
+inverter.
+
+### Changed
+
+- **The battery can reach its configured power.** A quarter-hour at 10 kW is
+  2.3717 kWh at the pack, which is 9.487 of beta.16's 0.25 kWh state-space
+  buckets — so nine buckets were reachable, ten needed 10.54 kW, and **the top
+  5.13 % of the inverter was unusable in both directions**. It is now reachable
+  exactly: 10.0000 kW charging and discharging.
+
+  The fix is a *rounding* of the bucket rather than a refinement of it — divide a
+  maximum-power quarter into a whole number of buckets — and that distinction is
+  why it is affordable. beta.16 costed the refinement (0.25 → 0.10 kWh: reaches
+  only 9.87 kW and takes 461 ms instead of 80 ms) and rejected it correctly, then
+  drew the wrong conclusion. Rounding costs nothing: the reference installation
+  now solves on **84 states instead of 88**, slightly faster, and because the
+  bucket is still constant within a solve every surviving move is still exactly
+  linear — the invariant the whole pricing table rests on is untouched.
+
+  **Nobody's installation gets worse.** The bucket is chosen by a search under
+  three hard constraints: neither direction may lose representable power, the
+  bucket must stay between 0.15 and 0.40 kWh so energy resolution cannot collapse,
+  and the state count may grow by at most a tenth. Across fourteen
+  configurations — 10 to 50 kWh, 3 to 20 kW, 85 % to 95 % efficiency, symmetric
+  and asymmetric power — **twelve improve and two keep the beta.16 lattice
+  unchanged.** A 22 kWh / 5 kW pack is one of the two: the obvious alignment would
+  take its charge side to exactly 5 kW while pushing its discharge side from
+  5.1 % short to 10.0 % short, and that trade is refused rather than taken. Which
+  rule produced the lattice is published, because two installations can now
+  legitimately differ.
+
+  Worth €0.08–0.33 on a short expensive window, measured.
+
+  **Expect a small discontinuity in your history across this upgrade.** Where the
+  lattice changed, economic energies and euro figures are quantised on a slightly
+  different grid, so a plan from before and a plan from after can differ by up to
+  one bucket — about 0.26 kWh on the reference installation — for no reason other
+  than the grid. Stored documents are **not** rewritten to hide it: the bucket has
+  always been recorded, and beta.17 records the rule and both directional peaks
+  beside it, so a figure can be interpreted in the terms it was computed under.
+  Making old and new values look continuous would be a fabrication.
+
+- **An Activity line says which boundary each figure belongs to.** The live line
+  read:
+
+  ```
+  export to the grid 0.95 kW, 0.27 kWh during 18:30-19:30
+  ```
+
+  Every number in it was true and the sentence was still misleading: 0.95 kW was
+  the **battery** in the first interval, 0.27 kWh was what reached the **meter**
+  across the whole run, and the remainder covered the house. A reader who
+  multiplies gets nonsense; a reader who does not still cannot tell which is
+  which. It now reads:
+
+  > plans to export to the grid during 18:30-19:30: 0.95 kW average (0.95 kWh
+  > from the battery), of which 0.27 kWh reaches the grid and the rest covers the
+  > house.
+
+  The mean power is used rather than the first interval's, so the arithmetic
+  closes. Every beta.16 anti-spam property is unchanged: one announcement per run
+  within a quarter-hour of its start, no repetition, no back-dating, at most one
+  entry per refresh, advisory wording throughout.
+
+- **The terminal condition's cost is no longer reported as money.**
+  `terminal_protection_cost_eur` is now `terminal_plan_cost_eur`, and it says in
+  the payload what it is: a *whole-horizon plan* difference, not realised cost.
+
+  The rename is the fix for a real reporting defect. The live installation
+  reported about €3.9 and it read as €3.9 lost. But a plan is rebuilt every
+  quarter-hour and only its **first interval** is ever executed, so a difference
+  in the tail is discarded before it can happen. Rolling the horizon forward —
+  re-plan each quarter, execute one interval, roll the state through the same
+  physics — the released rule and every alternative to it land within **€0.10 per
+  day** of each other. The figure overstated by roughly fortyfold.
+
+  Two honest figures replace it: **`first_run_changed`**, which is whether the
+  bound altered the interval about to be executed, and `near_field_cost_eur` over
+  the first hour. On one synthetic shape the bound does reach the next interval
+  with a single day of prices and does not with two — and the whole-horizon figure
+  is identical either way, which is exactly why it could not answer the question.
+
+### Added
+
+- **`horizon.tomorrow_prices`, `horizon.reserve_basis` and
+  `horizon.bridge_requirement_kwh`** — the pre-publication regime, made
+  measurable and consumed by nothing.
+
+  `tomorrow_prices` comes from what the source has published. There is no
+  publication time anywhere in this integration and there must not be: whether
+  tomorrow is visible is a fact about the data, and answering it from the hour of
+  the day would break on the first day the source is late.
+
+  `reserve_basis` is Phase 7's own verdict on its tail, and it is the reason a
+  terminal condition exists at all. The reserve's recursion starts from zero
+  deficit at its last interval, so **its requirement decays to the configured
+  floor plus one interval's demand at whatever point the forecast stops** — 4.72
+  against a 4.40 kWh floor, in summer and winter alike — and it reports
+  `truncated` to say so. A reserve that asks for almost nothing at midnight cannot
+  protect the night after it.
+
+  `bridge_requirement_kwh` asks the same recursion what tonight's end would need
+  if the forecast ran a day longer. It is published to be read rather than obeyed,
+  because the answer rules itself out as a constraint: **15.7 kWh in summer, 33 to
+  61 kWh in winter, against a 22 kWh pack.** A bound larger than the battery is
+  not a bound.
+
+- **`solver.max_representable_charge_kw` and `..._discharge_kw`**, beside the
+  configured limits and the rule that chose the lattice. beta.16 published only
+  the larger of the two, which on a 15 kWh / 7.5 kW pack read 7.4620 kW — half a
+  per cent short of nameplate and entirely reassuring — while concealing a
+  discharge side that reached 6.5666 kW. The asymmetry reaches **29.7 %** on a
+  3 kW installation, so beta.16's "roughly five per cent, in both directions" was
+  this installation's number and not a general one.
+
+- **`pv.remaining_today`** — the sum of the remaining quarter forecasts the plan
+  was actually built on, with a tolerance. Published to be compared against the
+  production source's own remaining-today figure: a difference beyond tolerance
+  points at the site selection or the interval mapping rather than at either
+  forecast. The quarter-level series stays authoritative, because an aggregate
+  cannot say *when* production arrives and when is most of what the optimizer
+  needs.
+
+### Fixed
+
+- **A flexible-load entity missing at startup no longer warns.** Home Assistant
+  brings integrations up in an arbitrary order, so the configured EV sensor is
+  routinely absent for the first refresh or two after a restart, and the warning
+  described the startup sequence rather than the configuration. It now logs at
+  debug for the first three refreshes, and warns immediately if the entity was
+  readable and then disappeared.
+
+  **The safety rule is untouched:** a missing reading is `None` and never zero,
+  baseline learning pauses from the very first absence, and the rejection reason
+  and the invalid-interval count are unchanged. Only the log line moved.
+
+### Unchanged, and verified as such
+
+The four behaviours that were in doubt are now regressions rather than arguments.
+Each was suspected of being a defect on the live installation; each is the cost
+objective doing its job:
+
+- **Sale timing is jointly optimal over quantity, power, quarter and household
+  avoidance.** Given four dear quarters that can absorb the energy, all four run
+  at the largest representable power. Given only *one*, an earlier sale into a
+  moderate window becomes rational — a single quarter can only carry one
+  quarter-hour of power. Given only 2 kWh, it serves the house rather than
+  exporting, because 0.25 avoided beats 0.20 earned. With import at 0.50 and
+  export at 0.08, less than a third of what the battery gives up reaches the grid.
+- **A losing round trip is refused.** Buy at 0.20, sell at 0.15, rebuy at 0.25:
+  no trade. Replace the middle with a genuine 0.60 peak and it trades hard. Import
+  is an all-in price and export is a compensation, and every euro in the payload
+  reconciles against that asymmetric pair per interval.
+- **A reserve-driven buy stops at the requirement.** At requirements of 8, 12,
+  15.5 and 19 kWh from a 5 kWh start, peak state of charge lands on the
+  requirement with an overshoot of **+0.00 kWh** every time — never the 22 kWh
+  ceiling. "Safety buy" remains a *label*, attributed by re-solving with the
+  reserve relaxed; there is no separate mechanism, and none is needed because
+  reserve feasibility already outranks cost lexicographically.
+- **The reserve is obeyed at every interval.** A requirement spiking to 18 kWh in
+  mid-horizon is met exactly while the surrounding intervals sit far lower. A plan
+  checking only its endpoint would sail through it.
+
+Also unchanged: **the terminal condition**, on the evidence above. **Phase 7** — no
+change to `reserve.py`; the bridge figure is a caller-side measurement using the
+existing three-argument entry point. **13 entities**, 12 sensors and 1 select, with
+`Economic Action` still carrying exactly 8 attributes. **Zero actuation** —
+`CONTROL_EXECUTION_AVAILABLE` remains False, `PERMITTED_SERVICES` is still three,
+the service callers are unchanged, and there is still no export, curtail, Force
+Export, Force Import or PV Switch primitive. The **beta.15 clamp** and its
+immediate mode refresh. Every **beta.16** reporting and Activity property.
+
+No season flag, no publication clock, no maximum-power rule, no
+one-trade-per-day rule, and no headroom rule was added. Each would be a weaker
+restatement of something the search already proves exactly, and a weaker
+restatement can only disagree with the optimum.
+
+### Storage
+
+`FORECAST_STORAGE_MINOR_VERSION` **1.6 → 1.7**, additive with two renames:
+`tpc`/`tpi` become `tplc`/`tpli`, and `tfrc` is new. **The reader accepts both
+spellings**, so a beta.16 document loads with every figure intact, and a beta.15
+document still loads with the newer fields absent rather than invented. No
+config-entry migration, no option change, no learning-history reset.
+
+### Verification
+
+Tests **2715 → 2817**. Three new files: the lattice guarantee, the rolling-horizon
+harness and the behaviour proofs. Mutations **139 → 147** across four suites, zero
+survivors.
+
+The rolling harness is the one that matters, and it is the slowest thing in the
+suite by design — it is the only test that can tell a plan-level artefact from
+realised money, which is the distinction beta.16 got wrong.
+
 ## [1.0.0-beta.16] - 2026-08-22
 
 **The optimizer's decisions were right; the numbers it published about them were
