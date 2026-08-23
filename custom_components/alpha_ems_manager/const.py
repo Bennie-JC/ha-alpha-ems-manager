@@ -1688,6 +1688,35 @@ DEFAULT_MINIMUM_TRADE_GAIN_EUR: Final = 0.10
 MIN_MINIMUM_TRADE_GAIN_EUR: Final = 0.0
 MAX_MINIMUM_TRADE_GAIN_EUR: Final = 5.0
 
+#: The minimum economic advantage a **marginal grid-caused** kilowatt-hour of
+#: charging must earn, in euros per kWh. Distinct from
+#: ``CONF_MINIMUM_TRADE_GAIN_EUR`` and deliberately not a replacement for it:
+#:
+#: * ``minimum_trade_gain_eur`` is a **fixed** amount a discretionary run must
+#:   earn before it is worth starting at all. It gates *thin* trades.
+#: * ``grid_charge_margin_eur_per_kwh`` is an **additional per-kWh** requirement
+#:   on the energy a charge actually causes to be imported. It gates *large* ones.
+#:
+#: The second exists because the first does not scale. Measured on the released
+#: beta.17 optimizer, a 14.2 kWh round trip was accepted while earning
+#: 0.0371 EUR per grid-caused kWh -- the fixed gain was cleared once and the
+#: volume behind it was unconstrained.
+#:
+#: **It is not a degradation model.** It is charged on marginal grid import
+#: caused by charging, so four things are outside it by construction rather than
+#: by exemption: ambient production absorption (causes no extra import), the
+#: sun's share of a mixed quarter (only the grid share is the basis),
+#: load-serving discharge and export (not charging at all), and reserve
+#: feasibility -- the objective compares ``(violation, cost)`` lexicographically,
+#: so no cost can outrank keeping the house supplied.
+#:
+#: Default **0.0**, which is exactly the behaviour of every release before
+#: beta.18. Upgrading changes nothing until this is deliberately set.
+CONF_GRID_CHARGE_MARGIN_EUR_PER_KWH: Final = "grid_charge_margin_eur_per_kwh"
+DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH: Final = 0.0
+MIN_GRID_CHARGE_MARGIN_EUR_PER_KWH: Final = 0.0
+MAX_GRID_CHARGE_MARGIN_EUR_PER_KWH: Final = 2.0
+
 #: Explicit opt-ins for the two behaviours a user would be surprised by. Both
 #: change the *published plan*, so they are meaningful in shadow and belong in
 #: the form -- unlike ``CONF_CONTROL_EXECUTION_ENABLED``, which cannot change
@@ -1757,6 +1786,36 @@ PV_REMAINING_CROSS_CHECK_FLOOR_KWH: Final = 0.5
 #: the very first absence regardless: the grace period governs the *log*, never
 #: the safety rule, and a missing reading is never read as zero.
 EV_ABSENCE_GRACE_REFRESHES: Final = 3
+
+#: What a future Stage B would have to physically do. **Not** the economic action
+#: label: ``discharge`` and ``export`` are both the battery delivering energy, but
+#: one is measured at the battery and the other at the meter, and on the live
+#: installation those differ by the entire house load -- 2.2 kW of battery
+#: delivered 1.3 kW of export against 0.9 kW of load. A contract that blurred them
+#: would command 1.3 kW and deliver 0.4.
+#:
+#: ``curtail_pv`` is deliberately absent. No actuator can decline production in
+#: this release, so offering it as an intent would advertise a capability that does
+#: not exist; a curtailment plan reports ``hold`` and says what it wanted in the
+#: economic reason instead.
+EXECUTION_INTENT_GRID_CHARGE: Final = "grid_charge"
+EXECUTION_INTENT_SERVE_LOAD: Final = "serve_load"
+EXECUTION_INTENT_NET_EXPORT: Final = "net_export"
+EXECUTION_INTENT_HOLD: Final = "hold"
+
+EXECUTION_INTENTS: Final = (
+    EXECUTION_INTENT_GRID_CHARGE,
+    EXECUTION_INTENT_SERVE_LOAD,
+    EXECUTION_INTENT_NET_EXPORT,
+    EXECUTION_INTENT_HOLD,
+)
+
+#: How long a published execution target may be trusted, in minutes. Two planning
+#: intervals: long enough to survive one missed refresh, short enough that a
+#: stalled integration cannot leave a future Stage B acting on a stale intention.
+#: **Enforced by nothing in this release** -- it is a contract timestamp for a
+#: dead-man Stage B will implement, not a timeout that exists today.
+EXECUTION_TARGET_STALE_MINUTES: Final = 2 * QUARTER_MINUTES
 
 #: What the battery actually did in a run, as the objective saw it.
 #:

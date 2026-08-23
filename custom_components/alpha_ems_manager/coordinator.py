@@ -60,6 +60,7 @@ from .const import (
     CONF_DAILY_HOUSE_LOAD_ENTITY,
     CONF_EV_POWER_ENTITY,
     CONF_FRANK_ENTRY_ID,
+    CONF_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     CONF_GRID_POWER_ENTITY,
     CONF_GRID_POWER_SIGN,
     CONF_HAS_PV,
@@ -84,10 +85,12 @@ from .const import (
     DEFAULT_CONTROL_EXECUTION_ENABLED,
     DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
     DEFAULT_CONTROL_HORIZON_MINUTES,
+    DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     DEFAULT_GRID_POWER_SIGN,
     DEFAULT_MINIMUM_TRADE_GAIN_EUR,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     EV_ABSENCE_GRACE_REFRESHES,
+    EXECUTION_TARGET_STALE_MINUTES,
     INHIBIT_NO_DECISION,
     INHIBIT_NO_PLAN,
     INHIBIT_PLAN_UNAVAILABLE,
@@ -129,6 +132,8 @@ from .economic import (
     build_horizon,
     build_outcome,
     build_physics_table,
+    execution_revision,
+    execution_target,
     fingerprint_settings,
     select_bucket_kwh,
 )
@@ -197,6 +202,7 @@ from .quarter import (
     sanitize_load_w,
     sanitize_pv_w,
 )
+from .realized import realized_window, soc_series_to_energy
 from .reserve import (
     ReserveProjection,
     build_reserve_snapshot,
@@ -383,6 +389,7 @@ class SourceConfig:
     #: are in the form because all three change the *published plan* -- unlike
     #: the execution flag above, which cannot change anything in this release.
     minimum_trade_gain_eur: float
+    grid_charge_margin_eur_per_kwh: float
     allow_grid_charging: bool
     allow_battery_export: bool
 
@@ -450,6 +457,10 @@ class SourceConfig:
             minimum_trade_gain_eur=_number(
                 value(CONF_MINIMUM_TRADE_GAIN_EUR),
                 DEFAULT_MINIMUM_TRADE_GAIN_EUR,
+            ),
+            grid_charge_margin_eur_per_kwh=_number(
+                value(CONF_GRID_CHARGE_MARGIN_EUR_PER_KWH),
+                DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH,
             ),
             allow_grid_charging=bool(
                 value(CONF_ALLOW_GRID_CHARGING, DEFAULT_ALLOW_GRID_CHARGING)
@@ -749,6 +760,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._grid_export_accumulator: QuarterAccumulator | None = None
         self._log = _ThrottledLogger()
         self.last_balance: BalanceSample | None = None
+        #: The Stage-A execution targets this refresh published, kept only so the
+        #: next refresh can decide whether anything actionable moved. **Nothing
+        #: consumes them** -- there is no Stage B, no actuator and no service
+        #: call behind them. Held on the coordinator rather than recomputed in
+        #: diagnostics because a revision number has to be a property of the
+        #: refresh that produced it, not of whoever happened to download a report.
+        self.execution_targets: tuple[dict[str, Any], ...] = ()
         #: Session-scoped balance tally and debounce state. Not persisted:
         #: a restart must not inherit a failure run that may already be over.
         self.balance = BalanceMonitor()
@@ -1870,6 +1888,16 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             today_interval_count=baseline_today.interval_count,
         )
 
+        # Derived from runs already solved, so this costs no extra search. Held on
+        # the coordinator only so the next refresh can tell a revision from a new
+        # plan; nothing reads it and no actuator exists behind it.
+        self.execution_targets = self._execution_targets(
+            outcome=economic,
+            plan=plan,
+            today_interval_count=baseline_today.interval_count,
+            tz=tz,
+        )
+
         return {
             "today": adapted,
             "today_baseline": baseline_today,
@@ -1883,6 +1911,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "forecast_error_window": record.window,
             "battery_plan": plan,
             "economic": economic,
+            "execution_targets": self.execution_targets,
             # The instant this refresh describes. Published so a consumer that
             # needs to know "now" reads the same one the plan, the reserve and the
             # economic solve were all computed at, rather than taking a second
@@ -1979,14 +2008,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             (value - ceiling for value in raw_reserve if value is not None),
             default=0.0,
         )
-        # The hold trajectory's end energy is the terminal condition. It carries
-        # no price, so it forecasts nothing -- it only stops the optimizer
-        # emptying the pack in the last priced interval because the data ran out.
-        terminal = (
-            plan.state.energy_kwh
-            if plan.reference is None
-            else plan.reference.end_energy_kwh
-        )
+        # The configured physical floor, and nothing else.
+        #
+        # Until beta.18 this was the hold trajectory's end energy, on the reading
+        # that a plan should never leave the battery worse off than doing nothing
+        # would have. That duplicated what the dynamic reserve already says, and
+        # on a horizon with no surplus production ahead the idle trajectory is
+        # flat -- so the requirement became "end no lower than you are now",
+        # forbidding net discharge and ratcheting upward every time the pack
+        # charged. The reserve is the authoritative requirement, it is enforced at
+        # every interval, and its own forecast outlives the price horizon.
+        terminal = floor_energy
 
         return await self.hass.async_add_executor_job(
             _solve_economic,
@@ -2002,6 +2034,121 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.config.allow_grid_charging,
             self.config.allow_battery_export,
         )
+
+    @callback
+    def _execution_targets(
+        self,
+        *,
+        outcome: EconomicOutcome | None,
+        plan: Any,
+        today_interval_count: int,
+        tz: tzinfo,
+    ) -> tuple[dict[str, Any], ...]:
+        """Return the machine-readable targets a future Stage B would consume.
+
+        Advisory, and consumed by nothing in this release. Built here because this
+        is where the calendar is: a run is indexed by the plan's continuous
+        chronological position, and turning that into an instant needs the civil
+        day and its real length -- 92, 96 or 100 intervals. The optimizer
+        deliberately has no calendar, which is why ``economic.execution_target``
+        takes instants rather than indices.
+        """
+        if outcome is None or not outcome.available or plan is None:
+            return ()
+        day = plan.target_day
+        if day is None or today_interval_count <= 0:
+            return ()
+
+        projection = plan.reserve_projection
+        required = {
+            entry.index: entry.required_dc_kwh
+            for entry in (projection.intervals if projection else ())
+        }
+        hard_floor = projection.floor_energy_kwh if projection is not None else 0.0
+        previous = {item.get("plan_id"): item for item in self.execution_targets}
+
+        def moment(index: int) -> datetime | None:
+            if index < 0:
+                return None
+            if index < today_interval_count:
+                return interval_start_utc(day, index, tz)
+            return interval_start_utc(
+                day + timedelta(days=1), index - today_interval_count, tz
+            )
+
+        targets: list[dict[str, Any]] = []
+        for run in outcome.desired.runs:
+            opens = moment(run.start_index)
+            closes = moment(run.end_index + 1)
+            if opens is None or closes is None:
+                continue
+            floor = required.get(run.start_index)
+            target = execution_target(
+                run,
+                window_start=opens,
+                window_end=closes,
+                reserve_floor_kwh=(
+                    hard_floor if floor is None else max(floor, hard_floor)
+                ),
+                stale_after=opens + timedelta(minutes=EXECUTION_TARGET_STALE_MINUTES),
+                safety_buy=run.start_index in outcome.safety_buy_runs,
+                margin_passed=True,
+            )
+            target["revision"] = execution_revision(
+                previous.get(target["plan_id"]), target
+            )
+            targets.append(target)
+        return tuple(targets)
+
+    @callback
+    def realized_today(self, plan: Any) -> dict[str, Any]:
+        """Return what today actually cost, from measured flows and stored prices.
+
+        Read-only with respect to every decision. The optimizer, the reserve, the
+        policy and the safety gate are given nothing from here -- an optimizer that
+        learned from its own recorded outcomes would be a later phase wearing this
+        one's clothes, and a structural test pins that it does not.
+        """
+        if plan is None or plan.target_day is None:
+            return {"available": False, "reason": "no_day_record"}
+        record = self.store.days.get(plan.target_day)
+        if record is None:
+            return {"available": False, "reason": "no_day_record"}
+        forecast = (self.price_forecasts or {}).get(plan.target_day)
+        if forecast is None:
+            return {"available": False, "reason": "no_stored_prices"}
+
+        count = record.interval_count
+        buy: list[float | None] = [None] * count
+        sell: list[float | None] = [None] * count
+        for interval in forecast.intervals:
+            if 0 <= interval.index < count:
+                buy[interval.index] = interval.import_price_eur_kwh
+                sell[interval.index] = interval.export_price_eur_kwh
+
+        limits = plan.state.limits if plan.state is not None else None
+        capacity = None if limits is None else limits.capacity_kwh
+        window = realized_window(
+            grid_import_kwh=[record.grid_import_at(i) for i in range(count)],
+            grid_export_kwh=[record.grid_export_at(i) for i in range(count)],
+            import_price_eur_kwh=buy,
+            export_price_eur_kwh=sell,
+            load_kwh=[record.baseline_at(i) for i in range(count)],
+            production_kwh=[record.pv_at(i) for i in range(count)],
+            stored_energy_kwh=soc_series_to_energy(
+                [record.soc_at(i) for i in range(count)], capacity_kwh=capacity
+            ),
+            capacity_kwh=capacity,
+            charge_efficiency=None if limits is None else limits.charge_efficiency,
+            discharge_efficiency=(
+                None if limits is None else limits.discharge_efficiency
+            ),
+        )
+        return {
+            "available": True,
+            "day": plan.target_day.isoformat(),
+            **window.as_dict(),
+        }
 
     @callback
     def _economic_prices(

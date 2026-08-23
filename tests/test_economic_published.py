@@ -373,7 +373,15 @@ async def test_the_reserve_and_terminal_rules_are_stated_in_the_payload(
     low, high = ECONOMIC_BUCKET_BAND_KWH
     assert low <= section["solver"]["bucket_kwh"] <= high
     assert section["terminal"]["basis"] == TERMINAL_BASIS
-    assert "given no price" in section["terminal"]["rule"]
+    # Not a tautology: the basis must name the *configured floor*, because since
+    # beta.18 that is what is enforced. Naming the hold trajectory here would be a
+    # false statement about a number the dashboard shows.
+    assert section["terminal"]["basis"] == "configured_floor_on_bucket_grid"
+    assert "hold_trajectory" not in section["terminal"]["basis"]
+    assert "configured physical floor" in section["terminal"]["rule"]
+    # And it says what it is no longer, so a reader of an older download is
+    # not left guessing which release changed underneath them.
+    assert "idle trajectory" in section["terminal"]["rule"]
 
 
 async def test_the_provenance_states_that_no_grid_limit_is_known(

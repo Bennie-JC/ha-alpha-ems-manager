@@ -31,6 +31,30 @@ The candidate rules, and why these four:
 below pins that: the reserve is already enforced at every interval, so requiring
 it again at the last one adds nothing. That equivalence is the reason the
 candidate list is shorter than it looks.
+
+What beta.18 added, and what it found
+-------------------------------------
+
+The beta.17 conclusion -- every rule within about ten cents a day -- was measured
+on shapes whose valuable quarters sat in the *middle* of the horizon. beta.18
+added four endings the earlier evidence never covered, and two of them break that
+conclusion badly.
+
+When the dearest quarters are the horizon's **last** ones, the released rule
+refuses to sell into them, because selling would end lower than it started and the
+bound forbids that. Measured: **+0.87 EUR against -5.52 EUR** on a single
+19-quarter horizon, with a seventh as much energy sold into a 1.20 EUR/kWh peak.
+
+That was a real defect, and beta.18 **fixed it by deleting the rule**: the
+coordinator now passes the configured physical floor, and the pointwise dynamic
+reserve is the only physical floor the optimizer is given.
+
+The measurement stayed exactly as it was. These tests solve the candidate rules
+directly, so they still compare ``ambient`` against ``none`` on the same shapes,
+and they still have to hold -- they are the evidence the removal rests on rather
+than a record of an outstanding fault. See
+``test_the_ratchet_refuses_the_dearest_quarters_when_they_end_the_horizon``, and
+``tests/test_terminal_reserve_only.py`` for what production does now.
 """
 
 from __future__ import annotations
@@ -39,6 +63,10 @@ import math
 
 import pytest
 
+from custom_components.alpha_ems_manager.const import (
+    ECONOMIC_ACTION_DISCHARGE,
+    ECONOMIC_ACTION_EXPORT,
+)
 from custom_components.alpha_ems_manager.economic import IntervalPrice, solve
 from custom_components.alpha_ems_manager.simulation import IntervalDemand
 
@@ -376,3 +404,305 @@ def test_the_harness_actually_executes_something() -> None:
     assert result["import_kwh"] + result["export_kwh"] > 1.0
     assert result["paid_eur"] != pytest.approx(0.0)
     assert result["lowest_kwh"] >= FLOOR
+
+
+# ===========================================================================
+# C. the four shapes the terminal rule was never measured on
+# ===========================================================================
+#
+# beta.17 kept the terminal condition on the evidence that every alternative
+# realised within about ten cents a day of it. These are the shapes that
+# evidence did not cover, and they are the ones where a horizon-end artefact
+# would be most likely to show: a peak in the final quarters, a trough there, and
+# a horizon that stops immediately after something worth doing.
+#
+# **Nothing here changes the optimizer.** If one of these had shown a serious
+# defect the correct response was to stop and report, not to redesign quietly.
+
+
+def edge_shape(kind: str, *, days: int = 2, load_kwh: float = 0.30):
+    """Return production, price and load for one awkward horizon ending.
+
+    The tail is what differs. Each shape is otherwise the ordinary day used
+    throughout this file, so a difference in outcome is attributable to the
+    ending rather than to the whole curve being different.
+    """
+    production, price = [], []
+    total = 96 * days
+    for index in range(total):
+        quarter = index % 96
+        production.append(0.0)
+        if quarter < 24:
+            base = 0.10
+        elif 78 <= quarter < 84:
+            base = 0.40
+        else:
+            base = 0.22
+        price.append(base)
+
+    tail = slice(total - 4, total)
+    if kind == "late_peak":
+        # The dearest quarters of the whole horizon are its last four.
+        price[tail] = [1.20] * 4
+    elif kind == "cheap_tail":
+        price[tail] = [0.01] * 4
+    elif kind == "expensive_tail":
+        price[tail] = [0.60] * 4
+    elif kind == "peak_then_stop":
+        # Something well worth doing, and then the data simply ends.
+        price[total - 8 : total - 4] = [1.20] * 4
+        price[tail] = [0.20] * 4
+    else:  # pragma: no cover - guarded by the parametrisation
+        raise AssertionError(kind)
+    return production, price, [load_kwh] * total
+
+
+def roll_edge(
+    rule: str, kind: str, *, start_kwh: float, reserve_kwh: float, steps: int = 10
+):
+    """Roll the last stretch of an awkward horizon, executing one interval each time.
+
+    Starts deliberately close to the end, because the whole question is what the
+    rule does when the horizon's edge is within reach.
+    """
+    production, price, load = edge_shape(kind)
+    total = len(price)
+    soc = start_kwh
+    paid = violation = 0.0
+    lowest = start_kwh
+    first_actions = []
+    for offset in range(steps):
+        step = total - steps - 4 + offset
+        window = range(step + 1, total)
+        if len(window) < 2:
+            break
+        horizon = horizon_for(
+            TABLE,
+            demands=[
+                IntervalDemand(
+                    index=index - (step + 1),
+                    baseline_kwh=load[index],
+                    pv_kwh=production[index],
+                )
+                for index in window
+            ],
+            prices=[
+                IntervalPrice(
+                    import_eur_kwh=price[index], export_eur_kwh=price[index] * 0.55
+                )
+                for index in window
+            ],
+            reserve_kwh=[reserve_kwh] * len(window),
+        )
+        plan = solve(
+            table=TABLE,
+            horizon=horizon,
+            start_energy_kwh=soc,
+            terminal_floor_kwh=terminal_for(rule, soc=soc, reserve=reserve_kwh),
+            minimum_trade_gain_eur=0.10,
+            permitted=EVERYTHING,
+        )
+        if not plan.available or not plan.intervals:
+            break
+        executed = plan.intervals[0]
+        soc = min(
+            CEILING,
+            max(FLOOR, executed.start_energy_dc_kwh + executed.battery_delta_dc_kwh),
+        )
+        paid += executed.cost_eur
+        lowest = min(lowest, soc)
+        violation += max(0.0, reserve_kwh - soc)
+        first_actions.append(executed.action)
+    return {
+        "paid_eur": paid,
+        "end_kwh": soc,
+        "lowest_kwh": lowest,
+        "violation_kwh": violation,
+        "actions": first_actions,
+    }
+
+
+EDGE_SHAPES = ("late_peak", "cheap_tail", "expensive_tail", "peak_then_stop")
+
+
+#: Shapes whose most valuable quarters are **not** at the horizon edge. On these
+#: the beta.17 conclusion holds and every rule realises within cents.
+BENIGN_SHAPES = ("cheap_tail", "peak_then_stop")
+
+#: Shapes whose dearest quarters *are* at the edge. These expose a defect in the
+#: released rule -- see the module note below and the beta.18 review.
+EDGE_DEFECT_SHAPES = ("late_peak", "expensive_tail")
+
+
+@pytest.mark.parametrize("kind", BENIGN_SHAPES)
+@pytest.mark.parametrize("start_kwh", [8.0, 19.5])
+def test_the_rules_agree_when_the_value_is_not_at_the_horizon_edge(
+    kind: str, start_kwh: float
+) -> None:
+    """A cheap tail, and a peak that has already passed: cents apart, as before.
+
+    This is the beta.17 result reproduced on two new shapes. It matters because it
+    localises the defect below: the released rule is not generally worse, it is
+    worse specifically when the best quarters are the last ones.
+    """
+    results = {
+        rule: roll_edge(rule, kind, start_kwh=start_kwh, reserve_kwh=FLOOR)
+        for rule in RULES
+    }
+    paid = [outcome["paid_eur"] for outcome in results.values()]
+
+    assert max(paid) - min(paid) < 1.2, {
+        rule: round(outcome["paid_eur"], 4) for rule, outcome in results.items()
+    }
+
+
+@pytest.mark.parametrize("kind", EDGE_DEFECT_SHAPES)
+@pytest.mark.parametrize("start_kwh", [8.0, 19.5])
+def test_the_ratchet_refuses_the_dearest_quarters_when_they_end_the_horizon(
+    kind: str, start_kwh: float
+) -> None:
+    """**The measurement that removed the terminal rule. Do not silence this test.**
+
+    beta.18 pinned this as an outstanding defect. It is now the evidence for a
+    deletion, and every assertion below is unchanged: if the old rule ever stops
+    looking worse on these shapes, the justification for removing it has gone and
+    that needs to be known.
+
+    The rule this measures is the endpoint of the idle-with-absorption walk.
+    On a horizon with no production ahead that walk is flat, so the bound equals
+    the *current* state of charge -- and the plan may then never end lower than it
+    started. When the dearest quarters of the horizon are its **last** ones,
+    selling into them would end lower, so it does not sell.
+
+    Measured on a 19-quarter horizon ending in four quarters at 1.20 EUR/kWh,
+    starting at 19.5 kWh:
+
+    * released rule: cost **+0.87 EUR**, sold **1.17 kWh** into the peak;
+    * no terminal bound: cost **-5.52 EUR**, sold **8.29 kWh** into the peak.
+
+    Under rolling execution the released rule pays about **3 EUR more** over the
+    last ten quarters and ends at the ceiling having *bought* into the peak.
+
+    beta.17 measured every rule as within ten cents a day of the others and kept
+    the bound on that evidence. **That evidence was incomplete**: none of its
+    shapes had value at the horizon edge, which is exactly where a real Frank day
+    sits before tomorrow's prices publish -- the tail of the visible horizon is the
+    evening peak.
+
+    **What beta.18 did about it.** It removed the rule. The coordinator passes the
+    configured physical floor and nothing else, and the reserve -- already enforced
+    at every interval, and forecast further ahead than the prices reach -- is the
+    only physical floor. Nothing replaced it: no continuation value, no salvage
+    term, no boundary bridge.
+
+    This test still solves the candidate rules directly, so it keeps measuring what
+    the old rule would do rather than what production does. That is deliberate. It
+    is the reason the deletion was justified, and it is cheap to keep true.
+    """
+    results = {
+        rule: roll_edge(rule, kind, start_kwh=start_kwh, reserve_kwh=FLOOR)
+        for rule in RULES
+    }
+    bounded = results["ambient"]["paid_eur"]
+    unbounded = results["none"]["paid_eur"]
+
+    # The finding: the removed rule costs materially more on these shapes.
+    assert bounded > unbounded + 0.5, {
+        rule: round(outcome["paid_eur"], 4) for rule, outcome in results.items()
+    }
+    # And "end no lower than you started" is the mechanism, so those two agree.
+    assert results["ambient"]["paid_eur"] == pytest.approx(
+        results["start"]["paid_eur"], abs=1e-9
+    )
+    # While the two rules that permit net discharge agree with each other.
+    assert results["reserve"]["paid_eur"] == pytest.approx(unbounded, abs=1e-9)
+
+
+def test_the_ratchet_is_the_bound_equalling_the_current_state_of_charge() -> None:
+    """The mechanism, isolated from the rolling loop.
+
+    Not a property of the harness: a single solve on a no-production horizon
+    reports an enforced terminal floor equal to the state of charge it started
+    from, which is what forbids net discharge.
+    """
+    production, price, load = edge_shape("late_peak")
+    total = len(price)
+    step = total - 20
+    window = range(step + 1, total)
+    horizon = horizon_for(
+        TABLE,
+        demands=[
+            IntervalDemand(
+                index=index - (step + 1),
+                baseline_kwh=load[index],
+                pv_kwh=production[index],
+            )
+            for index in window
+        ],
+        prices=[
+            IntervalPrice(
+                import_eur_kwh=price[index], export_eur_kwh=price[index] * 0.55
+            )
+            for index in window
+        ],
+        reserve_kwh=[FLOOR] * len(window),
+    )
+    common = {
+        "table": TABLE,
+        "horizon": horizon,
+        "start_energy_kwh": 19.5,
+        "minimum_trade_gain_eur": 0.10,
+        "permitted": EVERYTHING,
+    }
+    bounded = solve(terminal_floor_kwh=CEILING * 2.0, **common)
+    free = solve(terminal_floor_kwh=FLOOR, **common)
+
+    assert bounded.terminal_floor_kwh == pytest.approx(19.5, abs=0.3)
+    assert bounded.end_energy_dc_kwh == pytest.approx(19.5, abs=0.3)
+    # Six euros of difference on one horizon, and a seventh of the peak sold.
+    assert bounded.cost_eur - free.cost_eur > 5.0
+    peak = [index for index, value in enumerate(price[step + 1 : total]) if value > 1.0]
+    sold_bounded = sum(bounded.intervals[index].grid_export_kwh for index in peak)
+    sold_free = sum(free.intervals[index].grid_export_kwh for index in peak)
+    assert sold_free > sold_bounded * 5.0
+
+
+@pytest.mark.parametrize("kind", EDGE_SHAPES)
+def test_an_awkward_ending_never_breaks_the_floor(kind: str) -> None:
+    """The configured floor holds at every horizon edge, under every rule.
+
+    The safety half, and it is unaffected by the defect above: the ratchet makes
+    the plan hold *too much* energy rather than too little, so nothing here can
+    strand the house.
+    """
+    for rule in RULES:
+        outcome = roll_edge(rule, kind, start_kwh=19.5, reserve_kwh=FLOOR)
+        assert outcome["lowest_kwh"] >= FLOOR - 1e-9, (rule, kind)
+
+
+@pytest.mark.parametrize("kind", EDGE_SHAPES)
+def test_a_substantial_requirement_is_met_through_an_awkward_ending(kind: str) -> None:
+    """With a real reserve in force the requirement governs the tail, under every rule.
+
+    The live installation runs a requirement around 15.5 kWh in summer, which is a
+    far stronger constraint than the configured floor -- and it is met on all four
+    shapes without a single violation.
+    """
+    for rule in RULES:
+        outcome = roll_edge(rule, kind, start_kwh=19.5, reserve_kwh=15.5)
+        assert outcome["lowest_kwh"] >= 15.5 - 1e-9, (rule, kind)
+        assert outcome["violation_kwh"] == pytest.approx(0.0, abs=1e-9), (rule, kind)
+
+
+def test_a_late_peak_is_reachable_by_some_rule() -> None:
+    """A guard on the shape: if nothing could sell into it, it would prove nothing.
+
+    The released rule mostly refuses -- that is the defect above -- so this asserts
+    the *shape* is sound by checking the unbounded rule does trade into it.
+    """
+    outcome = roll_edge("none", "late_peak", start_kwh=19.5, reserve_kwh=FLOOR)
+
+    assert any(
+        action in (ECONOMIC_ACTION_EXPORT, ECONOMIC_ACTION_DISCHARGE)
+        for action in outcome["actions"]
+    )

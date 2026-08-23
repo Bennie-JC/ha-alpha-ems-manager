@@ -486,9 +486,83 @@ def test_a_beta16_document_is_read_through_the_rename() -> None:
     assert restored.direction_changes == current.direction_changes
 
 
+def test_a_recorded_terminal_figure_survives_the_beta18_removal() -> None:
+    """beta.18 stopped computing these. It must not stop *reading* them.
+
+    The rename test above compares a freshly built snapshot against itself, and
+    since beta.18 writes ``None`` for the terminal figures it can no longer show
+    that a recorded number survives -- both sides are absent. This does, by
+    reading a document with the figures a beta.16 or beta.17 installation really
+    wrote in it.
+
+    That is the whole reason the fields were kept rather than deleted. Dropping
+    them would silently rewrite history to look like beta.18 had always been the
+    behaviour, and a stored figure is evidence of what an earlier release decided.
+    """
+    payload = snapshot_of().to_dict()
+    # What beta.17 wrote on the live installation: a euro difference, the import
+    # it forced, and a first run the bound did reach.
+    payload["tplc"] = 3.9142
+    payload["tpli"] = 9.4871
+    payload["tfrc"] = True
+
+    restored = EconomicSnapshot.from_dict(NORMAL, payload)
+
+    assert restored is not None
+    assert restored.terminal_plan_cost_eur == pytest.approx(3.9142)
+    assert restored.terminal_plan_import_kwh == pytest.approx(9.4871)
+    assert restored.terminal_first_run_changed is True
+    # And it still round-trips, so reading an old document and writing it back
+    # does not quietly erase the figures.
+    assert EconomicSnapshot.from_dict(NORMAL, restored.to_dict()) == restored
+
+
+def test_a_beta16_spelling_of_a_recorded_figure_also_survives() -> None:
+    """The same, through the beta.17 rename, with a number rather than a ``None``.
+
+    beta.16 wrote ``tpc``/``tpi``. Both spellings must still yield the figure.
+    """
+    payload = snapshot_of().to_dict()
+    del payload["tplc"]
+    del payload["tpli"]
+    payload["tpc"] = 1.7700
+    payload["tpi"] = 9.4900
+
+    restored = EconomicSnapshot.from_dict(NORMAL, payload)
+
+    assert restored is not None
+    assert restored.terminal_plan_cost_eur == pytest.approx(1.77)
+    assert restored.terminal_plan_import_kwh == pytest.approx(9.49)
+
+
+def test_no_storage_migration_was_performed_for_the_removal() -> None:
+    """Nothing left the schema, so nothing needed migrating.
+
+    The honest treatment of an instrumentation field that stops being computed is
+    to write ``None`` and keep reading what is there. Bumping the version to strip
+    optional fields would rewrite records for no gain and lose the old figures.
+    """
+    from custom_components.alpha_ems_manager.const import (
+        FORECAST_STORAGE_MINOR_VERSION,
+    )
+
+    assert FORECAST_STORAGE_MINOR_VERSION == 7
+    # The keys are still written, and still absent-not-zero.
+    payload = snapshot_of().to_dict()
+    for key in ("tplc", "tpli", "tfrc"):
+        assert key in payload, key
+        assert payload[key] is None, key
+
+
 def test_the_new_scalars_round_trip_like_the_rest() -> None:
     """Additive fields are still fields, and still have to survive the journey."""
     snapshot = snapshot_of()
 
-    assert snapshot.terminal_plan_cost_eur is not None
+    # Absent since beta.18: the comparison these priced no longer happens, and a
+    # zero would say the constraint is free rather than gone.
+    assert snapshot.terminal_plan_cost_eur is None
+    assert snapshot.terminal_plan_import_kwh is None
+    assert snapshot.terminal_first_run_changed is None
+    # The lattice provenance is still recorded, and still round-trips.
+    assert snapshot.bucket_rule is not None
     assert EconomicSnapshot.from_dict(NORMAL, snapshot.to_dict()) == snapshot

@@ -9,6 +9,224 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.18] - 2026-08-22
+
+**Stage A completion.** The economic planner gains the one thing it was missing
+before physical execution could be built on top of it: a target a controller can
+act on without guessing which side of the meter a number refers to. Plus a per-kWh
+requirement on bought energy, and realised figures beside the forecast ones.
+
+**Nothing is executed.** `CONTROL_EXECUTION_AVAILABLE` remains False, there is no
+Stage B, and no actuator exists for any of this.
+
+**A serious pre-existing defect was found in this pass and is fixed in it.** The
+terminal condition refused the dearest quarters of the day whenever they were the
+last ones it could see. See *Removed* below.
+
+### Added
+
+- **`grid_charge_margin_eur_per_kwh`** — an additional economic requirement, in
+  euros per kilowatt-hour, on energy a charge actually causes to be bought.
+  **Default 0.0, which is exactly the previous behaviour**, so upgrading changes
+  nothing until it is deliberately set.
+
+  It exists because the existing `minimum_trade_gain_eur` is a *fixed* amount and
+  does not scale. Measured on the released beta.17 optimizer: once a trade cleared
+  the fixed gain, the volume behind it was unconstrained, and a **14.230 kWh**
+  round trip was planned while earning **0.0371 EUR per grid-caused kWh**. The two
+  settings are different quantities and both remain — a fixed amount a run must
+  earn to be worth starting, and a per-kWh requirement on the energy it buys.
+
+  Charged on **marginal grid-caused charging**, which is what makes four exemptions
+  structural rather than written:
+
+  | not charged | why |
+  |---|---|
+  | ambient production absorption | causes no import beyond the idle baseline, so the basis is zero |
+  | the sun's share of a mixed quarter | only the grid share is the basis |
+  | discharging to supply the house | not charging at all |
+  | charging to protect the reserve | the objective compares `(violation, cost)` lexicographically, so no cost can outrank keeping the house supplied — proven at margins up to 10 000 EUR/kWh |
+
+  **It is not a degradation model.** The boundary is strict: a trade is taken while
+  its net benefit per kWh *exceeds* the margin, and one exactly equal to it is
+  indifferent and not taken. On the measured shape the flip is at
+  **0.037129 EUR/kWh**.
+
+- **`execution_target`** in the diagnostics economic block — one entry per planned
+  run, and the contract a future Stage B will be written against. **Consumed by
+  nothing.** Three properties are the point, and each was a defect waiting to
+  happen:
+
+  - **Two boundaries, two fields.** `battery_target_kwh` is at the battery;
+    `grid_target_kwh` is at the meter and is present only for a net export. The
+    existing per-run `energy_kwh` changes meaning with the action, and on the live
+    installation 1.3 kW of intended export needs **2.2 kW** of battery against
+    0.9 kW of house load — a consumer handed one generic figure would command 1.3
+    and deliver 0.4.
+  - **Absolute instants.** `window_start` / `window_end` / `stale_after`, never
+    horizon indices. An index moves every quarter, which is exactly what made the
+    beta.16 Activity log repeat itself.
+  - **Identity that survives replanning.** `plan_id` is `(intent, start instant)`,
+    so a run keeps its identity as its remaining energy shrinks; `revision`
+    increments only when the target moves beyond one state-space bucket, so
+    floating-point drift cannot cause control jitter.
+
+  `intent` is `grid_charge`, `serve_load`, `net_export` or `hold` — separating a
+  load-serving discharge from a net export, which the action label only half does.
+  There is deliberately **no `curtail_pv` intent**: no actuator can decline
+  production, and offering one would advertise a capability that does not exist.
+
+- **`realized`** in the same block — what today actually cost, from measured flows
+  at the prices recorded for the same intervals. Import cost, export revenue, net
+  cash flow, both grid energies, battery movement, and load avoidance.
+
+  **No new storage.** The evidence was already being recorded per interval and per
+  day: house baseline, production, state of charge, and grid import and export.
+  This is a multiplication over data already on disk, so the storage version is
+  **unchanged**.
+
+  **Deliberately not published: `trade_profit_eur`.** Attributing a discharged
+  kilowatt-hour to a particular earlier charge needs an inventory convention —
+  weighted average, first-in-first-out — and a battery has no physical ordering
+  that makes either true rather than conventional. Beside figures that are
+  measured, such a number would borrow a precision it has not got.
+
+  Energy already in the pack is **opening inventory of unknown provenance** and is
+  never priced. There is no cost basis anywhere, and a structural test proves the
+  optimizer cannot import the module at all — "never sell below what this cost" is
+  economically wrong, because energy that cost 0.20 is a sunk cost and selling it
+  at 0.18 is correct when it makes room for something cheaper.
+
+### Removed
+
+- **The hold-end terminal floor.** The dynamic battery reserve is now the only
+  physical floor the economic optimizer is given.
+
+  The old rule ended the horizon no lower than doing nothing would have. That
+  reads like a rule against dumping the battery, and it is not one. With no
+  surplus production ahead, "doing nothing" is a *flat* line, so the requirement
+  became **"never end lower than you are now"** — a prohibition on net discharge.
+  When the most valuable quarters of the day are the last ones visible, selling
+  into them ends lower, so it did not sell.
+
+  It also **ratcheted**. The floor was recomputed from the current state of charge
+  at every refresh, so a charge raised it, the next refresh inherited the raised
+  value, and the pack was locked out of late value for the rest of the day. Rolled
+  forward across an evening the enforced floor climbed **19.5 → 20.5 → 21.5 →
+  22.0 kWh** and stayed there.
+
+  Measured on a 19-quarter horizon ending in four quarters at 1.20 EUR/kWh from
+  19.5 kWh:
+
+  | | cost | sold into the peak |
+  |---|---|---|
+  | the old floor | **+0.87 EUR** | 1.17 kWh |
+  | the reserve alone | **−5.52 EUR** | 8.29 kWh |
+
+  Rolled forward over fourteen quarters of an evening peak, the old floor sold
+  **0.000 kWh** into the dearest quarters and *bought* 0.450 kWh inside them; the
+  reserve alone sells **6.665 kWh** and buys nothing.
+
+  **What replaces it: nothing.** No continuation value, no salvage term, no
+  boundary bridge, no second floor. The requirement it was standing in for already
+  existed and is authoritative — the pointwise dynamic reserve, enforced at
+  **every** interval rather than only at the end. The reason that is sufficient is
+  a fact about the forecasts rather than a hope: the reserve's own demand forecast
+  legitimately outlives the price horizon, because production is forecast for
+  today *and tomorrow* while prices are only priced as far as they have published.
+  On the live installation that is **143 reserve intervals against 47 priced
+  ones**, so the requirement is at its most substantial exactly where the prices
+  stop — 15.7 kWh in summer and 19.4 kWh in winter, against a 4.25 kWh configured
+  floor. Energy above the requirement is discretionary by construction, and the
+  objective is now free to trade it.
+
+  An earlier investigation reached the opposite conclusion, and the mistake is
+  worth recording because it is easy to repeat: its harness passed a **constant**
+  reserve. A flat floor has nothing holding the tail of the horizon up, so removing
+  the terminal bound appeared to empty the pack — dumping that the real pointwise
+  profile prevents. Both the sweep and a mutation test now use the real recursion
+  over demands that extend past the prices.
+
+  **Safety: no new violations.** Across 200 seeded adversarial worlds — randomised
+  price levels, production, load, publication time and forecast error, rolled
+  forward with the optimizer and the scorer on separate information sets — the
+  total reserve shortfall is **identical** to the old rule's, to the kilowatt-hour.
+  Every remaining shortfall belongs to a world that starts *below* a saturated
+  requirement, where no terminal rule can help and all candidates behave alike.
+  Economically the same sweep gives the old rule **+39.694 EUR** of total regret
+  against an oracle and the reserve alone **−19.629 EUR**; they choose identically
+  on 175 of 200 worlds, and on the three where the old rule comes out ahead it does
+  so by at most **0.4542 EUR**.
+
+  **Where it loses, stated plainly.** The old floor is not worse everywhere. On a
+  summer evening peak *with tomorrow's prices already published*, it finishes
+  **0.63 EUR ahead** over fourteen quarters — it sells 3.843 kWh into the dear
+  quarters against 4.318 kWh, and the extra it holds turns out to be worth more
+  than the sale. Being able to see past the peak is exactly the case where "hold
+  something back" is sound advice, and the sweep agrees: the old rule wins 3 of 200
+  worlds. What it cannot do is tell that case apart from the one where the peak is
+  the last thing it can see, and there — tomorrow unpublished, the ordinary
+  situation every evening before publication — it pays **+3.7701 EUR against
+  −4.0894**, having sold **nothing** into the peak and bought 6.835 kWh inside it.
+  A rule that is right when it can see ahead and badly wrong when it cannot is not
+  a rule worth keeping over one that is close to right in both.
+
+  A boundary bridge — a floor at the reserve's own requirement at the price
+  boundary — was tested as a candidate and is **bit-identical** to having no
+  terminal floor at all, on every case tried. It is not adopted, because a second
+  constraint that restates an existing one is a second place to keep correct.
+
+### Changed
+
+- **The terminal instrumentation is absent rather than zero.**
+  `terminal_plan_cost_eur`, `terminal_plan_import_kwh`,
+  `terminal_near_field_cost_eur` and `terminal_first_run_changed` are now `null`.
+
+  They priced the removed constraint by re-solving with it relaxed. With no
+  constraint the relaxed solve *is* the desired solve, so the difference would be
+  identically zero — and publishing a zero would say the constraint is free, which
+  is a different claim from there being no constraint. The fields are kept so that
+  documents written by beta.16 and beta.17 still read back with the values they
+  recorded; nothing is migrated to make old and new look continuous.
+
+  A **fourth solve is no longer performed**, which is where the release's solve
+  time comes back from.
+
+### Unchanged, and re-verified
+
+Import valuation still uses the source's all-in purchase price; export still uses
+the reconstructed return price with the configured feed-in adjustment and VAT only
+when enabled. Production opportunity cost is still priced through forgone export
+revenue — the crossover is measurable at 0.18 EUR/kWh — and **no explicit term was
+added**, because that would double-count. Remaining production is still read per
+quarter. Today-plus-tomorrow semantics, the reserve model, Safety Buy, the bucket
+selector, the beta.15 clamp and mode refresh, and the beta.16 Activity behaviour
+are all untouched.
+
+**13 entities, `Economic Action` at exactly 8 attributes.** Everything added is
+diagnostics or one option.
+
+Also pinned this release: both live physics cases. 3.7 kW of battery charging
+against 1.1 kW of house and 0.63 kW of production draws **4.170 kW** at the meter;
+2.2 kW of battery discharge against 0.9 kW of house delivers **1.300 kW** of export
+while 1.3 kW of discharge delivers only 0.400.
+
+### Verification
+
+Tests **2817 → 2940**. Mutations **147 → 167** across four suites, zero
+survivors.
+
+**Three solves per refresh instead of four**, and that is measurably cheaper rather
+than notionally so. Measured on one machine against the fourth solve reproduced
+exactly as beta.17 performed it: **307 ms → 224 ms**, so 83 ms and 27 % of the
+solve work per refresh goes away. Table build 13.1 ms; the realised layer 0.100 ms
+per day. No new state dimension, no history replay.
+
+The terminal removal carries its own evidence: seven regressions on a horizon whose
+reserve outlives its prices, nine mutations including restoring the old floor and
+flattening the reserve to a constant, a seven-scenario deterministic campaign, and
+the 200-seed adversarial sweep above.
+
 ## [1.0.0-beta.17] - 2026-08-22
 
 **beta.16's first live day produced four things that looked like defects in the

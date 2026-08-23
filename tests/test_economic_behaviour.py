@@ -24,7 +24,10 @@ from __future__ import annotations
 
 import pytest
 
-from custom_components.alpha_ems_manager.battery import build_limits
+from custom_components.alpha_ems_manager.battery import (
+    build_limits,
+    split_grid_energy,
+)
 from custom_components.alpha_ems_manager.const import (
     ECONOMIC_ACTION_CHARGE,
     ECONOMIC_ACTION_DISCHARGE,
@@ -475,24 +478,19 @@ def test_the_chosen_curve_follows_the_configured_power(power: float) -> None:
     assert peak / QUARTER_HOURS > power * 0.9
 
 
-def test_seeing_a_second_day_removes_the_bounds_grip_on_the_next_interval() -> None:
-    """The stability property, and it is sharper than 'the tail does not matter'.
+def test_the_horizon_length_no_longer_changes_the_terminal_requirement() -> None:
+    """Extending the forecast must not move the floor, because the floor is fixed.
 
-    On this shape, with one day of prices, the bound **does** reach the
-    interval about to be executed: the bounded plan holds where the unbounded
-    one would charge. Extend the same shape to two days and it does not. The
-    whole-horizon figure is unchanged at 2.22 EUR either way, which is exactly
-    why that figure cannot tell you whether the bound affects anything you
-    will actually do.
-
-    So ``terminal_first_run_changed`` is not decoration. It must be **true
-    when the first runs really differ and false when they do not** -- asserted
-    here in both directions rather than assumed in either.
+    This test used to measure how far the hold-end constraint reached into the
+    next interval, and how that changed between a one-day and a two-day horizon.
+    beta.18 removed that constraint, and the property worth pinning is the
+    stronger one that replaced it: the terminal requirement is the configured
+    physical floor, so it is **the same number** whatever the horizon length --
+    there is nothing left for a longer forecast to loosen or tighten.
     """
-    seen: dict[int, bool] = {}
-    for count in (96, 192):
-        imports = []
-        production = []
+    floors = set()
+    for count in (48, 96, 192):
+        imports, production = [], []
         for index in range(count):
             quarter = index % 96
             imports.append(0.10 if quarter < 24 else (0.40 if quarter >= 78 else 0.22))
@@ -513,34 +511,19 @@ def test_seeing_a_second_day_removes_the_bounds_grip_on_the_next_interval() -> N
             table=TABLE,
             horizon=horizon,
             start_energy_kwh=19.0,
-            terminal_floor_kwh=CEILING * 2.0,
+            terminal_floor_kwh=FLOOR,
             floor_energy_kwh=FLOOR,
             minimum_trade_gain_eur=0.10,
             allow_grid_charging=True,
             allow_battery_export=True,
         )
+        floors.add(round(outcome.desired.terminal_floor_kwh, 6))
+        # And no comparison is published, at any horizon length.
+        assert outcome.terminal_plan_cost_eur is None
+        assert outcome.terminal_first_run_changed is None
 
-        # The instrument must agree with the plans it is derived from.
-        bounded = outcome.desired.intervals[0]
-        free = outcome.unbounded.intervals[0]
-        moved = bounded.battery_charge_ac_kwh - bounded.battery_discharge_ac_kwh
-        otherwise = free.battery_charge_ac_kwh - free.battery_discharge_ac_kwh
-        really_differs = (
-            bounded.action != free.action or abs(moved - otherwise) > TABLE.bucket_kwh
-        )
-        assert outcome.terminal_first_run_changed is really_differs, count
-        seen[count] = outcome.terminal_first_run_changed
-
-        # And in both cases the whole-horizon figure is large, which is the
-        # discrepancy beta.16 published without qualifying.
-        assert outcome.terminal_plan_cost_eur > 0.5, count
-        assert (
-            abs(outcome.terminal_near_field_cost_eur) < outcome.terminal_plan_cost_eur
-        )
-
-    # One day: the bound reaches the next interval. Two days: it does not.
-    assert seen[96] is True
-    assert seen[192] is False
+    assert len(floors) == 1, floors
+    assert floors.pop() <= FLOOR + 1e-9
 
 
 def test_the_published_actions_stay_within_the_documented_vocabulary() -> None:
@@ -558,3 +541,234 @@ def test_the_published_actions_stay_within_the_documented_vocabulary() -> None:
         ECONOMIC_ACTION_EXPORT,
     }
     assert {run.action for run in plan.runs} <= allowed
+
+
+# ===========================================================================
+# E. the live installation, pinned
+# ===========================================================================
+#
+# Measured on the real AlphaESS around beta.17. Both cases are about the same
+# thing: **a battery figure and a grid figure are different numbers**, and a
+# future Stage B that confused them would command the wrong quantity. Stage A
+# already models this correctly -- these tests exist so it stays that way while
+# the execution contract is built on top of it.
+
+
+def test_the_live_charge_case_reproduces_the_measured_grid_import() -> None:
+    """3.7 kW of battery charging drew 4.17 kW from the meter, not 3.7.
+
+    House 1.1 kW, production 0.63 kW, battery charging 3.7 kW. The meter showed
+    about 4.2 kW. The identity is ``load - production + charge``, netted in AC
+    before any conversion, and it lands on 4.170.
+
+    **The Stage-B consequence:** the dispatch setpoint is the *battery* figure.
+    House load must not be added to it -- the house is already in the residual.
+    """
+    flows = split_grid_energy(
+        load_ac_kwh=1.1 * QUARTER_HOURS,
+        charge_ac_kwh=3.7 * QUARTER_HOURS,
+        discharge_ac_kwh=0.0,
+        pv_ac_kwh=0.63 * QUARTER_HOURS,
+    )
+
+    assert flows.import_kwh / QUARTER_HOURS == pytest.approx(4.17, abs=0.005)
+    assert flows.export_kwh == pytest.approx(0.0)
+    # The two figures differ by production less load, which is the whole point.
+    assert abs(flows.import_kwh / QUARTER_HOURS - 3.7) == pytest.approx(0.47, abs=0.005)
+
+
+def test_the_live_export_case_needs_more_battery_than_it_delivers() -> None:
+    """1.3 kW of net export needs 2.2 kW of battery against 0.9 kW of house.
+
+    And the converse, which is the dangerous one: discharging *at* the export
+    figure delivers well under half of it, because the house takes its share
+    first.
+    """
+    wanted = split_grid_energy(
+        load_ac_kwh=0.9 * QUARTER_HOURS,
+        charge_ac_kwh=0.0,
+        discharge_ac_kwh=2.2 * QUARTER_HOURS,
+        pv_ac_kwh=0.0,
+    )
+    naive = split_grid_energy(
+        load_ac_kwh=0.9 * QUARTER_HOURS,
+        charge_ac_kwh=0.0,
+        discharge_ac_kwh=1.3 * QUARTER_HOURS,
+        pv_ac_kwh=0.0,
+    )
+
+    assert wanted.export_kwh / QUARTER_HOURS == pytest.approx(1.3, abs=0.005)
+    assert naive.export_kwh / QUARTER_HOURS == pytest.approx(0.4, abs=0.005)
+
+
+def test_the_optimizer_prices_the_grid_consequence_not_the_battery_movement() -> None:
+    """A charge under production costs what the *meter* saw, not what the pack took.
+
+    The same live shape put through the solver: the interval's cost is the grid
+    import at the import price, and the battery movement is larger than the import.
+    A model that priced battery energy would overcharge this interval by the whole
+    production term.
+    """
+    plan = planned(
+        imports=[0.30] * 4,
+        exports=[0.10] * 4,
+        load=[1.1 * QUARTER_HOURS] * 4,
+        production=[0.63 * QUARTER_HOURS] * 4,
+        start_kwh=FLOOR + 2.0,
+        gain=0.0,
+    )
+
+    for entry in plan.intervals:
+        expected = entry.grid_import_kwh * 0.30 - entry.grid_export_kwh * 0.10
+        assert entry.cost_eur == pytest.approx(expected, abs=1e-9)
+        if entry.battery_charge_ac_kwh > 0.0:
+            # Production covered part of it, so the meter saw less than the pack.
+            assert entry.grid_import_kwh < entry.battery_charge_ac_kwh + 1e-9
+
+
+# ===========================================================================
+# F. production coverage requested for beta.18
+# ===========================================================================
+
+
+def test_limited_headroom_makes_a_sale_before_the_sun_rational() -> None:
+    """A nearly full pack with production coming sells first to make room.
+
+    Not a rule -- an outcome. The alternative is curtailing free energy, and the
+    objective can see that because the forgone export appears in the residual.
+    """
+    # Sell into a decent price now, absorb the sun, spend it on a dear evening.
+    # Without the early sale there is no room for the sun at all.
+    plan = planned(
+        imports=[0.22] * 4 + [0.22] * 4 + [0.60] * 4,
+        exports=[0.18] * 4 + [0.02] * 4 + [0.55] * 4,
+        load=[0.10] * 8 + [0.30] * 4,
+        production=[0.0] * 4 + [2.5] * 4 + [0.0] * 4,
+        start_kwh=CEILING - 1.0,
+        gain=0.0,
+    )
+
+    sold_early = sum(entry.grid_export_kwh for entry in plan.intervals[:4])
+    absorbed = sum(entry.battery_charge_ac_kwh for entry in plan.intervals[4:8])
+    spent_late = sum(entry.battery_discharge_ac_kwh for entry in plan.intervals[8:])
+
+    assert sold_early > 0.5
+    assert absorbed > 0.5
+    assert spent_late > 0.5
+
+
+def test_a_high_export_price_sends_production_to_the_grid_instead() -> None:
+    """When selling now beats storing for later, it sells. The crossover exists.
+
+    Measured at 0.18 EUR/kWh against a 0.40 evening on the reference pack: below
+    it the sun is stored, above it the sun is sold. No rule decides this; the
+    forgone revenue is simply part of the cost.
+    """
+    stored = planned(
+        imports=[0.22] * 4 + [0.40] * 4,
+        exports=[0.05] * 4 + [0.22] * 4,
+        load=[0.10] * 8,
+        production=[2.0] * 4 + [0.0] * 4,
+        start_kwh=FLOOR + 2.0,
+        gain=0.0,
+    )
+    sold = planned(
+        imports=[0.22] * 4 + [0.40] * 4,
+        exports=[0.30] * 4 + [0.22] * 4,
+        load=[0.10] * 8,
+        production=[2.0] * 4 + [0.0] * 4,
+        start_kwh=FLOOR + 2.0,
+        gain=0.0,
+    )
+
+    absorbed_cheap = sum(e.battery_charge_ac_kwh for e in stored.intervals[:4])
+    absorbed_dear = sum(e.battery_charge_ac_kwh for e in sold.intervals[:4])
+    assert absorbed_cheap > absorbed_dear
+    assert sum(e.grid_export_kwh for e in sold.intervals[:4]) > sum(
+        e.grid_export_kwh for e in stored.intervals[:4]
+    )
+
+
+def test_a_negative_export_price_stores_the_sun_rather_than_paying_to_export() -> None:
+    """Being charged to export makes storing free energy strictly better.
+
+    The curtailment-equivalent case: with no actuator to decline production, the
+    battery is the only place for it to go, and the objective wants it there.
+    """
+    plan = planned(
+        imports=[0.22] * 4 + [0.40] * 4,
+        exports=[-0.05] * 4 + [0.22] * 4,
+        load=[0.10] * 8,
+        production=[2.0] * 4 + [0.0] * 8,
+        start_kwh=FLOOR + 2.0,
+        gain=0.0,
+    )
+
+    assert sum(e.battery_charge_ac_kwh for e in plan.intervals[:4]) > 1.0
+
+
+def test_a_mixed_production_and_grid_charge_is_reported_as_mixed() -> None:
+    """Sun and meter in the same campaign, and the attribution says so.
+
+    The figure a per-kWh margin is charged on, and the figure a reader needs in
+    order to believe "charged 8 kWh" without assuming 8 kWh was bought.
+    """
+    plan = planned(
+        imports=[0.05] * 4 + [0.60] * 4,
+        exports=[0.02] * 4 + [0.55] * 4,
+        load=[0.10] * 8,
+        production=[0.8] * 4 + [0.0] * 4,
+        start_kwh=FLOOR,
+        gain=0.0,
+    )
+
+    charge_runs = [run for run in plan.runs if run.battery_charge_ac_kwh > 0.0]
+    assert charge_runs
+    run = charge_runs[0]
+    assert 0.0 < run.marginal_grid_import_kwh < run.battery_charge_ac_kwh
+
+
+# ===========================================================================
+# G. safety buy, re-pinned under the new margin
+# ===========================================================================
+
+
+def test_safety_buy_still_buys_only_what_the_reserve_needs() -> None:
+    """Four requirements, four exact landings, and never the ceiling."""
+    for reserve in (8.0, 12.0, 15.5, 19.0):
+        plan = planned(
+            imports=[0.25] * 32,
+            exports=[0.15] * 32,
+            load=[0.30] * 32,
+            start_kwh=5.0,
+            reserve_kwh=reserve,
+            gain=0.10,
+        )
+        peak = max(
+            entry.start_energy_dc_kwh + entry.battery_delta_dc_kwh
+            for entry in plan.intervals
+        )
+        assert peak == pytest.approx(reserve, abs=1e-9), reserve
+        assert peak < CEILING
+
+
+def test_safety_buy_works_with_only_today_priced() -> None:
+    """Tomorrow absent must not stop the reserve being met.
+
+    The pre-publication state: a short horizon and a requirement above the current
+    state of charge. Reserve feasibility outranks cost, so it recovers regardless
+    of how far ahead the prices reach.
+    """
+    plan = planned(
+        imports=[0.25] * 20,
+        exports=[0.15] * 20,
+        load=[0.30] * 20,
+        start_kwh=6.0,
+        reserve_kwh=15.5,
+        gain=0.10,
+    )
+
+    ended = plan.intervals[-1]
+    landed = ended.start_energy_dc_kwh + ended.battery_delta_dc_kwh
+    assert landed == pytest.approx(15.5, abs=1e-9)
+    assert plan.available

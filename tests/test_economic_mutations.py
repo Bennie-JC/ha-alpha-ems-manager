@@ -35,10 +35,12 @@ from __future__ import annotations
 
 import ast
 import math
-from datetime import UTC, datetime
+import pathlib
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from custom_components.alpha_ems_manager import economic as economic_module
 from custom_components.alpha_ems_manager.activity import (
     PlannedRun,
     RunContent,
@@ -68,11 +70,13 @@ from custom_components.alpha_ems_manager.economic import (
     IntervalPrice,
     build_horizon,
     build_physics_table,
+    economic_as_dict,
     fingerprint_economic,
     hold_cost,
     select_bucket_kwh,
 )
 from custom_components.alpha_ems_manager.economic import solve as economic_solve
+from custom_components.alpha_ems_manager.reserve import build_reserve
 from custom_components.alpha_ems_manager.simulation import IntervalDemand
 
 from .test_economic_actions import outcome_for, reserve_deadline_horizon
@@ -1129,28 +1133,30 @@ def test_attributing_site_import_to_the_battery_run_is_caught() -> None:
     )
 
 
-def test_reporting_a_zero_terminal_plan_cost_is_caught() -> None:
-    """Mutation: publish zero, or publish the bounded solve twice.
+def test_fabricating_a_zero_terminal_cost_is_caught() -> None:
+    """**The beta.18 honesty mutation.** No comparison means no number.
 
-    The whole point of the fourth solve is that the figure is a *difference*. A
-    constant zero would hide precisely the effect it exists to measure, and would
-    do so most on the shape where the bound costs most.
+    The tempting mutation is to keep the fields and return ``0.0`` and ``False``
+    now that the fourth solve is gone -- it keeps every consumer working and reads
+    as "the terminal condition costs nothing". It is a different claim from "there
+    is no terminal condition", and the second is the true one.
     """
-    from .test_economic_actions import outcome_for
-    from .test_economic_model import reference_table
-    from .test_economic_reporting import two_day_case
-
     table = reference_table()
     horizon, hold_end = two_day_case(table)
     outcome = outcome_for(
         table, horizon, start_kwh=17.42, terminal_kwh=hold_end, gain=0.10
     )
 
-    assert outcome.unbounded is not None
-    assert outcome.terminal_plan_cost_eur > 1.0
-    assert outcome.desired.cost_eur != pytest.approx(outcome.unbounded.cost_eur)
-    # And the production plan is still the bounded one.
-    assert outcome.desired.end_energy_dc_kwh > outcome.unbounded.end_energy_dc_kwh
+    assert outcome.unbounded is None
+    for value in (
+        outcome.terminal_plan_cost_eur,
+        outcome.terminal_plan_import_kwh,
+        outcome.terminal_near_field_cost_eur,
+    ):
+        assert value is None
+        assert value != 0.0
+    assert outcome.terminal_first_run_changed is None
+    assert outcome.terminal_first_run_changed is not False
 
 
 def test_relaxing_the_production_terminal_bound_is_caught() -> None:
@@ -1466,27 +1472,26 @@ def test_reporting_only_the_larger_directional_power_is_caught() -> None:
     assert (7.5 - table.max_representable_discharge_kw) / 7.5 > 0.12
 
 
-def test_calling_the_whole_horizon_figure_a_realised_cost_is_caught() -> None:
-    """The beta.16 reporting defect, written down so it cannot come back.
+def test_the_payload_says_the_terminal_figures_are_gone_not_free() -> None:
+    """A reader of the download must be able to tell absent from zero.
 
-    ``terminal_plan_cost_eur`` is a whole-horizon plan difference. The mutation is
-    presenting it as what the bound *costs*, which is what beta.16 did and what
-    made a EUR 3.9 tail look like EUR 3.9 of lost money. The near-field figure is
-    the honest one, and it must be the smaller of the two.
+    beta.16 published a whole-horizon plan difference that read as realised money;
+    beta.17 renamed and qualified it; beta.18 removed the constraint it priced. The
+    payload has to say which of those it is doing.
     """
     table = reference_table()
     horizon, hold_end = two_day_case(table)
     outcome = outcome_for(
         table, horizon, start_kwh=17.42, terminal_kwh=hold_end, gain=0.10
     )
+    payload = economic_as_dict(
+        outcome, execution_blocked_reason="execution_unavailable"
+    )["terminal"]
 
-    assert outcome.terminal_plan_cost_eur > 1.0
-    assert abs(outcome.terminal_near_field_cost_eur) < outcome.terminal_plan_cost_eur
-    # The mutation -- reporting the plan figure as the near-field one -- would
-    # make these equal.
-    assert outcome.terminal_near_field_cost_eur != pytest.approx(
-        outcome.terminal_plan_cost_eur
-    )
+    assert payload["plan_cost_eur"] is None
+    assert payload["first_run_changed"] is None
+    assert "no longer exists" in payload["plan_cost_rule"]
+    assert "ratcheted" in payload["plan_cost_rule"]
 
 
 def test_an_activity_sentence_that_multiplies_out_wrongly_is_caught() -> None:
@@ -1561,3 +1566,578 @@ def test_inventing_a_price_for_an_absent_tomorrow_is_caught() -> None:
     # invented a price would give 48.
     assert horizon.intervals == 24
     assert horizon.limited_by is not None
+
+
+# ===========================================================================
+# J. beta.18: the margin, the realised layer, and the execution contract
+# ===========================================================================
+
+
+def _margin_plan(
+    *, spread, margin, gain=0.10, production=0.0, reserve=None, start=None, load=0.10
+):
+    """Return an arbitrage plan under a per-kWh grid-charge margin."""
+    table = reference_table()
+    floor = table.limits.energy_for_soc(FLOOR_PERCENT)
+    count = 12
+    horizon = horizon_for(
+        table,
+        demands=[
+            IntervalDemand(
+                index=index,
+                baseline_kwh=load,
+                pv_kwh=production if index < 6 else 0.0,
+            )
+            for index in range(count)
+        ],
+        prices=[
+            IntervalPrice(
+                import_eur_kwh=0.20 if index < 6 else 0.20 + spread,
+                export_eur_kwh=(0.20 if index < 6 else 0.20 + spread) * 0.9,
+            )
+            for index in range(count)
+        ],
+        reserve_kwh=[floor if reserve is None else reserve] * count,
+    )
+    return economic_solve(
+        table=table,
+        horizon=horizon,
+        start_energy_kwh=floor if start is None else start,
+        terminal_floor_kwh=floor,
+        minimum_trade_gain_eur=gain,
+        permitted=EVERYTHING,
+        grid_charge_margin_eur_per_kwh=margin,
+    )
+
+
+def test_charging_the_margin_once_per_run_instead_of_per_kwh_is_caught() -> None:
+    """The mutation is the bug the margin exists to fix, reintroduced.
+
+    A fixed amount per run does not scale with volume: it is cleared once and then
+    an arbitrary quantity rides through. The released margin scales, so the same
+    thin spread that survives a fixed charge dies under a per-kWh one.
+    """
+    thin = _margin_plan(spread=0.10, margin=0.0, gain=0.10)
+    per_kwh = _margin_plan(spread=0.10, margin=0.10, gain=0.10)
+    # A fixed charge of the same size, expressed the only way the DP can express
+    # one: as a larger per-run gain.
+    per_run = _margin_plan(spread=0.10, margin=0.0, gain=1.50)
+
+    assert thin.marginal_grid_charge_kwh > 10.0
+    assert per_kwh.marginal_grid_charge_kwh < 1.0
+    # The per-run form cannot reproduce it: a fixed 1.50 still lets volume ride
+    # through once cleared, or blocks small honest trades. Either way it is not
+    # the same instrument.
+    assert (
+        per_run.marginal_grid_charge_kwh
+        != pytest.approx(per_kwh.marginal_grid_charge_kwh, abs=0.5)
+        or per_run.marginal_grid_charge_kwh < 1.0
+    )
+
+
+def test_charging_the_margin_on_total_battery_charge_is_caught() -> None:
+    """The basis is marginal grid import, not battery movement.
+
+    On a mixed quarter the two differ by the production term. A margin on total
+    charge would tax the sun -- and the reported basis proves it does not.
+    """
+    plan = _margin_plan(spread=0.40, margin=0.02, production=0.8)
+
+    charged = sum(entry.battery_charge_ac_kwh for entry in plan.intervals[:6])
+    assert charged > 0.0
+    # Strictly less: the mutation would make these equal.
+    assert plan.marginal_grid_charge_kwh < charged
+    assert plan.grid_charge_margin_eur == pytest.approx(
+        0.02 * plan.marginal_grid_charge_kwh, abs=1e-9
+    )
+
+
+def test_charging_the_margin_on_ambient_absorption_is_caught() -> None:
+    """Absorption causes no marginal import, so it must cost nothing.
+
+    An absurd margin with plenty of production: the battery still fills, and the
+    basis stays at zero. The mutation -- charging every charged kilowatt-hour --
+    would empty the plan of free energy.
+    """
+    plan = _margin_plan(spread=0.10, margin=5.0, production=2.0)
+
+    absorbed = sum(entry.battery_charge_ac_kwh for entry in plan.intervals[:6])
+    assert absorbed > 1.0
+    assert plan.marginal_grid_charge_kwh < 0.3
+
+
+def test_a_margin_that_blocks_the_reserve_is_caught() -> None:
+    """**The safety mutation.** No cost may outrank keeping the house supplied.
+
+    Lexicographic ordering is what guarantees it, so this holds at any margin --
+    including one four orders of magnitude beyond anything sane.
+    """
+    for margin in (1.0, 99.0, 10_000.0):
+        plan = _margin_plan(spread=0.0, margin=margin, reserve=15.5, start=5.0)
+        peak = max(
+            entry.start_energy_dc_kwh + entry.battery_delta_dc_kwh
+            for entry in plan.intervals
+        )
+        assert plan.available, margin
+        assert peak == pytest.approx(15.5, abs=1e-9), margin
+
+
+def test_a_margin_that_taxes_load_avoidance_is_caught() -> None:
+    """A discharge is not charging, so supplying the house is never charged."""
+    plan = _margin_plan(spread=0.0, margin=99.0, load=1.0, start=11.0)
+
+    discharged = sum(entry.battery_discharge_ac_kwh for entry in plan.intervals)
+    assert discharged > 1.0
+    assert plan.grid_charge_margin_eur == pytest.approx(0.0, abs=1e-9)
+
+
+def test_folding_the_margin_into_the_reported_cost_is_caught() -> None:
+    """``cost_eur`` must stay reconcilable to grid energy at the interval's prices.
+
+    The margin is notional -- nobody pays it. Folding it in would break the
+    invariant that every euro in the payload can be checked against the flows
+    printed beside it, which is the same reason the switching cost is kept out.
+    """
+    plan = _margin_plan(spread=0.40, margin=0.05)
+
+    assert plan.grid_charge_margin_eur > 0.0
+    for entry in plan.intervals:
+        expected = entry.grid_import_kwh * (
+            entry.import_price_eur_kwh or 0.0
+        ) - entry.grid_export_kwh * (entry.export_price_eur_kwh or 0.0)
+        assert entry.cost_eur == pytest.approx(expected, abs=1e-9)
+
+
+def test_inverting_the_margin_boundary_is_caught() -> None:
+    """Above the threshold must refuse and below must allow, not the other way."""
+    below = _margin_plan(spread=0.10, margin=0.02)
+    above = _margin_plan(spread=0.10, margin=0.10)
+
+    assert below.marginal_grid_charge_kwh > above.marginal_grid_charge_kwh
+
+
+def test_a_realised_figure_reaching_the_objective_is_caught() -> None:
+    """**The sunk-cost mutation.** A cost basis must never enter the search.
+
+    Structural: no module that decides anything may import the realised layer, and
+    inside the optimizer only the payload builder may even name it. A rule like
+    "never sell below what this cost" would forbid correct decisions -- selling at
+    0.18 energy that cost 0.20 is right when it makes room for something cheaper.
+    """
+    package = pathlib.Path(economic_module.__file__).parent
+    for name in ("economic.py", "reserve.py", "policy.py", "safety.py", "battery.py"):
+        tree = ast.parse((package / name).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                assert "realized" not in node.module, name
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert "realized" not in alias.name, name
+
+    touching = set()
+    tree = ast.parse((package / "economic.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+            names |= {a.arg for a in ast.walk(node) if isinstance(a, ast.arg)}
+            if any("realized" in name for name in names):
+                touching.add(node.name)
+    assert touching == {"economic_as_dict"}, touching
+
+
+def test_keying_the_execution_target_on_a_horizon_index_is_caught() -> None:
+    """The beta.16 Activity defect, refused in the new contract.
+
+    An index moves every quarter as the horizon advances. Two targets for the same
+    run at different horizon positions must share an identifier; the mutation --
+    hashing the index -- would give them different ones and make a future Stage B
+    abandon its own dispatch every fifteen minutes.
+    """
+    from custom_components.alpha_ems_manager.economic import execution_target
+
+    opens = datetime(2026, 8, 22, 18, 30, tzinfo=UTC)
+    closes = opens + timedelta(minutes=60)
+    early = _target_run(start_index=42, charge=6.0)
+    late = _target_run(start_index=41, charge=4.0)
+
+    first = execution_target(
+        early,
+        window_start=opens,
+        window_end=closes,
+        reserve_floor_kwh=4.4,
+        stale_after=closes,
+    )
+    second = execution_target(
+        late,
+        window_start=opens,
+        window_end=closes,
+        reserve_floor_kwh=4.4,
+        stale_after=closes,
+    )
+
+    assert first["plan_id"] == second["plan_id"]
+    assert "42" not in first["plan_id"]
+
+
+def test_revision_churn_on_insignificant_noise_is_caught() -> None:
+    """A revision that moved on floating-point drift would cause control jitter."""
+    from custom_components.alpha_ems_manager.economic import (
+        execution_revision,
+        execution_target,
+    )
+
+    opens = datetime(2026, 8, 22, 18, 30, tzinfo=UTC)
+    closes = opens + timedelta(minutes=60)
+    base = execution_target(
+        _target_run(start_index=1, charge=6.0),
+        window_start=opens,
+        window_end=closes,
+        reserve_floor_kwh=4.4,
+        stale_after=closes,
+    )
+    base["revision"] = 5
+    nudged = execution_target(
+        _target_run(start_index=1, charge=6.0 + 1e-9),
+        window_start=opens,
+        window_end=closes,
+        reserve_floor_kwh=4.4,
+        stale_after=closes,
+    )
+
+    assert execution_revision(base, nudged) == 5
+
+
+def test_using_the_grid_target_as_a_battery_setpoint_is_caught() -> None:
+    """**The boundary mutation, and the most dangerous one here.**
+
+    On the live installation 1.3 kW of net export needed 2.2 kW of battery. A
+    Stage B that took the grid figure as a battery command would deliver 0.4 kW.
+    The contract keeps them in separate, separately named fields, and the grid
+    field is absent entirely unless the meter is what the plan aims at.
+    """
+    from custom_components.alpha_ems_manager.economic import execution_target
+
+    opens = datetime(2026, 8, 22, 18, 30, tzinfo=UTC)
+    exporting = execution_target(
+        _target_run(
+            start_index=1, discharge=2.2, grid_export=1.3, action=ECONOMIC_ACTION_EXPORT
+        ),
+        window_start=opens,
+        window_end=opens + timedelta(minutes=60),
+        reserve_floor_kwh=4.4,
+        stale_after=opens,
+    )
+    charging = execution_target(
+        _target_run(start_index=1, charge=5.0, grid_import=4.2),
+        window_start=opens,
+        window_end=opens + timedelta(minutes=60),
+        reserve_floor_kwh=4.4,
+        stale_after=opens,
+    )
+
+    assert exporting["battery_target_kwh"] == pytest.approx(2.2)
+    assert exporting["grid_target_kwh"] == pytest.approx(1.3)
+    assert exporting["battery_target_kwh"] != pytest.approx(
+        exporting["grid_target_kwh"]
+    )
+    # A charge has no meter-side target at all, so it cannot be confused for one.
+    assert charging["grid_target_kwh"] is None
+    assert charging["battery_target_kwh"] == pytest.approx(5.0)
+
+
+def test_a_missing_staleness_stamp_is_caught() -> None:
+    """Every target carries the instant beyond which it must not be trusted."""
+    from custom_components.alpha_ems_manager.economic import execution_target
+
+    opens = datetime(2026, 8, 22, 18, 30, tzinfo=UTC)
+    target = execution_target(
+        _target_run(start_index=1, charge=1.0),
+        window_start=opens,
+        window_end=opens + timedelta(minutes=60),
+        reserve_floor_kwh=4.4,
+        stale_after=opens + timedelta(minutes=30),
+    )
+
+    assert target["stale_after"]
+    assert target["stale_after"] > target["window_start"]
+
+
+def _target_run(
+    *,
+    start_index,
+    charge=0.0,
+    discharge=0.0,
+    grid_import=0.0,
+    grid_export=0.0,
+    action=ECONOMIC_ACTION_CHARGE,
+):
+    """Return one run for the execution-contract mutations."""
+    from custom_components.alpha_ems_manager.economic import EconomicRun
+
+    return EconomicRun(
+        action=action,
+        start_index=start_index,
+        end_index=start_index + 3,
+        interval_count=4,
+        battery_charge_ac_kwh=charge,
+        battery_discharge_ac_kwh=discharge,
+        grid_import_kwh=grid_import,
+        grid_export_kwh=grid_export,
+        pv_curtailed_kwh=0.0,
+        first_power_kw=(charge + discharge) * 4.0,
+        net_cash_flow_eur=0.0,
+        min_price_eur_kwh=0.1,
+        max_price_eur_kwh=0.4,
+        average_price_eur_kwh=0.25,
+        marginal_grid_import_kwh=grid_import,
+        marginal_grid_export_kwh=grid_export,
+        marginal_cost_eur=-1.0,
+        direction="charge" if charge else "discharge",
+        charged_switching_fee=True,
+    )
+
+
+# --- K. beta.18: the reserve is the only physical floor ----------------------
+
+
+def _cb_world(pv_total=30.0, load=0.15, tail=1.20, days=2):
+    """Return a shaped world: production tomorrow, dear quarters at the end today."""
+    production, price, demand = [], [], []
+    for index in range(96 * days):
+        quarter = index % 96
+        day = index // 96
+        arc = 0.0
+        if 32 <= quarter < 80 and pv_total > 0.0:
+            arc = max(0.0, pv_total * math.sin(math.pi * (quarter - 32) / 48) / 30.55)
+        production.append(arc)
+        demand.append(load)
+        value = 0.10 if quarter < 24 else (0.40 if 78 <= quarter < 84 else 0.22)
+        if day == 0 and quarter >= 92:
+            value = tail
+        price.append(value)
+    return production, price, demand
+
+
+def _cb_horizon(step=80, priced_end=96, flatten_reserve=False, **kw):
+    """Return a horizon whose reserve outlives its prices, as production does.
+
+    The physical forecast runs a further civil day past the last priced interval,
+    because that is how much forecast exists: production covers today and
+    tomorrow, and the learned load baseline is defined for any interval. Every
+    mutation below depends on that asymmetry being present, since it is what makes
+    the reserve substantial exactly where the prices stop.
+    """
+    table = reference_table()
+    floor = table.limits.energy_for_soc(FLOOR_PERCENT)
+    production, price, demand = _cb_world(**kw)
+    window = range(step + 1, min(len(price), priced_end + 96))
+    demands = tuple(
+        IntervalDemand(
+            index=i - (step + 1), baseline_kwh=demand[i], pv_kwh=production[i]
+        )
+        for i in window
+    )
+    if flatten_reserve:
+        required = tuple(floor for _ in demands)
+    else:
+        projection = build_reserve(
+            limits=table.limits, floor_energy_kwh=floor, demands=demands
+        )
+        required = tuple(entry.required_dc_kwh for entry in projection.intervals)
+    prices = tuple(
+        IntervalPrice(
+            import_eur_kwh=price[i] if i < priced_end else None,
+            export_eur_kwh=price[i] * 0.55 if i < priced_end else None,
+        )
+        for i in window
+    )
+    return build_horizon(
+        demands=demands, prices=prices, required_reserve_kwh=required, table=table
+    )
+
+
+def _cb_solve(horizon, terminal, start=19.5):
+    """Solve one case, varying only the terminal floor the caller asks for."""
+    return economic_solve(
+        table=reference_table(),
+        horizon=horizon,
+        start_energy_kwh=start,
+        terminal_floor_kwh=terminal,
+        minimum_trade_gain_eur=0.10,
+        permitted=EVERYTHING,
+    )
+
+
+def test_restoring_the_hold_end_terminal_floor_is_caught() -> None:
+    """**The headline mutation.** Asking for the idle endpoint restores the defect.
+
+    The solver still honours whatever terminal floor it is handed -- the internal
+    clamp is a reachability guard, not a policy -- so the removed defect is one
+    caller change away. Handed the idle endpoint it holds everything it has;
+    handed the configured floor it spends down to the reserve's requirement.
+    """
+    table = reference_table()
+    floor = table.limits.energy_for_soc(FLOOR_PERCENT)
+    horizon = _cb_horizon()
+
+    mutated = _cb_solve(horizon, table.limits.energy_for_soc(100.0) * 2.0)
+    released = _cb_solve(horizon, floor)
+
+    # The idle walk across an evening with no surplus is flat, so the floor is
+    # the starting charge and the plan ends exactly where it began.
+    assert mutated.terminal_floor_kwh == pytest.approx(19.5, abs=0.4)
+    assert mutated.end_energy_dc_kwh == pytest.approx(19.5, abs=0.4)
+    assert released.terminal_floor_kwh <= floor + 1e-9
+    assert released.end_energy_dc_kwh < mutated.end_energy_dc_kwh - 5.0
+
+
+def test_using_the_current_charge_as_the_terminal_floor_is_caught() -> None:
+    """The same defect stated plainly, since a flat walk makes the two identical."""
+    table = reference_table()
+    horizon = _cb_horizon()
+
+    as_current = _cb_solve(horizon, 19.5)
+    released = _cb_solve(horizon, table.limits.energy_for_soc(FLOOR_PERCENT))
+
+    assert as_current.end_energy_dc_kwh > released.end_energy_dc_kwh + 5.0
+
+
+def test_adding_the_boundary_reserve_as_a_second_floor_is_caught() -> None:
+    """Redundant, and provably so: the reserve already binds at that interval.
+
+    A boundary bridge was a serious candidate. It turns out bit-identical to
+    having no terminal floor at all, so adding it would be a second constraint
+    expressing something already enforced pointwise -- and a second place to have
+    to keep correct.
+    """
+    table = reference_table()
+    horizon = _cb_horizon()
+
+    released = _cb_solve(horizon, table.limits.energy_for_soc(FLOOR_PERCENT))
+    bridged = _cb_solve(horizon, horizon.planning_reserve_kwh[-1])
+
+    assert bridged.cost_eur == pytest.approx(released.cost_eur, abs=1e-9)
+    assert bridged.end_energy_dc_kwh == pytest.approx(released.end_energy_dc_kwh)
+    assert bridged.violation_kwh == pytest.approx(released.violation_kwh)
+
+
+def test_flattening_the_reserve_to_the_configured_floor_is_caught() -> None:
+    """**The safety mutation.** With no terminal floor the reserve is the only guard.
+
+    This is also the harness mistake that made an earlier investigation reach the
+    wrong conclusion: passing a constant reserve invents dumping that the real
+    pointwise profile prevents, and so appears to justify a terminal floor.
+    """
+    table = reference_table()
+    floor = table.limits.energy_for_soc(FLOOR_PERCENT)
+    real = _cb_horizon()
+    flattened = _cb_horizon(flatten_reserve=True)
+
+    guarded = _cb_solve(real, floor)
+    unguarded = _cb_solve(flattened, floor)
+
+    assert real.planning_reserve_kwh[-1] > floor + 3.0
+    assert guarded.end_energy_dc_kwh >= real.planning_reserve_kwh[-1] - 1e-6
+    assert unguarded.end_energy_dc_kwh < guarded.end_energy_dc_kwh - 3.0
+
+
+def test_spending_below_the_requirement_at_any_interval_is_caught() -> None:
+    """The requirement holds at every interval, not merely at the horizon's end."""
+    table = reference_table()
+    horizon = _cb_horizon()
+    plan = _cb_solve(horizon, table.limits.energy_for_soc(FLOOR_PERCENT))
+
+    assert plan.violation_kwh == pytest.approx(0.0)
+    for index, entry in enumerate(plan.intervals):
+        landed = entry.start_energy_dc_kwh + entry.battery_delta_dc_kwh
+        assert landed >= horizon.planning_reserve_kwh[index] - 1e-6
+
+
+def test_a_terminal_floor_that_ratchets_across_refreshes_is_caught() -> None:
+    """Under rolling execution the floor must be one number, refresh after refresh.
+
+    The mutation is the released beta.17 caller, and this is the mechanism that
+    made it worse over time rather than merely suboptimal once: the floor is
+    recomputed from the *current* charge, so a charge raises it, the next refresh
+    inherits the raised value, and the pack is locked out of late value for good.
+    Measured here it climbs; the configured floor does not move.
+    """
+    table = reference_table()
+    floor = table.limits.energy_for_soc(FLOOR_PERCENT)
+    ceiling = table.limits.energy_for_soc(100.0)
+
+    def walk(*, hold_end):
+        charge, floors = 19.5, []
+        for offset in range(12):
+            horizon = _cb_horizon(step=80 + offset)
+            if not horizon.intervals:
+                break
+            plan = _cb_solve(
+                horizon, ceiling * 2.0 if hold_end else floor, start=charge
+            )
+            if not plan.available or not plan.intervals:
+                break
+            floors.append(round(plan.terminal_floor_kwh, 2))
+            entry = plan.intervals[0]
+            charge = min(
+                ceiling,
+                max(floor, entry.start_energy_dc_kwh + entry.battery_delta_dc_kwh),
+            )
+        return floors
+
+    ratcheting = walk(hold_end=True)
+    fixed = walk(hold_end=False)
+
+    assert len(ratcheting) > 4
+    assert len(set(ratcheting)) > 1
+    assert max(ratcheting) > min(ratcheting) + 1.0
+    assert ratcheting == sorted(ratcheting)
+    assert len(set(fixed)) == 1
+
+
+def test_fabricating_a_false_first_run_comparison_is_caught() -> None:
+    """``False`` claims the bound left the executing run alone. Nothing compared it.
+
+    The tempting shape is ``return False`` for "no difference found". There was no
+    comparison, so there is no difference to have found, and a boolean here would
+    be read by the dashboard as a measurement.
+    """
+    table = reference_table()
+    outcome = outcome_for(
+        table,
+        _cb_horizon(),
+        start_kwh=19.5,
+        terminal_kwh=table.limits.energy_for_soc(FLOOR_PERCENT),
+        gain=0.10,
+    )
+
+    assert outcome.unbounded is None
+    assert outcome.terminal_first_run_changed is None
+    assert outcome.terminal_first_run_changed is not False
+    # And the run it would have compared does exist, so the absence is about the
+    # missing comparison rather than a missing plan.
+    assert outcome.desired.available
+    assert outcome.desired.intervals
+
+
+def test_running_a_fourth_solve_to_price_nothing_is_caught() -> None:
+    """The comparison solve is gone, and its absence is worth pinning.
+
+    Three remain: desired, capability, and the reserve-relaxed solve that labels a
+    safety buy. A fourth would cost a quarter of a second per refresh to compute a
+    difference that is identically zero by construction.
+    """
+    source = pathlib.Path(economic_module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    calls = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "build_outcome":
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Name)
+                    and inner.func.id == "solve"
+                ):
+                    calls += 1
+
+    assert calls == 3

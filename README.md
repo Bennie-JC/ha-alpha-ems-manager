@@ -19,9 +19,9 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.17` — a public beta.**
+> **Current release: `1.0.0-beta.18` — a public beta.**
 >
-> The integration is feature-complete for Phase 8 Stage A and covered by 2817
+> The integration is feature-complete for Phase 8 Stage A and covered by 2914
 > automated tests, but the learning and forecast model has **not** yet been validated
 > across enough real-world complete days to be called stable. Treat it as
 > something to run and observe, not yet as something to depend on.
@@ -61,7 +61,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.17` is not offered.
+     dialog if `1.0.0-beta.18` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -441,11 +441,23 @@ through the energy it put in the pack; it is just not a decision anybody made.
 So a sunny afternoon with both opt-ins off will show `hold` while the battery
 fills. That is correct, not a fault.
 
-`minimum_trade_gain_eur` on the same page is the one economic knob: how much a
-single charge or discharge must earn before it is worth planning, charged once per
-stretch of one action rather than per kilowatt-hour, and **only** for actions
-Alpha EMS actually chose — never for absorbed sunshine. It is not a wear model. It
-is your answer to "how small is too small".
+There are two economic knobs on that page and they are **not** the same thing.
+
+`minimum_trade_gain_eur` is a **fixed** amount a single charge or discharge must
+earn before it is worth planning at all — charged once per stretch of one action
+rather than per kilowatt-hour, and **only** for actions Alpha EMS actually chose,
+never for absorbed sunshine. It stops a plan full of two-cent trades. It is not a
+wear model; it is your answer to "how small is too small".
+
+`grid_charge_margin_eur_per_kwh`, new in beta.18 and **off by default**, is an
+**additional per-kilowatt-hour** requirement on energy a charge actually causes to
+be bought from the grid. It exists because a fixed amount does not scale: once a
+trade clears it, the volume behind it is unconstrained, so a fourteen-kilowatt-hour
+round trip can be planned while earning under four cents a kilowatt-hour. Set this
+and every bought kilowatt-hour has to earn its keep. Your own solar entering the
+battery, the solar share of a mixed quarter, discharging to supply the house, and
+charging to protect the reserve are all outside it — the last of those because
+keeping the house supplied outranks every economic figure, at any margin.
 
 Since beta.16 a sunny quarter in the middle of a charging campaign no longer ends
 that campaign. Absorbed sunshine still creates no action of its own, but it is now
@@ -457,6 +469,29 @@ Every planned run appears in the `economic_plan` block of a diagnostics download
 with all five energy boundaries stated separately — the two battery-side AC
 figures, the two grid-side ones, and the curtailment — because every euro in the
 payload is priced on grid energy and a reader has to be able to check that.
+
+**A note on upgrading to beta.18: the battery will sell in the evening now.**
+
+Until beta.18 the plan was not allowed to end a horizon holding less than it would
+have held by doing nothing. That sounds like a sensible rule against emptying the
+battery, and it was not one: with no sun left to come, "doing nothing" is a flat
+line, so the rule really said *never end lower than you are now* — and the plan
+therefore refused to sell into the evening peak, because selling ends lower. It got
+worse as the day went on, because the bar was re-read from the current charge at
+every refresh, so every charge raised it.
+
+That rule is gone. What protects your battery is the **dynamic battery reserve**,
+which is the thing actually designed for the job: it is checked at every quarter of
+the horizon rather than only at the end, and it is calculated from load and
+production forecasts that reach *further ahead than prices are published* — so on a
+summer evening it is still asking for around 15 kWh, and in winter around 19 kWh,
+at the point where the prices stop. Energy above that figure is yours to trade, and
+now it is traded.
+
+Expect to see evening discharges into expensive quarters that beta.17 would have
+declined. Your reserve setting is unchanged and is enforced exactly as before; if
+you want the battery to hold more back, raise the reserve rather than looking for
+the old rule.
 
 **A note on upgrading to beta.17.** The optimizer now picks the size of its
 internal energy step to match your inverter's power, so the whole of it is
@@ -488,6 +523,22 @@ the difference — so since beta.17 an Activity line names both boundaries inste
 of putting one of each in the same sentence. "0.95 kW average (0.95 kWh from the
 battery), of which 0.27 kWh reaches the grid" is the same run beta.16 described as
 "0.95 kW, 0.27 kWh", which was true and read as arithmetic.
+
+**What a future controller would be told.** A diagnostics download now carries an
+`execution_target` for each planned run: what to do, over which absolute window,
+and **how much energy at which boundary** — the battery figure and the meter figure
+in separate fields, because they are different numbers. Sending 1.3 kW to the
+battery when 1.3 kW of export was wanted delivers about 0.4 kW, since the house
+takes its share first. Nothing in this release consumes any of it, and no actuator
+exists for it.
+
+**What today actually cost** appears beside it, computed from measured flows at the
+prices recorded for the same quarters — import cost, export revenue, net cash flow,
+and what the battery saved by supplying the house. These are *realised* figures and
+are never mixed with the forecast ones. What is deliberately absent is a profit
+figure per trade: working out which stored kilowatt-hour came from which earlier
+charge needs a convention a battery does not physically have, and a number that
+depends on an arbitrary choice does not belong beside numbers that do not.
 
 A run about to start files one line in the **logbook**, on the sensor's own
 history — once, when it is within a quarter of an hour of beginning, and then

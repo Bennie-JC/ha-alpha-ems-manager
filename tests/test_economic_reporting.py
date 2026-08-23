@@ -26,11 +26,14 @@ Arithmetic is asserted at exact values wherever the arithmetic is exact.
 
 from __future__ import annotations
 
+import ast
 import math
+import pathlib
 import time
 
 import pytest
 
+from custom_components.alpha_ems_manager import economic as economic_module
 from custom_components.alpha_ems_manager.battery import (
     INTERVAL_HOURS,
     build_state,
@@ -540,12 +543,16 @@ def two_day_case(table, *, pv_scale: float = 1.0, intervals: int = 137):
     return horizon, hold_end
 
 
-def test_the_terminal_bound_publishes_what_it_cost() -> None:
-    """The distortion measured during planning, now a published figure.
+def test_the_terminal_comparison_is_absent_rather_than_zero() -> None:
+    """beta.18 removed the hold-end constraint, so there is nothing left to price.
 
-    On this shape the bound's signature is a maximum-power purchase in the final
-    quarters purely to end full -- which is exactly the live plan's last run. The
-    figure exists so the decision about the bound can rest on live evidence.
+    beta.16 and beta.17 ran a fourth solve with the terminal bound relaxed to the
+    configured floor and published the difference. Candidate B removed the
+    constraint, so the relaxed solve *is* the desired solve and the difference
+    would be identically zero.
+
+    Publishing a zero would state that a constraint costs nothing, which is a
+    different claim from there being no constraint. All four figures are ``None``.
     """
     table = reference_table()
     horizon, hold_end = two_day_case(table)
@@ -553,22 +560,39 @@ def test_the_terminal_bound_publishes_what_it_cost() -> None:
         table, horizon, start_kwh=17.42, terminal_kwh=hold_end, gain=0.10
     )
 
-    assert outcome.desired.terminal_binding is True
-    assert outcome.terminal_plan_cost_eur > 1.0
-    assert outcome.terminal_plan_import_kwh > 5.0
-    # Exactly the difference between the two solves, not an estimate.
-    assert outcome.unbounded is not None
-    assert outcome.terminal_plan_cost_eur == pytest.approx(
-        outcome.desired.cost_eur - outcome.unbounded.cost_eur
-    )
+    assert outcome.unbounded is None
+    assert outcome.terminal_plan_cost_eur is None
+    assert outcome.terminal_plan_import_kwh is None
+    assert outcome.terminal_first_run_changed is None
+    assert outcome.terminal_near_field_cost_eur is None
 
 
-def test_the_production_plan_is_the_bounded_one() -> None:
-    """**beta.16 does not change the terminal condition.** Asserted, not promised.
+def test_the_solver_runs_three_solves_not_four() -> None:
+    """Removing the comparison removed its solve, and that is a saving.
 
-    The relaxed solve exists only to price the bound. If the plan the caller
-    receives were ever the relaxed one, the release would have silently changed
-    safety-relevant behaviour while claiming not to.
+    Desired, capability and the reserve-relaxed label solve remain. The fourth
+    existed only to price the constraint beta.18 deleted.
+    """
+    tree = ast.parse(pathlib.Path(economic_module.__file__).read_text(encoding="utf-8"))
+    calls = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "build_outcome":
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Name)
+                    and inner.func.id == "solve"
+                ):
+                    calls += 1
+
+    assert calls == 3
+
+
+def test_the_published_plan_is_the_only_plan() -> None:
+    """There is no second terminal candidate for it to be published *instead of*.
+
+    The distinction beta.16 drew -- bounded plan published, unbounded plan for
+    instrumentation -- has no content once the bound is gone.
     """
     table = reference_table()
     horizon, hold_end = two_day_case(table)
@@ -576,28 +600,28 @@ def test_the_production_plan_is_the_bounded_one() -> None:
         table, horizon, start_kwh=17.42, terminal_kwh=hold_end, gain=0.10
     )
 
-    assert outcome.desired.end_energy_dc_kwh == pytest.approx(
-        outcome.desired.terminal_floor_kwh, abs=ECONOMIC_BUCKET_KWH
-    )
-    assert outcome.unbounded.end_energy_dc_kwh < outcome.desired.end_energy_dc_kwh
-    # The published action comes from the bounded plan.
-    assert outcome.action == outcome.desired.published_run.action
+    assert outcome.unbounded is None
+    assert outcome.desired.available
+    assert outcome.desired.intervals
 
 
-def test_a_bound_that_costs_nothing_reports_nothing() -> None:
-    """A figure that was never zero would be a figure nobody could read."""
+def test_the_terminal_floor_is_a_physical_floor_and_nothing_more() -> None:
+    """What ``terminal_floor_kwh`` means after beta.18, asserted not assumed.
+
+    A physical floor the plan must still hold at the horizon's end, whose only
+    production value is the user's configured minimum. Emphatically not the idle
+    trajectory's endpoint: asked for the floor, the plan is free to end anywhere
+    at or above it -- including well below where it started, which is exactly what
+    the removed constraint forbade.
+    """
     table = reference_table()
     floor = table.limits.energy_for_soc(FLOOR_PERCENT)
     horizon = eight_interval_horizon(table)
     outcome = outcome_for(table, horizon, start_kwh=START_KWH, terminal_kwh=floor)
 
-    assert outcome.desired.terminal_binding is False
-    assert outcome.terminal_plan_cost_eur == pytest.approx(0.0)
-    assert outcome.terminal_plan_import_kwh == pytest.approx(0.0)
-    # And the near-field pair agrees: a bound that costs nothing cannot be
-    # shaping the run that is about to happen.
-    assert outcome.terminal_first_run_changed is False
-    assert outcome.terminal_near_field_cost_eur == pytest.approx(0.0)
+    assert outcome.desired.terminal_floor_kwh <= floor + 1e-9
+    assert outcome.desired.end_energy_dc_kwh < START_KWH
+    assert outcome.terminal_plan_cost_eur is None
 
 
 def test_the_publication_gap_needs_no_hedge_of_its_own() -> None:

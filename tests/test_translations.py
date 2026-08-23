@@ -93,6 +93,10 @@ EXPECTED_OPTIONS_FIELDS: dict[str, list[str]] = {
     # value forgone and the per-run diagnostics without a command being sent.
     "economics": [
         "minimum_trade_gain_eur",
+        # beta.18: an additional per-kWh requirement on marginal grid-caused
+        # charging. Listed beside the fixed per-run gain deliberately -- the two
+        # are different quantities and the form has to show both.
+        "grid_charge_margin_eur_per_kwh",
         "allow_grid_charging",
         "allow_battery_export",
     ],

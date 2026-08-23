@@ -549,6 +549,8 @@ def _economic_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any
         ),
         horizon_start=start,
         horizon_end=end,
+        execution_targets=list(coordinator.execution_targets),
+        realized=coordinator.realized_today(plan),
         provenance={
             "settings": {
                 "minimum_trade_gain_eur": config.minimum_trade_gain_eur,

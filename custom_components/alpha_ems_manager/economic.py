@@ -70,15 +70,24 @@ earns no run, and pays no switching cost. The plan specified the permission in
 terms of direction; read that way, a battery with the default opt-ins never
 absorbed its own solar.
 
-**The terminal bound lives on the solver's grid.** ``HoldPolicy`` remains the
-conceptual counterfactual, but what is enforced -- and what ``terminal_floor_kwh``
-publishes -- is the idle-with-absorption endpoint expressed on the same bucketed
-state space the search runs over, reachable by construction. The plan named the
-continuous ``plan.reference.end_energy_kwh`` literally; a terminal requirement the
-state space cannot represent makes an otherwise valid sunny horizon artificially
-infeasible. ``TERMINAL_BASIS`` says which of the two a reader is looking at, so
-the continuous reference can never be silently confused with the bucketed
-constraint.
+**The only physical floor is the reserve.** Since beta.18 ``terminal_floor_kwh``
+is the user's configured minimum expressed on the solver's own bucketed grid, and
+nothing more. It used to be the idle-with-absorption endpoint -- "end no lower than
+doing nothing would have" -- which sounds like a rule against dumping the battery
+and is not one: with no surplus production ahead the idle walk is flat, so it read
+"end no lower than you are now" and forbade net discharge outright. Recomputed from
+the current charge every refresh it also ratcheted upward as the pack filled.
+
+What protects stored energy is the pointwise Phase-7 reserve, enforced at every
+interval rather than only the last, and forecast further ahead than the prices
+reach -- production is forecast for today and tomorrow while prices extend only as
+far as they have published, so the requirement is at its largest exactly where the
+prices stop. Energy above it is discretionary, and the objective may trade it.
+
+``HoldPolicy`` remains the conceptual counterfactual every euro is measured
+against. The floor is still expressed on the bucket grid, because a floor the state
+space cannot represent would make an otherwise valid horizon artificially
+infeasible; ``TERMINAL_BASIS`` records which quantity is being read.
 """
 
 from __future__ import annotations
@@ -139,6 +148,10 @@ from .const import (
     ECONOMIC_TOMORROW_ABSENT,
     ECONOMIC_UNAVAILABLE_HORIZON_EMPTY,
     ECONOMIC_UNAVAILABLE_TERMINAL_UNREACHABLE,
+    EXECUTION_INTENT_GRID_CHARGE,
+    EXECUTION_INTENT_HOLD,
+    EXECUTION_INTENT_NET_EXPORT,
+    EXECUTION_INTENT_SERVE_LOAD,
     MAX_ECONOMIC_RUNS_REPORTED,
     MODE_CHARGE,
     MODE_DISCHARGE,
@@ -800,6 +813,12 @@ class EconomicPlan:
     unavailable_reason: str | None = None
     worst_shortfall_kwh: float = 0.0
     first_violation_index: int | None = None
+    #: What the per-kWh grid-charge margin charged this plan, and the energy it
+    #: was charged on. Notional, exactly like the switching cost: nobody pays it,
+    #: so it is added back in :attr:`expected_net_value_eur` rather than being
+    #: allowed to understate what the plan earns.
+    grid_charge_margin_eur: float = 0.0
+    marginal_grid_charge_kwh: float = 0.0
 
     # -- what the entity reads --------------------------------------------
 
@@ -1006,6 +1025,7 @@ def solve(
     terminal_floor_kwh: float,
     minimum_trade_gain_eur: float,
     permitted: frozenset[str],
+    grid_charge_margin_eur_per_kwh: float = 0.0,
 ) -> EconomicPlan:
     """Return the least-cost plan over the horizon. Pure, total, never raises.
 
@@ -1041,15 +1061,33 @@ def solve(
         for position, demand in enumerate(horizon.demands)
     ]
 
-    # Down, so the plan never assumes more stored energy than the pack holds --
-    # and then clamped to where doing nothing *on this grid* actually lands.
+    # ``terminal_floor_kwh`` is a **physical floor the plan must still hold at the
+    # end of the horizon**, and since beta.18 its only production value is the
+    # user's configured minimum. Down, so the plan never assumes more stored
+    # energy than the pack holds, and then clamped to what the state space can
+    # actually reach.
     #
-    # The clamp is load-bearing. The requested floor is the continuous hold
-    # trajectory's endpoint, and bucketed absorption loses up to one bucket per
-    # interval against it, so on a sunny horizon the requested figure can sit a
-    # few buckets above anything the state space can reach. Enforcing it then
-    # makes every state infeasible and the plan unavailable -- a bound nobody can
-    # satisfy is not a bound, it is a refusal to plan.
+    # The clamp stays because it is a *reachability guard*, not a policy: a floor
+    # the lattice cannot express would make every state infeasible and refuse to
+    # plan at all. What changed in beta.18 is what the caller supplies.
+    #
+    # Until beta.18 the coordinator passed the **hold trajectory's endpoint**,
+    # meaning "end no lower than doing nothing would have". That reads like an
+    # anti-dumping rule and is not one. On a horizon with no surplus production
+    # ahead the idle walk is flat, so the requirement collapsed to "end no lower
+    # than you are now" -- a prohibition on *net discharge*. Recomputed from the
+    # current state each refresh it also ratcheted: a charge raised the floor, the
+    # next refresh inherited it, and the pack was locked out of late-horizon value
+    # for good. On a nineteen-quarter horizon ending in four quarters at
+    # 1.20 EUR/kWh it sold nothing into the peak and *bought* 4.74 kWh at peak
+    # prices.
+    #
+    # It was also a second, hidden reserve, and "doing nothing" is neither a
+    # physical requirement nor an economic one. The authoritative requirement
+    # already exists: the pointwise dynamic reserve, whose own forecast
+    # legitimately outlives the price horizon -- 143 intervals against 47 on the
+    # live installation -- so it is substantial exactly where the prices stop.
+    # Energy above it is discretionary, and the objective is free to trade it.
     ambient = _ambient_walk(
         table=table,
         outcomes_per_interval=outcomes_per_interval,
@@ -1104,6 +1142,19 @@ def solve(
                     cost = outcome.cost_eur
                     if onward_state != _RUN_IDLE and onward_state != run:
                         cost += minimum_trade_gain_eur
+                    # The per-kWh margin, charged **locally** on this interval's
+                    # own marginal grid-caused charging. Local is what makes it
+                    # free: the value table is indexed by bucket and run state
+                    # with no accumulated-energy axis, so a cost that depends on
+                    # a whole run's size could not be charged here at all --
+                    # while a cost that depends only on this interval can.
+                    #
+                    # Adding ``margin * kWh`` to the cost is exactly the
+                    # requirement "this energy must earn at least ``margin`` per
+                    # kWh beyond what it costs to buy": the search takes the move
+                    # only when its benefit clears purchase cost plus margin.
+                    if grid_charge_margin_eur_per_kwh > 0.0:
+                        cost += grid_charge_margin_eur_per_kwh * outcome.grid_charge_kwh
                     candidate = (
                         onward[0] + violations[move.target],
                         onward[1] + cost,
@@ -1115,6 +1166,11 @@ def solve(
                 choice[position][bucket][run] = best_move
 
     if value[start_bucket][_RUN_IDLE] >= _UNREACHABLE:  # pragma: no cover
+        # Note the margin cannot reach this branch. It is a *cost*, and the
+        # objective compares ``(violation, cost)`` lexicographically, so no cost
+        # can make a state unreachable or outrank reserve feasibility -- it can
+        # only order paths that violate the reserve equally. That is why the
+        # margin needs no exemption for reserve or safety charging.
         # The ambient walk is itself a feasible path to ``terminal_bucket``, so
         # this is unreachable by construction. Reported rather than raised, and
         # named honestly: an earlier version reported "horizon empty" here, which
@@ -1133,6 +1189,7 @@ def solve(
         terminal_bucket=terminal_bucket,
         minimum_trade_gain_eur=minimum_trade_gain_eur,
         permitted=permitted,
+        grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
     )
 
 
@@ -1216,6 +1273,15 @@ class _DeltaOutcome:
     idle_import_kwh: float
     idle_export_kwh: float
     idle_cost_eur: float
+    #: The grid import this move *caused*, and only when it caused it by charging:
+    #: ``flows.import - idle.import`` for a discretionary charge, zero otherwise.
+    #:
+    #: The basis for ``grid_charge_margin_eur_per_kwh``, and the reason that margin
+    #: needs no exemption rules. Ambient absorption causes no extra import, so the
+    #: basis is zero for it. A discharge is not charging, so the basis is zero for
+    #: load avoidance and for export. A quarter that mixes sun and grid is charged
+    #: on the grid share alone, because the share is what this measures.
+    grid_charge_kwh: float = 0.0
 
 
 def _ac_by_delta(table: PhysicsTable) -> dict[int, tuple[float, float]]:
@@ -1309,7 +1375,18 @@ def _interval_outcomes(
             # a paid charging campaign it happens to fall inside. See
             # ``_resolved_run_state``.
             run_state = _RUN_CHARGE if caused_import else _RUN_ABSORB
+            # Only the grid-caused share, and only for a charge. Never the whole
+            # battery movement: on a mixed quarter the sun's contribution owes
+            # nothing, and multiplying total charge by the margin would tax it.
+            grid_charge = (
+                max(0.0, flows.import_kwh - unavoidable_import)
+                if caused_import
+                else 0.0
+            )
         elif delta < 0:
+            # A discharge is not charging. Load avoidance and export are outside
+            # this margin by construction rather than by exemption.
+            grid_charge = 0.0
             allowed = ECONOMIC_ACTION_DISCHARGE in permitted
             action = (
                 ECONOMIC_ACTION_EXPORT if caused_export else ECONOMIC_ACTION_DISCHARGE
@@ -1318,6 +1395,7 @@ def _interval_outcomes(
                 allowed = allowed and ECONOMIC_ACTION_EXPORT in permitted
             run_state = _RUN_DISCHARGE
         else:
+            grid_charge = 0.0
             allowed = True
             action = ECONOMIC_ACTION_HOLD
             run_state = _RUN_IDLE
@@ -1336,6 +1414,7 @@ def _interval_outcomes(
             idle_import_kwh=unavoidable_import,
             idle_export_kwh=unavoidable_export,
             idle_cost_eur=idle_cost_eur,
+            grid_charge_kwh=grid_charge,
         )
     return outcomes
 
@@ -1351,6 +1430,8 @@ def _empty_plan(
         cost_eur=0.0,
         hold_cost_eur=0.0,
         switching_cost_eur=0.0,
+        grid_charge_margin_eur=0.0,
+        marginal_grid_charge_kwh=0.0,
         terminal_floor_kwh=terminal_floor_kwh,
         terminal_binding=False,
         permitted=permitted,
@@ -1370,6 +1451,7 @@ def _walk_forward(
     terminal_bucket: int,
     minimum_trade_gain_eur: float,
     permitted: frozenset[str],
+    grid_charge_margin_eur_per_kwh: float = 0.0,
 ) -> EconomicPlan:
     """Replay the chosen moves to produce the plan the caller reads.
 
@@ -1382,6 +1464,8 @@ def _walk_forward(
     run = _RUN_IDLE
     total_cost = 0.0
     total_switching = 0.0
+    total_margin = 0.0
+    total_grid_charge = 0.0
     total_violation = 0.0
     worst_shortfall = 0.0
     first_violation: int | None = None
@@ -1397,6 +1481,12 @@ def _walk_forward(
         run_start = resolved != _RUN_IDLE and resolved != run
         if run_start:
             total_switching += minimum_trade_gain_eur
+        # Reported separately and **never** folded into ``cost_eur``. Every euro
+        # in that field reconciles to grid energy at the interval's own prices,
+        # which a notional margin would silently break -- the same reason the
+        # switching cost is kept out of it.
+        total_margin += grid_charge_margin_eur_per_kwh * outcome.grid_charge_kwh
+        total_grid_charge += outcome.grid_charge_kwh
         total_cost += outcome.cost_eur
 
         landed = table.energy(move.target)
@@ -1443,6 +1533,8 @@ def _walk_forward(
             start_energy_kwh=table.energy(start_bucket),
         ),
         switching_cost_eur=total_switching,
+        grid_charge_margin_eur=total_margin,
+        marginal_grid_charge_kwh=total_grid_charge,
         terminal_floor_kwh=terminal_floor_kwh,
         terminal_binding=bucket <= terminal_bucket,
         permitted=permitted,
@@ -1817,7 +1909,7 @@ class EconomicOutcome:
         return self.desired.cost_eur - self.relaxed.cost_eur
 
     @property
-    def terminal_plan_cost_eur(self) -> float:
+    def terminal_plan_cost_eur(self) -> float | None:
         """Return the **whole-horizon** cost of ending at the hold endpoint.
 
         The difference between the plan and the same solve with the terminal bound
@@ -1839,11 +1931,11 @@ class EconomicOutcome:
         reader can act on.
         """
         if self.unbounded is None or not self.unbounded.available:
-            return 0.0
+            return None
         return self.desired.cost_eur - self.unbounded.cost_eur
 
     @property
-    def terminal_plan_import_kwh(self) -> float:
+    def terminal_plan_import_kwh(self) -> float | None:
         """Return the whole-horizon extra grid import the bound is responsible for.
 
         Same scope and the same caveat as :attr:`terminal_plan_cost_eur`. The
@@ -1851,14 +1943,14 @@ class EconomicOutcome:
         download: a maximum-power purchase in the final quarters.
         """
         if self.unbounded is None or not self.unbounded.available:
-            return 0.0
+            return None
         return (
             self.desired.planned_grid_import_kwh
             - self.unbounded.planned_grid_import_kwh
         )
 
     @property
-    def terminal_first_run_changed(self) -> bool:
+    def terminal_first_run_changed(self) -> bool | None:
         """Return whether the terminal bound altered the run about to happen.
 
         **The only part of the terminal condition a reader can act on**, and the
@@ -1873,7 +1965,10 @@ class EconomicOutcome:
         -- late in the day with tomorrow's prices still unpublished.
         """
         if self.unbounded is None or not self.unbounded.available:
-            return False
+            # No comparison was performed, so there is no answer. A ``False``
+            # here would claim the bound left the next run alone, when in fact
+            # there is no bound to leave anything alone.
+            return None
         if not self.desired.available or not self.desired.intervals:
             return False
         if not self.unbounded.intervals:
@@ -1888,7 +1983,7 @@ class EconomicOutcome:
         return abs(moved - otherwise) > ECONOMIC_BUCKET_KWH
 
     @property
-    def terminal_near_field_cost_eur(self) -> float:
+    def terminal_near_field_cost_eur(self) -> float | None:
         """Return what the bound costs over the intervals that will be executed.
 
         The first hour, because a refresh is a quarter and four of them is a
@@ -1898,7 +1993,7 @@ class EconomicOutcome:
         end, which is the case worth investigating.
         """
         if self.unbounded is None or not self.unbounded.available:
-            return 0.0
+            return None
         near = 4
         bounded = sum(e.cost_eur for e in self.desired.intervals[:near])
         free = sum(e.cost_eur for e in self.unbounded.intervals[:near])
@@ -1927,6 +2022,7 @@ def build_outcome(
     reserve_above_capacity_kwh: float = 0.0,
     table_ms: float = 0.0,
     bucket_rule: str = ECONOMIC_BUCKET_RULE_CONSTANT,
+    grid_charge_margin_eur_per_kwh: float = 0.0,
 ) -> EconomicOutcome:
     """Run both solves and the label solve, and derive everything published.
 
@@ -1951,6 +2047,7 @@ def build_outcome(
         terminal_floor_kwh=terminal_floor_kwh,
         minimum_trade_gain_eur=minimum_trade_gain_eur,
         permitted=desired_permitted,
+        grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
     )
     capability = solve(
         table=table,
@@ -1959,6 +2056,7 @@ def build_outcome(
         terminal_floor_kwh=terminal_floor_kwh,
         minimum_trade_gain_eur=minimum_trade_gain_eur,
         permitted=capability_permitted,
+        grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
     )
     relaxed_horizon = EconomicHorizon(
         demands=horizon.demands,
@@ -1973,26 +2071,18 @@ def build_outcome(
         terminal_floor_kwh=terminal_floor_kwh,
         minimum_trade_gain_eur=minimum_trade_gain_eur,
         permitted=desired_permitted,
+        grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
     )
 
-    # A fourth solve, for instrumentation only. The plan the caller receives is
-    # always ``desired`` -- this one exists purely to answer "what did ending the
-    # horizon where the hold trajectory ends actually cost?".
+    # There is no fourth solve any more, and no comparison to publish.
     #
-    # Same shape as the relaxed-reserve solve above and for the same reason: a
-    # constraint that can quietly cost money needs its price visible rather than
-    # argued about. Measured on a synthetic two-day shape the terminal bound cost
-    # EUR 1.77 and forced 9.49 kWh of grid import that a plan seeing one more day
-    # would not have bought -- but that is a synthetic figure, and this field is
-    # here to replace it with a live one before beta.17 decides anything.
-    unbounded = solve(
-        table=table,
-        horizon=horizon,
-        start_energy_kwh=start_energy_kwh,
-        terminal_floor_kwh=floor_energy_kwh,
-        minimum_trade_gain_eur=minimum_trade_gain_eur,
-        permitted=desired_permitted,
-    )
+    # beta.16 and beta.17 ran one with the terminal bound relaxed to the
+    # configured floor, to price what the hold-end constraint cost. Candidate B
+    # removed that constraint, so the relaxed solve and the desired solve are now
+    # the *same problem* -- the difference would be identically zero, and
+    # publishing a zero would state that a constraint costs nothing rather than
+    # that no constraint exists. The terminal figures are reported absent instead.
+    unbounded = None
     solve_ms = (time.perf_counter() - started) * 1000.0
 
     return EconomicOutcome(
@@ -2056,9 +2146,15 @@ ECONOMIC_BASIS: str = (
     "can be validated before anything is allowed to act on it"
 )
 
-#: What the terminal condition is measured against. Named rather than inlined,
+#: What the terminal floor is measured against. Named rather than inlined,
 #: because the evidence layer and the diagnostics payload must agree on it.
-TERMINAL_BASIS: str = "hold_trajectory_end_on_bucket_grid"
+#:
+#: Until beta.18 this read ``hold_trajectory_end_on_bucket_grid``: the floor was
+#: the idle-with-absorption endpoint, reproduced on the solver's grid. beta.18
+#: removed that rule, and the value has to move with it -- a basis string naming a
+#: trajectory the floor no longer follows would be a false statement about a
+#: published number, which is worse than no basis string at all.
+TERMINAL_BASIS: str = "configured_floor_on_bucket_grid"
 
 ECONOMIC_DECIDES_NOTHING: str = (
     "Phase 8 calculates a plan. It never executes one: no service call reaches "
@@ -2136,6 +2232,158 @@ def _plan_totals(plan: EconomicPlan) -> dict[str, Any]:
     }
 
 
+def execution_intent(run: EconomicRun) -> str:
+    """Return what Stage B would have to *do*, not what the plan calls it.
+
+    The action label answers "what is this economically?"; this answers "which
+    physical quantity is the target?". They are not the same question and the
+    difference is dangerous: a ``discharge`` and an ``export`` are both the
+    battery delivering energy, but one is measured at the battery and the other at
+    the meter, and on the live installation those differ by the whole house load
+    -- 2.2 kW of battery for 1.3 kW of export.
+
+    ``curtail_pv`` is deliberately **not** an intent. No actuator can decline
+    production in this release, so emitting it would imply a capability that does
+    not exist; a curtailment plan reports ``hold`` here and says what it wanted in
+    ``economic_reason``.
+    """
+    if run.action in (ECONOMIC_ACTION_CHARGE, ECONOMIC_ACTION_SAFETY_BUY):
+        return EXECUTION_INTENT_GRID_CHARGE
+    if run.action == ECONOMIC_ACTION_DISCHARGE:
+        return EXECUTION_INTENT_SERVE_LOAD
+    if run.action == ECONOMIC_ACTION_EXPORT:
+        return EXECUTION_INTENT_NET_EXPORT
+    return EXECUTION_INTENT_HOLD
+
+
+def execution_target(
+    run: EconomicRun,
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    reserve_floor_kwh: float,
+    stale_after: datetime,
+    safety_buy: bool = False,
+    margin_passed: bool = True,
+) -> dict[str, Any]:
+    """Return the machine-readable target a future Stage B would consume.
+
+    **Nothing consumes this in beta.18.** It is published so that Stage B can be
+    written against a contract that already exists, rather than inventing one and
+    discovering the ambiguities afterwards.
+
+    Three properties are the whole point:
+
+    * **Absolute time.** ``window_start`` and ``window_end`` are instants, never
+      horizon indices. An index moves every quarter as the horizon advances, which
+      is precisely the defect that made the beta.16 Activity log announce the same
+      run over and over. Stage B would have inherited it.
+    * **Two boundaries, two fields.** ``battery_target_kwh`` is at the battery and
+      ``grid_target_kwh`` is at the meter. A single ``energy_kwh`` whose meaning
+      changes with the action is exactly how 1.3 kW of intended export becomes a
+      1.3 kW battery command and delivers 0.4 kW.
+    * **Identity that survives replanning.** ``plan_id`` is ``(intent, start
+      instant)``, so a run whose remaining energy shrinks as it is executed keeps
+      its identity, while a genuinely different run gets a different one.
+
+    ``revision`` is supplied by the caller, which is the only layer that can
+    remember the previous target. ``stale_after`` is a contract timestamp for a
+    future dead-man: this release implements no timeout, and Stage B must decide
+    for itself to stop trusting a target beyond it.
+    """
+    intent = EXECUTION_INTENT_GRID_CHARGE if safety_buy else execution_intent(run)
+    battery = run.battery_charge_ac_kwh + run.battery_discharge_ac_kwh
+    return {
+        "plan_id": _execution_plan_id(intent, window_start),
+        "intent": intent,
+        "purpose": ECONOMIC_ACTION_SAFETY_BUY if safety_buy else run.action,
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "stale_after": stale_after.isoformat(),
+        # Battery side. Authoritative for a charge: the AlphaESS dispatch setpoint
+        # is a battery figure, and house load must **not** be added to it.
+        "battery_target_kwh": _round_kwh(battery),
+        # Meter side. Present only when the meter is what the plan is aiming at,
+        # so a consumer cannot mistake one for the other by reading whichever is
+        # non-zero.
+        "grid_target_kwh": (
+            _round_kwh(run.grid_export_kwh)
+            if intent == EXECUTION_INTENT_NET_EXPORT
+            else None
+        ),
+        "initial_average_power_kw": _round_kw(run.average_power_kw),
+        "reserve_floor_kwh": _round_kwh(reserve_floor_kwh),
+        "expected_grid_import_kwh": _round_kwh(run.marginal_grid_import_kwh),
+        "expected_grid_export_kwh": _round_kwh(run.marginal_grid_export_kwh),
+        "economic_reason": run.action,
+        "expected_value_eur": _round_eur(-run.marginal_cost_eur),
+        "margin_passed": margin_passed,
+        "boundary_rule": (
+            "battery_target_kwh is AC energy at the battery and is what a charge "
+            "command must aim at -- house load is NOT added to it. "
+            "grid_target_kwh is AC energy at the meter and is set only for "
+            "net_export, where the battery must deliver the target plus whatever "
+            "the house is taking at the time. measured on the live installation: "
+            "1.3 kW of net export needed 2.2 kW of battery against 0.9 kW of load"
+        ),
+        "contract_rule": (
+            "advisory only. nothing in this release consumes this block, no "
+            "actuator exists for it, and CONTROL_EXECUTION_AVAILABLE is false. "
+            "identity is (intent, window_start) so a run keeps its plan_id as its "
+            "remaining energy shrinks; revision increments when the target moves "
+            "beyond the published deadband; stale_after is a contract timestamp "
+            "for a future dead-man and is enforced by nothing today"
+        ),
+    }
+
+
+def _execution_plan_id(intent: str, window_start: datetime) -> str:
+    """Return a short stable identifier for one planned run.
+
+    Over the intent and the absolute start instant, and nothing else. Not the
+    energy, which shrinks as the run is executed; not the index, which moves every
+    refresh; not the price, which is revised.
+    """
+    digest = hashlib.sha256(f"{intent}|{window_start.isoformat()}".encode()).hexdigest()
+    return digest[:ECONOMIC_FINGERPRINT_CHARS]
+
+
+def execution_revision(previous: dict[str, Any] | None, current: dict[str, Any]) -> int:
+    """Return the revision ``current`` should carry, given what was last published.
+
+    Starts at one. Holds while nothing actionable has moved; increments when it
+    has. The deadbands are the same constants the Activity surface uses, for the
+    same reason -- a revision that churned on floating-point noise would make a
+    future Stage B re-plan continuously, which is the control jitter this contract
+    exists to avoid:
+
+    * energy, either boundary, by more than one state-space bucket;
+    * the window end by more than one planning interval;
+    * the intent at all.
+
+    A different ``plan_id`` is a different run, so it starts again at one rather
+    than continuing someone else's numbering.
+    """
+    if previous is None or previous.get("plan_id") != current.get("plan_id"):
+        return 1
+    if previous.get("intent") != current.get("intent"):
+        return int(previous.get("revision", 1)) + 1
+
+    def moved(key: str, tolerance: float) -> bool:
+        before, after = previous.get(key), current.get(key)
+        if before is None or after is None:
+            return before is not after
+        return abs(float(after) - float(before)) > tolerance
+
+    if moved("battery_target_kwh", ECONOMIC_BUCKET_KWH) or moved(
+        "grid_target_kwh", ECONOMIC_BUCKET_KWH
+    ):
+        return int(previous.get("revision", 1)) + 1
+    if previous.get("window_end") != current.get("window_end"):
+        return int(previous.get("revision", 1)) + 1
+    return int(previous.get("revision", 1))
+
+
 def economic_as_dict(
     outcome: EconomicOutcome | None,
     *,
@@ -2150,6 +2398,8 @@ def economic_as_dict(
     reserve_basis: str | None = None,
     bridge_requirement_kwh: float | None = None,
     pack_ceiling_kwh: float | None = None,
+    execution_targets: list[dict[str, Any]] | None = None,
+    realized: dict[str, Any] | None = None,
     horizon_start: Any = None,
     horizon_end: Any = None,
     provenance: dict[str, Any] | None = None,
@@ -2266,36 +2516,49 @@ def economic_as_dict(
             "floor_kwh": _round_kwh(desired.terminal_floor_kwh),
             "basis": TERMINAL_BASIS,
             "binding": desired.terminal_binding,
-            # What the bound does, from the fourth solve with it relaxed to
-            # the configured floor. Instrumentation only: the bound is unchanged
-            # in beta.17, on the evidence that under rolling re-solve every
-            # alternative is within 0.10 EUR/day of it and several are worse.
-            #
-            # The near-field pair leads, because it is the part that executes.
+            # Absent, and absent on purpose. beta.16 and beta.17 priced a
+            # hold-end terminal constraint against a relaxed re-solve; beta.18
+            # removed that constraint, so there is no comparison left to make.
+            # Publishing zeroes would say the constraint is free rather than
+            # gone.
             "first_run_changed": outcome.terminal_first_run_changed,
             "near_field_cost_eur": _round_eur(outcome.terminal_near_field_cost_eur),
             "plan_cost_eur": _round_eur(outcome.terminal_plan_cost_eur),
             "plan_import_kwh": _round_kwh(outcome.terminal_plan_import_kwh),
             "plan_cost_rule": (
-                "whole-horizon difference against the same solve with the bound "
-                "relaxed to the configured floor. NOT realised money: the plan "
-                "is rebuilt every quarter-hour and only its first interval is "
-                "ever executed, so a difference in the tail is discarded before "
-                "it happens. measured against a rolling re-solve this figure ran "
-                "about fortyfold above the realised difference. read "
-                "first_run_changed for the part that executes"
+                "null since beta.18. these figures priced a hold-trajectory "
+                "terminal constraint that no longer exists: it duplicated "
+                "reserve semantics, collapsed to the current state of charge on a "
+                "flat idle horizon, and ratcheted upward across refreshes. the "
+                "dynamic reserve is now the only physical floor, and documents "
+                "written by beta.16 or beta.17 still read back with their "
+                "recorded values"
             ),
             "rule": (
-                "the plan may not leave the battery worse off than doing "
-                "nothing would have. Stored energy is given no price, so this "
-                "forecasts nothing -- it only stops the optimizer emptying the "
-                "pack in the last priced interval because the data ran out. The "
-                "figure is what was *enforced*: the hold trajectory's endpoint "
-                "clamped to the same bucket grid the states live on, because a "
-                "bound the state space cannot express is a bound nothing can "
-                "satisfy"
+                "the configured physical floor, and nothing else. until beta.18 "
+                "this was the idle trajectory's endpoint, which on a horizon "
+                "with no surplus production ahead is simply the current state of "
+                "charge -- so it forbade net discharge rather than forbidding "
+                "dumping, and ratcheted upward as the pack charged. the pointwise "
+                "dynamic reserve is the authoritative requirement, and its own "
+                "forecast outlives the price horizon, so it is substantial "
+                "exactly where the prices stop. energy above it is discretionary"
             ),
         },
+        # What a future Stage B would consume, and what today actually cost.
+        # Neither is read by anything in this release: there is no Stage B, no
+        # actuator behind the targets, and the realised figures are measurements
+        # rather than inputs. They are published so the contract can be written
+        # against and the arithmetic checked.
+        "execution_targets": execution_targets or [],
+        "execution_contract_rule": (
+            "advisory. one target per planned run, addressed by absolute instants "
+            "rather than horizon indices so identity survives replanning, with "
+            "the battery-side and grid-side quantities in separate fields so a "
+            "consumer cannot mistake one boundary for the other. nothing in "
+            "beta.18 consumes these and CONTROL_EXECUTION_AVAILABLE is false"
+        ),
+        "realized": realized or {"available": False, "reason": "not_computed"},
         "solver": {
             "buckets": outcome.buckets,
             "bucket_kwh": outcome.bucket_kwh,

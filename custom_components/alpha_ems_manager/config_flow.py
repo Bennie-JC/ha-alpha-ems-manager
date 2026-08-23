@@ -51,6 +51,7 @@ from .const import (
     CONF_DAILY_HOUSE_LOAD_ENTITY,
     CONF_EV_POWER_ENTITY,
     CONF_FRANK_ENTRY_ID,
+    CONF_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     CONF_GRID_POWER_ENTITY,
     CONF_GRID_POWER_SIGN,
     CONF_HAS_PV,
@@ -70,6 +71,7 @@ from .const import (
     DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
     DEFAULT_CONTROL_HORIZON_MINUTES,
+    DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     DEFAULT_GRID_POWER_SIGN,
     DEFAULT_INSTANCE_NAME,
     DEFAULT_MINIMUM_TRADE_GAIN_EUR,
@@ -82,12 +84,14 @@ from .const import (
     MAX_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     MAX_CONTROL_EXPORT_MARGIN_PERCENT,
     MAX_CONTROL_HORIZON_MINUTES,
+    MAX_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     MAX_MINIMUM_TRADE_GAIN_EUR,
     MIN_BATTERY_CAPACITY_KWH,
     MIN_BATTERY_POWER_KW,
     MIN_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     MIN_CONTROL_EXPORT_MARGIN_PERCENT,
     MIN_CONTROL_HORIZON_MINUTES,
+    MIN_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     MIN_MINIMUM_TRADE_GAIN_EUR,
 )
 from .solcast_source import discover as discover_solcast
@@ -237,6 +241,16 @@ _TRADE_GAIN_SELECTOR = _number_selector(
     unit="EUR",
 )
 
+#: Per kilowatt-hour rather than per trade, and the unit says so. A step of one
+#: cent, because a tenth of a cent per kWh is below anything a price curve can
+#: justify caring about.
+_GRID_CHARGE_MARGIN_SELECTOR = _number_selector(
+    minimum=MIN_GRID_CHARGE_MARGIN_EUR_PER_KWH,
+    maximum=MAX_GRID_CHARGE_MARGIN_EUR_PER_KWH,
+    step=0.01,
+    unit="EUR/kWh",
+)
+
 
 def _economics_schema(
     current: Callable[[str, Any], Any],
@@ -261,6 +275,13 @@ def _economics_schema(
                     CONF_MINIMUM_TRADE_GAIN_EUR, DEFAULT_MINIMUM_TRADE_GAIN_EUR
                 ),
             ): _TRADE_GAIN_SELECTOR,
+            vol.Required(
+                CONF_GRID_CHARGE_MARGIN_EUR_PER_KWH,
+                default=current(
+                    CONF_GRID_CHARGE_MARGIN_EUR_PER_KWH,
+                    DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH,
+                ),
+            ): _GRID_CHARGE_MARGIN_SELECTOR,
             vol.Required(
                 CONF_ALLOW_GRID_CHARGING,
                 default=current(CONF_ALLOW_GRID_CHARGING, DEFAULT_ALLOW_GRID_CHARGING),
