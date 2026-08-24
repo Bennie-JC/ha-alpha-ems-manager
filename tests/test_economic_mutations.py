@@ -1270,10 +1270,17 @@ def test_emitting_an_execution_started_event_is_caught() -> None:
     )
     from custom_components.alpha_ems_manager.const import (
         ECONOMIC_EVENT_STARTED,
+        ECONOMIC_EVENT_STOPPED,
         ECONOMIC_EXECUTION_EVENT_KINDS,
     )
 
-    assert ECONOMIC_EXECUTION_EVENT_KINDS == (ECONOMIC_EVENT_STARTED,)
+    # beta.19 added ``stopped`` as its counterpart: ``started`` alone meant a
+    # stop could only be inferred from silence. Both are refused while the
+    # barrier stands, which is the property this test actually protects.
+    assert ECONOMIC_EXECUTION_EVENT_KINDS == (
+        ECONOMIC_EVENT_STARTED,
+        ECONOMIC_EVENT_STOPPED,
+    )
     with pytest.raises(ValueError, match="executes nothing"):
         logbook_payload(
             ActivityEntry(
@@ -1765,6 +1772,7 @@ def test_keying_the_execution_target_on_a_horizon_index_is_caught() -> None:
         window_start=opens,
         window_end=closes,
         reserve_floor_kwh=4.4,
+        issued_at=opens,
         stale_after=closes,
     )
     second = execution_target(
@@ -1772,6 +1780,7 @@ def test_keying_the_execution_target_on_a_horizon_index_is_caught() -> None:
         window_start=opens,
         window_end=closes,
         reserve_floor_kwh=4.4,
+        issued_at=opens,
         stale_after=closes,
     )
 
@@ -1793,6 +1802,7 @@ def test_revision_churn_on_insignificant_noise_is_caught() -> None:
         window_start=opens,
         window_end=closes,
         reserve_floor_kwh=4.4,
+        issued_at=opens,
         stale_after=closes,
     )
     base["revision"] = 5
@@ -1801,6 +1811,7 @@ def test_revision_churn_on_insignificant_noise_is_caught() -> None:
         window_start=opens,
         window_end=closes,
         reserve_floor_kwh=4.4,
+        issued_at=opens,
         stale_after=closes,
     )
 
@@ -1825,6 +1836,7 @@ def test_using_the_grid_target_as_a_battery_setpoint_is_caught() -> None:
         window_start=opens,
         window_end=opens + timedelta(minutes=60),
         reserve_floor_kwh=4.4,
+        issued_at=opens,
         stale_after=opens,
     )
     charging = execution_target(
@@ -1832,6 +1844,7 @@ def test_using_the_grid_target_as_a_battery_setpoint_is_caught() -> None:
         window_start=opens,
         window_end=opens + timedelta(minutes=60),
         reserve_floor_kwh=4.4,
+        issued_at=opens,
         stale_after=opens,
     )
 
@@ -1855,6 +1868,7 @@ def test_a_missing_staleness_stamp_is_caught() -> None:
         window_start=opens,
         window_end=opens + timedelta(minutes=60),
         reserve_floor_kwh=4.4,
+        issued_at=opens,
         stale_after=opens + timedelta(minutes=30),
     )
 

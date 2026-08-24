@@ -43,6 +43,10 @@ async def test_diagnostics_report_every_documented_section(
         # nothing is sent. Nothing here is executed.
         "economic_plan",
         "control",
+        # Stage B, new in beta.19. What the physical controller measured, what it
+        # would ask the inverter for, and why not more. Zero on every path in this
+        # release: the execution barrier is closed.
+        "execution",
         # Phase 5. Sixteen sections to seventeen: a dict key rather than a list
         # entry, so the sixteen-item list ceiling every payload is held to is
         # untouched.

@@ -553,7 +553,9 @@ async def test_the_executor_refuses_even_when_called_directly(
     from .test_control_pipeline import make_intent
 
     steps = plan_commands(build_command(make_intent(energy_ac_kwh=0.5)))
-    assert len(steps) == 5
+    # Six since beta.19: the owner marker leads the arming sequence, so a
+    # dispatch running without it is somebody else's by construction.
+    assert len(steps) == 6
 
     with pytest.raises(ControlExecutionUnavailable):
         await async_execute(hass, steps)
@@ -611,7 +613,7 @@ async def test_the_state_entity_reports_eligible_when_only_the_barrier_stopped_i
 
     assert report["intent"]["action"] == "discharge"
     assert report["safety"]["safe"] is True
-    assert report["commands_planned"] == 5
+    assert report["commands_planned"] == 6
     assert hass.states.get(CONTROL_STATE).state == CONTROL_STATE_ELIGIBLE
     # Safe, planned, and still not authorized: the barrier is the only thing
     # between this and the inverter.
@@ -766,9 +768,7 @@ async def test_the_read_back_sees_the_device_without_claiming_it(
 
     assert running.dispatch_active is True
     assert running.as_dict()["owned"] is False
-    assert (
-        "matching parameters are not evidence" in (running.as_dict()["ownership_note"])
-    )
+    assert "parameters are never evidence" in (running.as_dict()["ownership_note"])
 
 
 async def test_the_activation_boolean_alone_counts_as_a_running_dispatch(

@@ -137,9 +137,20 @@ class ControlContext:
     #: Whether another feature of the control surface is driving the battery.
     excess_export_active: bool = False
     peak_shaving_active: bool = False
-    #: Whether any dispatch is running. Ownership is never inferred, so this
-    #: being true means "someone else's", full stop.
+    #: Whether any dispatch is running. Says nothing about whose it is -- see
+    #: ``dispatch_owned``, which is the only thing that may answer that.
     dispatch_active: bool = False
+    #: Whether the running dispatch has been *established* as Alpha EMS's own.
+    #:
+    #: Supplied by the controller, which holds the two pieces of evidence -- the
+    #: owner marker and the persisted causal record. Deliberately a verdict rather
+    #: than the evidence: this module must not be able to derive ownership, because
+    #: the only derivation available from the vendor surface is parameter matching
+    #: and that is worse than nothing here.
+    #:
+    #: ``False`` is the safe default, so a caller that forgets to supply it gets
+    #: beta.18's behaviour: any dispatch inhibits.
+    dispatch_owned: bool = False
 
     # -- configuration --------------------------------------------------------
     battery_configured: bool = False
@@ -363,12 +374,23 @@ def evaluate(intent: ControlIntent | None, context: ControlContext) -> SafetyVer
         return SafetyVerdict(False, INHIBIT_EXCESS_EXPORT_ACTIVE, tuple(checks))
     if not check(INHIBIT_PEAK_SHAVING_ACTIVE, not context.peak_shaving_active):
         return SafetyVerdict(False, INHIBIT_PEAK_SHAVING_ACTIVE, tuple(checks))
-    # Any dispatch at all. Not "any dispatch that is not ours": nothing in the
-    # control surface records who armed one, so there is no sound test for
-    # ownership and none is attempted. Matching power, cutoff, duration or mode
-    # proves nothing -- a person watching the shadow recommendation is exactly
-    # who would arm the same figures by hand.
-    if not check(INHIBIT_DISPATCH_ACTIVE, not context.dispatch_active):
+    # Any dispatch that is not *established* as ours.
+    #
+    # Until beta.19 this was any dispatch at all, which was correct while nothing
+    # could record a writer -- and which also meant Alpha EMS inhibited itself the
+    # moment it armed anything, so no command spanning more than one interval was
+    # expressible. That was the second of the two blockers this gate names.
+    #
+    # The relaxation is strictly additive: ``dispatch_owned`` defaults to false, so
+    # every path that does not supply it keeps the old behaviour. What it is *not*
+    # is a parameter test -- this module cannot derive ownership and must not learn
+    # how. It is handed a verdict that rests on a marker outside the vendor surface
+    # plus a persisted causal record, and a foreign dispatch still stops everything
+    # exactly as before.
+    if not check(
+        INHIBIT_DISPATCH_ACTIVE,
+        not context.dispatch_active or context.dispatch_owned,
+    ):
         return SafetyVerdict(False, INHIBIT_DISPATCH_ACTIVE, tuple(checks))
 
     # -- is there a decision to carry out? ----------------------------------

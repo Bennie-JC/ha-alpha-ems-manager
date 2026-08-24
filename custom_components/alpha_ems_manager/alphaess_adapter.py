@@ -26,6 +26,7 @@ from .alphaess_device import (
     AUTOMATION_DISPATCH_RESET_FULL,
     AUTOMATION_HOLD_MONITOR,
     BOOLEAN_EXCESS_EXPORT,
+    BOOLEAN_EXECUTION_OWNER,
     BOOLEAN_PEAK_SHAVING,
     CHARGE_FAMILY,
     DISCHARGE_FAMILY,
@@ -164,6 +165,16 @@ class DeviceSnapshot:
     dispatch_time_s: float | None
     #: Which activation booleans are on, if any.
     active_modes: tuple[str, ...]
+    #: Whether the owner marker is on. Read since beta.19, and the only positive
+    #: evidence that Alpha EMS armed what is running. ``None`` when the marker
+    #: entity does not exist, which is not the same as "off": a missing marker
+    #: means ownership cannot be established at all.
+    owner_marker: bool | None = None
+
+    @property
+    def marker_present(self) -> bool:
+        """Return whether the marker entity exists to be read."""
+        return self.owner_marker is not None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the bounded diagnostics form."""
@@ -175,12 +186,19 @@ class DeviceSnapshot:
             "dispatch_soc_percent": self.dispatch_soc_percent,
             "dispatch_time_s": self.dispatch_time_s,
             "active_modes": list(self.active_modes[:MAX_CONTROL_EVENTS_REPORTED]),
-            "owned": False,
+            "owner_marker": self.owner_marker,
+            "owner_marker_entity": BOOLEAN_EXECUTION_OWNER,
+            # Ownership of a *running* dispatch, from the marker alone. The
+            # controller requires a matching causal record on top of this before
+            # it will act, so this field is evidence rather than a verdict.
+            "owned": bool(self.dispatch_active and self.owner_marker),
             "ownership_provable": OWNERSHIP_PROVABLE,
             "ownership_note": (
-                "nothing in the control surface records who armed a dispatch, so "
-                "an active dispatch is treated as someone else's and is never "
-                "modified or cancelled; matching parameters are not evidence"
+                "the vendor surface still records no writer, so parameters are "
+                "never evidence. since beta.19 ownership rests on a marker "
+                "outside that surface plus a persisted causal record, and both "
+                "are required -- a dispatch running without the marker is "
+                "someone else's and is never modified, reset or cancelled"
             ),
         }
 
@@ -248,6 +266,7 @@ def read_snapshot(hass: HomeAssistant) -> DeviceSnapshot:
     # boolean is on. The two can disagree for a second or two while the control
     # surface settles, and during that window the safe reading is the pessimistic
     # one.
+    marker = _state_of(hass, BOOLEAN_EXECUTION_OWNER)
     return DeviceSnapshot(
         dispatch_active=bool(start) or bool(active_modes),
         dispatch_start=start,
@@ -256,6 +275,10 @@ def read_snapshot(hass: HomeAssistant) -> DeviceSnapshot:
         dispatch_soc_percent=_numeric_state(hass, SENSOR_DISPATCH_SOC),
         dispatch_time_s=_numeric_state(hass, SENSOR_DISPATCH_TIME),
         active_modes=active_modes,
+        # ``None`` when the helper does not exist. Absent is not off: without the
+        # marker there is no way to establish ownership, and the controller must
+        # treat a running dispatch as foreign rather than assume it is free.
+        owner_marker=None if marker is None else marker == STATE_ON,
     )
 
 

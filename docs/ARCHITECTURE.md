@@ -3005,10 +3005,43 @@ makes that safe.
 
 ### The Stage-A to Stage-B contract
 
-Stage A decides *what* should happen; a future Stage B will decide *how* to make
-the inverter do it. ``execution_target`` is the seam, published in diagnostics and
-**consumed by nothing** -- there is no Stage B, no actuator, and
-``CONTROL_EXECUTION_AVAILABLE`` is false.
+Stage A decides *what* should happen; Stage B decides *how* to make the inverter do
+it. ``execution_target`` is the seam. Since beta.19 it is **consumed by
+``execution.py``**, which computes the command a live run would send and sends
+nothing: ``CONTROL_EXECUTION_AVAILABLE`` is still false and no actuator is reachable
+from that path.
+
+Four things were added to the contract in beta.19, and each exists for the same
+reason: Stage B must be able to do its job without ever forming an economic view.
+
+**Freshness is anchored to the issue instant.** beta.18 derived ``stale_after`` from
+``window_start``, which measured the wrong thing entirely -- a run eighteen hours out
+carried a deadline eighteen and a half hours out. ``issued_at`` is published beside
+it, the window stays a separate fact, and the deadline is now *enforced*.
+
+**Two power figures, because one was misnamed.** ``initial_average_power_kw`` is the
+run's mean and always was. It keeps its name and value, and ``first_power_kw`` sits
+beside it.
+
+**The charge-window balance.** Expected production, expected house load, expected
+production *reaching the battery*, the expected grid contribution as a maximum, and
+``charge_source``. The third is the substance: expected production is not production
+available to the battery, because the house consumes throughout the window and takes
+its share first. Publishing the gross figure would invite Stage B to preserve
+headroom against energy the house was always going to eat.
+
+**The headroom constraint.** ``required_headroom_kwh``, ``max_end_energy_kwh`` and
+``headroom_until``. An old cheap-grid charge target that fills the pack early
+displaces production the plan meant to absorb -- and deciding how much headroom is
+*worth* keeping is an economic question. So Stage A answers it from the trajectory it
+already chose: the plan's own landing energy is the cap, and the deadline is the next
+interval at which the plan absorbs surplus. ``null`` means unconstrained, never zero.
+
+None of the four changes a plan. Every figure is an aggregate or projection of
+something the solve already computed, no new term enters the objective, and there are
+still three solves -- ``test_stage_a_contract_inertness.py`` holds all of that,
+including the solve count, because a projection that needed one more solve would be a
+performance regression dressed as reporting.
 
 Three properties, each of which is a defect avoided rather than a feature added:
 
@@ -3033,7 +3066,9 @@ so a run keeps its identity while its remaining energy shrinks -- otherwise a
 controller would abandon and restart its own dispatch every fifteen minutes.
 ``revision`` increments only past one state-space bucket of movement, so
 floating-point drift cannot produce control jitter. ``stale_after`` is a contract
-timestamp for a dead-man Stage B will implement; **nothing enforces it today.**
+timestamp for the dead-man Stage B implements, and since beta.19 it **is**
+enforced: a stale target may not start, and an owned run whose target goes stale is
+stopped.
 
 ``intent`` separates ``serve_load`` from ``net_export``, which the action label only
 half does. There is no ``curtail_pv`` intent: no actuator can decline production,

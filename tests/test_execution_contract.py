@@ -51,7 +51,10 @@ from custom_components.alpha_ems_manager.economic import (
 
 OPENS = datetime(2026, 8, 22, 18, 30, tzinfo=UTC)
 CLOSES = OPENS + timedelta(minutes=60)
-STALE = OPENS + timedelta(minutes=EXECUTION_TARGET_STALE_MINUTES)
+#: When the plan was issued. Since beta.19 freshness hangs off this, not off the
+#: window: a run many hours out must not carry a freshness deadline many hours out.
+ISSUED = OPENS - timedelta(hours=3)
+STALE = ISSUED + timedelta(minutes=EXECUTION_TARGET_STALE_MINUTES)
 
 
 def run_of(
@@ -88,13 +91,19 @@ def run_of(
 
 
 def target_of(run: EconomicRun, **overrides) -> dict:
-    """Return the published target for one run."""
+    """Return the published target for one run.
+
+    ``issued_at`` and ``stale_after`` are anchored to each other rather than to
+    the window, which is the beta.19 correction: freshness asks how old an
+    instruction is, and that cannot depend on when the instruction is for.
+    """
     return execution_target(
         run,
         window_start=OPENS,
         window_end=CLOSES,
         reserve_floor_kwh=overrides.pop("reserve_floor_kwh", 4.4),
-        stale_after=STALE,
+        issued_at=overrides.pop("issued_at", ISSUED),
+        stale_after=overrides.pop("stale_after", ISSUED + timedelta(minutes=30)),
         **overrides,
     )
 
@@ -220,22 +229,39 @@ def test_the_window_is_absolute_and_no_index_appears() -> None:
         assert forbidden not in target
 
 
-def test_stale_after_is_published_and_enforced_by_nothing() -> None:
-    """A contract timestamp for a future dead-man, and it says so."""
+def test_stale_after_is_anchored_to_the_issue_instant_not_the_window() -> None:
+    """**The beta.19 correction, and the reason it mattered.**
+
+    beta.18 derived ``stale_after`` from ``window_start``, which made it useless
+    for the one job its name describes. This run opens three hours after the plan
+    was issued, so the beta.18 rule would have called it fresh until three and a
+    half hours from now -- long after any ordinary meaning of the word.
+
+    Freshness asks how old an instruction is. That cannot depend on when the
+    instruction is *for*, and the window remains a separate published fact.
+    """
     target = target_of(run_of(action=ECONOMIC_ACTION_CHARGE, charge=1.0))
 
+    assert target["issued_at"] == ISSUED.isoformat()
     assert target["stale_after"] == STALE.isoformat()
     assert EXECUTION_TARGET_STALE_MINUTES >= 30
-    assert "enforced by nothing" in target["contract_rule"]
+    # The whole point: the deadline is near the issue instant, not near the window.
+    assert target["stale_after"] < target["window_start"]
+    # And the window is still published independently.
+    assert target["window_start"] == OPENS.isoformat()
+    assert target["window_end"] == CLOSES.isoformat()
 
 
-def test_the_contract_says_it_is_advisory() -> None:
-    """Every published surface in this release has to say this."""
+def test_the_contract_says_what_consumes_it_and_that_nothing_executes() -> None:
+    """Stage B reads this now. Nothing sends anything, and it still says so."""
     target = target_of(run_of(action=ECONOMIC_ACTION_CHARGE, charge=1.0))
 
     rule = target["contract_rule"]
-    assert "advisory" in rule
+    assert "Stage B" in rule
+    assert "sends nothing" in rule
     assert "CONTROL_EXECUTION_AVAILABLE is false" in rule
+    # Freshness is enforced from beta.19, so the old disclaimer would be false.
+    assert "enforced by nothing" not in rule
 
 
 # ===========================================================================
@@ -268,6 +294,7 @@ def test_a_different_start_instant_is_a_different_plan() -> None:
         window_start=OPENS + timedelta(minutes=15),
         window_end=CLOSES,
         reserve_floor_kwh=4.4,
+        issued_at=ISSUED,
         stale_after=STALE,
     )
 
@@ -339,6 +366,7 @@ def test_a_moved_window_end_bumps_the_revision() -> None:
         window_start=OPENS,
         window_end=CLOSES + timedelta(minutes=30),
         reserve_floor_kwh=4.4,
+        issued_at=ISSUED,
         stale_after=STALE,
     )
 

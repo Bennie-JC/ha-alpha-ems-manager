@@ -224,5 +224,17 @@
     "house_load_source_missing": {
       "message": "Alpha EMS Manager heeft geen bron voor huisverbruik ingesteld en kan daardoor niets leren. Verwijder de integratie en voeg hem opnieuw toe om een momentane vermogenssensor voor huisverbruik te kiezen."
     }
+  },
+  "entity": {
+    "select": {
+      "control_mode": {
+        "name": "Regelmodus",
+        "state": {
+          "off": "Uit",
+          "shadow": "Schaduw",
+          "active": "Live"
+        }
+      }
+    }
   }
 }

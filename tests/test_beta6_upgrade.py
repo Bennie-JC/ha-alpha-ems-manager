@@ -560,10 +560,11 @@ async def test_the_storage_minor_version_moved_and_the_major_did_not(
     from custom_components.alpha_ems_manager.const import STORAGE_MINOR_VERSION
 
     assert STORAGE_VERSION == 2
-    # 2.4 as of beta.14, which added the measured grid-flow arrays. The *major*
+    # 2.5 as of beta.19, which added the optional ``execution`` key. The *major*
     # staying at 2 is the load-bearing half of this assertion: it is what
-    # guarantees a beta.6 document is read rather than discarded.
-    assert STORAGE_MINOR_VERSION == 4
+    # guarantees a beta.6 document is read rather than discarded, and every minor
+    # bump so far has been additive for exactly that reason.
+    assert STORAGE_MINOR_VERSION == 5
 
     coordinator = upgraded.runtime_data
     assert coordinator.store.reset_by_migration is False
@@ -571,9 +572,14 @@ async def test_the_storage_minor_version_moved_and_the_major_did_not(
 
     document = hass_storage[f"alpha_ems_manager.{upgraded.entry_id}.learning"]
     assert document["version"] == 2
-    assert document["minor_version"] == 4
+    # Rewritten at the current minor, which is what an additive bump does: read
+    # the old document unchanged, write the new one back.
+    assert document["minor_version"] == 5
     # The six days beta.6 wrote are all still there.
     assert len(document["data"]["days"]) == 6
+    # And nothing was invented. A beta.6 installation has armed nothing, so the
+    # beta.19 key is absent rather than present-and-empty.
+    assert "execution" not in document["data"]
 
 
 def test_the_new_configuration_keys_do_not_collide_with_the_legacy_model() -> None:

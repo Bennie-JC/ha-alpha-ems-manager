@@ -63,6 +63,7 @@ from . import AlphaEmsConfigEntry
 from .activity import (
     ActivityEntry,
     ActivityState,
+    ExecutionView,
     PlannedRun,
     RunContent,
     RunIdentity,
@@ -90,6 +91,8 @@ from .const import (
     ECONOMIC_BLOCKED_NOT_ENABLED,
     ECONOMIC_EUR_PRECISION,
     ECONOMIC_GAP_NONE,
+    EXECUTION_STATE_ARMED,
+    EXECUTION_STATE_RUNNING,
     FORECAST_ERROR_WINDOW_DAYS,
     NAME,
     SENSOR_BATTERY_PLANNED_POWER,
@@ -656,6 +659,66 @@ def _economic_activity(
         previous=previous,
         runs=_planned_runs(coordinator),
         now=dt_util.as_utc(issued),
+        execution=_execution_view(coordinator),
+    )
+
+
+def _execution_view(coordinator: AlphaEmsCoordinator) -> ExecutionView | None:
+    """Return the few facts Activity needs about Stage B, or ``None``.
+
+    Narrow on purpose. Activity is handed a summary rather than the controller's
+    state, so it cannot start describing the rolling setpoint -- which is the one
+    thing that must stay out of this surface, being arithmetic rather than a
+    decision and the largest source of the old spam.
+    """
+    control = (coordinator.data or {}).get("control") or {}
+    report = control.get("execution") or {}
+    if not report:
+        return None
+    target = report.get("target") or {}
+    progress = report.get("progress") or {}
+    power = report.get("power") or {}
+    intent = report.get("intent")
+    if not isinstance(intent, str):
+        return None
+    opens = report.get("window_start")
+    closes = report.get("window_end")
+    identity = None
+    if isinstance(opens, str):
+        start = dt_util.parse_datetime(opens)
+        if start is not None:
+            identity = RunIdentity(
+                direction=direction_of(report.get("purpose") or intent),
+                start_utc=dt_util.as_utc(start),
+            )
+    return ExecutionView(
+        identity=identity,
+        # "Under way, or would be": in shadow nothing is ever armed, so the
+        # lifecycle is driven by the controller having an actionable target. The
+        # wording is decided by ``executed``, not by this.
+        running=report.get("state") in (EXECUTION_STATE_ARMED, EXECUTION_STATE_RUNNING),
+        executed=bool(power.get("executed")),
+        target_kwh=float(target.get("battery_target_kwh") or 0.0),
+        delivered_kwh=float(progress.get("battery_realized_kwh") or 0.0),
+        initial_power_kw=float(power.get("requested_kw") or 0.0),
+        window=_execution_window(opens, closes),
+        intent=intent,
+        stop_reason=(report.get("result") or {}).get("stop_reason"),
+        inhibit_reason=(report.get("result") or {}).get("inhibit_reason"),
+    )
+
+
+def _execution_window(opens: object, closes: object) -> str:
+    """Return the window as local wall-clock text, for one Activity line."""
+    if not isinstance(opens, str) or not isinstance(closes, str):
+        return ""
+    start = dt_util.parse_datetime(opens)
+    end = dt_util.parse_datetime(closes)
+    if start is None or end is None:
+        return ""
+    return (
+        f"{dt_util.as_local(start).strftime('%H:%M')}-"
+        f"{dt_util.as_local(end).strftime('%H:%M')}"
     )
 
 

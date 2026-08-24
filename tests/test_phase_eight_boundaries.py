@@ -43,6 +43,7 @@ from custom_components.alpha_ems_manager.const import (
     ECONOMIC_EVENT_CANCELLED,
     ECONOMIC_EVENT_KINDS,
     ECONOMIC_EVENT_STARTED,
+    ECONOMIC_EVENT_STOPPED,
     ECONOMIC_EXECUTION_EVENT_KINDS,
 )
 
@@ -329,7 +330,13 @@ def test_the_activity_surface_sees_only_planned_runs_and_the_clock() -> None:
     """
     parameters = inspect.signature(activity_module.next_activity).parameters
 
-    assert set(parameters) == {"previous", "runs", "now"}
+    # ``execution`` since beta.19, and its arrival is the whole point of the
+    # design: this module could not describe execution while execution was not an
+    # argument, and the docstring said changing that would have to be "a visible
+    # act". It is one, and the discipline it protected is intact -- what is passed
+    # is a narrow summary, not the controller, so Activity still cannot reach the
+    # rolling setpoint it must never report.
+    assert set(parameters) == {"previous", "runs", "now", "execution"}
     for parameter in parameters.values():
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
@@ -370,7 +377,12 @@ def test_the_event_kinds_partition_into_advice_and_execution() -> None:
     # advice set in beta.16: withdrawing advice that never began is plainly an
     # advice event, and the one-message-per-run design has to be able to retract
     # an announcement or leave it standing as a lie.
-    assert execution == {ECONOMIC_EVENT_STARTED}
+    # Two execution kinds since beta.19, and shadow's ``would_start`` /
+    # ``would_stop`` are deliberately on the *advice* side of the partition: a
+    # shadow line is not a claim about the battery, and giving it an execution
+    # kind would have forced the refusal below to be relaxed for the real case
+    # too.
+    assert execution == {ECONOMIC_EVENT_STARTED, ECONOMIC_EVENT_STOPPED}
     assert ECONOMIC_EVENT_CANCELLED in advice
 
 
@@ -516,7 +528,15 @@ async def test_the_economic_surface_writes_nothing_in_active_mode(
     assert (coordinator.control_report or {}).get("last_write") is None
     for entry in logbook:
         assert entry["name"] == activity_module.ACTIVITY_NAME
-        assert "Advisory only" in entry["message"]
+        # Every line disclaims execution. Two kinds of wording do it: the
+        # advisory qualifier on an advice line, and an explicit statement that no
+        # command was sent on a shadow lifecycle line -- the stronger of the two,
+        # because it names what did not happen rather than hedging about it.
+        lowered = entry["message"].lower()
+        assert any(
+            phrase in lowered
+            for phrase in ("advisory only", "no command sent", "no command was sent")
+        ), entry["message"]
 
     # And it did not repeat itself. The live symptom was a near-identical line
     # every quarter of an hour about a run already under way, so eight refreshes

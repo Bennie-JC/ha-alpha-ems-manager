@@ -9,6 +9,226 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.19] - 2026-08-24
+
+**Stage B, the physical execution controller — built, wired in, and executing
+nothing.** It reads a Stage-A target, measures what has actually been delivered,
+works out the power that would finish the job inside the window Stage A chose, and
+stops there. `CONTROL_EXECUTION_AVAILABLE` remains `False`, so no command can reach
+the inverter and no actuator is reachable from the controller's path.
+
+That split is deliberate. This release introduces the controller; a separately
+approved beta.20 will change the one constant that lets it act. The alternative —
+shipping the actuator and removing the barrier together — would have meant the
+release that introduces the write is also the release that removes the thing
+preventing it, and a defect in either would be harder to isolate.
+
+### Added
+
+- **`execution.py`** — the controller, and **pure**: no Home Assistant import, no
+  price module, no economics. It is handed every economic quantity as data.
+
+  The rule it exists to hold is worth stating precisely, because two things that
+  look like one rule are not:
+
+  - the **rolling controller may raise power**. Being behind schedule on an
+    already-approved target inside its own window is exactly what it is for, and
+    refusing to catch up would quietly under-deliver a plan Stage A chose. It
+    raises the *rate*, never the *amount*;
+  - the **PV/headroom cap may only lower** what the rolling controller asked for.
+    It is applied afterwards and can reach zero, which means stop.
+
+  Progress is **measured**, never `setpoint × elapsed`: a clamp, a limit, a cloud
+  or a full pack each make what arrived differ from what was asked for, and a
+  controller trusting the request compounds its own error every refresh. Two bases
+  are published rather than reconciled — an integral of measured battery power
+  within the quarter, and a state-of-charge difference that survives a restart.
+  Where they disagree the disagreement is the information.
+
+- **Two-factor ownership.** Stage B may modify or stop only a dispatch it can prove
+  is its own, and the AlphaESS surface cannot prove that: every arming path is
+  driven by helper *values*, so a dashboard-armed dispatch and a service-armed one
+  leave byte-identical state. The project's own position has been that matching
+  parameters is *worse* than no evidence, because the person watching Shadow is
+  exactly the person who would set those same figures by hand.
+
+  So ownership rests on two things outside that surface, and **both** are required:
+  an owner marker (`input_boolean.alpha_ems_dispatch_owner`, turned on as the first
+  step of arming and off as the last step of resetting) and a persisted causal
+  record tying the claim to the dispatch the inverter reports. A marker alone is
+  `unproven`; a record alone is `foreign`; neither is `owned`.
+
+  | dispatch | marker | record | verdict |
+  |---|---|---|---|
+  | running | on | matches | **owned** — controllable |
+  | running | off | — | **foreign** — never modified, never reset |
+  | running | on | missing or contradictory | **unproven** — also never touched, but reported as a fault |
+  | not running | on | — | stale marker, cleared safely |
+
+  The marker costs **no new permitted service**: `turn_on` and `turn_off` were
+  already in the closed set of three. `OWNERSHIP_PROVABLE` stays `False`, because
+  what changed is not that the vendor surface became provable — it is that Alpha
+  EMS stopped depending on it.
+
+- **An explicit stop path**, `plan_reset()`, separate from arming rather than a
+  branch inside it. The two run in opposite orders for opposite reasons: arming
+  settles its parameters before switching on, and resetting switches off first, so
+  an interrupted reset leaves the dispatch *off*. **Setting power to zero is not a
+  stop** — a dispatch left armed at zero still holds a duration, a cutoff and a
+  timer, and the next run would inherit them, so a short run following a long one
+  would silently acquire the long one's dead-man.
+
+- **An `execution` diagnostics block**, and it is the surface this release is meant
+  to be validated from. Every Stage-A expectation sits beside what actually
+  happened — expected production against measured, expected house load against
+  measured, expected grid contribution against measured — so a deviation is
+  readable rather than something a reader has to compute. `applied_kw` is `0.0` and
+  `executed` is `false` on every path.
+
+- **A START/STOP Activity lifecycle**, and nothing else. A six-hour run produces
+  two lines, not twenty-four: routine quarter-by-quarter corrections are silent by
+  construction, because the dedup compares the *intent* rather than the run's start
+  instant. Shadow gets its own event kinds (`would_start`, `would_stop`) on the
+  *advice* side of the vocabulary, so a Shadow line cannot be filed as execution
+  even by mistake — `started` and `stopped` remain execution kinds and remain
+  refused while the barrier stands.
+
+### Changed — the Stage-A contract, additively
+
+Four fixes, all published figures, none of which changes a plan. Every one is an
+aggregate or projection of something the solve had already computed for the plan it
+had already chosen, and a suite proves inertness: same objective, same runs, same
+reserve behaviour, same terminal behaviour, and still **three solves**.
+
+- **Freshness is anchored to the issue instant, not to the window.** beta.18
+  derived `stale_after` from `window_start`, which made it useless for the one job
+  its name describes: a run eighteen hours out carried a freshness deadline
+  eighteen and a half hours out, so a target could be stale by any ordinary meaning
+  of the word and still be inside it. `issued_at` is now published beside it, the
+  window remains a separate fact, and **`stale_after` is enforced** — a stale target
+  may not start, and an owned run whose target goes stale is stopped.
+
+- **`first_power_kw` is published**, because `initial_average_power_kw` is the run's
+  *mean* and always was, despite the name. The old field keeps its name and its
+  value; the honest figure sits beside it rather than quietly replacing it.
+
+- **The charge-window balance.** For every `grid_charge` target Stage A publishes
+  expected production, expected house load, expected production *reaching the
+  battery*, the expected grid contribution as a **maximum**, and `charge_source`.
+
+  The middle one is the point: **expected production is not production available to
+  the battery.** The house consumes throughout the window and its share is taken
+  first, so a fifteen-kilowatt-hour afternoon with five kilowatt-hours of load
+  offers substantially less than fifteen to the pack. Publishing the gross figure
+  would have invited Stage B to preserve headroom against energy the house was
+  always going to eat.
+
+- **The headroom constraint** — `required_headroom_kwh`, `max_end_energy_kwh` and
+  `headroom_until`, and this is what keeps economics out of Stage B entirely.
+
+  The problem: an old cheap-grid charge target is still live while substantial
+  production is forecast before a later window. Charging the pack full early
+  displaces production the plan meant to absorb. Deciding *how much* headroom is
+  worth keeping is an economic question — so Stage A answers it, publishes the
+  answer, and Stage B does arithmetic against it. Stage B never reads a price,
+  never identifies an export window, and never computes a headroom of its own. If
+  honouring the constraint would need a *different economic decision* rather than
+  merely less execution, it reduces or stops and waits for a fresh revision.
+
+  **`null` means unconstrained, never zero** — zero would forbid the pack from
+  filling at all, and reading absence as zero is a one-character mistake with the
+  opposite effect.
+
+- **An owned dispatch no longer inhibits Alpha EMS.** Strictly additive: the gate
+  is handed an ownership *verdict* rather than the evidence, `dispatch_owned`
+  defaults to `false` so every existing path keeps beta.18's behaviour, and a
+  foreign dispatch still stops everything exactly as before. This was the second of
+  the two blockers named in `CONTROL_EXECUTION_AVAILABLE`'s own documentation —
+  until now Alpha EMS would have inhibited itself the moment it armed anything.
+
+- **The control mode reads "Live" instead of "Active"**, while the stored value
+  stays `active`. The integration had no `entity` translation block at all, so
+  every enum state rendered as its raw value; there is one now, in English and
+  Dutch. The value does not move, because a restored entity and every stored
+  document already use it.
+
+- **`STORAGE_MINOR_VERSION` 4 → 5**, additive. The learning document gained an
+  optional `execution` key holding the published revision of each target and the
+  causal ownership record. Both must survive a restart: a revision that reset to
+  one on every reboot would tell Stage B that every target it had been tracking for
+  hours was brand new, and a causal record that did not survive would make an owned
+  dispatch indistinguishable from a stranger's. Absent on every earlier document,
+  and read as "nothing was running" rather than as a claim. **Progress is
+  deliberately not persisted** — it is re-measured from evidence, because a restart
+  must never replay a target from the beginning.
+
+### Not in this release
+
+**No Live execution.** `CONTROL_EXECUTION_AVAILABLE` is `False`, `PERMITTED_SERVICES`
+is 3, and a runtime proof registers real handlers for every service the integration
+may call, runs the whole controller across a simulated day in the most permissive
+mode this release can reach, and records **zero** writes — including zero
+acquisitions of the owner marker.
+
+**No export or curtailment actuation.** `serve_load` and `net_export` are computed
+and diagnosed only. Their physics is pinned — 1.3 kW of net export against 0.9 kW of
+house load needs 2.2 kW of battery — but nothing drives them, and `export` still has
+no primitive in the capability layer. That contradiction is named rather than
+papered over, and is future work. PV curtailment remains absent entirely: no
+negative-price rule, no hidden heuristic.
+
+### Two gates that must close before Live
+
+Neither is solved here, and neither is a defect in beta.19 — it sends nothing. Both
+are conditions on the release that *would* send something.
+
+**The vendor timer.** The reset sequence assumes the AlphaESS package's own
+automation clears the dispatch timer when the activation boolean goes off. That
+cannot be established from source, and `timer.cancel` is not a permitted service.
+Before beta.20, on the real installation: `activate` off must stop the dispatch,
+leave the vendor timer inactive, leave no stale timer behind, and let the next
+dispatch start clean. If it does not, beta.20 stays blocked — widening the service
+set needs its own review rather than a quiet addition.
+
+**One-interval-ahead arming, and this one is measured rather than merely
+unverified.** The economic horizon begins at the *next* interval boundary, so the
+controller treats a window opening within one planning interval as actionable —
+without that it selects nothing, ever. Measured on the current implementation:
+fifteen minutes before a window opens, the controller reaches `armed` and computes a
+real request.
+
+Arming an AlphaESS dispatch starts it immediately. So **as it stands, flipping the
+barrier would begin delivering battery energy before the Stage-A window opens.** In
+Shadow that is harmless and invisible; in Live it would be a plan executed early.
+
+Preparing a command before a window and delivering energy inside one are different
+things, and beta.19 does not yet distinguish them. **beta.20 is blocked until it
+does**, and the correction belongs there rather than here — it changes when energy
+physically moves, which is exactly what this release is not permitted to decide.
+
+### Two defects found during implementation
+
+Both were found by walking a simulated day rather than by a unit test, and both are
+now pinned.
+
+- **The controller was acting on the previous refresh's plan.** The execution
+  targets were built *after* the control report, so Stage B read a target one
+  quarter stale — with a `plan_id` and `revision` describing a plan it was not
+  executing. Nothing failed loudly; the figures were simply wrong.
+- **Strict window containment selected nothing, ever.** The economic horizon begins
+  at the *next* interval boundary, so a run planned at 09:00 opens at 09:15 — and a
+  controller asking "does this window contain now?" sat idle beside a perfectly
+  good target through an entire simulated day. A dispatch armed now runs through the
+  coming interval, so imminence within one planning interval is the correct reading,
+  and it is the same gate the Activity surface already used.
+
+### Verification
+
+Tests **2940 → 3073**, 1 skipped, 0 failed. Mutation suites extended with 21 Stage-B
+mutations, zero survivors. Ruff clean, format clean, `git diff --check` clean. Entity
+count **13**, `Economic Action` at exactly **8** attributes, `PERMITTED_SERVICES` **3**,
+`reserve.py` unchanged, both storage majors unchanged, no learning reset.
+
 ## [1.0.0-beta.18] - 2026-08-22
 
 **Stage A completion.** The economic planner gains the one thing it was missing

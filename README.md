@@ -19,12 +19,15 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.18` — a public beta.**
+> **Current release: `1.0.0-beta.19` — a public beta.**
 >
-> The integration is feature-complete for Phase 8 Stage A and covered by 2914
-> automated tests, but the learning and forecast model has **not** yet been validated
-> across enough real-world complete days to be called stable. Treat it as
-> something to run and observe, not yet as something to depend on.
+> Stage A is feature-complete and Stage B — the physical execution controller — is
+> built and running in shadow, covered by 3073 automated tests. **Nothing is
+> executed:** no command can reach the inverter in this release, by a constant in
+> the source rather than by a setting. The learning and forecast model has still
+> **not** been validated across enough real-world complete days to be called
+> stable. Treat it as something to run and observe, not yet as something to depend
+> on.
 >
 > It is safe in one important respect: it never writes to your inverter, never
 > issues a charge or discharge command, and cannot change how your system
@@ -61,7 +64,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.18` is not offered.
+     dialog if `1.0.0-beta.19` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -176,7 +179,7 @@ Two new entities:
 
 | Entity | What it is |
 |---|---|
-| **Control Mode** | `off`, `shadow` or `active`. Starts at `off`. |
+| **Control Mode** | **Off**, **Shadow** or **Live**. Starts at Off. (The stored value behind "Live" is still `active`, so nothing that already reads it breaks.) |
 | **Control State** | `inhibited`, `eligible`, `idle` or `off` — what the pipeline decided, with the reason in its attributes. |
 
 **Shadow is the one to use.** It runs the *real* pipeline — the same translation,
@@ -469,6 +472,31 @@ Every planned run appears in the `economic_plan` block of a diagnostics download
 with all five energy boundaries stated separately — the two battery-side AC
 figures, the two grid-side ones, and the curtailment — because every euro in the
 payload is priced on grid energy and a reader has to be able to check that.
+
+**A note on upgrading to beta.19: the controller exists now, and still sends
+nothing.**
+
+beta.19 adds Stage B — the part that works out *how* to physically achieve what the
+economic plan asked for. It measures how much energy has actually reached the
+battery, works out the power needed to finish inside the window, respects the reserve
+and every hardware limit, and then stops: the last step is unreachable by a constant
+in the source, exactly as it has been since Phase 4.
+
+There is one thing to do if you want to be ready for the release that *can* act.
+**Create a helper called `input_boolean.alpha_ems_dispatch_owner`** (Settings →
+Devices & Services → Helpers → Toggle). Alpha EMS switches it on as the first step of
+starting a dispatch and off as the last step of stopping one, and it is how Alpha EMS
+tells its own dispatch from one you started by hand — which the AlphaESS helpers
+cannot do, because arming from a dashboard and arming from an automation leave
+identical values behind. Without it, a running dispatch is treated as yours and left
+alone. That is the safe answer, and it is also the answer that means Alpha EMS could
+never stop its own run.
+
+**What to look at while it is in shadow.** A diagnostics download now has an
+`execution` section: what Stage A expected of production, house load and the grid
+against what actually happened, how much has reached the battery, what power the
+controller would have asked for, and why it is not asking for more. `applied_kw` is
+always zero there, and `executed` is always false.
 
 **A note on upgrading to beta.18: the battery will sell in the evening now.**
 

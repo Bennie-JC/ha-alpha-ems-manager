@@ -1126,7 +1126,10 @@ def test_the_clamp_changed_no_persisted_schema() -> None:
         STORAGE_MINOR_VERSION,
     )
 
-    assert STORAGE_MINOR_VERSION == 4
+    # 5 since beta.19: Stage B remembers published revisions and one causal
+    # ownership record. Neither is a control figure -- the assertions below still
+    # forbid a command, a safety verdict or a power from reaching either store.
+    assert STORAGE_MINOR_VERSION == 5
     assert FORECAST_STORAGE_MINOR_VERSION == 7
 
     for module in (storage, history_store):
@@ -1148,12 +1151,15 @@ def test_the_clamp_reaches_no_activity_entry() -> None:
 
     from custom_components.alpha_ems_manager import activity
 
-    # The announcement policy reads planned runs and the clock, and nothing from
-    # the safety layer -- so a command reduced by 0.1 kW cannot produce a line.
+    # The announcement policy reads planned runs, the clock and -- since
+    # beta.19 -- a narrow execution summary. Still nothing from the safety layer:
+    # no command, no power, no verdict, so a command reduced by 0.1 kW cannot
+    # produce a line.
     assert set(inspect.signature(activity.next_activity).parameters) == {
         "previous",
         "runs",
         "now",
+        "execution",
     }
 
     source = inspect.getsource(activity)

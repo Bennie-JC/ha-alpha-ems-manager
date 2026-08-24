@@ -166,7 +166,16 @@ STORAGE_VERSION: Final = 2
 #:   economics can never be reconstructed. Read by nothing that decides anything,
 #:   including the optimizer -- an optimizer learning from its own recorded
 #:   outcomes would be Phase 9 wearing Phase 8's clothes.
-STORAGE_MINOR_VERSION: Final = 4
+#: * **2.5** -- v1.0.0-beta.19. The document gained an optional ``execution``
+#:   key beside ``days``: the published revision of each execution target, and
+#:   the causal record of an armed dispatch. Both exist because a restart must not
+#:   lose them. A revision that reset to one on every reboot would tell Stage B
+#:   that every target was brand new, and a causal record that did not survive a
+#:   reboot would make an owned dispatch indistinguishable from a stranger's --
+#:   which is the one situation where the safe action is to touch nothing.
+#:   Absent on every earlier document, and read as "nothing was running" rather
+#:   than as a claim.
+STORAGE_MINOR_VERSION: Final = 5
 STORAGE_KEY_TEMPLATE: Final = f"{DOMAIN}.{{entry_id}}.learning"
 
 #: Config-entry schema version. v1 was the previous integration's source model,
@@ -807,6 +816,11 @@ CONTROL_MODE_OPTIONS: Final = (
 #: mode. ``idle`` means the gate passed and there was nothing to send, which is
 #: what a hold is. No state describes a completed write, because this release
 #: cannot perform one; a later phase adds that option when it can.
+#: A command was authorized and sent. Added in beta.19 so the vocabulary is in
+#: place before anything can reach this state -- ``CONTROL_EXECUTION_AVAILABLE``
+#: is still false, so in this release it is unreachable by construction, exactly
+#: as ``started`` is on the Activity surface.
+CONTROL_STATE_EXECUTED: Final = "executed"
 CONTROL_STATE_OFF: Final = "off"
 CONTROL_STATE_INHIBITED: Final = "inhibited"
 CONTROL_STATE_ELIGIBLE: Final = "eligible"
@@ -817,6 +831,10 @@ CONTROL_STATE_OPTIONS: Final = (
     CONTROL_STATE_INHIBITED,
     CONTROL_STATE_ELIGIBLE,
     CONTROL_STATE_IDLE,
+    # Declared, and unreachable in this release. Declaring it now means beta.20
+    # changes a barrier rather than an entity's enumeration, and a dashboard built
+    # against beta.19 does not acquire a new state it has never seen.
+    CONTROL_STATE_EXECUTED,
 )
 
 # --- Phase 4: configuration keys ----------------------------------------------
@@ -1812,10 +1830,149 @@ EXECUTION_INTENTS: Final = (
 
 #: How long a published execution target may be trusted, in minutes. Two planning
 #: intervals: long enough to survive one missed refresh, short enough that a
-#: stalled integration cannot leave a future Stage B acting on a stale intention.
-#: **Enforced by nothing in this release** -- it is a contract timestamp for a
-#: dead-man Stage B will implement, not a timeout that exists today.
+#: stalled integration cannot leave Stage B acting on a stale intention.
+#:
+#: **Anchored to the issue instant since beta.19, not to the window.** beta.18
+#: anchored it to ``window_start``, which made it useless as the thing it is named
+#: for: a run eighteen hours out carried a freshness deadline eighteen and a half
+#: hours out, so a target could be stale by any ordinary meaning of the word and
+#: still be inside it. Command freshness asks "how old is this instruction?" and
+#: the answer cannot depend on when the instruction was for.
+#:
+#: The planning window stays entirely separate: ``window_start`` and
+#: ``window_end`` say *when the energy is wanted*, and ``stale_after`` says *how
+#: long this statement of intent may be believed*. Conflating them is what went
+#: wrong, so they are now two independent facts about every target.
 EXECUTION_TARGET_STALE_MINUTES: Final = 2 * QUARTER_MINUTES
+
+#: Where Stage B stands with respect to one execution target.
+#:
+#: ``idle`` -- nothing actionable. ``armed`` -- a target is current and every gate
+#: passed, so a command exists. ``running`` -- an owned dispatch is under way.
+#: ``stopping`` -- a reset has been decided and is being carried out.
+#: ``inhibited`` -- something refused, and the reason says which.
+#: ``unproven`` -- a dispatch is active and ownership cannot be established, which
+#: is the one state where the safe action is to do nothing at all.
+EXECUTION_STATE_IDLE: Final = "idle"
+EXECUTION_STATE_ARMED: Final = "armed"
+EXECUTION_STATE_RUNNING: Final = "running"
+EXECUTION_STATE_STOPPING: Final = "stopping"
+EXECUTION_STATE_INHIBITED: Final = "inhibited"
+EXECUTION_STATE_UNPROVEN: Final = "unproven"
+
+EXECUTION_STATES: Final = (
+    EXECUTION_STATE_IDLE,
+    EXECUTION_STATE_ARMED,
+    EXECUTION_STATE_RUNNING,
+    EXECUTION_STATE_STOPPING,
+    EXECUTION_STATE_INHIBITED,
+    EXECUTION_STATE_UNPROVEN,
+)
+
+#: Whether a running dispatch belongs to Alpha EMS, and how confidently.
+#:
+#: Three values and not two, because "not ours" and "cannot tell" call for
+#: different behaviour: a foreign dispatch is someone else's and must be left
+#: alone, while an unproven one might be ours and must *still* be left alone --
+#: but the second is a fault to report rather than a normal condition.
+OWNERSHIP_NONE: Final = "none"
+OWNERSHIP_OWNED: Final = "owned"
+OWNERSHIP_FOREIGN: Final = "foreign"
+OWNERSHIP_UNPROVEN: Final = "unproven"
+
+OWNERSHIP_STATES: Final = (
+    OWNERSHIP_NONE,
+    OWNERSHIP_OWNED,
+    OWNERSHIP_FOREIGN,
+    OWNERSHIP_UNPROVEN,
+)
+
+#: The owner marker: a helper Alpha EMS turns on as the first step of arming and
+#: off as the last step of resetting.
+#:
+#: Deliberately **not** an AlphaESS helper. It is outside the vendor package
+#: because its whole purpose is to record something the vendor surface cannot: who
+#: armed the dispatch. Every AlphaESS arming path is driven by helper *values*, so
+#: a dashboard-armed dispatch and a service-armed one leave byte-identical state --
+#: which is why parameter matching is not merely weak evidence here but actively
+#: misleading, the person watching Shadow being exactly the person who would set
+#: those same figures by hand.
+#:
+#: It costs no new permitted service: ``turn_on`` and ``turn_off`` are already in
+#: the closed set of three.
+BOOLEAN_EXECUTION_OWNER: Final = "input_boolean.alpha_ems_dispatch_owner"
+
+#: Why Stage B reduced the power the rolling controller asked for, or stopped.
+#:
+#: Every one of these is a *physical* or *published-constraint* reason. None of
+#: them is a price, a value or a preference, and that is the whole point: Stage B
+#: reduces for reasons it can measure or was told, never for reasons it decided.
+EXECUTION_REDUCTION_NONE: Final = "none"
+EXECUTION_REDUCTION_PV_AHEAD: Final = "pv_ahead_of_forecast"
+EXECUTION_REDUCTION_HEADROOM: Final = "headroom_constraint"
+EXECUTION_REDUCTION_RESERVE: Final = "reserve_limit"
+EXECUTION_REDUCTION_SAFETY: Final = "safety_limited"
+EXECUTION_REDUCTION_TARGET_MET: Final = "target_reached"
+
+EXECUTION_REDUCTION_REASONS: Final = (
+    EXECUTION_REDUCTION_NONE,
+    EXECUTION_REDUCTION_PV_AHEAD,
+    EXECUTION_REDUCTION_HEADROOM,
+    EXECUTION_REDUCTION_RESERVE,
+    EXECUTION_REDUCTION_SAFETY,
+    EXECUTION_REDUCTION_TARGET_MET,
+)
+
+#: Why an owned run stopped. Published so a stop is never silent, and so the
+#: difference between "finished" and "gave up" is a recorded fact.
+EXECUTION_STOP_TARGET_REACHED: Final = "target_reached"
+EXECUTION_STOP_WINDOW_ENDED: Final = "window_ended"
+EXECUTION_STOP_STAGE_A_HOLD: Final = "stage_a_hold"
+EXECUTION_STOP_PLAN_REPLACED: Final = "plan_replaced"
+EXECUTION_STOP_SAFETY: Final = "safety"
+EXECUTION_STOP_RESERVE_LIMIT: Final = "reserve_limit"
+EXECUTION_STOP_STALE_PLAN: Final = "stale_plan"
+EXECUTION_STOP_SWITCHED_TO_SHADOW: Final = "user_switched_to_shadow"
+EXECUTION_STOP_SWITCHED_OFF: Final = "user_switched_off"
+EXECUTION_STOP_OWNERSHIP_CONFLICT: Final = "ownership_conflict"
+EXECUTION_STOP_EXECUTION_ERROR: Final = "execution_error"
+
+EXECUTION_STOP_REASONS: Final = (
+    EXECUTION_STOP_TARGET_REACHED,
+    EXECUTION_STOP_WINDOW_ENDED,
+    EXECUTION_STOP_STAGE_A_HOLD,
+    EXECUTION_STOP_PLAN_REPLACED,
+    EXECUTION_STOP_SAFETY,
+    EXECUTION_STOP_RESERVE_LIMIT,
+    EXECUTION_STOP_STALE_PLAN,
+    EXECUTION_STOP_SWITCHED_TO_SHADOW,
+    EXECUTION_STOP_SWITCHED_OFF,
+    EXECUTION_STOP_OWNERSHIP_CONFLICT,
+    EXECUTION_STOP_EXECUTION_ERROR,
+)
+
+#: How the realised battery figure was obtained, so a reader can weigh it.
+#:
+#: ``accumulated`` integrates measured battery power and is the better figure
+#: within a quarter; ``state_of_charge_delta`` differences the persisted level and
+#: is the only one that survives a restart. They are published together rather
+#: than reconciled, because where they disagree the disagreement is the
+#: information.
+EXECUTION_BASIS_ACCUMULATED: Final = "accumulated"
+EXECUTION_BASIS_SOC_DELTA: Final = "state_of_charge_delta"
+EXECUTION_BASIS_BOTH: Final = "accumulated_and_state_of_charge"
+EXECUTION_BASIS_UNAVAILABLE: Final = "unavailable"
+
+#: Whether the realised figure is good enough to act on.
+#:
+#: ``partial`` is the honest answer for the first quarter after a restart: the
+#: coverage threshold measures against the *whole* quarter, so a quarter that
+#: began before the integration did can never reach it. Reporting that as
+#: ``measured`` would dress a gap as a reading.
+EXECUTION_QUALITY_MEASURED: Final = "measured"
+EXECUTION_QUALITY_PARTIAL: Final = "partial"
+EXECUTION_QUALITY_RECONSTRUCTED: Final = "reconstructed"
+EXECUTION_QUALITY_UNAVAILABLE: Final = "unavailable"
 
 #: What the battery actually did in a run, as the objective saw it.
 #:
@@ -1863,11 +2020,43 @@ ECONOMIC_EVENT_STARTED: Final = "started"
 ECONOMIC_EVENT_ENDED: Final = "ended"
 ECONOMIC_EVENT_CANCELLED: Final = "cancelled"
 ECONOMIC_EVENT_REFUSED: Final = "refused"
+#: A dispatch ended, with the reason it ended. Added in beta.19: ``started`` had
+#: no counterpart, so a stop could only ever be inferred from the absence of a
+#: further line -- and an announcement left standing after its run finished is the
+#: one way this surface can mislead. **Execution-class**, so it is refused exactly
+#: as ``started`` is while nothing can be sent.
+ECONOMIC_EVENT_STOPPED: Final = "stopped"
+
+#: What shadow says instead. Advice-class, and separate kinds rather than the same
+#: kinds worded differently.
+#:
+#: The distinction is load-bearing. ``logbook_payload`` refuses an execution kind
+#: outright while the barrier stands, and that refusal is what guarantees this
+#: surface cannot claim the battery moved. A shadow line describing a dispatch it
+#: *would* have started is not a claim about the battery, but if it carried the
+#: ``started`` kind it would be refused -- and if the refusal were relaxed to let
+#: it through, the guarantee would be gone for the real case too. Two kinds keeps
+#: both: shadow speaks, execution stays refused, and the classification does the
+#: work rather than a caller remembering to word things carefully.
+ECONOMIC_EVENT_WOULD_START: Final = "would_start"
+ECONOMIC_EVENT_WOULD_STOP: Final = "would_stop"
+
+#: A standing condition began or ended. Transitions only: repeating an inhibit
+#: every refresh is the spam the whole surface is designed against. Advice-class,
+#: because a refusal to act is a statement about the pipeline rather than about the
+#: battery.
+ECONOMIC_EVENT_INHIBITED: Final = "inhibited"
+ECONOMIC_EVENT_AVAILABLE: Final = "available"
 
 ECONOMIC_EVENT_KINDS: Final = (
     ECONOMIC_EVENT_PLANNED,
     ECONOMIC_EVENT_CHANGED,
     ECONOMIC_EVENT_STARTED,
+    ECONOMIC_EVENT_STOPPED,
+    ECONOMIC_EVENT_WOULD_START,
+    ECONOMIC_EVENT_WOULD_STOP,
+    ECONOMIC_EVENT_INHIBITED,
+    ECONOMIC_EVENT_AVAILABLE,
     ECONOMIC_EVENT_ENDED,
     ECONOMIC_EVENT_CANCELLED,
     ECONOMIC_EVENT_REFUSED,
@@ -1890,15 +2079,29 @@ ECONOMIC_ADVICE_EVENT_KINDS: Final = (
     ECONOMIC_EVENT_CANCELLED,
     ECONOMIC_EVENT_ENDED,
     ECONOMIC_EVENT_REFUSED,
+    # beta.19. Shadow's own lifecycle, and the two pipeline transitions. None of
+    # them says the battery did anything.
+    ECONOMIC_EVENT_WOULD_START,
+    ECONOMIC_EVENT_WOULD_STOP,
+    ECONOMIC_EVENT_INHIBITED,
+    ECONOMIC_EVENT_AVAILABLE,
 )
 
-#: The kind that describes *execution*: a command went out and began. Unreachable
-#: while ``CONTROL_EXECUTION_AVAILABLE`` is false, and the emitter refuses it
-#: rather than trusting that no caller will ask -- an Activity line reading
-#: "started" while the integration sends nothing would be a lie about the
-#: battery, which is the one thing this surface must never say. The vocabulary is
-#: fixed here so Stage B inherits it rather than inventing it.
-ECONOMIC_EXECUTION_EVENT_KINDS: Final = (ECONOMIC_EVENT_STARTED,)
+#: The kinds that describe *execution*: a command went out, and later stopped.
+#: Both unreachable while ``CONTROL_EXECUTION_AVAILABLE`` is false, and the emitter
+#: refuses them rather than trusting that no caller will ask -- an Activity line
+#: reading "started" while the integration sends nothing would be a lie about the
+#: battery, which is the one thing this surface must never say.
+#:
+#: beta.19 added ``stopped`` here rather than making ``started`` do both jobs, and
+#: added ``would_start``/``would_stop`` to the *advice* set for shadow. So the
+#: refusal below is unchanged in strength while shadow gained a voice: a shadow run
+#: cannot accidentally be filed as execution, because it does not carry an
+#: execution kind.
+ECONOMIC_EXECUTION_EVENT_KINDS: Final = (
+    ECONOMIC_EVENT_STARTED,
+    ECONOMIC_EVENT_STOPPED,
+)
 
 #: How far an announced run must move before it is worth a second Activity entry.
 #:

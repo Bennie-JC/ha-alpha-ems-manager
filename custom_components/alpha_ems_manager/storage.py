@@ -665,6 +665,20 @@ class LearningStore:
         self.days: dict[date, DayRecord] = {}
         self.balance = BalanceStats()
         self.last_finalized: str | None = None
+        #: What Stage B needs to survive a restart, and nothing else.
+        #:
+        #: Two things, both of which are worthless if forgotten. The published
+        #: revision of each execution target, because a revision that reset to one
+        #: on every reboot would tell Stage B that every target it has been
+        #: tracking for hours is brand new. And the causal record of a dispatch
+        #: Alpha EMS armed, because without it an owned dispatch is
+        #: indistinguishable from a stranger's after a restart -- and that is the
+        #: one situation where the only safe action is to touch nothing.
+        #:
+        #: Deliberately not the plan, not the progress and not the economics. A
+        #: restart should reconstruct those from evidence, not trust a snapshot.
+        self.execution_revisions: dict[str, dict[str, Any]] = {}
+        self.execution_record: dict[str, Any] | None = None
         #: Set when the document could not be read at all. While true the store
         #: refuses to write, because an empty in-memory history must never be
         #: allowed to overwrite a file whose only problem may have been a
@@ -715,9 +729,21 @@ class LearningStore:
         last = raw.get("last_finalized")
         self.last_finalized = last if isinstance(last, str) else None
 
+        # Absent on every document written before beta.19, and absence means
+        # nothing was running -- never an assertion that something was.
+        execution = raw.get("execution")
+        if isinstance(execution, dict):
+            revisions = execution.get("revisions")
+            if isinstance(revisions, dict):
+                for plan_id, value in revisions.items():
+                    if isinstance(plan_id, str) and isinstance(value, dict):
+                        self.execution_revisions[plan_id] = dict(value)
+            record = execution.get("record")
+            self.execution_record = dict(record) if isinstance(record, dict) else None
+
     def to_dict(self) -> dict[str, Any]:
         """Return the full serialisable document."""
-        return {
+        payload: dict[str, Any] = {
             "days": {
                 day.isoformat(): record.to_dict()
                 for day, record in sorted(self.days.items())
@@ -725,6 +751,17 @@ class LearningStore:
             "balance": self.balance.to_dict(),
             "last_finalized": self.last_finalized,
         }
+        execution: dict[str, Any] = {}
+        if self.execution_revisions:
+            execution["revisions"] = self.execution_revisions
+        if self.execution_record is not None:
+            execution["record"] = self.execution_record
+        if execution:
+            # Omitted entirely while there is nothing to remember, so a document
+            # from an installation that has never armed anything is byte-identical
+            # to a beta.18 one.
+            payload["execution"] = execution
+        return payload
 
     def schedule_save(self) -> None:
         """Queue a debounced write.

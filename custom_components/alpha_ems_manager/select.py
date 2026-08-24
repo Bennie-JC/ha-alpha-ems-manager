@@ -53,11 +53,22 @@ async def async_setup_entry(
 class AlphaEmsControlModeSelect(
     CoordinatorEntity[AlphaEmsCoordinator], RestoreEntity, SelectEntity
 ):
-    """Off, shadow or active."""
+    """Off, shadow or active -- shown as Off, Shadow and Live.
+
+    **The displayed label and the stored value are deliberately different.**
+    ``active`` is what a restored entity, every stored document and every test
+    already say, so moving it would rename a value with history behind it for the
+    sake of a caption. "Live" is the clearer word for what the mode will mean once
+    it can act, so the translation says that and the value does not move.
+    """
 
     _attr_has_entity_name = True
     _attr_name = "Control Mode"
     _attr_icon = "mdi:tune-variant"
+    #: Resolves the option labels through ``entity.select.control_mode.state``.
+    #: Without it Home Assistant renders the raw values, which is what every enum
+    #: in this integration did before beta.19.
+    _attr_translation_key = SELECT_CONTROL_MODE
     _attr_options: ClassVar[list[str]] = list(CONTROL_MODE_OPTIONS)
 
     def __init__(self, coordinator: AlphaEmsCoordinator) -> None:

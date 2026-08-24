@@ -66,7 +66,7 @@ entry worth reading: it is about something that is about to happen.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from .const import (
@@ -86,11 +86,17 @@ from .const import (
     ECONOMIC_DEADBAND_POWER_KW,
     ECONOMIC_DIRECTION_CHARGE,
     ECONOMIC_DIRECTION_DISCHARGE,
+    ECONOMIC_EVENT_AVAILABLE,
     ECONOMIC_EVENT_CANCELLED,
     ECONOMIC_EVENT_CHANGED,
     ECONOMIC_EVENT_ENDED,
+    ECONOMIC_EVENT_INHIBITED,
     ECONOMIC_EVENT_PLANNED,
     ECONOMIC_EVENT_REFUSED,
+    ECONOMIC_EVENT_STARTED,
+    ECONOMIC_EVENT_STOPPED,
+    ECONOMIC_EVENT_WOULD_START,
+    ECONOMIC_EVENT_WOULD_STOP,
     ECONOMIC_EXECUTION_EVENT_KINDS,
     ECONOMIC_REASON_CHEAP_WINDOW,
     ECONOMIC_REASON_EXPENSIVE_WINDOW,
@@ -207,6 +213,72 @@ class AnnouncedRun:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionView:
+    """What Stage B is doing, in the few terms Activity needs.
+
+    A deliberately narrow reading rather than the controller's own state. Activity
+    must not be able to reach into the controller and start describing its
+    arithmetic -- the quarter-by-quarter setpoint corrections are precisely what
+    this surface must never carry, and the cheapest way to guarantee that is not
+    to hand them over.
+
+    ``executed`` is what separates a Shadow line from a Live one. While the
+    execution barrier stands it is always false, and the wording follows it: a
+    Shadow run says what it *would* have done and never claims the battery moved.
+    """
+
+    #: The run being executed, so lifecycle lines share the plan's identity.
+    identity: RunIdentity | None = None
+    #: Whether a dispatch is actually under way.
+    running: bool = False
+    #: Whether a command physically went out. False for the whole of beta.19.
+    executed: bool = False
+    target_kwh: float = 0.0
+    delivered_kwh: float = 0.0
+    initial_power_kw: float = 0.0
+    window: str = ""
+    intent: str = ""
+    stop_reason: str | None = None
+    inhibit_reason: str | None = None
+
+    @property
+    def deviation_kwh(self) -> float:
+        """Return how far delivery landed from the target."""
+        return self.delivered_kwh - self.target_kwh
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionMemory:
+    """What has already been said about execution, so it is not said twice.
+
+    Separate from ``announced`` because the two answer different questions. A plan
+    is announced once because it was *planned*; a dispatch is announced once
+    because it *started*, and the same plan can be announced and then never start.
+    Collapsing them would make a start event impossible to distinguish from the
+    plan line that preceded it.
+    """
+
+    #: The intent whose start has been announced, if any.
+    #:
+    #: The **intent**, not the run identity, and the difference is load-bearing. A
+    #: run driven by the reserve begins at *now*, so its start instant advances
+    #: every quarter and its identity with it -- keying on that re-announced the
+    #: same physical campaign every fifteen minutes, which is precisely the spam
+    #: this surface exists to prevent.
+    #:
+    #: An intent changes when the campaign genuinely changes: charging becomes
+    #: discharging, or serving load becomes exporting. Those are worth a line. A
+    #: window sliding forward under a campaign that is still running is not.
+    started: str | None = None
+    #: The inhibit reason last spoken about, so a standing condition is reported
+    #: on the transition and then left alone. Repeating it every refresh is the
+    #: exact spam this surface exists to avoid.
+    inhibit_reason: str | None = None
+    #: The mode last spoken about.
+    mode: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ActivityState:
     """Every run announced so far, bounded.
 
@@ -216,6 +288,14 @@ class ActivityState:
     """
 
     announced: tuple[AnnouncedRun, ...] = ()
+    #: What has been said about execution. Session-scoped like the rest of this
+    #: state, for the same reason: a reload costs at most one redundant line and
+    #: buys not restoring an observational cursor wrongly.
+    execution: ExecutionMemory = field(default_factory=ExecutionMemory)
+
+    def with_execution(self, memory: ExecutionMemory) -> ActivityState:
+        """Return this state with its execution memory replaced."""
+        return ActivityState(announced=self.announced, execution=memory)
 
     def find(self, identity: RunIdentity) -> AnnouncedRun | None:
         """Return the announced record for ``identity``, or ``None``."""
@@ -230,12 +310,16 @@ class ActivityState:
         record = AnnouncedRun(identity=run.identity, content=run.content)
         # Newest last, oldest dropped first: the cap can only ever discard a run
         # whose window is furthest behind us.
-        return ActivityState(announced=(*kept, record)[-MAX_ECONOMIC_RUNS_TRACKED:])
+        return ActivityState(
+            announced=(*kept, record)[-MAX_ECONOMIC_RUNS_TRACKED:],
+            execution=self.execution,
+        )
 
     def without(self, identity: RunIdentity) -> ActivityState:
         """Return this state with one announced run forgotten."""
         return ActivityState(
-            announced=tuple(e for e in self.announced if e.identity != identity)
+            announced=tuple(e for e in self.announced if e.identity != identity),
+            execution=self.execution,
         )
 
 
@@ -253,19 +337,38 @@ def next_activity(
     previous: ActivityState | None,
     runs: tuple[PlannedRun, ...],
     now: datetime,
+    execution: ExecutionView | None = None,
 ) -> ActivityEntry | None:
     """Return the one entry this refresh deserves, or ``None`` for silence.
 
     Silence is the common case and the default. At most one entry is returned per
-    refresh; anything else the plan did waits for the next one, which is fifteen
-    minutes away and self-healing.
+    refresh; anything else waits for the next one, which is fifteen minutes away
+    and self-healing.
 
-    Priority is retraction first, then change, then announcement. A line that
-    withdraws something already said matters more than a new one, because leaving
-    a stale announcement standing is the only way this surface can mislead.
+    **The signature widened in beta.19, and that was the point.** This module used
+    to be unable to describe execution because execution was not an argument, and
+    the docstring said a later phase wanting to log one would have to change the
+    signature -- "which is a visible act". This is that act. What has *not*
+    changed is the discipline: ``execution`` is a narrow view rather than the
+    controller's state, so Activity still cannot reach the rolling setpoint.
+
+    Priority: execution lifecycle first, then retraction, then change, then
+    announcement. Execution leads because a dispatch that started or stopped is a
+    thing that happened to the battery, and a line about a plan is a thing that
+    might happen -- the first outranks the second whenever both are true.
+
+    What is deliberately silent: every routine quarter. A run under way whose
+    power moved from 2.1 to 2.3 kW produces nothing here, because that is
+    arithmetic rather than a decision and reporting it was the largest source of
+    the old spam. It is in diagnostics, where a reader can go looking.
     """
     state = previous or ActivityState()
     live = {run.identity: run for run in runs}
+
+    if execution is not None:
+        entry = _execution_entry(state, execution, now=now)
+        if entry is not None:
+            return entry
 
     # 1. Something we spoke about is gone.
     for record in state.announced:
@@ -304,6 +407,127 @@ def next_activity(
         )
 
     return None
+
+
+def _execution_entry(
+    state: ActivityState, execution: ExecutionView, *, now: datetime
+) -> ActivityEntry | None:
+    """Return an execution lifecycle line, or ``None`` when nothing changed.
+
+    Four things are worth saying and nothing else is: a run started, a run
+    stopped, a standing inhibit began or ended, and the mode changed. Each is a
+    transition, and each is said exactly once -- the memory is what makes a
+    six-hour run produce a start and a stop rather than twenty-four repetitions of
+    the same sentence.
+    """
+    memory = state.execution
+
+    # A dispatch stopped, or turned into a different campaign. Said before
+    # anything else about it, because a stop that goes unrecorded leaves the last
+    # line standing as though it were still true.
+    if memory.started is not None and (
+        not execution.running or execution.intent != memory.started
+    ):
+        return ActivityEntry(
+            kind=(
+                ECONOMIC_EVENT_STOPPED
+                if execution.executed
+                else ECONOMIC_EVENT_WOULD_STOP
+            ),
+            message=_stopped_message(execution),
+            state=state.with_execution(
+                ExecutionMemory(
+                    started=None,
+                    inhibit_reason=memory.inhibit_reason,
+                    mode=memory.mode,
+                )
+            ),
+        )
+
+    # A dispatch started. Once per run, keyed on the same identity the plan lines
+    # use, so a replan that keeps the run does not re-announce it.
+    if execution.running and execution.intent and memory.started != execution.intent:
+        return ActivityEntry(
+            kind=(
+                ECONOMIC_EVENT_STARTED
+                if execution.executed
+                else ECONOMIC_EVENT_WOULD_START
+            ),
+            message=_started_message(execution),
+            state=state.with_execution(
+                ExecutionMemory(
+                    started=execution.intent,
+                    inhibit_reason=memory.inhibit_reason,
+                    mode=memory.mode,
+                )
+            ),
+        )
+
+    # A standing condition changed. The transition speaks; the condition does not.
+    if execution.inhibit_reason != memory.inhibit_reason:
+        began = execution.inhibit_reason is not None
+        return ActivityEntry(
+            kind=ECONOMIC_EVENT_INHIBITED if began else ECONOMIC_EVENT_AVAILABLE,
+            message=(
+                f"Execution inhibited: {execution.inhibit_reason}."
+                if began
+                else "Execution available again."
+            ),
+            state=state.with_execution(
+                ExecutionMemory(
+                    started=memory.started,
+                    inhibit_reason=execution.inhibit_reason,
+                    mode=memory.mode,
+                )
+            ),
+        )
+
+    return None
+
+
+def _started_message(execution: ExecutionView) -> str:
+    """Return the line for a dispatch beginning.
+
+    Short, and honest about which of the two things happened. A Shadow run says
+    what it would have done; only a Live one says a command went out. Getting that
+    wrong would make this surface claim the battery moved when it did not, which
+    is the one thing it must never do.
+    """
+    what = execution.intent.replace("_", " ")
+    window = f" during {execution.window}" if execution.window else ""
+    if not execution.executed:
+        return (
+            f"Shadow: would {what} to a {execution.target_kwh:.2f} kWh battery "
+            f"target{window}. No command sent."
+        )
+    return (
+        f"Dispatch started: {what}, target {execution.target_kwh:.2f} kWh"
+        f"{window}, initial power {execution.initial_power_kw:.1f} kW."
+    )
+
+
+def _stopped_message(execution: ExecutionView) -> str:
+    """Return the line for a run ending.
+
+    **The two cases report different things, and that is the point.** A Live run
+    delivered energy, so it reports what arrived against what was asked for. A
+    shadow run delivered nothing -- no command was sent, so the battery did
+    whatever it was going to do anyway -- and reporting a "delivered" figure
+    beside a target would dress that in the clothes of a measurement. So shadow
+    names the target it was tracking and stops there.
+    """
+    reason = execution.stop_reason or "plan ended"
+    if not execution.executed:
+        return (
+            f"Shadow run finished: {reason}. It was tracking a "
+            f"{execution.target_kwh:.2f} kWh target; no command was sent, so "
+            f"nothing was executed."
+        )
+    return (
+        f"Dispatch stopped: {reason}. "
+        f"{execution.delivered_kwh:.2f} / {execution.target_kwh:.2f} kWh "
+        f"(deviation {execution.deviation_kwh:+.2f} kWh)."
+    )
 
 
 def _due(run: PlannedRun, *, now: datetime) -> bool:
@@ -434,11 +658,21 @@ def _source_clause(content: RunContent) -> str:
     return f", {phrase}"
 
 
+def _advisory_suffix() -> str:
+    """Return the advisory qualifier while nothing can be executed.
+
+    Behind the barrier rather than unconditional. Two messages appended it
+    unconditionally, which was harmless while the barrier could not move and would
+    have become a false statement the moment it did.
+    """
+    return "" if CONTROL_EXECUTION_AVAILABLE else f" {_ADVISORY}"
+
+
 def _ended_message(record: AnnouncedRun) -> str:
     """Return the line for a run whose window has passed."""
     return (
         f"has finished the planned window to {_verb(record.content.action)}"
-        f" ({record.content.window}). {_ADVISORY}"
+        f" ({record.content.window}).{_advisory_suffix()}"
     )
 
 
@@ -450,7 +684,7 @@ def _cancelled_message(record: AnnouncedRun) -> str:
     return (
         f"no longer plans to {_verb(record.content.action)}"
         f" ({record.content.window}); the plan changed before its window opened."
-        f" {_ADVISORY}"
+        f"{_advisory_suffix()}"
     )
 
 
@@ -492,8 +726,7 @@ def _message(kind: str, run: PlannedRun, *, now: datetime) -> str:
     if content.price_eur_kwh is not None:
         sentence += f" Price {content.price_eur_kwh:.4f} EUR/kWh."
 
-    if not CONTROL_EXECUTION_AVAILABLE:
-        sentence += f" {_ADVISORY}"
+    sentence += _advisory_suffix()
     return sentence
 
 

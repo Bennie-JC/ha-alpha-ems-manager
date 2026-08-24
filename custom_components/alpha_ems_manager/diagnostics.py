@@ -1367,6 +1367,20 @@ async def async_get_config_entry_diagnostics(
         # shadow and active, which is what makes shadow worth reading: the
         # verdict and the command list below are the real ones. Nothing is sent.
         "control": coordinator.control_report,
+        # Stage B, since beta.19. What the physical controller made of the
+        # Stage-A target: what it measured, what it would ask the inverter for,
+        # and why it is not asking for more. Every Stage-A expectation sits beside
+        # the measured figure, so a deviation is readable rather than something a
+        # reader has to compute.
+        #
+        # ``applied_kw`` is zero and ``executed`` is false on every path in this
+        # release. A dict rather than another list entry, so the section ceiling is
+        # untouched.
+        "execution": (coordinator.control_report or {}).get("execution")
+        or {
+            "available": False,
+            "reason": "no_control_report",
+        },
         "pv": {
             "enabled": config.use_pv_forecast,
             # What the optimizer thinks is still to come today, summed from the

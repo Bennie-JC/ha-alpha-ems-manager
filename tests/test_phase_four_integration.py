@@ -291,7 +291,8 @@ async def test_the_whole_chain_running_at_once_writes_nothing(
 
     report = coordinator.control_report
     assert report["intent"]["action"] == ACTION_DISCHARGE
-    assert report["commands_planned"] == 5
+    # Six since beta.19: the owner marker is the first step of arming.
+    assert report["commands_planned"] == 6
     assert report["safety"]["safe"] is True
     assert report["authorization"]["authorized"] is False
     assert captured_calls == []

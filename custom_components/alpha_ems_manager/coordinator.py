@@ -36,8 +36,18 @@ from homeassistant.helpers.sun import get_astral_event_date
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .alphaess_adapter import discover, read_snapshot
-from .alphaess_device import build_command, limit_command, plan_commands
+from .alphaess_adapter import (
+    ControlExecutionUnavailable,
+    async_execute,
+    discover,
+    read_snapshot,
+)
+from .alphaess_device import (
+    BOOLEAN_EXECUTION_OWNER,
+    build_command,
+    limit_command,
+    plan_commands,
+)
 from .api import load_forecast_from
 from .battery import INTERVAL_HOURS, BatteryLimits, sanitize_soc_percent
 from .confidence import ConfidenceBreakdown, compute_confidence
@@ -71,9 +81,11 @@ from .const import (
     CONF_SOLCAST_ENTRY_ID,
     CONF_USE_PV_FORECAST,
     CONTROL_EXECUTION_AVAILABLE,
+    CONTROL_MODE_ACTIVE,
     CONTROL_MODE_OFF,
     CONTROL_MODE_OPTIONS,
     CONTROL_STATE_ELIGIBLE,
+    CONTROL_STATE_EXECUTED,
     CONTROL_STATE_IDLE,
     CONTROL_STATE_INHIBITED,
     CONTROL_STATE_OFF,
@@ -96,6 +108,8 @@ from .const import (
     INHIBIT_PLAN_UNAVAILABLE,
     LOG_THROTTLE_SECONDS,
     MAX_CONTROL_EVENTS_REPORTED,
+    MIN_QUARTER_COVERAGE,
+    OWNERSHIP_OWNED,
     PRICE_CROSS_CHECK_DISAGREES,
     PRICE_FLAG_EXPORT_CROSS_CHECK_FAILED,
     PRICE_FLAG_IMPORT_CROSS_CHECK_FAILED,
@@ -145,6 +159,13 @@ from .energy_balance import (
     evaluate_balance,
     measure_coherence,
 )
+from .execution import (
+    OwnershipEvidence,
+    actionable_target,
+    decide,
+    measure_progress,
+)
+from .execution import as_dict as execution_as_dict
 from .forecast import (
     DayForecast,
     TodayForecast,
@@ -758,15 +779,41 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: reason about it again -- the same rule ``PowerFlows`` exists to enforce.
         self._grid_import_accumulator: QuarterAccumulator | None = None
         self._grid_export_accumulator: QuarterAccumulator | None = None
+        #: Measured battery power, integrated so Stage B can read delivered energy
+        #: *within* a quarter rather than waiting for one to close.
+        #:
+        #: A separate accumulator rather than a reading of the existing ones,
+        #: because none of them measures the battery and because
+        #: ``setpoint x elapsed`` is not the same quantity: a clamp, a limit, a
+        #: cloud or a full pack all make what arrived differ from what was asked
+        #: for, and a controller trusting the request would compound its own error
+        #: every refresh. Sign-normalised charge only -- discharge is a separate
+        #: question and is not what a charge target is measured against.
+        self._battery_charge_accumulator: QuarterAccumulator | None = None
         self._log = _ThrottledLogger()
         self.last_balance: BalanceSample | None = None
-        #: The Stage-A execution targets this refresh published, kept only so the
-        #: next refresh can decide whether anything actionable moved. **Nothing
-        #: consumes them** -- there is no Stage B, no actuator and no service
-        #: call behind them. Held on the coordinator rather than recomputed in
-        #: diagnostics because a revision number has to be a property of the
-        #: refresh that produced it, not of whoever happened to download a report.
+        #: The Stage-A execution targets this refresh published. Read by the
+        #: Stage B controller, which computes the command a Live run would send
+        #: and sends nothing: the execution barrier is closed and no service call
+        #: is reachable from that path. Held on the coordinator rather than
+        #: recomputed in diagnostics because a revision number has to be a
+        #: property of the refresh that produced it, not of whoever happened to
+        #: download a report.
         self.execution_targets: tuple[dict[str, Any], ...] = ()
+        #: The same, as remembered across a restart. Only the fields
+        #: ``execution_revision`` compares, so a reboot does not announce every
+        #: target it has been tracking for hours as brand new.
+        self._execution_revisions: dict[str, dict[str, Any]] = {}
+        #: What Stage B concluded this refresh, for diagnostics. A dict rather
+        #: than the dataclass so the payload builder cannot reach the controller's
+        #: internals and start deciding things with them.
+        self.execution_report: dict[str, Any] = {}
+        #: Delivered battery energy inside the current execution window, and the
+        #: window it belongs to. Session-scoped: after a restart progress is
+        #: reconstructed from the persisted state-of-charge series instead, which
+        #: is the only basis that survives one.
+        self._execution_window: tuple[str, int] | None = None
+        self._execution_window_start_kwh: float | None = None
         #: Session-scoped balance tally and debounce state. Not persisted:
         #: a restart must not inherit a failure run that may already be over.
         self.balance = BalanceMonitor()
@@ -812,9 +859,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: Recent control outcomes, newest first, bounded for diagnostics.
         self._control_events: list[dict[str, Any]] = []
         #: When a command was last sent, and at what power. Both stay ``None``
-        #: for the lifetime of this release, because nothing is ever sent.
+        #: while the execution barrier is closed, because nothing is ever sent --
+        #: but they are now *assigned* on the one path that would send something,
+        #: so beta.20 flips a barrier rather than also discovering that the
+        #: cooldown gate had never had anything to read.
         self._last_control_write: datetime | None = None
         self._last_control_power_kw: float | None = None
+        #: What this refresh would send, held only for the single send site.
+        self._pending_commands: tuple[Any, ...] = ()
+        self._pending_power_kw: float | None = None
         #: What of the Solcast boundary was found on the last refresh, and what it
         #: said. Held for diagnostics so a user can see which sites exist, which
         #: are selected and which selected one has gone missing -- without a
@@ -851,6 +904,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         await self.store.async_load(str(dt_util.get_default_time_zone()))
         await self.history.async_load()
+        # Revisions survive a restart; progress deliberately does not. A revision
+        # is a statement about what Stage A published and must be continuous,
+        # whereas progress must be re-measured from evidence rather than trusted
+        # from a snapshot taken before the lights went out.
+        self._execution_revisions = dict(self.store.execution_revisions)
 
     @callback
     def async_start(self) -> None:
@@ -883,6 +941,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._grid_export_accumulator = (
             QuarterAccumulator(tz, sanitizer=sanitize_load_w)
             if self.config.grid_power_entity
+            else None
+        )
+        # Charging only, and the load sanitiser for the same reason the grid pair
+        # uses it: once the configured sign is resolved this is a plain
+        # non-negative power with the same plausibility band.
+        self._battery_charge_accumulator = (
+            QuarterAccumulator(tz, sanitizer=sanitize_load_w)
+            if self.config.battery_power_entity
             else None
         )
 
@@ -1143,6 +1209,18 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             grid_export_results = self._grid_export_accumulator.add_sample(
                 moment, None if flows is None else flows.grid_export_w
+            )
+
+        if self._battery_charge_accumulator is not None:
+            # Charging only: a charge target is measured against energy that went
+            # *in*, and netting a discharge against it would report a pack that
+            # cycled as one that never moved. The results are discarded because
+            # nothing persists this series -- it exists to be read in flight, via
+            # ``open_energy_kwh``, which is the only way to know progress inside a
+            # quarter rather than after it.
+            power = self._canonical_battery_power_w()
+            self._battery_charge_accumulator.add_sample(
+                moment, None if power is None else max(0.0, power)
             )
 
         self._ingest(
@@ -1880,6 +1958,25 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             tz=tz,
         )
 
+        # Derived from runs already solved, so this costs no extra search.
+        #
+        # **Before the control report, and that ordering is load-bearing.** The
+        # Stage B controller reads ``self.execution_targets``, so building them
+        # afterwards would have it acting on the previous refresh's plan -- one
+        # quarter stale, with a plan_id and revision lagging behind the plan they
+        # describe. Found by walking twelve refreshes and noticing the window it
+        # was working to had not started yet.
+        self.execution_targets = self._execution_targets(
+            outcome=economic,
+            plan=plan,
+            today_interval_count=baseline_today.interval_count,
+            tz=tz,
+            issued_at=now,
+        )
+        # Remembered across a restart, so a reboot does not tell Stage B that
+        # every target it has been tracking for hours is brand new.
+        self._remember_execution_revisions()
+
         control = self._build_control_report_safely(
             plan=plan,
             now=now,
@@ -1887,16 +1984,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             elapsed=elapsed,
             today_interval_count=baseline_today.interval_count,
         )
-
-        # Derived from runs already solved, so this costs no extra search. Held on
-        # the coordinator only so the next refresh can tell a revision from a new
-        # plan; nothing reads it and no actuator exists behind it.
-        self.execution_targets = self._execution_targets(
-            outcome=economic,
-            plan=plan,
-            today_interval_count=baseline_today.interval_count,
-            tz=tz,
-        )
+        # Refuses on every path in this release. Called unconditionally so the
+        # refusal is exercised rather than merely assumed.
+        await self._async_dispatch(control, now)
 
         return {
             "today": adapted,
@@ -2036,6 +2126,203 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     @callback
+    def _remember_execution_revisions(self) -> None:
+        """Persist just enough of each target for revisions to survive a restart.
+
+        Only the fields :func:`economic.execution_revision` compares. Not the
+        plan, not the progress, not the economics -- a restart should reconstruct
+        those from evidence, and a snapshot of them would be a stale claim
+        dressed as a fact.
+        """
+        remembered = {
+            target["plan_id"]: {
+                "plan_id": target["plan_id"],
+                "revision": target.get("revision", 1),
+                "intent": target.get("intent"),
+                "battery_target_kwh": target.get("battery_target_kwh"),
+                "grid_target_kwh": target.get("grid_target_kwh"),
+                "window_end": target.get("window_end"),
+            }
+            for target in self.execution_targets
+            if isinstance(target.get("plan_id"), str)
+        }
+        if remembered == self._execution_revisions:
+            return
+        self._execution_revisions = remembered
+        self.store.execution_revisions = remembered
+        self.store.schedule_save()
+
+    @callback
+    def _execution_progress(self, target: Any, plan: Any) -> Any:
+        """Return delivered battery energy inside ``target``'s window.
+
+        Two bases, because neither alone is enough. The accumulator integrates
+        measured battery power and is the better figure within a quarter; the
+        state-of-charge difference is coarser but is the only basis that survives
+        a restart. Both are reported, and where they disagree the disagreement is
+        published rather than resolved -- picking one silently would hide exactly
+        the case a reader needs to see.
+
+        Never ``setpoint x elapsed``. That is what the inverter was *asked* for,
+        and a clamp, a limit, a cloud or a full pack each make it a different
+        number from what arrived.
+        """
+        window = (target.plan_id, target.revision)
+        stored = None if plan is None or plan.state is None else plan.state.energy_kwh
+        if self._execution_window != window:
+            # A new run, or a revision that moved the target. Progress restarts
+            # from here rather than carrying a previous run's delivery.
+            self._execution_window = window
+            self._execution_window_start_kwh = stored
+            if self._battery_charge_accumulator is not None:
+                self._battery_charge_accumulator.reset()
+
+        accumulated = None
+        coverage = None
+        if self._battery_charge_accumulator is not None:
+            accumulator = self._battery_charge_accumulator
+            if accumulator.started:
+                accumulated = accumulator.open_energy_kwh
+                coverage = accumulator.open_coverage
+
+        soc_delta = None
+        opening = self._execution_window_start_kwh
+        if stored is not None and opening is not None:
+            soc_delta = max(0.0, stored - opening)
+
+        return measure_progress(
+            accumulated_kwh=accumulated,
+            soc_delta_kwh=soc_delta,
+            current_quarter_kwh=accumulated,
+            coverage=coverage,
+            minimum_coverage=MIN_QUARTER_COVERAGE,
+            reconstructed=opening is None,
+        )
+
+    @callback
+    def _remaining_expected_pv_kwh(self, target: Any, now: datetime) -> float | None:
+        """Return how much of Stage A's expected production is still to come.
+
+        Pro-rated across the window by elapsed time. Crude on purpose: a finer
+        split would need the per-interval production forecast, and reaching for
+        that here would put Stage B one short step from forming its own view of
+        what production is worth. The figure is only ever used to *reduce*
+        charging, so a coarse estimate errs toward charging less rather than more.
+        """
+        expected = target.expected_pv_to_battery_kwh
+        if expected is None:
+            return None
+        total = (target.window_end - target.window_start).total_seconds()
+        if total <= 0.0:
+            return 0.0
+        remaining = max(0.0, (target.window_end - now).total_seconds())
+        return max(0.0, expected * min(1.0, remaining / total))
+
+    @callback
+    def _stage_b_report(
+        self,
+        *,
+        plan: Any,
+        snapshot: Any,
+        now: datetime,
+        mode: str,
+    ) -> dict[str, Any]:
+        """Run the Stage B controller and return what it concluded.
+
+        **Computes the command a Live run would send, and sends nothing.** There
+        is one calculation path: the mode is passed in so the *lifecycle* can
+        differ -- Shadow never acquires the owner marker -- but it does not reach
+        the arithmetic, so the power computed here is the power a Live refresh
+        would compute from the same inputs.
+        """
+        evidence = OwnershipEvidence(
+            dispatch_active=bool(snapshot is not None and snapshot.dispatch_active),
+            # A marker that does not exist is not a marker that is off: without it
+            # ownership cannot be established at all, so a running dispatch reads
+            # as foreign rather than as free.
+            marker_on=bool(snapshot is not None and snapshot.owner_marker),
+            record=self.store.execution_record,
+            dispatch_start=None,
+            plan_id=None,
+        )
+        target = actionable_target(self.execution_targets, now)
+        progress = (
+            measure_progress(accumulated_kwh=None, soc_delta_kwh=None)
+            if target is None
+            else self._execution_progress(target, plan)
+        )
+        decision = decide(
+            # Shadow and off are both non-executing; only ``active`` would send.
+            mode_executes=mode == CONTROL_MODE_ACTIVE,
+            mode_off=mode == CONTROL_MODE_OFF,
+            targets=self.execution_targets,
+            now=now,
+            evidence=evidence,
+            progress=progress,
+            current_energy_kwh=(
+                None if plan is None or plan.state is None else plan.state.energy_kwh
+            ),
+            remaining_expected_pv_kwh=(
+                None if target is None else self._remaining_expected_pv_kwh(target, now)
+            ),
+            running_plan_id=None,
+        )
+        report = execution_as_dict(decision, mode=mode, executed=False)
+        report["actual_balance"] = self._execution_actuals(plan)
+        report["safety"] = {
+            "reserve_floor_kwh": (
+                None if decision.target is None else decision.target.reserve_floor_kwh
+            ),
+            "stale": (
+                None if decision.target is None else decision.target.stale_at(now)
+            ),
+            "deadman_duration_minutes": self.config.control_horizon_minutes,
+            "ownership_marker_entity": BOOLEAN_EXECUTION_OWNER,
+            "ownership_marker": None if snapshot is None else snapshot.owner_marker,
+            "record_present": self.store.execution_record is not None,
+            "record_matches": evidence.record_matches,
+        }
+        report["last_successful_write"] = (
+            None
+            if self._last_control_write is None
+            else self._last_control_write.isoformat()
+        )
+        return report
+
+    @callback
+    def _execution_actuals(self, plan: Any) -> dict[str, Any]:
+        """Return the measured side of the charge balance, for comparison.
+
+        Every figure here has a Stage-A expectation beside it in ``target``. That
+        is the point: a deviation should be readable rather than something a
+        reader has to compute, and house load is present precisely because it
+        explains the grid figure without ever entering the battery command.
+        """
+        flows = self.read_flows()
+        state = None if plan is None else plan.state
+        power = self._canonical_battery_power_w()
+        return {
+            "house_load_w": self._read_house_load_w(),
+            "pv_production_w": self._read_pv_power_w(),
+            "grid_import_w": None if flows is None else flows.grid_import_w,
+            "grid_export_w": None if flows is None else flows.grid_export_w,
+            "battery_power_w": power,
+            "battery_charging": None if power is None else power > 0.0,
+            "soc_percent": None if state is None else state.soc_percent,
+            "current_headroom_kwh": (
+                None if state is None else state.headroom_energy_kwh
+            ),
+            "stored_energy_kwh": None if state is None else state.energy_kwh,
+            "balance_rule": (
+                "house load and production explain the grid figure; neither is "
+                "added to the battery charge setpoint. 3.7 kW of charging against "
+                "1.1 kW of house and 0.63 kW of production draws 4.17 kW at the "
+                "meter, and the meter figure is a consequence rather than a "
+                "command"
+            ),
+        }
+
+    @callback
     def _execution_targets(
         self,
         *,
@@ -2043,15 +2330,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         plan: Any,
         today_interval_count: int,
         tz: tzinfo,
+        issued_at: datetime,
     ) -> tuple[dict[str, Any], ...]:
-        """Return the machine-readable targets a future Stage B would consume.
+        """Return the machine-readable targets the Stage B controller consumes.
 
-        Advisory, and consumed by nothing in this release. Built here because this
-        is where the calendar is: a run is indexed by the plan's continuous
-        chronological position, and turning that into an instant needs the civil
-        day and its real length -- 92, 96 or 100 intervals. The optimizer
-        deliberately has no calendar, which is why ``economic.execution_target``
-        takes instants rather than indices.
+        Built here because this is where the calendar is: a run is indexed by the
+        plan's continuous chronological position, and turning that into an instant
+        needs the civil day and its real length -- 92, 96 or 100 intervals. The
+        optimizer deliberately has no calendar, which is why
+        ``economic.execution_target`` takes instants rather than indices.
+
+        Since beta.19 this also projects, for a charge, the window's energy
+        balance and the headroom the plan needs preserved. **Both are readings of
+        the trajectory the solve already chose** -- the per-interval production and
+        baseline the horizon was built from, and the stored energy the plan lands
+        on -- so publishing them cannot change a plan. A mutation test holds that.
         """
         if outcome is None or not outcome.available or plan is None:
             return ()
@@ -2065,7 +2358,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for entry in (projection.intervals if projection else ())
         }
         hard_floor = projection.floor_energy_kwh if projection is not None else 0.0
-        previous = {item.get("plan_id"): item for item in self.execution_targets}
+        ceiling = projection.ceiling_energy_kwh if projection is not None else None
+        previous = dict(self._execution_revisions)
+        previous.update({item.get("plan_id"): item for item in self.execution_targets})
+
+        # The horizon the solve actually ran over, and the trajectory it chose.
+        # Keyed by chronological index, which is what a run carries.
+        demands = {entry.index: entry for entry in outcome.horizon.demands}
+        landed = {
+            entry.index: entry.start_energy_dc_kwh + entry.battery_delta_dc_kwh
+            for entry in outcome.desired.intervals
+        }
 
         def moment(index: int) -> datetime | None:
             if index < 0:
@@ -2076,6 +2379,49 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 day + timedelta(days=1), index - today_interval_count, tz
             )
 
+        def window_totals(run: Any) -> tuple[float | None, float | None]:
+            """Return forecast production and baseline across the run's window."""
+            production = 0.0
+            baseline = 0.0
+            seen = False
+            for index in range(run.start_index, run.end_index + 1):
+                demand = demands.get(index)
+                if demand is None:
+                    continue
+                seen = True
+                production += demand.pv_kwh or 0.0
+                baseline += demand.baseline_kwh or 0.0
+            if not seen:
+                return None, None
+            return production, baseline
+
+        def headroom_of(run: Any) -> tuple[float | None, float | None, int | None]:
+            """Return the headroom this plan needs preserved after ``run``.
+
+            The plan's own landing energy is the constraint. Stage A chose to hold
+            that much and no more, and it chose it knowing what production was
+            forecast afterwards -- so capping the pack there is exactly "do not
+            fill early and displace the production this plan means to absorb".
+
+            The deadline is the next interval at which the plan absorbs surplus
+            production, because that is the first moment the headroom is spent.
+            Absent when the plan absorbs nothing further: then nothing is being
+            protected and the constraint would be noise.
+            """
+            end_energy = landed.get(run.end_index)
+            if end_energy is None or ceiling is None:
+                return None, None, None
+            absorbs_at: int | None = None
+            for entry in outcome.desired.intervals:
+                if entry.index <= run.end_index:
+                    continue
+                if entry.absorbing and entry.battery_delta_dc_kwh > 0.0:
+                    absorbs_at = entry.index
+                    break
+            if absorbs_at is None:
+                return None, None, None
+            return max(0.0, ceiling - end_energy), end_energy, absorbs_at
+
         targets: list[dict[str, Any]] = []
         for run in outcome.desired.runs:
             opens = moment(run.start_index)
@@ -2083,6 +2429,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if opens is None or closes is None:
                 continue
             floor = required.get(run.start_index)
+            production, baseline = window_totals(run)
+            headroom, max_end, absorbs_at = headroom_of(run)
+            until = None if absorbs_at is None else moment(absorbs_at)
             target = execution_target(
                 run,
                 window_start=opens,
@@ -2090,9 +2439,18 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 reserve_floor_kwh=(
                     hard_floor if floor is None else max(floor, hard_floor)
                 ),
-                stale_after=opens + timedelta(minutes=EXECUTION_TARGET_STALE_MINUTES),
+                # Anchored to this refresh, not to a window that may be a day
+                # away. Command freshness cannot depend on when the command is for.
+                issued_at=issued_at,
+                stale_after=issued_at
+                + timedelta(minutes=EXECUTION_TARGET_STALE_MINUTES),
                 safety_buy=run.start_index in outcome.safety_buy_runs,
                 margin_passed=True,
+                expected_pv_production_kwh=production,
+                expected_house_load_kwh=baseline,
+                required_headroom_kwh=headroom,
+                max_end_energy_kwh=max_end,
+                headroom_until=until,
             )
             target["revision"] = execution_revision(
                 previous.get(target["plan_id"]), target
@@ -3230,6 +3588,51 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             window.append(end > sunrise and start < sunset)
         return tuple(window)
 
+    async def _async_dispatch(
+        self, report: dict[str, Any] | None, now: datetime
+    ) -> None:
+        """Send the authorized command, if there is one. There never is yet.
+
+        **The single send site, and the only one there will ever be.** Isolated
+        into its own method for two reasons: the report itself is synchronous and
+        pure, so a send cannot hide inside it; and one narrow function is a thing
+        an architecture test can assert about.
+
+        ``authorize`` has already refused -- it checks the mode, the execution
+        option and ``CONTROL_EXECUTION_AVAILABLE`` -- so this is unreachable in
+        this release, and the adapter refuses again behind it. It exists now,
+        unreachable, so that beta.20 flips a constant rather than also introducing
+        a call site. It also assigns the two fields the cooldown gate reads, which
+        have been dead since beta.14 and would otherwise make that gate
+        ornamental at the moment it first mattered.
+        """
+        if report is None:
+            return
+        authorization = report.get("authorization") or {}
+        if not authorization.get("authorized"):
+            return
+        steps = report.get("commands_planned") or 0
+        if steps <= 0:  # pragma: no cover - authorize already refuses this
+            return
+        commands = self._pending_commands
+        if not commands:  # pragma: no cover - defensive
+            return
+        try:  # pragma: no cover - the barrier makes this unreachable
+            await async_execute(self.hass, commands)
+        except ControlExecutionUnavailable:
+            # The expected outcome while the barrier stands, and recorded rather
+            # than swallowed: a release that believes it sent something is worse
+            # than one that knows it could not.
+            report["execution"]["result"]["execution_error"] = "execution_unavailable"
+        else:
+            report["state"] = CONTROL_STATE_EXECUTED
+            report["execution"]["power"]["applied_kw"] = report["execution"]["power"][
+                "requested_kw"
+            ]
+            report["execution"]["power"]["executed"] = True
+            self._last_control_write = now
+            self._last_control_power_kw = self._pending_power_kw
+
     def _build_control_report_safely(
         self,
         *,
@@ -3359,6 +3762,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             today_interval_count=today_interval_count,
             command=requested,
         )
+        # Stage B, before the gate: its ownership verdict is what lets an owned
+        # dispatch stop inhibiting Alpha EMS, and its request is what a command
+        # would be built from. It computes and returns; it sends nothing.
+        stage_b = self._stage_b_report(plan=plan, snapshot=snapshot, now=now, mode=mode)
+        owned = stage_b.get("ownership", {}).get("state") == OWNERSHIP_OWNED
+        context = replace(context, dispatch_owned=owned)
         safe_power_kw = safe_discharge_power_kw(context)
         command = None if requested is None else limit_command(requested, safe_power_kw)
         if command is not None and command is not requested:
@@ -3386,6 +3795,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             state = CONTROL_STATE_ELIGIBLE if commands else CONTROL_STATE_IDLE
 
         self._record_control_event(now, state, verdict, decision)
+        # Held for the one async method that would send them. Not published and
+        # not read anywhere else: the report already carries the step list for
+        # diagnostics, and a second reader of the live tuple would be a second
+        # path to the inverter.
+        self._pending_commands = commands
+        self._pending_power_kw = None if command is None else command.power_kw
 
         return {
             "mode": mode,
@@ -3407,6 +3822,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 inhibit_reason=verdict.inhibit_reason,
             ),
             "authorization": decision.as_dict(),
+            "execution": stage_b,
             "last_write": (
                 None
                 if self._last_control_write is None

@@ -77,30 +77,45 @@ AUTOMATION_DISPATCH_RESET_FULL = "automation.alphaess_dispatch_reset_full"
 #: just less prompt.
 AUTOMATION_HOLD_MONITOR = "automation.alphaess_cutoff_soc_hold_monitoring"
 
-#: Whether Alpha EMS can establish that it created a running dispatch.
+#: Whether ownership can be established **from the AlphaESS surface alone**.
 #:
-#: False, and not as a policy choice -- as a property of the control surface.
-#: There is exactly one arming path per direction and it is driven entirely by
-#: helper *values*, so a dispatch armed from a dashboard and one armed by a
-#: service call leave byte-identical helper states, register values, timer and
-#: read-backs. Nothing records a writer.
+#: Still false, and still not a policy choice -- it remains a property of that
+#: surface. There is exactly one arming path per direction and it is driven
+#: entirely by helper *values*, so a dispatch armed from a dashboard and one armed
+#: by a service call leave byte-identical helper states, register values, timer and
+#: read-backs. Nothing in the vendor package records a writer.
 #:
-#: Matching power, cutoff, duration or mode is therefore not evidence. It is
-#: worse than no evidence: someone watching the shadow recommendation is exactly
-#: the person who would arm those same figures by hand, so a parameter-match test
-#: would be most confident precisely when it was most likely to be wrong.
-#: A call context does not help either -- it cannot separate this integration
-#: from any other automation, and a restart discards it.
+#: Matching power, cutoff, duration or mode is therefore not evidence. It is worse
+#: than no evidence: someone watching the shadow recommendation is exactly the
+#: person who would arm those same figures by hand, so a parameter-match test would
+#: be most confident precisely when it was most likely to be wrong. A call context
+#: does not help either -- it cannot separate this integration from any other
+#: automation, and a restart discards it.
 #:
-#: The consequence is not confined to stopping a dispatch. Continuing one needs
-#: the same proof, so until this can be established no command spanning more than
-#: a single interval is expressible.
+#: **This constant is kept at false on purpose, and beta.19 does not flip it.**
+#: What beta.19 adds is a way to stop needing it: an owner marker written outside
+#: the vendor package (:data:`BOOLEAN_EXECUTION_OWNER`), which records the one fact
+#: the surface cannot. Ownership is then positive evidence rather than inference,
+#: and the inference this constant describes stays forbidden -- a mutation test
+#: catches anything that starts deriving ownership from parameters again.
 OWNERSHIP_PROVABLE: bool = False
 
 #: Features of the control surface that drive the battery on their own. If either
 #: is on, Alpha EMS stands down rather than switching it off.
 BOOLEAN_EXCESS_EXPORT = "input_boolean.alphaess_helper_excess_export"
 BOOLEAN_PEAK_SHAVING = "input_boolean.alphaess_helper_peak_shaving"
+
+#: The owner marker. Not an AlphaESS helper, and that is the whole point.
+#:
+#: Every AlphaESS arming path is driven by helper values, so the vendor surface
+#: cannot record who armed a dispatch. This one lives outside the package and
+#: records exactly that: Alpha EMS turns it on as the **first** step of arming and
+#: off as the **last** step of resetting, so a dispatch running without it is
+#: somebody else's by construction rather than by inference.
+#:
+#: It costs no new permitted service -- ``turn_on`` and ``turn_off`` are already in
+#: the closed set of three -- and it is never written in shadow.
+BOOLEAN_EXECUTION_OWNER = "input_boolean.alpha_ems_dispatch_owner"
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,19 +503,26 @@ def plan_commands(command: DeviceCommand) -> tuple[CommandStep, ...]:
     the numbers mean nothing until the boolean changes, so a partial run commands
     nothing at all.
 
-    There is deliberately **no stop branch**. Stopping a dispatch would require
-    proving Alpha EMS created it, and nothing in the control surface records who
-    armed one -- see :data:`OWNERSHIP_PROVABLE`. A stop path whose authorization
-    cannot be established is worse than no stop path, because the next person to
-    read it inherits an open safety question dressed as working code.
+    Stopping is a **separate function** -- see :func:`plan_reset`. It is not a
+    branch here, because the two sequences run in opposite orders for opposite
+    reasons: arming settles its parameters before switching on, and resetting
+    switches off before disturbing anything. Folding them together is how one of
+    them ends up in the other's order.
+
+    **The marker goes first, before any parameter.** If the sequence is interrupted
+    after the marker and before activation, the result is a marker on with no
+    dispatch running -- which reads as a stale marker and is cleared safely. The
+    opposite order would leave a dispatch running with no marker, which reads as
+    somebody else's and could never be stopped.
     """
     if not command.moves_battery:
-        # Nothing to arm, and nothing that may be stopped: a dispatch might be
-        # running, but this release can never prove one is its own.
+        # Nothing to arm. Stopping is plan_reset's job, and a hold reaching here
+        # must not quietly become one.
         return ()
 
     family = FAMILIES[command.action]
     return (
+        CommandStep(*SERVICE_TURN_ON, BOOLEAN_EXECUTION_OWNER),
         CommandStep(*SERVICE_SET_VALUE, family.power, command.power_kw),
         CommandStep(
             *SERVICE_SET_VALUE,
@@ -518,3 +540,64 @@ def plan_commands(command: DeviceCommand) -> tuple[CommandStep, ...]:
         ),
         CommandStep(*SERVICE_TURN_ON, family.activate),
     )
+
+
+def plan_reset(action: str) -> tuple[CommandStep, ...]:
+    """Return the exact ordered steps that end an owned dispatch.
+
+    **Deactivation first**, which is the mirror of arming and for the mirrored
+    reason. Turning the activation boolean off is what stops the device write, so
+    doing it first means an interrupted reset leaves the dispatch *off* with some
+    parameters still populated -- inert, and cleaned up by the next attempt. The
+    other order would clear the parameters of a dispatch that was still running.
+
+    **Setting power to zero is not a stop**, and this deliberately does more than
+    that. A dispatch left armed at zero power still holds a duration, a cutoff and
+    a timer, and the next run would inherit them -- so a short run following a long
+    one would silently acquire the long one's dead-man. Every field a run depends
+    on is returned to a resting value.
+
+    **The marker goes last.** Until it is off, the dispatch is still owned, and
+    releasing ownership before finishing the reset would leave Alpha EMS unable to
+    finish its own cleanup.
+
+    Only ever called for a dispatch ownership has been *established* for. Nothing
+    here checks that, because the check belongs to the layer that knows the
+    evidence -- but a reset issued without it would be exactly the "touch a
+    dispatch it did not start" this project promises never to do.
+    """
+    family = FAMILIES.get(action)
+    if family is None:
+        # No direction to reset. The marker is still released, because a marker
+        # with nothing behind it is the stale case and clearing it is safe.
+        return (CommandStep(*SERVICE_TURN_OFF, BOOLEAN_EXECUTION_OWNER),)
+    return (
+        # 1. Stop the dispatch.
+        CommandStep(*SERVICE_TURN_OFF, family.activate),
+        # 2. Leave nothing a later run could inherit. Power to zero, and the
+        #    dead-man to its own minimum rather than to zero -- the helper refuses
+        #    values below its range, and a refused write is not a cleared field.
+        CommandStep(*SERVICE_SET_VALUE, family.power, 0.0),
+        CommandStep(
+            *SERVICE_SET_VALUE,
+            family.duration,
+            float(CONTROL_MIN_DURATION_MINUTES),
+        ),
+        CommandStep(
+            *SERVICE_SET_VALUE,
+            family.cutoff_soc,
+            float(CONTROL_CUTOFF_MIN_PERCENT),
+        ),
+        CommandStep(*SERVICE_TURN_OFF, family.hold),
+        # 3. Release ownership, having finished with it.
+        CommandStep(*SERVICE_TURN_OFF, BOOLEAN_EXECUTION_OWNER),
+    )
+
+
+def plan_release_marker() -> tuple[CommandStep, ...]:
+    """Return the single step that clears a stale marker.
+
+    A marker on with no dispatch running. Clearing it is not an ownership claim --
+    there is nothing to claim -- and it is the one write that is safe without one.
+    """
+    return (CommandStep(*SERVICE_TURN_OFF, BOOLEAN_EXECUTION_OWNER),)

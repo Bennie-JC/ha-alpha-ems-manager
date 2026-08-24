@@ -181,6 +181,7 @@ def control_surface(hass: HomeAssistant) -> None:
         AUTOMATION_DISPATCH_RESET_FULL,
         AUTOMATION_HOLD_MONITOR,
         BOOLEAN_EXCESS_EXPORT,
+        BOOLEAN_EXECUTION_OWNER,
         BOOLEAN_PEAK_SHAVING,
         CHARGE_FAMILY,
         DISCHARGE_FAMILY,
@@ -199,6 +200,10 @@ def control_surface(hass: HomeAssistant) -> None:
     hass.states.async_set(AUTOMATION_HOLD_MONITOR, "on")
     hass.states.async_set(BOOLEAN_EXCESS_EXPORT, "off")
     hass.states.async_set(BOOLEAN_PEAK_SHAVING, "off")
+    # The beta.19 owner marker, off. Present so ownership is *readable*: a marker
+    # that does not exist means ownership cannot be established at all, which is
+    # the correct fail-safe but is a different case from a marker reading off.
+    hass.states.async_set(BOOLEAN_EXECUTION_OWNER, "off")
 
 
 @pytest.fixture

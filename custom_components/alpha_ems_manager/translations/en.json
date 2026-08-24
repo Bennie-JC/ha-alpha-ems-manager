@@ -224,5 +224,17 @@
     "house_load_source_missing": {
       "message": "Alpha EMS Manager has no house-load source configured, so it cannot learn anything. Remove the integration and add it again to select an instantaneous house-load power sensor."
     }
+  },
+  "entity": {
+    "select": {
+      "control_mode": {
+        "name": "Control Mode",
+        "state": {
+          "off": "Off",
+          "shadow": "Shadow",
+          "active": "Live"
+        }
+      }
+    }
   }
 }

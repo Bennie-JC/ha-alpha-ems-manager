@@ -313,11 +313,46 @@ async def test_the_setup_failure_message_is_translated_in_both_languages(
 
 
 async def test_both_languages_expose_the_same_keys(hass: HomeAssistant) -> None:
-    """Dutch and English never drift apart."""
-    for category in ("config", "options", "selector", "exceptions"):
+    """Dutch and English never drift apart.
+
+    ``entity`` joined the list in beta.19. It was absent before because the
+    integration had no ``entity`` block at all -- so every enum state rendered as
+    its raw value -- and a category nobody declares is a category this guard
+    silently does not cover.
+    """
+    for category in ("config", "options", "selector", "exceptions", "entity"):
         english = own_keys(await bundle(hass, "en", category))
         dutch = own_keys(await bundle(hass, "nl", category))
         assert dutch == english, f"{category} differs between en and nl"
+
+
+async def test_the_control_mode_reads_live_while_its_value_stays_active(
+    hass: HomeAssistant,
+) -> None:
+    """The label moved to "Live". The stored value did not.
+
+    Two different things, and conflating them would rename a value that a
+    restored entity, every stored document and every test already use. The
+    caption is the part that should be clear; the value is the part that must be
+    stable.
+    """
+    from custom_components.alpha_ems_manager.const import (
+        CONTROL_MODE_ACTIVE,
+        CONTROL_MODE_OPTIONS,
+    )
+
+    assert CONTROL_MODE_ACTIVE == "active"
+    assert CONTROL_MODE_OPTIONS == ("off", "shadow", "active")
+
+    for language, expected in (("en", "Live"), ("nl", "Live")):
+        states = await bundle(hass, language, "entity")
+        key = "component.alpha_ems_manager.entity.select.control_mode.state.active"
+        assert states.get(key) == expected, states
+    english = await bundle(hass, "en", "entity")
+    assert (
+        english["component.alpha_ems_manager.entity.select.control_mode.state.shadow"]
+        == "Shadow"
+    )
 
 
 async def test_dutch_is_actually_translated(hass: HomeAssistant) -> None:

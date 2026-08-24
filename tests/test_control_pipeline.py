@@ -23,6 +23,7 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from custom_components.alpha_ems_manager.alphaess_device import (
+    BOOLEAN_EXECUTION_OWNER,
     CHARGE_FAMILY,
     DISCHARGE_FAMILY,
     FAMILIES,
@@ -510,12 +511,20 @@ def test_a_discharge_maps_only_to_the_battery_discharge_family() -> None:
     steps = plan_commands(command)
 
     assert [step.entity_id for step in steps] == [
+        # The owner marker leads since beta.19. It is not an AlphaESS helper and
+        # touches nothing on the inverter -- it records who armed the dispatch,
+        # which the vendor surface cannot.
+        BOOLEAN_EXECUTION_OWNER,
         DISCHARGE_FAMILY.power,
         DISCHARGE_FAMILY.cutoff_soc,
         DISCHARGE_FAMILY.duration,
         DISCHARGE_FAMILY.hold,
         DISCHARGE_FAMILY.activate,
     ]
+    # Every AlphaESS entity touched still belongs to the one family.
+    assert {
+        step.entity_id for step in steps if step.entity_id != BOOLEAN_EXECUTION_OWNER
+    } == set(DISCHARGE_FAMILY.parameters) | {DISCHARGE_FAMILY.activate}
 
 
 def test_a_charge_maps_only_to_the_battery_charge_family() -> None:
@@ -524,12 +533,20 @@ def test_a_charge_maps_only_to_the_battery_charge_family() -> None:
     steps = plan_commands(command)
 
     assert [step.entity_id for step in steps] == [
+        # The owner marker leads since beta.19. It is not an AlphaESS helper and
+        # touches nothing on the inverter -- it records who armed the dispatch,
+        # which the vendor surface cannot.
+        BOOLEAN_EXECUTION_OWNER,
         CHARGE_FAMILY.power,
         CHARGE_FAMILY.cutoff_soc,
         CHARGE_FAMILY.duration,
         CHARGE_FAMILY.hold,
         CHARGE_FAMILY.activate,
     ]
+    # Every AlphaESS entity touched still belongs to the one family.
+    assert {
+        step.entity_id for step in steps if step.entity_id != BOOLEAN_EXECUTION_OWNER
+    } == set(CHARGE_FAMILY.parameters) | {CHARGE_FAMILY.activate}
 
 
 def test_no_shipped_policy_ever_asks_for_a_charge() -> None:

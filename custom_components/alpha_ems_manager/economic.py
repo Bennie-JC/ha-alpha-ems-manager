@@ -2262,9 +2262,15 @@ def execution_target(
     window_start: datetime,
     window_end: datetime,
     reserve_floor_kwh: float,
+    issued_at: datetime,
     stale_after: datetime,
     safety_buy: bool = False,
     margin_passed: bool = True,
+    expected_pv_production_kwh: float | None = None,
+    expected_house_load_kwh: float | None = None,
+    required_headroom_kwh: float | None = None,
+    max_end_energy_kwh: float | None = None,
+    headroom_until: datetime | None = None,
 ) -> dict[str, Any]:
     """Return the machine-readable target a future Stage B would consume.
 
@@ -2287,9 +2293,29 @@ def execution_target(
       its identity, while a genuinely different run gets a different one.
 
     ``revision`` is supplied by the caller, which is the only layer that can
-    remember the previous target. ``stale_after`` is a contract timestamp for a
-    future dead-man: this release implements no timeout, and Stage B must decide
-    for itself to stop trusting a target beyond it.
+    remember the previous target -- and since beta.19 the only layer that can
+    remember it *across a restart*.
+
+    **Two independent clocks, since beta.19.** ``window_start``/``window_end`` say
+    when the energy is wanted; ``issued_at``/``stale_after`` say how long this
+    statement of intent may be believed. beta.18 derived the second from the first,
+    which made it useless for the job it is named for: a run eighteen hours out
+    carried a freshness deadline eighteen and a half hours out, so a target could
+    be stale by any ordinary meaning of the word and still be inside it.
+
+    **Two power figures, because one was misnamed.**
+    ``initial_average_power_kw`` is the run's *mean* -- it always was, despite the
+    name -- and is kept unchanged so nothing reading it breaks.
+    ``first_power_kw`` is the first interval's power, which is what a controller
+    starting a run actually wants. Both are published rather than one being
+    quietly redefined.
+
+    **The charge balance and the headroom constraint** are published for a
+    ``grid_charge`` so Stage B can preserve headroom without doing economics. See
+    :func:`charge_window_balance`. ``required_headroom_kwh``,
+    ``max_end_energy_kwh`` and ``headroom_until`` are ``None`` when the plan
+    imposes no such constraint, and absent means *unconstrained* -- never zero,
+    which would forbid the pack from filling at all.
     """
     intent = EXECUTION_INTENT_GRID_CHARGE if safety_buy else execution_intent(run)
     battery = run.battery_charge_ac_kwh + run.battery_discharge_ac_kwh
@@ -2299,6 +2325,9 @@ def execution_target(
         "purpose": ECONOMIC_ACTION_SAFETY_BUY if safety_buy else run.action,
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
+        # When this was said, and how long it may be believed. Independent of the
+        # window on purpose -- see the docstring.
+        "issued_at": issued_at.isoformat(),
         "stale_after": stale_after.isoformat(),
         # Battery side. Authoritative for a charge: the AlphaESS dispatch setpoint
         # is a battery figure, and house load must **not** be added to it.
@@ -2311,13 +2340,42 @@ def execution_target(
             if intent == EXECUTION_INTENT_NET_EXPORT
             else None
         ),
+        # The run mean. Named "initial" since beta.14 and never was; kept
+        # unchanged for compatibility, with the honest figure beside it.
         "initial_average_power_kw": _round_kw(run.average_power_kw),
+        "average_power_kw": _round_kw(run.average_power_kw),
+        "first_power_kw": _round_kw(run.first_power_kw),
         "reserve_floor_kwh": _round_kwh(reserve_floor_kwh),
         "expected_grid_import_kwh": _round_kwh(run.marginal_grid_import_kwh),
         "expected_grid_export_kwh": _round_kwh(run.marginal_grid_export_kwh),
         "economic_reason": run.action,
         "expected_value_eur": _round_eur(-run.marginal_cost_eur),
         "margin_passed": margin_passed,
+        # The physical constraint Stage B must preserve, and until when. Absent
+        # means unconstrained.
+        "required_headroom_kwh": _round_kwh(required_headroom_kwh),
+        "max_end_energy_kwh": _round_kwh(max_end_energy_kwh),
+        "headroom_until": (
+            None if headroom_until is None else headroom_until.isoformat()
+        ),
+        "headroom_rule": (
+            "the physical headroom Stage B must leave available, decided here "
+            "because how much headroom is worth keeping is an economic question. "
+            "max_end_energy_kwh caps stored energy at headroom_until so forecast "
+            "production this plan intends to absorb is not displaced by charging "
+            "the pack full early. null means unconstrained, NOT zero. Stage B may "
+            "only reduce or stop to honour it: buying the difference when "
+            "production disappoints is a new economic decision and belongs here"
+        ),
+        **(
+            charge_window_balance(
+                run,
+                expected_pv_production_kwh=expected_pv_production_kwh,
+                expected_house_load_kwh=expected_house_load_kwh,
+            )
+            if intent == EXECUTION_INTENT_GRID_CHARGE
+            else {}
+        ),
         "boundary_rule": (
             "battery_target_kwh is AC energy at the battery and is what a charge "
             "command must aim at -- house load is NOT added to it. "
@@ -2327,13 +2385,59 @@ def execution_target(
             "1.3 kW of net export needed 2.2 kW of battery against 0.9 kW of load"
         ),
         "contract_rule": (
-            "advisory only. nothing in this release consumes this block, no "
-            "actuator exists for it, and CONTROL_EXECUTION_AVAILABLE is false. "
+            "consumed by the Stage B controller since beta.19, which computes "
+            "the command a Live run would send and sends nothing: "
+            "CONTROL_EXECUTION_AVAILABLE is false and no actuator is reachable. "
             "identity is (intent, window_start) so a run keeps its plan_id as its "
             "remaining energy shrinks; revision increments when the target moves "
-            "beyond the published deadband; stale_after is a contract timestamp "
-            "for a future dead-man and is enforced by nothing today"
+            "beyond the published deadband and survives a restart; stale_after is "
+            "anchored to issued_at, not to the window, and IS enforced -- a stale "
+            "target may not start, and an owned run whose target goes stale is "
+            "stopped"
         ),
+    }
+
+
+def charge_window_balance(
+    run: EconomicRun,
+    *,
+    expected_pv_production_kwh: float | None,
+    expected_house_load_kwh: float | None,
+) -> dict[str, Any]:
+    """Return the charge-window energy balance Stage B needs, and no economics.
+
+    Stage B has to be able to preserve headroom without deciding *how much*
+    headroom is worth preserving. That is an economic judgement, and it belongs
+    here. So the balance is published rather than left to be inferred.
+
+    **Expected production is not production available to the battery.** The house
+    is consuming throughout the window, and its share is taken first -- so a
+    fifteen-kilowatt-hour afternoon with five kilowatt-hours of load offers
+    substantially less than fifteen to the pack. Publishing production alone would
+    invite Stage B to preserve headroom against energy the house was always going
+    to eat.
+
+    The split itself needs no new arithmetic. ``marginal_grid_import_kwh`` is
+    already the exact grid share of this run measured against its own idle
+    counterfactual, computed from the same ``split_grid_energy`` call as the flow
+    it is subtracted from -- so what the grid supplied is known, and what is left
+    of the battery's charge came from production.
+
+    ``expected_grid_to_battery_kwh`` is a **maximum**, not an allowance Stage B may
+    spend up to. If production disappoints, buying the difference is a fresh
+    economic decision and Stage A must make it.
+    """
+    charge = run.battery_charge_ac_kwh
+    grid_share = max(0.0, run.marginal_grid_import_kwh)
+    return {
+        "expected_pv_production_kwh": _round_kwh(expected_pv_production_kwh),
+        "expected_house_load_kwh": _round_kwh(expected_house_load_kwh),
+        # What is left of the charge once the grid's measured share is removed.
+        # Bounded below at zero: a rounding artefact must not publish a negative
+        # contribution, and bounded above by the charge itself.
+        "expected_pv_to_battery_kwh": _round_kwh(max(0.0, charge - grid_share)),
+        "expected_grid_to_battery_kwh": _round_kwh(min(grid_share, charge)),
+        "charge_source": run.charge_source,
     }
 
 
