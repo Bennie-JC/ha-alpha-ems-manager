@@ -20,7 +20,6 @@ from custom_components.alpha_ems_manager.alphaess_device import (
     BOOLEAN_EXECUTION_OWNER,
     CHARGE_FAMILY,
     DISCHARGE_FAMILY,
-    PERMITTED_SERVICES,
 )
 from custom_components.alpha_ems_manager.const import (
     CONTROL_EXECUTION_AVAILABLE,
@@ -36,25 +35,6 @@ from .test_control_modes import set_mode
 from .test_economic_published import allow_trading
 
 pytestmark = pytest.mark.usefixtures("control_surface")
-
-
-@pytest.fixture
-def writes(hass: HomeAssistant) -> list:
-    """Capture every call to a service this integration may make.
-
-    Real handlers, so a write would land rather than raise. The marker is
-    ``input_boolean.turn_on``, which is already permitted -- so if Shadow ever
-    acquired ownership it would show up here rather than as an error.
-    """
-    calls: list = []
-
-    async def record(call) -> None:
-        calls.append(call)
-
-    for domain, service in PERMITTED_SERVICES:
-        hass.services.async_register(domain, service, record)
-    assert len(set(PERMITTED_SERVICES)) == 3
-    return calls
 
 
 async def prepared(

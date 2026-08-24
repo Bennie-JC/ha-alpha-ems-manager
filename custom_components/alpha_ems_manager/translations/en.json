@@ -181,11 +181,15 @@
         "description": "How Alpha EMS should behave if it is ever allowed to act on its own recommendation. This release cannot send a command to your inverter at all: the control pipeline is built and checked end to end, and the final step that would write to the battery is unavailable. Set the Control Mode entity to Shadow to watch what it would have done.",
         "data": {
           "control_horizon_minutes": "Command duration",
-          "control_export_margin_percent": "Export safety margin"
+          "control_export_margin_percent": "Export safety margin",
+          "grid_charge_budget_kwh": "Grid energy budget per charge run",
+          "control_execution_enabled": "Allow Alpha EMS to send commands"
         },
         "data_description": {
           "control_horizon_minutes": "How long a command would tell the inverter to hold, in minutes. This is a safety timeout rather than a delivery time: the plan is rebuilt every fifteen minutes and each command replaces the last, so it only matters if Alpha EMS stops running -- then the inverter returns to normal by itself once this expires. It has to be longer than fifteen minutes or a command would lapse before the next one arrived.",
-          "control_export_margin_percent": "How far below your current house load a discharge command must stay, in percent. A forced discharge sets the battery's rate, so anything the house cannot use goes out to the grid -- and the inverter's own feed-in limit does not apply to it. If a command would exceed this, the whole command is refused rather than made smaller."
+          "control_export_margin_percent": "How far below your current house load a discharge command must stay, in percent. A forced discharge sets the battery's rate, so anything the house cannot use goes out to the grid -- and the inverter's own feed-in limit does not apply to it. If a command would exceed this, the whole command is refused rather than made smaller.",
+          "grid_charge_budget_kwh": "A commissioning limit on how much energy one charge run may buy from the grid, in kilowatt-hours. Leave it at zero to switch the limit off -- zero means no extra limit, not a ban on charging. The plan's own expected grid contribution is always the real ceiling; this can only ever stop a run earlier, which is what makes it useful for a first supervised run. Energy the sun puts into the battery does not count against it.",
+          "control_execution_enabled": "Your consent for Alpha EMS to write to the inverter. It is one of two things that must both be true, and it is the only one you control: this release also holds the final step closed in its own code, so turning this on does not by itself make anything happen. Set the Control Mode entity to Shadow to watch what would have been sent."
         }
       },
       "economics": {

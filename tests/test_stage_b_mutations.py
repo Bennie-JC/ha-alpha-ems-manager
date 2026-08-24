@@ -69,7 +69,7 @@ def owned() -> OwnershipEvidence:
         marker_on=True,
         record=matching_record(),
         dispatch_start=DISPATCH_START,
-        plan_id="abc123",
+        run_id="abc123",
     )
 
 
@@ -97,8 +97,19 @@ def test_letting_the_controller_read_a_price_is_caught() -> None:
         assert forbidden not in imported
 
     # And the mutation would be visible even if the import were indirect, because
-    # the only module it may reach is the constants one.
-    assert imported <= {"const", "dataclasses", "datetime", "typing", "__future__"}
+    # the reachable set is closed and every member of it is itself pure. ``battery``
+    # and ``control`` joined in beta.20, when Stage B became the command source and
+    # therefore had to express an interval and a ``ControlIntent``; neither module
+    # contains economics, and the forbidden set above has not moved.
+    assert imported <= {
+        "const",
+        "battery",
+        "control",
+        "dataclasses",
+        "datetime",
+        "typing",
+        "__future__",
+    }, sorted(imported)
 
 
 def test_the_controller_choosing_its_own_headroom_is_caught() -> None:
@@ -261,7 +272,7 @@ def test_extending_the_window_is_caught() -> None:
         evidence=owned(),
         progress=progress_of(2.0),
         current_energy_kwh=8.0,
-        running_plan_id="abc123",
+        running_run_id="abc123",
     )
 
     assert decision.stop_reason == EXECUTION_STOP_WINDOW_ENDED
@@ -336,7 +347,7 @@ def test_claiming_a_foreign_dispatch_is_caught() -> None:
         marker_on=False,
         record=matching_record(),
         dispatch_start=DISPATCH_START,
-        plan_id="abc123",
+        run_id="abc123",
     )
 
     assert ownership_of(evidence) == OWNERSHIP_FOREIGN

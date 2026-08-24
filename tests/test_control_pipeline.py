@@ -128,8 +128,15 @@ def make_intent(
     start_index: int = 48,
     built_at: datetime = NOW,
     target_day: date = TODAY,
+    ceiling_soc_percent: float | None = 100.0,
 ) -> ControlIntent:
-    """Return an intent built directly, for driving the gate."""
+    """Return an intent built directly, for driving the gate.
+
+    ``ceiling_soc_percent`` defaults to the full pack, because a charge with no
+    establishable ceiling is *refused* since beta.20 -- so a charge fixture that
+    omitted it would be testing the refusal rather than the mapping. Tests that
+    want the refusal pass ``None`` explicitly.
+    """
     return ControlIntent(
         action=action,
         energy_ac_kwh=energy_ac_kwh,
@@ -144,6 +151,7 @@ def make_intent(
         reason="forecast_load_and_available_energy",
         policy="reserve_guard",
         policy_version=1,
+        ceiling_soc_percent=ceiling_soc_percent,
     )
 
 

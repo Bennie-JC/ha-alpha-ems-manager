@@ -508,10 +508,10 @@ def test_production_below_forecast_does_not_buy_more() -> None:
 # ===========================================================================
 
 
-def matching_record(plan_id: str = "abc123", start: float = 1000.0) -> dict:
+def matching_record(run_id: str = "abc123", start: float = 1000.0) -> dict:
     """Return a causal record that ties to a dispatch starting at ``start``."""
     return {
-        "plan_id": plan_id,
+        "run_id": run_id,
         "dispatch_start": datetime(2026, 8, 24, 10, 46, tzinfo=UTC).isoformat(),
         "power_kw": 2.1,
     }
@@ -529,7 +529,7 @@ DISPATCH_START = datetime(2026, 8, 24, 10, 46, tzinfo=UTC)
         (True, False, matching_record(), OWNERSHIP_FOREIGN),
         (True, True, None, OWNERSHIP_UNPROVEN),
         (True, True, {}, OWNERSHIP_UNPROVEN),
-        (True, True, {"plan_id": "other"}, OWNERSHIP_UNPROVEN),
+        (True, True, {"run_id": "other"}, OWNERSHIP_UNPROVEN),
         (True, True, matching_record(), OWNERSHIP_OWNED),
     ],
 )
@@ -545,7 +545,7 @@ def test_the_ownership_matrix(active, marker, record, expected) -> None:
         marker_on=marker,
         record=record,
         dispatch_start=DISPATCH_START if active else None,
-        plan_id="abc123",
+        run_id="abc123",
     )
 
     assert ownership_of(evidence) == expected
@@ -578,9 +578,9 @@ def test_a_record_for_a_different_plan_is_contradictory_not_merely_old() -> None
     evidence = OwnershipEvidence(
         dispatch_active=True,
         marker_on=True,
-        record=matching_record(plan_id="something_else"),
+        record=matching_record(run_id="something_else"),
         dispatch_start=DISPATCH_START,
-        plan_id="abc123",
+        run_id="abc123",
     )
 
     assert ownership_of(evidence) == OWNERSHIP_UNPROVEN
@@ -593,7 +593,7 @@ def test_a_dispatch_that_started_far_from_the_record_is_not_ours() -> None:
         marker_on=True,
         record=matching_record(),
         dispatch_start=DISPATCH_START + timedelta(hours=2),
-        plan_id="abc123",
+        run_id="abc123",
     )
 
     assert ownership_of(evidence) == OWNERSHIP_UNPROVEN
@@ -606,7 +606,7 @@ def test_a_missing_device_start_is_not_read_as_agreement() -> None:
         marker_on=True,
         record=matching_record(),
         dispatch_start=None,
-        plan_id="abc123",
+        run_id="abc123",
     )
 
     assert ownership_of(evidence) == OWNERSHIP_UNPROVEN
@@ -635,7 +635,7 @@ def decision_at(
     stored: float = 8.0,
     pv_left: float = 4.0,
     targets: list[dict] | None = None,
-    running_plan_id: str | None = None,
+    running_run_id: str | None = None,
 ) -> object:
     """Return a decision for one refresh."""
     return decide(
@@ -647,7 +647,7 @@ def decision_at(
         progress=progress_of(delivered),
         current_energy_kwh=stored,
         remaining_expected_pv_kwh=pv_left,
-        running_plan_id=running_plan_id,
+        running_run_id=running_run_id,
     )
 
 
@@ -712,7 +712,7 @@ def test_an_owned_run_reports_running() -> None:
             marker_on=True,
             record=matching_record(),
             dispatch_start=DISPATCH_START,
-            plan_id="abc123",
+            run_id="abc123",
         ),
     )
 
@@ -727,7 +727,7 @@ def owned_evidence() -> OwnershipEvidence:
         marker_on=True,
         record=matching_record(),
         dispatch_start=DISPATCH_START,
-        plan_id="abc123",
+        run_id="abc123",
     )
 
 
@@ -793,7 +793,7 @@ def test_a_different_plan_ends_the_old_run_before_the_new_one_starts() -> None:
         mode_executes=True,
         targets=[raw_target()],
         evidence=owned_evidence(),
-        running_plan_id="an_older_plan",
+        running_run_id="an_older_plan",
     )
 
     assert decision.state == EXECUTION_STATE_STOPPING
@@ -827,7 +827,7 @@ def test_the_window_ending_short_stops_without_extending_it() -> None:
         evidence=owned_evidence(),
         progress=progress_of(3.0),
         current_energy_kwh=9.0,
-        running_plan_id="abc123",
+        running_run_id="abc123",
     )
 
     assert decision.state == EXECUTION_STATE_STOPPING

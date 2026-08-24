@@ -98,6 +98,8 @@ from .const import (
     ECONOMIC_EVENT_WOULD_START,
     ECONOMIC_EVENT_WOULD_STOP,
     ECONOMIC_EXECUTION_EVENT_KINDS,
+    ECONOMIC_GAP_FORECAST_INFEASIBLE,
+    ECONOMIC_GAP_NONE,
     ECONOMIC_REASON_CHEAP_WINDOW,
     ECONOMIC_REASON_EXPENSIVE_WINDOW,
     ECONOMIC_REASON_MAKE_HEADROOM,
@@ -189,6 +191,9 @@ class RunContent:
     value_eur: float
     refused: bool
     window: str
+    #: Why the capability plan differs, when it does. Defaulted and last, so the
+    #: dataclass ordering rule is not the thing that breaks.
+    gap_reason: str = ECONOMIC_GAP_NONE
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,7 +236,10 @@ class ExecutionView:
     identity: RunIdentity | None = None
     #: Whether a dispatch is actually under way.
     running: bool = False
-    #: Whether a command physically went out. False for the whole of beta.19.
+    #: Whether a command physically went out. False for as long as
+    #: :data:`~.const.CONTROL_EXECUTION_AVAILABLE` is, which is every release so
+    #: far -- stated against the constant rather than a version number, so it
+    #: cannot go stale the way a version can.
     executed: bool = False
     target_kwh: float = 0.0
     delivered_kwh: float = 0.0
@@ -716,10 +724,22 @@ def _message(kind: str, run: PlannedRun, *, now: datetime) -> str:
 
     if kind == ECONOMIC_EVENT_REFUSED:
         instead = _verb(content.capability_action)
-        sentence += (
-            f" No actuator in this release can do that, so the best available"
-            f" action is to {instead}, at a cost of {content.value_eur:.2f} EUR."
-        )
+        # **Keyed on why, rather than asserting one cause for all of them.** The
+        # sentence used to say "no actuator can do that" unconditionally, which was
+        # wrong twice over for a charge: an actuator exists, and the reason that
+        # actually fires for a charge desire is that the restricted plan works out
+        # differently, not that the action is impossible.
+        if content.gap_reason == ECONOMIC_GAP_FORECAST_INFEASIBLE:
+            sentence += (
+                f" Working only with charging and discharging the plan comes out"
+                f" differently, so the best available action is to {instead}, at a"
+                f" cost of {content.value_eur:.2f} EUR."
+            )
+        else:
+            sentence += (
+                f" No actuator in this release can do that, so the best available"
+                f" action is to {instead}, at a cost of {content.value_eur:.2f} EUR."
+            )
     else:
         sentence += f" Expected value {content.value_eur:.2f} EUR."
 

@@ -86,6 +86,11 @@ EXPECTED_OPTIONS_FIELDS: dict[str, list[str]] = {
     "control": [
         "control_horizon_minutes",
         "control_export_margin_percent",
+        # beta.20. The commissioning tightener, and the user's half of the two
+        # consents a Live write needs. The other half is a release constant, and
+        # the form says so rather than implying this switch is sufficient.
+        "grid_charge_budget_kwh",
+        "control_execution_enabled",
     ],
     # Phase 8. Three fields, all with defaults. The two opt-ins *are* offered,
     # unlike the execution enable, and the difference is that they change the

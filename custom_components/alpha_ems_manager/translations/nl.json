@@ -181,11 +181,15 @@
         "description": "Hoe Alpha EMS zich moet gedragen als het ooit zelf naar zijn eigen advies mag handelen. Deze versie kan helemaal geen opdracht naar je omvormer sturen: de regelketen is volledig gebouwd en getoetst, en de laatste stap die naar de batterij zou schrijven is niet beschikbaar. Zet de entiteit Control Mode op Shadow om te zien wat er gebeurd zou zijn.",
         "data": {
           "control_horizon_minutes": "Duur van een opdracht",
-          "control_export_margin_percent": "Veiligheidsmarge teruglevering"
+          "control_export_margin_percent": "Veiligheidsmarge teruglevering",
+          "grid_charge_budget_kwh": "Netenergie per laadronde",
+          "control_execution_enabled": "Alpha EMS mag opdrachten sturen"
         },
         "data_description": {
           "control_horizon_minutes": "Hoe lang een opdracht de omvormer zou laten vasthouden, in minuten. Dit is een veiligheidstimer en geen levertijd: het plan wordt elk kwartier opnieuw opgesteld en elke opdracht vervangt de vorige, dus het telt alleen als Alpha EMS stopt -- dan gaat de omvormer na het verstrijken zelf terug naar normaal. Het moet langer zijn dan vijftien minuten, anders verloopt een opdracht voordat de volgende komt.",
-          "control_export_margin_percent": "Hoeveel procent onder je huidige huisverbruik een ontlaadopdracht moet blijven. Een geforceerde ontlading stelt het vermogen van de batterij in, dus wat het huis niet gebruikt gaat naar het net -- en de teruglevergrens van de omvormer geldt daar niet voor. Zou een opdracht hierboven uitkomen, dan wordt de hele opdracht geweigerd in plaats van verkleind."
+          "control_export_margin_percent": "Hoeveel procent onder je huidige huisverbruik een ontlaadopdracht moet blijven. Een geforceerde ontlading stelt het vermogen van de batterij in, dus wat het huis niet gebruikt gaat naar het net -- en de teruglevergrens van de omvormer geldt daar niet voor. Zou een opdracht hierboven uitkomen, dan wordt de hele opdracht geweigerd in plaats van verkleind.",
+          "grid_charge_budget_kwh": "Een inbedrijfstellingsgrens voor hoeveel energie een laadronde van het net mag kopen, in kilowattuur. Laat het op nul staan om de grens uit te zetten -- nul betekent geen extra grens, geen laadverbod. De verwachte netbijdrage uit het plan is altijd het echte plafond; dit kan een ronde alleen eerder stoppen, en daarom is het nuttig voor een eerste ronde onder toezicht. Energie die de zon in de batterij stopt telt niet mee.",
+          "control_execution_enabled": "Jouw toestemming dat Alpha EMS naar de omvormer schrijft. Het is een van twee dingen die beide waar moeten zijn, en het enige waar jij over gaat: deze versie houdt de laatste stap ook in de eigen code gesloten, dus hiermee aanzetten laat op zichzelf niets gebeuren. Zet de entiteit Control Mode op Shadow om te zien wat er gestuurd zou zijn."
         }
       },
       "economics": {

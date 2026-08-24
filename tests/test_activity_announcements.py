@@ -63,6 +63,9 @@ from custom_components.alpha_ems_manager.const import (
     ECONOMIC_EVENT_PLANNED,
     ECONOMIC_EVENT_REFUSED,
     ECONOMIC_EVENT_STARTED,
+    ECONOMIC_GAP_FORECAST_INFEASIBLE,
+    ECONOMIC_GAP_NO_PRIMITIVE,
+    ECONOMIC_GAP_NONE,
     ECONOMIC_REASON_CHEAP_WINDOW,
     QUARTER_MINUTES,
 )
@@ -82,6 +85,7 @@ def make_run(
     average_power_kw: float | None = None,
     charge_source: str = ECONOMIC_CHARGE_SOURCE_MIXED,
     refused: bool = False,
+    gap_reason: str = ECONOMIC_GAP_NO_PRIMITIVE,
     now: datetime = NOW,
 ) -> PlannedRun:
     """Return one planned run, positioned relative to ``now``."""
@@ -107,6 +111,7 @@ def make_run(
             value_eur=1.23,
             refused=refused,
             window=f"{start:%H:%M}-{end:%H:%M}",
+            gap_reason=(gap_reason if refused else ECONOMIC_GAP_NONE),
         ),
     )
 
@@ -523,6 +528,28 @@ def test_a_refused_run_says_what_it_wanted_and_what_is_possible() -> None:
     assert entry.kind == ECONOMIC_EVENT_REFUSED
     assert "wants to export to the grid" in entry.message
     assert "No actuator in this release can do that" in entry.message
+
+
+def test_a_forecast_gap_does_not_claim_the_action_is_impossible() -> None:
+    """**The sentence was wrong twice over for a charge, and this is the second.**
+
+    ``forecast_infeasible`` is what fires when the restricted plan simply works out
+    differently -- not when nothing could do the job. Saying "no actuator can do
+    that" beside a charge, which beta.20 executes, would be plainly false.
+    """
+    run = make_run(
+        start_minutes=10,
+        action=ECONOMIC_ACTION_CHARGE,
+        refused=True,
+        gap_reason=ECONOMIC_GAP_FORECAST_INFEASIBLE,
+    )
+    entry = next_activity(previous=None, runs=(run,), now=NOW)
+
+    assert entry is not None
+    assert entry.kind == ECONOMIC_EVENT_REFUSED
+    assert "No actuator" not in entry.message
+    assert "comes out" in entry.message
+    assert "best available action is to" in entry.message
 
 
 def test_the_execution_kind_is_still_refused() -> None:

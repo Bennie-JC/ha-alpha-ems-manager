@@ -175,6 +175,12 @@ STORAGE_VERSION: Final = 2
 #:   which is the one situation where the safe action is to touch nothing.
 #:   Absent on every earlier document, and read as "nothing was running" rather
 #:   than as a claim.
+#:
+#:   v1.0.0-beta.20 keys that causal record on the Stage-B **run** rather than on
+#:   the Stage-A publication, and the minor version deliberately does not move:
+#:   beta.19 defined the record but never wrote one, so no stored document in
+#:   existence contains the older shape. There is nothing to migrate, and bumping
+#:   the version would claim a compatibility boundary that was never crossed.
 STORAGE_MINOR_VERSION: Final = 5
 STORAGE_KEY_TEMPLATE: Final = f"{DOMAIN}.{{entry_id}}.learning"
 
@@ -1733,12 +1739,29 @@ MAX_MINIMUM_TRADE_GAIN_EUR: Final = 5.0
 CONF_GRID_CHARGE_MARGIN_EUR_PER_KWH: Final = "grid_charge_margin_eur_per_kwh"
 DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH: Final = 0.0
 MIN_GRID_CHARGE_MARGIN_EUR_PER_KWH: Final = 0.0
+
+#: A ceiling, in kWh, on how much grid energy one Live charge run may buy.
+#:
+#: **A commissioning tightener, and zero disables it.** The Stage-A figure
+#: ``expected_grid_to_battery_kwh`` is always the hard ceiling when published;
+#: this only ever tightens it further, and only when set above zero.
+#:
+#: Written down because the obvious formulation is wrong and was caught in review:
+#: ``min(stage_a_ceiling, configured)`` with a default of ``0.0`` yields a cap of
+#: zero and forbids all charging. Absent means unconstrained, never zero -- the
+#: same rule the headroom constraint and the charge cutoff both obey.
+CONF_GRID_CHARGE_BUDGET_KWH: Final = "grid_charge_budget_kwh"
+DEFAULT_GRID_CHARGE_BUDGET_KWH: Final = 0.0
+MIN_GRID_CHARGE_BUDGET_KWH: Final = 0.0
+MAX_GRID_CHARGE_BUDGET_KWH: Final = 50.0
 MAX_GRID_CHARGE_MARGIN_EUR_PER_KWH: Final = 2.0
 
 #: Explicit opt-ins for the two behaviours a user would be surprised by. Both
 #: change the *published plan*, so they are meaningful in shadow and belong in
-#: the form -- unlike ``CONF_CONTROL_EXECUTION_ENABLED``, which cannot change
-#: anything in this release and is therefore withheld from it.
+#: the form. ``CONF_CONTROL_EXECUTION_ENABLED`` is offered alongside them from
+#: beta.20: it is one of two independent consents rather than a switch with
+#: nothing behind it, and the form says plainly that the release also holds the
+#: final step closed in code.
 #:
 #: ``CONF_ALLOW_GRID_CHARGING`` permits **buying**, and nothing else. Storing
 #: production the house cannot use is permitted unconditionally, because it draws
@@ -1859,8 +1882,19 @@ EXECUTION_STATE_RUNNING: Final = "running"
 EXECUTION_STATE_STOPPING: Final = "stopping"
 EXECUTION_STATE_INHIBITED: Final = "inhibited"
 EXECUTION_STATE_UNPROVEN: Final = "unproven"
+#: A target is current and everything has been computed, but its window has not
+#: opened yet.
+#:
+#: Distinct from ``armed`` because on this hardware **arming is delivering**:
+#: measured on the real installation, turning the activation helper on starts
+#: moving energy immediately. So "we know what to send" and "it is time to send
+#: it" are different facts, and beta.19 conflated them -- it reached ``armed``
+#: with a live power request fifteen minutes before the window opened, which
+#: would have begun charging early the moment the barrier moved.
+EXECUTION_STATE_PREPARED: Final = "prepared"
 
 EXECUTION_STATES: Final = (
+    EXECUTION_STATE_PREPARED,
     EXECUTION_STATE_IDLE,
     EXECUTION_STATE_ARMED,
     EXECUTION_STATE_RUNNING,
@@ -1885,6 +1919,26 @@ OWNERSHIP_STATES: Final = (
     OWNERSHIP_OWNED,
     OWNERSHIP_FOREIGN,
     OWNERSHIP_UNPROVEN,
+)
+
+#: Why the write boundary refused a command outright.
+#:
+#: These are not safety inhibits and not economic refusals: they mean the command
+#: *itself* was malformed, and the only correct response to a malformed command is
+#: to send none of it. Every one describes a mistake a future edit could make, so
+#: each is checked against the real entity list rather than trusted.
+CONTROL_REFUSE_DIRECTION_MISMATCH: Final = "direction_mismatch"
+CONTROL_REFUSE_FOREIGN_FAMILY: Final = "foreign_family_entity"
+CONTROL_REFUSE_RAW_DISPATCH_WRITE: Final = "raw_dispatch_write"
+CONTROL_REFUSE_NEGATIVE_MAGNITUDE: Final = "negative_helper_magnitude"
+CONTROL_REFUSE_SERVICE_NOT_PERMITTED: Final = "service_not_permitted"
+
+CONTROL_WRITE_REFUSALS: Final = (
+    CONTROL_REFUSE_DIRECTION_MISMATCH,
+    CONTROL_REFUSE_FOREIGN_FAMILY,
+    CONTROL_REFUSE_RAW_DISPATCH_WRITE,
+    CONTROL_REFUSE_NEGATIVE_MAGNITUDE,
+    CONTROL_REFUSE_SERVICE_NOT_PERMITTED,
 )
 
 #: The owner marker: a helper Alpha EMS turns on as the first step of arming and
@@ -1914,7 +1968,14 @@ EXECUTION_REDUCTION_RESERVE: Final = "reserve_limit"
 EXECUTION_REDUCTION_SAFETY: Final = "safety_limited"
 EXECUTION_REDUCTION_TARGET_MET: Final = "target_reached"
 
+#: The Stage-A grid ceiling, or the commissioning tightener below it, has been
+#: reached. Distinct from ``headroom_constraint``: that one is about how much
+#: room is left in the pack, this one about how much energy this plan approved
+#: buying.
+EXECUTION_REDUCTION_BUDGET: Final = "grid_energy_ceiling"
+
 EXECUTION_REDUCTION_REASONS: Final = (
+    EXECUTION_REDUCTION_BUDGET,
     EXECUTION_REDUCTION_NONE,
     EXECUTION_REDUCTION_PV_AHEAD,
     EXECUTION_REDUCTION_HEADROOM,
@@ -1936,8 +1997,15 @@ EXECUTION_STOP_SWITCHED_TO_SHADOW: Final = "user_switched_to_shadow"
 EXECUTION_STOP_SWITCHED_OFF: Final = "user_switched_off"
 EXECUTION_STOP_OWNERSHIP_CONFLICT: Final = "ownership_conflict"
 EXECUTION_STOP_EXECUTION_ERROR: Final = "execution_error"
+#: The approved grid energy for this run has all been bought.
+EXECUTION_STOP_GRID_CEILING: Final = "grid_energy_ceiling"
+#: No valid charge ceiling could be established, so the charge was refused
+#: rather than given a substituted bound. See ``CONTROL_CUTOFF_MIN_PERCENT``.
+EXECUTION_STOP_NO_CHARGE_CEILING: Final = "no_charge_ceiling"
 
 EXECUTION_STOP_REASONS: Final = (
+    EXECUTION_STOP_GRID_CEILING,
+    EXECUTION_STOP_NO_CHARGE_CEILING,
     EXECUTION_STOP_TARGET_REACHED,
     EXECUTION_STOP_WINDOW_ENDED,
     EXECUTION_STOP_STAGE_A_HOLD,

@@ -9,6 +9,181 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.20] - 2026-08-24
+
+**Phase 1 complete. Phase 2 shadow validation build.** The whole Stage-B command
+path now exists, end to end, and is exercised on every refresh: a Stage-A
+`grid_charge` target becomes a carried execution run, becomes actionable when its
+window actually opens, becomes a charge intent, becomes a complete six-step
+AlphaESS command with a positive unsigned magnitude and an upper state-of-charge
+cutoff -- and is then refused, whole, at the final barrier.
+
+**LIVE EXECUTION REMAINS DISABLED.** `CONTROL_EXECUTION_AVAILABLE` is still
+`False`. No command can reach the inverter, by a constant in the source rather
+than by a setting. `applied_kw` is zero, `executed` is false, the owner marker is
+never written and ownership is never acquired.
+
+beta.20 is published for one reason: so at least one complete real `grid_charge`
+window can be observed in shadow, on real hardware, before any Live commissioning
+is considered.
+
+### The defect this release exists to fix
+
+beta.19 shipped a controller that was correct and connected to nothing.
+`request_kw` was computed, published, and read by no one -- the command was built
+from the Phase-3 reserve-guard plan, which never charges. Flipping the barrier
+would have armed a **discharge** while the economic plan asked to buy.
+
+Fixing the wire exposed a second problem that only measurement could find. Ten
+consecutive real refreshes showed the controller stuck in `prepared` for ever,
+because activation is strictly inside the window -- correctly, since arming this
+hardware delivers energy immediately -- while every refresh rebuilds the economic
+horizon from the *next* interval boundary. A freshly published target therefore
+always opens fifteen minutes from now, and can never open its own window.
+
+The run whose window opens is the one accepted a refresh earlier. So Stage B now
+carries it.
+
+### Added
+
+- **Carried execution runs.** Stage B mints its own `run_id`, stable for the life
+  of a run, and Stage A is unchanged. Progress, the cumulative grid attribution
+  and the ownership record all key on it rather than on the publication -- which
+  matters, because Stage A's `plan_id` is `sha256(intent | window_start)` and so
+  churns every fifteen minutes as the horizon rolls. Keying on it would have reset
+  every one of those figures every quarter.
+
+  Each refresh the carried run is *affirmed* if the fresh publication holds a run
+  of the same intent whose window overlaps the accepted one. Rolling movement
+  always overlaps; a campaign Stage A has moved to tonight does not, and the
+  carried run is withdrawn. The accepted window is never moved by a later
+  publication -- that is precisely what makes activation reachable.
+
+  Four bounds keep a carried run short: withdrawal on the first non-affirming
+  refresh, a freshness deadline re-anchored on each affirmation, its own window
+  end, and the grid ceiling. A restart discards the carried run and keeps the
+  ownership record, because those are different questions.
+
+- **A cumulative grid-energy ceiling.** `expected_grid_to_battery_kwh` was parsed
+  and compared against nothing. It is now a hard ceiling, enforced in the terms
+  Stage A published it in: an attribution estimate that credits production first
+  and the grid second, monotonic by construction, accruing nothing across a
+  measurement gap, and attributing more to the grid where readings disagree so the
+  cap binds earlier rather than later.
+
+  Headroom does not cover this. The headroom cap bounds stored energy at window
+  end, not how much of it was bought -- if production disappoints, the ceiling
+  correctly *rises* and the controller would fill it from the grid.
+
+- **A commissioning grid-charge budget** on the Control page, and the
+  execution-enable consent beside it. The budget is a tightener only: zero means
+  the tightener is **off**, never a ban on charging, and it can only ever bind
+  earlier than Stage A's own ceiling.
+
+- **Diagnostics a first Live day can actually be read from.** The Stage-A
+  publication and the carried run are published side by side under different
+  names, because conflating them was the whole bug. Plus the cumulative grid
+  estimate with its cap and remainder, the quantised physical power, and the
+  device's own dispatch readback -- there was previously nothing in that block to
+  compare a request against.
+
+### Fixed
+
+- **Stage B is the command source for a grid charge.** Evaluated before the
+  command is built, so the reserve guard cannot already hold the pending command
+  when the window opens. Everything else keeps the Phase-3 behaviour byte for
+  byte: Stage B returns an intent only for `grid_charge`, and the reserve guard
+  never emits a charge, so the two can never compete for the same action.
+
+- **No activation before the window opens.** Selection still looks one interval
+  ahead -- it must, or nothing is ever selected -- but activation is strictly
+  inside the window, and they are now separate questions asked by separate
+  methods. The pre-window power is no longer diluted across window-plus-lead.
+
+- **The charge cutoff is an upper bound.** It was the configured discharge floor,
+  for both directions: roughly 21 % written as a charge cutoff while the pack sat
+  at 61 %. A charge now takes the applicable ceiling, truncating downward because
+  for an upper bound that is the conservative direction, and a charge with no
+  establishable ceiling is **refused** rather than given a substituted default.
+
+- **Progress accumulates across quarter boundaries.** `QuarterAccumulator` zeroes
+  at every boundary, so reading its open quarter as run progress sawtoothed -- and
+  near a window's end, with a small denominator, asked for about 35 kW. Closed
+  quarters are now accumulated into a run total, and a revision bump no longer
+  re-baselines delivery already made.
+
+- **Ownership can be established, and a run can be stopped.** The ownership
+  evidence was hardcoded to `None`, so `owned` was unreachable and the causal
+  record was never written; `plan_reset` and `plan_release_marker` were defined,
+  tested and never called, so nothing could stop a run or release the marker that
+  arming sets. All of it is wired now: the record is persisted *before* the
+  writes, the marker is released as the *last* step of a stop, and the claim is
+  cleared only once the stop has actually landed -- so an interrupted stop leaves
+  enough evidence to retry rather than dropping to `unproven`, which is never
+  touched again.
+
+- **The write boundary cannot send the wrong direction.** A third interlock
+  validates the planned entity list itself rather than the intention that built
+  it, and refuses a malformed command in full -- there are no partial writes. The
+  cooldown gate is direction-aware; comparing raw kW made a 3 kW charge followed
+  by a 2 kW discharge read as a decrease.
+
+- **A command can no longer name a power the inverter cannot hold.** With no
+  headroom cap in force, a run late in its window asks for
+  `remaining / remaining_hours`, which grows without bound; a real campaign
+  reached 21.68 kW against a 20 kW register. Unclamped, the safety gate refused
+  the command outright -- so a late charge did not run at the maximum, it did not
+  run at all.
+
+- **The export-absorption limit governs a discharge only.** It is the capacity the
+  house can absorb, and its purpose is to stop discharged energy reaching the
+  grid. A charge cannot export, so clamping one against it would have silently
+  under-delivered an approved plan for a reason that does not apply to it.
+
+- **The coordinator survives a failed write.** The send site dereferenced a block
+  that is `None` in every reachable state, and sat outside the safe wrapper -- so
+  the first authorized send would have taken down the whole refresh. `applied_kw`
+  now comes from the power actually written rather than from the request, and a
+  failed write costs the write rather than the refresh loop that would retry it.
+
+- **The dead-man is bounded by the remaining window** as well as by the configured
+  horizon, so a command armed in a window's last quarter no longer carries a
+  timeout that outlives it.
+
+- **Activity no longer says an actuator is missing when one exists.** The
+  capability comparison was computed once, plan-wide, and stamped onto every run,
+  with the sentence *"No actuator in this release can do that"* hard-coded. It is
+  now per run and keyed on the reason that actually fired.
+
+### Honest limits
+
+- **Withdrawal is inferred, not signalled.** Stage A publishes no withdrawal
+  tombstone: a run it has dropped and a run it has rolled forward are both simply
+  absent from the next publication. The overlap test is an inference from
+  instants -- a good one, and deliberately not described as more than that. No
+  prices, no ranking and no second solver were added to Stage B to compensate.
+
+- **The real measured grid attribution has not been observed yet.** Its arithmetic
+  is unit-tested and its monotonicity holds under hostile inputs, but in shadow no
+  energy moves, so its behaviour on real measured production and battery power is
+  a Phase-2 observation rather than something this release proves.
+
+- **A supersession costs one interval.** The old run ends and resets on the
+  refresh that fails to affirm it, and a new one is admitted no earlier than the
+  refresh after -- so a reset always lands before a new claim. That ordering was
+  chosen over admitting and ending together.
+
+### Notes
+
+- Stage A economics are untouched. `economic.py`, `reserve.py`, `policy.py`,
+  `battery.py`, `simulation.py`, `realized.py` and `safety.py` are byte-identical
+  to beta.19.
+- The permitted service set remains closed at **three**. No timer service was
+  added: hardware testing established that deactivating the dispatch stops the
+  action and clears the vendor timer on both control surfaces.
+- The storage version deliberately does not move. beta.19 defined the causal
+  record but never wrote one, so no stored document contains the older shape.
+
 ## [1.0.0-beta.19] - 2026-08-24
 
 **Stage B, the physical execution controller — built, wired in, and executing

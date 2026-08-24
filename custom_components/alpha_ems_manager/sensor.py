@@ -109,7 +109,7 @@ from .const import (
     SENSOR_LEARNING_DAYS,
 )
 from .coordinator import AlphaEmsCoordinator
-from .economic import EconomicOutcome
+from .economic import IMPLEMENTED_ACTIONS, EconomicOutcome
 from .plan import BatteryPlan
 from .reserve import RESERVE_BASIS, shortfall
 from .storage import interval_start_utc
@@ -598,7 +598,13 @@ def _planned_runs(coordinator: AlphaEmsCoordinator) -> tuple[PlannedRun, ...]:
         return ()
 
     tz = dt_util.get_default_time_zone()
-    refused = outcome.capability_gap_reason != ECONOMIC_GAP_NONE
+    # **Per run, computed inside the loop.** This was a single plan-wide verdict
+    # stamped onto every run, so a charge the capability solve executes perfectly
+    # well was labelled refused by a comparison it was never part of. A run whose
+    # own direction has an actuator is not refused, whatever the plan-level
+    # comparison concluded about some other run.
+    gap = outcome.capability_gap_reason
+    plan_refused = gap != ECONOMIC_GAP_NONE
     runs: list[PlannedRun] = []
     for run in outcome.desired.runs:
         start = _economic_instant(plan.target_day, run.start_index, count, tz)
@@ -610,6 +616,10 @@ def _planned_runs(coordinator: AlphaEmsCoordinator) -> tuple[PlannedRun, ...]:
             if run.start_index in outcome.safety_buy_runs
             else run.action
         )
+        # ``run.action`` rather than the display label: a safety buy *is* a charge,
+        # and an actuator exists for it. Testing the label would mark every
+        # reserve-driven buy as impossible.
+        refused = plan_refused and run.action not in IMPLEMENTED_ACTIONS
         runs.append(
             PlannedRun(
                 identity=RunIdentity(
@@ -631,6 +641,7 @@ def _planned_runs(coordinator: AlphaEmsCoordinator) -> tuple[PlannedRun, ...]:
                     price_eur_kwh=run.average_price_eur_kwh,
                     value_eur=-run.marginal_cost_eur,
                     refused=refused,
+                    gap_reason=gap if refused else ECONOMIC_GAP_NONE,
                     window=f"{start:%H:%M}-{end:%H:%M}",
                 ),
             )

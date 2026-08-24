@@ -44,14 +44,20 @@ from .alphaess_adapter import (
 )
 from .alphaess_device import (
     BOOLEAN_EXECUTION_OWNER,
+    FAMILIES,
     build_command,
+    device_power_kw,
     limit_command,
     plan_commands,
+    plan_release_marker,
+    plan_reset,
+    write_refusal,
 )
 from .api import load_forecast_from
 from .battery import INTERVAL_HOURS, BatteryLimits, sanitize_soc_percent
 from .confidence import ConfidenceBreakdown, compute_confidence
 from .const import (
+    ACTION_DISCHARGE,
     BALANCE_MAX_SOURCE_AGE_SECONDS,
     BATTERY_MAX_SOC_PERCENT,
     CONF_ALLOW_BATTERY_EXPORT,
@@ -70,6 +76,7 @@ from .const import (
     CONF_DAILY_HOUSE_LOAD_ENTITY,
     CONF_EV_POWER_ENTITY,
     CONF_FRANK_ENTRY_ID,
+    CONF_GRID_CHARGE_BUDGET_KWH,
     CONF_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     CONF_GRID_POWER_ENTITY,
     CONF_GRID_POWER_SIGN,
@@ -97,6 +104,7 @@ from .const import (
     DEFAULT_CONTROL_EXECUTION_ENABLED,
     DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
     DEFAULT_CONTROL_HORIZON_MINUTES,
+    DEFAULT_GRID_CHARGE_BUDGET_KWH,
     DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     DEFAULT_GRID_POWER_SIGN,
     DEFAULT_MINIMUM_TRADE_GAIN_EUR,
@@ -108,6 +116,7 @@ from .const import (
     INHIBIT_PLAN_UNAVAILABLE,
     LOG_THROTTLE_SECONDS,
     MAX_CONTROL_EVENTS_REPORTED,
+    MAX_SAMPLE_GAP_SECONDS,
     MIN_QUARTER_COVERAGE,
     OWNERSHIP_OWNED,
     PRICE_CROSS_CHECK_DISAGREES,
@@ -160,8 +169,11 @@ from .energy_balance import (
     measure_coherence,
 )
 from .execution import (
+    CarriedRun,
     OwnershipEvidence,
     actionable_target,
+    carry_forward,
+    control_intent_for,
     decide,
     measure_progress,
 )
@@ -406,6 +418,9 @@ class SourceConfig:
     #: Read, and deliberately absent from the options form while the release
     #: barrier makes it unable to change anything.
     control_execution_enabled: bool
+    #: A ceiling, in kWh, on grid energy one Live charge run may buy. Zero means
+    #: the commissioning tightener is off, never that charging is forbidden.
+    grid_charge_budget_kwh: float
     #: Phase-8 economic settings. One threshold and two opt-ins, and all three
     #: are in the form because all three change the *published plan* -- unlike
     #: the execution flag above, which cannot change anything in this release.
@@ -468,6 +483,10 @@ class SourceConfig:
             control_export_margin_percent=_number(
                 value(CONF_CONTROL_EXPORT_MARGIN_PERCENT),
                 DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
+            ),
+            grid_charge_budget_kwh=_number(
+                value(CONF_GRID_CHARGE_BUDGET_KWH),
+                DEFAULT_GRID_CHARGE_BUDGET_KWH,
             ),
             control_execution_enabled=bool(
                 value(
@@ -583,6 +602,80 @@ def _solve_economic(
         reserve_above_capacity_kwh=reserve_above_capacity_kwh,
         table_ms=table_ms,
         bucket_rule=bucket_rule,
+    )
+
+
+def _execution_block(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the execution block, or ``None`` when there is nothing usable.
+
+    Every reader goes through here. beta.19 dereferenced
+    ``report["execution"]["power"]["requested_kw"]`` directly, and ``power`` is
+    ``None`` for every Stage-B state reachable today -- so the first authorized
+    send would have raised inside a call sitting *outside* the safe wrapper and
+    taken the whole refresh down with it.
+    """
+    if not isinstance(report, dict):
+        return None
+    block = report.get("execution")
+    return block if isinstance(block, dict) else None
+
+
+def _mark_execution_error(report: dict[str, Any] | None, reason: str) -> None:
+    """Record an execution error without assuming the report is well-formed."""
+    block = _execution_block(report)
+    if block is None:
+        return
+    result = block.get("result")
+    if not isinstance(result, dict):
+        result = {}
+        block["result"] = result
+    result["execution_error"] = reason
+
+
+def _mark_execution_applied(
+    report: dict[str, Any] | None, applied_kw: float | None
+) -> None:
+    """Record what was actually written, defensively.
+
+    A malformed or partial report degrades to doing nothing rather than raising:
+    the figures are diagnostics, and losing one is a cost worth paying to keep the
+    coordinator loop alive.
+    """
+    block = _execution_block(report)
+    if block is None:
+        return
+    power = block.get("power")
+    if not isinstance(power, dict):
+        power = {}
+        block["power"] = power
+    power["applied_kw"] = 0.0 if applied_kw is None else float(applied_kw)
+    power["executed"] = True
+
+
+def _dispatch_start_instant(snapshot: Any, now: datetime) -> datetime | None:
+    """Return the device's dispatch start as an instant, or ``None``.
+
+    The AlphaESS surface publishes a numeric register, not a timestamp, while the
+    ownership comparison works in instants -- passing the raw float through would
+    have raised on the subtraction. There is no calendar in that register to
+    recover, so what is compared is *the reading itself*: the record stores
+    whatever the register said when the command was written, and ownership requires
+    the live register to still say the same thing.
+
+    Represented as an instant offset from the day's start so the existing tolerance
+    comparison works unchanged, and so a register that resets cannot silently
+    match. A missing or zero reading yields ``None``, which the ownership rule
+    treats as "no evidence" rather than as agreement.
+    """
+    if snapshot is None:
+        return None
+    raw = getattr(snapshot, "dispatch_start", None)
+    if raw is None or not isinstance(raw, (int, float)) or raw != raw:
+        return None
+    if raw <= 0:
+        return None
+    return now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
+        seconds=float(raw)
     )
 
 
@@ -812,8 +905,43 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: window it belongs to. Session-scoped: after a restart progress is
         #: reconstructed from the persisted state-of-charge series instead, which
         #: is the only basis that survives one.
-        self._execution_window: tuple[str, int] | None = None
+        #: Which plan the delivered-energy total belongs to.
+        #:
+        #: The **run id**, which is minted by Stage B and stable for the life of
+        #: the run. Two earlier keys were both wrong, and in opposite directions:
+        #: beta.19 used ``(plan_id, revision)``, so a revision bump discarded
+        #: delivery already made and the controller re-demanded energy already in
+        #: the pack; ``plan_id`` alone then looked right but churns every refresh
+        #: as the horizon rolls, which would have reset these figures every quarter
+        #: and brought the sawtooth back by a different route.
+        #:
+        #: A revision moves the target; it does not un-deliver the kilowatt-hours.
+        #: Neither does the horizon advancing.
+        self._execution_run: str | None = None
         self._execution_window_start_kwh: float | None = None
+        #: Delivered battery energy in *closed* quarters of this window.
+        #:
+        #: Kept here because ``QuarterAccumulator`` zeroes at every boundary --
+        #: ``open_energy_kwh`` is one quarter, never a run. beta.19 read it as
+        #: cumulative progress, which sawtoothed and near a window's end asked for
+        #: about 35 kW.
+        self._execution_closed_kwh: float = 0.0
+        #: Grid energy attributed to charging this pack, this window. An estimate
+        #: from the measured balance, monotonic by construction.
+        self._execution_grid_kwh: float = 0.0
+        #: Instant of the last attribution sample, so gaps can be detected.
+        self._grid_attribution_at: datetime | None = None
+        #: The most recent Stage B decision, so the command and the published
+        #: report describe the same refresh.
+        self._stage_b_decision: Any = None
+        #: The Stage-A target Stage B has accepted and is carrying, if any.
+        #:
+        #: Deliberately **not** persisted. A carried run is a prediction admitted
+        #: before the restart and Stage A republishes within one refresh, so
+        #: resuming one would buy at most a single interval and inherit a whole
+        #: class of stale-resume risk. The ownership *record* is persisted, because
+        #: not abandoning a live dispatch is a different question.
+        self._carried: CarriedRun | None = None
         #: Session-scoped balance tally and debounce state. Not persisted:
         #: a restart must not inherit a failure run that may already be over.
         self.balance = BalanceMonitor()
@@ -868,6 +996,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: What this refresh would send, held only for the single send site.
         self._pending_commands: tuple[Any, ...] = ()
         self._pending_power_kw: float | None = None
+        #: The command and the device reading the pending steps were built from,
+        #: held for the same reason the steps are: the causal record has to be
+        #: written from what was *decided*, at the instant of writing, and the send
+        #: site is the only place that ordering can be honoured.
+        self._pending_command: Any = None
+        self._pending_snapshot: Any = None
+        #: Whether the pending steps stop a run rather than start one. A reset must
+        #: never write a claim of ownership.
+        self._pending_is_reset: bool = False
         #: What of the Solcast boundary was found on the last refresh, and what it
         #: said. Held for diagnostics so a user can see which sites exist, which
         #: are selected and which selected one has gone missing -- without a
@@ -1219,9 +1356,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # ``open_energy_kwh``, which is the only way to know progress inside a
             # quarter rather than after it.
             power = self._canonical_battery_power_w()
-            self._battery_charge_accumulator.add_sample(
-                moment, None if power is None else max(0.0, power)
-            )
+            charge_w = None if power is None else max(0.0, power)
+            for closed in self._battery_charge_accumulator.add_sample(moment, charge_w):
+                # Closed quarters are added to the window total rather than
+                # discarded. This is the whole of the sawtooth fix: progress is
+                # closed quarters plus the open one, for the same plan.
+                self._execution_closed_kwh += max(0.0, closed.energy_kwh)
+            self._accrue_grid_attribution(moment, charge_w)
 
         self._ingest(
             house_results,
@@ -2153,7 +2294,146 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.store.schedule_save()
 
     @callback
-    def _execution_progress(self, target: Any, plan: Any) -> Any:
+    def _stage_b_intent(self, *, plan: Any, now: datetime) -> Any:
+        """Return the ``ControlIntent`` Stage B wants, or ``None``.
+
+        ``None`` for everything that is not an executable grid charge inside its
+        window, which is what leaves the reserve-guard path untouched. The last
+        Stage-B decision is reused rather than recomputed, so the intent and the
+        published diagnostics describe the same refresh.
+        """
+        decision = self._stage_b_decision
+        if decision is None or plan is None or plan.state is None:
+            return None
+        day = getattr(plan, "target_day", None)
+        index = getattr(plan, "start_index", None)
+        if day is None or index is None:
+            return None
+        return control_intent_for(
+            decision,
+            floor_soc_percent=plan.reserve.configured_min_soc_percent,
+            # The pack's own maximum, and the only ceiling there is. If it cannot
+            # be read the device layer refuses the charge rather than substituting
+            # the discharge floor or a constant.
+            ceiling_soc_percent=plan.state.limits.max_soc_percent,
+            horizon_minutes=self.config.control_horizon_minutes,
+            target_day=day,
+            start_index=int(index),
+            built_at=now,
+        )
+
+    @callback
+    def _owned_run_id(self) -> str | None:
+        """Return the run a persisted causal record claims, if any."""
+        record = self.store.execution_record
+        if not isinstance(record, dict):
+            return None
+        run_id = record.get("run_id")
+        return run_id if isinstance(run_id, str) and run_id else None
+
+    @callback
+    def _write_execution_record(
+        self, run: Any, command: Any, snapshot: Any, now: datetime
+    ) -> None:
+        """Persist the causal record for a dispatch about to be armed.
+
+        Written **before** the writes, so a failure mid-sequence leaves a record
+        beside a marker and no dispatch -- recognisable, and clearable. The
+        alternative ordering would leave a dispatch running that nothing could
+        prove was ours.
+
+        It records what was intended and what the device said at the moment of
+        writing. Ownership is only granted later, when a subsequent readback shows
+        a dispatch whose start instant matches -- so this cannot claim a dispatch
+        Alpha EMS did not cause.
+        """
+        observed = _dispatch_start_instant(snapshot, now)
+        self.store.execution_record = {
+            # The run identity, so the record still names the right run after the
+            # horizon has rolled several times and every published ``plan_id`` has
+            # changed. The admitting publication is kept beside it for tracing.
+            "run_id": run.run_id,
+            "plan_id": run.plan_id,
+            "revision": run.revision,
+            "intent": run.intent,
+            "power_kw": None if command is None else command.power_kw,
+            "cutoff_soc_percent": (
+                None if command is None else command.cutoff_soc_percent
+            ),
+            "duration_minutes": None if command is None else command.duration_minutes,
+            "written_at": now.isoformat(),
+            "dispatch_start": None if observed is None else observed.isoformat(),
+        }
+        self.store.schedule_save()
+
+    @callback
+    def _clear_execution_record(self) -> None:
+        """Forget the causal record. Called when an owned run is reset."""
+        if self.store.execution_record is None:
+            return
+        self.store.execution_record = None
+        self.store.schedule_save()
+
+    @callback
+    def _accrue_grid_attribution(
+        self, moment: datetime, charge_w: float | None
+    ) -> None:
+        """Accumulate grid energy attributed to charging the pack.
+
+        **An attribution estimate, not a metered channel.** No such channel exists:
+        the meter reports one net figure and cannot say which electron reached the
+        battery. So the pack's charge is attributed to production surplus first and
+        the grid second --
+
+            pv_surplus = max(0, pv - house load)
+            grid_share = max(0, battery charge - pv_surplus)
+
+        -- which is :func:`split_grid_energy`'s arithmetic inverted, over the same
+        measured quantities, in the same order Stage A used to compute
+        ``marginal_grid_import_kwh``. So the ceiling is enforced in the terms it was
+        published in.
+
+        This must be measured in **grid** energy rather than battery energy.
+        Measured on the real installation, commanding 1.0 kW produced 1.135 kW of
+        *total* battery charge while production was already supplying part of it --
+        the helper commands the total rate and subsumes ambient charging. Counting
+        battery energy would charge the sun against a grid allowance.
+
+        Four defensive properties, each deliberate:
+
+        * **monotonic** -- every increment is ``max(0, ...) * dt >= 0``, so a
+          spuriously high production reading can only reduce an increment to zero,
+          never below, and the total can never fall;
+        * **gaps accrue nothing** -- the same tolerance ``QuarterAccumulator``
+          uses; a silence longer than that contributes no energy rather than
+          extrapolating the last reading across it;
+        * **conservative on disagreement** -- where the readings are incoherent the
+          production surplus is taken as *zero*, attributing more to the grid, so
+          the ceiling binds earlier. A budget exists to bound buying;
+        * **reset only at the plan boundary**, never per quarter and never on a
+          revision bump.
+        """
+        previous = self._grid_attribution_at
+        self._grid_attribution_at = moment
+        if previous is None or charge_w is None:
+            return
+        seconds = (moment - previous).total_seconds()
+        if seconds <= 0.0 or seconds > MAX_SAMPLE_GAP_SECONDS:
+            # Out of order, or a silence too long to integrate across.
+            return
+        pv_w = self._read_pv_power_w()
+        load_w = self._read_house_load_w()
+        if pv_w is None or load_w is None:
+            # Incoherent inputs: attribute the whole charge to the grid, which is
+            # the conservative direction for a ceiling on buying.
+            surplus_w = 0.0
+        else:
+            surplus_w = max(0.0, pv_w - load_w)
+        grid_w = max(0.0, charge_w - surplus_w)
+        self._execution_grid_kwh += grid_w * seconds / 3_600_000.0
+
+    @callback
+    def _execution_progress(self, run_id: str, plan: Any) -> Any:
         """Return delivered battery energy inside ``target``'s window.
 
         Two bases, because neither alone is enough. The accumulator integrates
@@ -2167,13 +2447,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         and a clamp, a limit, a cloud or a full pack each make it a different
         number from what arrived.
         """
-        window = (target.plan_id, target.revision)
         stored = None if plan is None or plan.state is None else plan.state.energy_kwh
-        if self._execution_window != window:
-            # A new run, or a revision that moved the target. Progress restarts
-            # from here rather than carrying a previous run's delivery.
-            self._execution_window = window
+        if self._execution_run != run_id:
+            # A genuinely different run -- not merely a new publication of this one,
+            # and not a revision. Energy already in the pack is not un-delivered by
+            # either.
+            self._execution_run = run_id
             self._execution_window_start_kwh = stored
+            self._execution_closed_kwh = 0.0
+            self._execution_grid_kwh = 0.0
             if self._battery_charge_accumulator is not None:
                 self._battery_charge_accumulator.reset()
 
@@ -2182,8 +2464,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._battery_charge_accumulator is not None:
             accumulator = self._battery_charge_accumulator
             if accumulator.started:
-                accumulated = accumulator.open_energy_kwh
+                # Closed quarters plus the quarter in flight. Reading the open
+                # quarter alone is what sawtoothed.
+                accumulated = self._execution_closed_kwh + accumulator.open_energy_kwh
                 coverage = accumulator.open_coverage
+            else:
+                accumulated = self._execution_closed_kwh or None
 
         soc_delta = None
         opening = self._execution_window_start_kwh
@@ -2235,6 +2521,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         the arithmetic, so the power computed here is the power a Live refresh
         would compute from the same inputs.
         """
+        # Carry-forward first, because everything below is keyed on its verdict.
+        # This reads *this* refresh's targets -- the ordering pinned in beta.19 --
+        # so the run being evaluated is never a refresh behind the publication that
+        # affirmed it.
+        outcome = carry_forward(self._carried, self.execution_targets, now)
+        self._carried = outcome.carried
+        carried = outcome.carried
         evidence = OwnershipEvidence(
             dispatch_active=bool(snapshot is not None and snapshot.dispatch_active),
             # A marker that does not exist is not a marker that is off: without it
@@ -2242,14 +2535,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # as foreign rather than as free.
             marker_on=bool(snapshot is not None and snapshot.owner_marker),
             record=self.store.execution_record,
-            dispatch_start=None,
-            plan_id=None,
+            # Supplied since beta.20. Both were hardcoded ``None``, which made
+            # ``record_matches`` permanently false and ``owned`` unreachable -- so
+            # the continuation relaxation added in beta.19 could never fire, and
+            # Alpha EMS would have inhibited itself the moment it armed anything.
+            dispatch_start=_dispatch_start_instant(snapshot, now),
+            run_id=None if carried is None else carried.run_id,
         )
-        target = actionable_target(self.execution_targets, now)
         progress = (
             measure_progress(accumulated_kwh=None, soc_delta_kwh=None)
-            if target is None
-            else self._execution_progress(target, plan)
+            if carried is None
+            else self._execution_progress(carried.run_id, plan)
         )
         decision = decide(
             # Shadow and off are both non-executing; only ``active`` would send.
@@ -2263,10 +2559,20 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 None if plan is None or plan.state is None else plan.state.energy_kwh
             ),
             remaining_expected_pv_kwh=(
-                None if target is None else self._remaining_expected_pv_kwh(target, now)
+                None
+                if carried is None
+                else self._remaining_expected_pv_kwh(carried.target, now)
             ),
-            running_plan_id=None,
+            grid_charged_kwh=self._execution_grid_kwh,
+            configured_budget_kwh=self.config.grid_charge_budget_kwh,
+            running_run_id=self._owned_run_id(),
+            carried=carried,
+            carry_ended=outcome.ended,
+            ended_run=outcome.ended_run,
         )
+        # Held so ``_stage_b_intent`` builds from the same decision this report
+        # describes, rather than deciding twice and risking a disagreement.
+        self._stage_b_decision = decision
         report = execution_as_dict(decision, mode=mode, executed=False)
         report["actual_balance"] = self._execution_actuals(plan)
         report["safety"] = {
@@ -2281,6 +2587,56 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "ownership_marker": None if snapshot is None else snapshot.owner_marker,
             "record_present": self.store.execution_record is not None,
             "record_matches": evidence.record_matches,
+        }
+        # What the request becomes on the wire, and the device's own account of
+        # what it is doing. There was previously **nothing** in this block to
+        # compare a request against, so a Live day could not be read.
+        power = report.get("power")
+        if isinstance(power, dict):
+            power["quantised_physical_power_kw"] = device_power_kw(
+                max(0.0, decision.request_kw) * INTERVAL_HOURS, INTERVAL_HOURS
+            )
+        report["device_readback"] = {
+            "dispatch_active": None if snapshot is None else snapshot.dispatch_active,
+            "dispatch_mode": getattr(snapshot, "dispatch_mode", None),
+            "dispatch_power_w": getattr(snapshot, "dispatch_power_w", None),
+            "dispatch_time_s": getattr(snapshot, "dispatch_start", None),
+            "commanded_duration_minutes": self.config.control_horizon_minutes,
+            "owner_marker": None if snapshot is None else snapshot.owner_marker,
+            "rule": (
+                "the raw dispatch surface reads signed: negative power is a "
+                "charge. it is a readback and never an input to a command, "
+                "because the helper families Alpha EMS writes take an unsigned "
+                "magnitude with direction carried by the family"
+            ),
+        }
+        latest = actionable_target(self.execution_targets, now)
+        report["carried"] = {
+            # **The whole bug was conflating these two**, so they are published
+            # together and named differently. The publication is what Stage A said
+            # this refresh; the run is what Stage B accepted and is executing.
+            "publication": None
+            if latest is None
+            else {
+                "plan_id": latest.plan_id,
+                "intent": latest.intent,
+                "window_start": latest.window_start.isoformat(),
+                "window_end": latest.window_end.isoformat(),
+            },
+            "run": None if carried is None else carried.as_dict(),
+            "affirmed_by_this_publication": outcome.affirmed,
+            "admitted_this_refresh": outcome.admitted,
+            "ended_reason": outcome.ended,
+            "window_open": None if carried is None else carried.actionable_at(now),
+            "rule": (
+                "a published target always opens one interval from now, so the run "
+                "whose window opens is the one admitted a refresh earlier. the "
+                "admitted window is never moved by a later publication -- that is "
+                "what makes activation reachable. a publication of the same intent "
+                "whose window overlaps the accepted one re-affirms it; anything "
+                "else withdraws it. this is an inference from instants, not a "
+                "cancellation signal, because the contract carries none"
+            ),
         }
         report["last_successful_write"] = (
             None
@@ -3617,21 +3973,76 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         commands = self._pending_commands
         if not commands:  # pragma: no cover - defensive
             return
+        # **Before the writes, and the ordering is the point.** The record is the
+        # second of the two ownership factors, and writing it afterwards would leave
+        # a window in which a dispatch is running that nothing can prove Alpha EMS
+        # caused. Written first, a failure mid-sequence leaves a record beside a
+        # marker and no dispatch -- which the ownership rule already reads as stale,
+        # and which the marker release can clear.
+        #
+        # It is a *claim*, not a grant: ownership still requires a later readback
+        # whose ``dispatch_start`` matches, so this cannot appropriate a dispatch
+        # somebody else started. And never for a reset, which ends a run rather
+        # than beginning one.
+        run = self._carried
+        claiming = run is not None and not self._pending_is_reset
+        if claiming:
+            self._write_execution_record(
+                run, self._pending_command, self._pending_snapshot, now
+            )
         try:  # pragma: no cover - the barrier makes this unreachable
             await async_execute(self.hass, commands)
         except ControlExecutionUnavailable:
             # The expected outcome while the barrier stands, and recorded rather
             # than swallowed: a release that believes it sent something is worse
             # than one that knows it could not.
-            report["execution"]["result"]["execution_error"] = "execution_unavailable"
+            #
+            # The claim is withdrawn rather than left behind. The barrier refuses
+            # before the first service call, so this cannot discard a record for a
+            # dispatch that did start.
+            if claiming:
+                self._clear_execution_record()
+            _mark_execution_error(report, "execution_unavailable")
+        except Exception:
+            # **A failed write costs the write, never the refresh.** The send site
+            # sits outside ``_build_control_report_safely`` -- it has to, because it
+            # is the one place awaiting the adapter -- so without this an
+            # unavailable helper or a rejected value would take down the whole
+            # coordinator update.
+            #
+            # That is worse than losing one command, because the refresh loop is
+            # what would *retry*. A stop interrupted partway leaves the dispatch
+            # possibly still running, and recovering from it needs another refresh
+            # to come round, read ``owned`` again and re-send the reset.
+            #
+            # **The claim is deliberately left in place.** ``plan_reset`` releases
+            # the marker as its last step, so an interrupted stop leaves marker on
+            # and record intact -- which reads as ``owned`` next refresh and
+            # re-attempts the stop. Clearing it here would drop to ``unproven``,
+            # and an unproven dispatch is never touched again.
+            _LOGGER.exception(
+                "A control command could not be sent. Ownership evidence has been "
+                "left intact so the next refresh can retry"
+            )
+            _mark_execution_error(report, "write_failed")
         else:
             report["state"] = CONTROL_STATE_EXECUTED
-            report["execution"]["power"]["applied_kw"] = report["execution"]["power"][
-                "requested_kw"
-            ]
-            report["execution"]["power"]["executed"] = True
+            # **From the power actually written**, not from Stage B's request.
+            # beta.19 copied ``requested_kw`` here, so the report would have
+            # asserted one figure while a different one was on the wire -- and it
+            # dereferenced a block that is ``None`` in every state reachable
+            # today, which would have failed the whole refresh.
+            _mark_execution_applied(report, self._pending_power_kw)
             self._last_control_write = now
             self._last_control_power_kw = self._pending_power_kw
+            # **The claim is released only once the stop has actually landed.**
+            # Clearing it while building the report would have been simpler and
+            # would abandon a dispatch that is still running: with the record gone
+            # but the marker on, ownership reads ``unproven``, and an unproven
+            # dispatch is never touched again -- so a failed reset would latch the
+            # run on permanently, which is the very fault F16 named.
+            if self._pending_is_reset:
+                self._clear_execution_record()
 
     def _build_control_report_safely(
         self,
@@ -3731,9 +4142,27 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif not plan.decision.decided:
             problem = INHIBIT_NO_DECISION
 
-        intent = translate(
-            plan, now=now, horizon_minutes=self.config.control_horizon_minutes
-        )
+        # Stage B first, because for a grid charge it is the authority. Computed
+        # before the command so its intent can *be* the command.
+        stage_b = self._stage_b_report(plan=plan, snapshot=snapshot, now=now, mode=mode)
+        owned = stage_b.get("ownership", {}).get("state") == OWNERSHIP_OWNED
+        charge_intent = self._stage_b_intent(plan=plan, now=now)
+
+        # **The command source, and the one place it is decided.**
+        #
+        # Stage B drives a grid charge; everything else keeps the Phase-3
+        # reserve-guard behaviour byte-for-byte. Two sources never compete for the
+        # same action: Stage B returns an intent only for ``grid_charge``, and the
+        # reserve guard never emits a charge at all.
+        #
+        # Until beta.20 the command was always the reserve-guard one, so Stage B's
+        # power reached no actuator and opening the barrier would have armed a
+        # discharge while the economic plan asked to buy.
+        intent = charge_intent
+        if intent is None:
+            intent = translate(
+                plan, now=now, horizon_minutes=self.config.control_horizon_minutes
+            )
         requested = build_command(intent) if intent is not None else None
 
         # One context, read once, describing the *requested* command. The export
@@ -3762,17 +4191,49 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             today_interval_count=today_interval_count,
             command=requested,
         )
-        # Stage B, before the gate: its ownership verdict is what lets an owned
-        # dispatch stop inhibiting Alpha EMS, and its request is what a command
-        # would be built from. It computes and returns; it sends nothing.
-        stage_b = self._stage_b_report(plan=plan, snapshot=snapshot, now=now, mode=mode)
-        owned = stage_b.get("ownership", {}).get("state") == OWNERSHIP_OWNED
         context = replace(context, dispatch_owned=owned)
         safe_power_kw = safe_discharge_power_kw(context)
-        command = None if requested is None else limit_command(requested, safe_power_kw)
+        # **The bound is an export bound, so it governs a discharge only.** It is
+        # the capacity the house can absorb, and its whole purpose is to stop
+        # discharged energy reaching the grid. A charge cannot export, so clamping
+        # one against it would cut a 4.3 kW charge to whatever the house happened to
+        # be drawing -- silently under-delivering an approved plan for a reason that
+        # does not apply to it.
+        #
+        # ``safety.evaluate`` already draws this line for the meter reading it needs
+        # ("only a discharge can export"); the clamp did not, which is the same
+        # direction-blindness the cooldown gate had. Discharge behaviour is
+        # unchanged, byte for byte.
+        command = requested
+        if requested is not None and requested.action == ACTION_DISCHARGE:
+            command = limit_command(requested, safe_power_kw)
         if command is not None and command is not requested:
             context = replace(context, device_power_kw=command.power_kw)
         commands = plan_commands(command) if command is not None else ()
+        # Layer 3 of the direction interlock: checked against the entity list
+        # itself, not against the intention that built it. A malformed command is
+        # refused whole -- there are no partial writes.
+        refusal = None if command is None else write_refusal(command, commands)
+        if refusal is not None:
+            commands = ()
+        stage_b["write_boundary"] = {
+            "refusal": refusal,
+            "action": None if command is None else command.action,
+            "family": (
+                None
+                if command is None or command.action not in FAMILIES
+                else FAMILIES[command.action].activate
+            ),
+            "steps": [step.as_dict() for step in commands],
+            "source": "stage_b" if charge_intent is not None else "reserve_guard",
+            "rule": (
+                "direction is the helper family and the magnitude is unsigned. the "
+                "raw dispatch surface takes signed power with the opposite "
+                "convention and is never written. a command naming the other "
+                "family, the raw surface, a negative magnitude or an unpermitted "
+                "service is refused in full"
+            ),
+        }
 
         verdict = evaluate(intent, context)
         starts_or_increases = (
@@ -3794,6 +4255,30 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if verdict.safe:
             state = CONTROL_STATE_ELIGIBLE if commands else CONTROL_STATE_IDLE
 
+        # F5/F16: the stop path. ``plan_reset`` and ``plan_release_marker`` were
+        # written in beta.19 and never called, so nothing could stop an owned run
+        # or release the marker that arming sets -- it would have latched on.
+        #
+        # Only ever for a dispatch ownership has been *established* for. A foreign
+        # or unproven one is never reset, and a stale marker is released on its
+        # own, which is the one write that is safe without a claim.
+        result = stage_b.get("result") or {}
+        if owned and result.get("reset_required"):
+            action = (stage_b.get("write_boundary") or {}).get("action")
+            commands = plan_reset(action if isinstance(action, str) else "")
+            stage_b["write_boundary"] = {
+                **(stage_b.get("write_boundary") or {}),
+                "steps": [step.as_dict() for step in commands],
+                "source": "stage_b_reset",
+            }
+        elif not owned and (stage_b.get("ownership") or {}).get("clear_stale_marker"):
+            commands = plan_release_marker()
+            stage_b["write_boundary"] = {
+                **(stage_b.get("write_boundary") or {}),
+                "steps": [step.as_dict() for step in commands],
+                "source": "stale_marker_release",
+            }
+
         self._record_control_event(now, state, verdict, decision)
         # Held for the one async method that would send them. Not published and
         # not read anywhere else: the report already carries the step list for
@@ -3801,6 +4286,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # path to the inverter.
         self._pending_commands = commands
         self._pending_power_kw = None if command is None else command.power_kw
+        self._pending_command = command
+        self._pending_snapshot = snapshot
+        self._pending_is_reset = (stage_b.get("write_boundary") or {}).get(
+            "source"
+        ) in ("stage_b_reset", "stale_marker_release")
 
         return {
             "mode": mode,

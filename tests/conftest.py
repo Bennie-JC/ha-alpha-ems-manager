@@ -26,6 +26,9 @@ from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
 )
 
+from custom_components.alpha_ems_manager.alphaess_device import (
+    PERMITTED_SERVICES,
+)
 from custom_components.alpha_ems_manager.const import (
     CONF_BATTERY_CAPACITY_KWH,
     CONF_BATTERY_MAX_CHARGE_KW,
@@ -162,6 +165,33 @@ CONTROL_SURFACE_AT_REST: dict[str, object] = {
     "sensor.alphaess_dispatch_time": 90,
     "sensor.alphaess_max_feed_to_grid": 100,
 }
+
+
+@pytest.fixture
+def writes(hass: HomeAssistant) -> list:
+    """Capture every call to a service this integration may make.
+
+    Real handlers are registered, so a write would *land* rather than raise. That
+    ordering matters: with no handler an attempted call could be mistaken for an
+    absent service and a zero-write assertion would pass for the wrong reason.
+
+    The owner marker is written through ``input_boolean.turn_on``, which is already
+    in the permitted set -- so an acquisition Shadow should never make shows up here
+    as a recorded call rather than as an error somewhere else.
+
+    Shared from ``conftest`` because more than one module needs it and the
+    alternative was importing a fixture across test modules, which shadows the name
+    it binds.
+    """
+    calls: list = []
+
+    async def record(call) -> None:
+        calls.append(call)
+
+    for domain, service in PERMITTED_SERVICES:
+        hass.services.async_register(domain, service, record)
+    assert len(set(PERMITTED_SERVICES)) == 3
+    return calls
 
 
 @pytest.fixture

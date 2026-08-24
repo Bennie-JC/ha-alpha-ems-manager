@@ -19,15 +19,19 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.19` — a public beta.**
+> **Current release: `1.0.0-beta.20` — a public beta.**
 >
-> Stage A is feature-complete and Stage B — the physical execution controller — is
-> built and running in shadow, covered by 3073 automated tests. **Nothing is
-> executed:** no command can reach the inverter in this release, by a constant in
-> the source rather than by a setting. The learning and forecast model has still
-> **not** been validated across enough real-world complete days to be called
-> stable. Treat it as something to run and observe, not yet as something to depend
-> on.
+> Stage A is feature-complete. Stage B — the physical execution controller — is now
+> wired end to end: it builds the complete AlphaESS charge command, checks it, and
+> is refused at the final barrier. Covered by 3137 automated tests.
+>
+> **Nothing is executed.** No command can reach the inverter in this release, by a
+> constant in the source rather than by a setting. `applied_kw` is zero, `executed`
+> is false, and the owner marker is never written.
+>
+> The learning and forecast model has still **not** been validated across enough
+> real-world complete days to be called stable. Treat it as something to run and
+> observe, not yet as something to depend on.
 >
 > It is safe in one important respect: it never writes to your inverter, never
 > issues a charge or discharge command, and cannot change how your system
@@ -64,7 +68,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.19` is not offered.
+     dialog if `1.0.0-beta.20` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -472,6 +476,31 @@ Every planned run appears in the `economic_plan` block of a diagnostics download
 with all five energy boundaries stated separately — the two battery-side AC
 figures, the two grid-side ones, and the curtailment — because every euro in the
 payload is priced on grid energy and a reader has to be able to check that.
+
+**A note on upgrading to beta.20: the command exists now, and is still not
+sent.**
+
+beta.19 built the controller and connected it to nothing — its power reached no
+actuator, and the command was still being built from the reserve-guard plan, which
+never charges. beta.20 connects it. A `grid_charge` target now becomes a real
+six-step AlphaESS command with a positive charge power and an upper state-of-charge
+cutoff, and that command is then refused, whole, at the barrier.
+
+The difference matters when you read the diagnostics. Before, there was no command
+to look at. Now there is one, and `applied_kw` is still `0.0`.
+
+**What to watch for in shadow.** The `execution` block publishes the Stage-A
+publication and the carried run side by side. Stage A's `plan_id` changes every
+fifteen minutes — that is the rolling horizon, not a new plan — while the carried
+`run_id` should stay the same for the whole of a charge window. If you see the
+`run_id` changing every quarter, or the revision counting upward every refresh,
+that is a bug worth reporting.
+
+One behaviour is deliberate and looks odd at first: while a charge is fifteen
+minutes away the controller reports `prepared` and the reserve guard may still be
+discharging to cover the house. At the window boundary Stage B takes over. That
+direction reversal is existing reserve-guard behaviour, and whether it should
+change is a question for real data rather than for a guess.
 
 **A note on upgrading to beta.19: the controller exists now, and still sends
 nothing.**

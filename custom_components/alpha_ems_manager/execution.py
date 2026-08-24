@@ -50,11 +50,16 @@ bring it down. Both are true at once, and neither is the other.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
+from .battery import INTERVAL_HOURS
 from .const import (
+    ACTION_CHARGE,
+    ECONOMIC_BUCKET_KWH,
+    ECONOMIC_FINGERPRINT_CHARS,
     EXECUTION_BASIS_ACCUMULATED,
     EXECUTION_BASIS_BOTH,
     EXECUTION_BASIS_SOC_DELTA,
@@ -66,6 +71,7 @@ from .const import (
     EXECUTION_QUALITY_PARTIAL,
     EXECUTION_QUALITY_RECONSTRUCTED,
     EXECUTION_QUALITY_UNAVAILABLE,
+    EXECUTION_REDUCTION_BUDGET,
     EXECUTION_REDUCTION_HEADROOM,
     EXECUTION_REDUCTION_NONE,
     EXECUTION_REDUCTION_PV_AHEAD,
@@ -73,9 +79,11 @@ from .const import (
     EXECUTION_STATE_ARMED,
     EXECUTION_STATE_IDLE,
     EXECUTION_STATE_INHIBITED,
+    EXECUTION_STATE_PREPARED,
     EXECUTION_STATE_RUNNING,
     EXECUTION_STATE_STOPPING,
     EXECUTION_STATE_UNPROVEN,
+    EXECUTION_STOP_GRID_CEILING,
     EXECUTION_STOP_PLAN_REPLACED,
     EXECUTION_STOP_STAGE_A_HOLD,
     EXECUTION_STOP_STALE_PLAN,
@@ -83,11 +91,13 @@ from .const import (
     EXECUTION_STOP_SWITCHED_TO_SHADOW,
     EXECUTION_STOP_TARGET_REACHED,
     EXECUTION_STOP_WINDOW_ENDED,
+    EXECUTION_TARGET_STALE_MINUTES,
     OWNERSHIP_FOREIGN,
     OWNERSHIP_NONE,
     OWNERSHIP_OWNED,
     OWNERSHIP_UNPROVEN,
 )
+from .control import ControlIntent
 
 #: How close to the target counts as reaching it, in kWh.
 #:
@@ -116,6 +126,17 @@ ACTIONABLE_LEAD_MINUTES: float = 15.0
 #: behaviour, so an exact match is not available. Kept tight: this is a
 #: corroborating condition, and a loose one would corroborate anything.
 OWNERSHIP_START_TOLERANCE_SECONDS: float = 120.0
+
+#: Characters of the run identity. Same width as a publication id, so the two are
+#: visually comparable in a diagnostics download without being confusable.
+RUN_ID_CHARS: int = ECONOMIC_FINGERPRINT_CHARS
+
+#: Fallback freshness, in minutes, when a publication carries no deadline.
+STALE_MINUTES: float = float(EXECUTION_TARGET_STALE_MINUTES)
+
+#: What counts as a material move in an executable figure, in kWh. One
+#: state-space bucket -- the same deadband the publication layer uses.
+BUCKET_KWH: float = ECONOMIC_BUCKET_KWH
 
 
 def _finite(value: Any) -> float | None:
@@ -165,9 +186,15 @@ class OwnershipEvidence:
     marker_on: bool
     record: dict[str, Any] | None = None
     dispatch_start: datetime | None = None
-    #: Which plan the caller is currently trying to execute, if any. A record for
-    #: a different plan is contradictory rather than merely old.
-    plan_id: str | None = None
+    #: Which **run** the caller is currently trying to execute, if any. A record
+    #: for a different run is contradictory rather than merely old.
+    #:
+    #: The run identity rather than the publication identity, and that is the
+    #: whole of the difference: ``plan_id`` churns every refresh as the horizon
+    #: rolls, so keying ownership on it would have dropped the record to
+    #: "contradictory" every fifteen minutes and lost ownership of a run nothing
+    #: had replaced.
+    run_id: str | None = None
 
     @property
     def record_present(self) -> bool:
@@ -178,7 +205,7 @@ class OwnershipEvidence:
     def record_matches(self) -> bool:
         """Return whether the record can be tied to the live dispatch.
 
-        Requires the record to name a plan, that plan to be the one being
+        Requires the record to name a run, that run to be the one being
         executed, and -- when both instants are known -- the dispatch the inverter
         reports to be the one the record says was armed.
 
@@ -189,10 +216,10 @@ class OwnershipEvidence:
         if not self.record_present:
             return False
         record = self.record or {}
-        recorded_plan = record.get("plan_id")
-        if not isinstance(recorded_plan, str) or not recorded_plan:
+        recorded_run = record.get("run_id")
+        if not isinstance(recorded_run, str) or not recorded_run:
             return False
-        if self.plan_id is not None and recorded_plan != self.plan_id:
+        if self.run_id is not None and recorded_run != self.run_id:
             return False
         observed = _instant(record.get("dispatch_start"))
         if observed is None or self.dispatch_start is None:
@@ -386,20 +413,32 @@ class Target:
     def actionable_at(
         self, moment: datetime, lead_minutes: float = ACTIONABLE_LEAD_MINUTES
     ) -> bool:
-        """Return whether this run is the one to be arming for at ``moment``.
+        """Return whether this run is the one to be *preparing* for at ``moment``.
 
-        Two conditions: the window has not ended, and it starts now or within one
-        planning interval. The second is what makes this work at all -- the
+        **Selection only.** The window has not ended, and it starts now or within
+        one planning interval. The lead is what makes selection work at all -- the
         economic horizon begins at the *next* boundary, so a run planned at 09:00
-        opens at 09:15, and a dispatch armed at 09:00 is what carries it out.
+        opens at 09:15 and strict containment would select nothing, ever.
 
-        Strict containment would have been the obvious test and would have
-        selected nothing, ever.
+        It emphatically does **not** authorise activation. On this hardware arming
+        *is* delivering -- measured -- so beta.19 reaching a live power request
+        fifteen minutes early would have begun charging before the window. See
+        :meth:`activatable_at`.
         """
         if moment >= self.window_end:
             return False
         ahead = (self.window_start - moment).total_seconds() / 60.0
         return ahead <= lead_minutes
+
+    def activatable_at(self, moment: datetime) -> bool:
+        """Return whether the window is actually open at ``moment``.
+
+        The whole of the timing fix. Strict containment, no lead, no tolerance: a
+        refresh landing a few seconds after the boundary starts a few seconds
+        late, which is correct and unavoidable, while a refresh a minute before it
+        starts nothing at all.
+        """
+        return self.covers(moment)
 
     def stale_at(self, moment: datetime) -> bool:
         """Return whether this target is too old to be believed.
@@ -509,6 +548,271 @@ def actionable_target(
 
 
 # ===========================================================================
+# Carry-forward: keeping one accepted run across a rolling horizon
+# ===========================================================================
+
+
+def mint_run_id(intent: str, window_start: datetime, admitted_at: datetime) -> str:
+    """Return a stable identity for one accepted execution run.
+
+    Minted by Stage B, because Stage A has nothing stable to offer. Its
+    ``plan_id`` is ``sha256(intent | window_start)`` and ``window_start`` advances
+    every refresh as the horizon truncates from the front -- so a publication
+    identity is a statement about the clock, not about the run.
+
+    Same shape as ``_execution_plan_id``: deterministic, reproducible in a test,
+    no random source. Over the *admitted* window start, which never moves, so the
+    identity holds for the life of the run.
+    """
+    digest = hashlib.sha256(
+        f"{intent}|{window_start.isoformat()}|{admitted_at.isoformat()}".encode()
+    ).hexdigest()
+    return digest[:RUN_ID_CHARS]
+
+
+@dataclass(frozen=True, slots=True)
+class CarriedRun:
+    """One Stage-A target Stage B has accepted and is carrying forward.
+
+    **Why this exists.** Every refresh rebuilds the horizon from the next interval
+    boundary, so a freshly published target always opens fifteen minutes from now.
+    Strict activation -- which the hardware requires, because arming delivers
+    energy immediately -- can therefore never be satisfied by a *fresh*
+    publication. The target whose window opens is the one accepted a refresh
+    earlier. Carrying it is execution continuity, not a new decision.
+
+    **The admitted target is immutable.** Its window never moves: that is
+    precisely what makes activation reachable, because the accepted 10:30 start
+    becomes past at the 10:30 refresh while the fresh 10:45 publication does not
+    overwrite it. Its energy figures are immutable too, and for a subtler reason:
+    a publication's ``battery_target_kwh`` shrinks as the horizon eats the run, so
+    adopting the fresh figure *and* subtracting measured progress would count the
+    same delivered kilowatt-hours twice.
+    """
+
+    run_id: str
+    #: The publication that was admitted. Kept for traceability only -- it is
+    #: stale by one refresh from the moment it is stored, by design.
+    plan_id: str
+    target: Target
+    revision: int
+    admitted_at: datetime
+    affirmed_at: datetime
+    #: Re-anchored on every affirmation, because an affirming publication is
+    #: Stage A restating the intent.
+    stale_after: datetime
+
+    @property
+    def intent(self) -> str:
+        """Return the accepted intent."""
+        return self.target.intent
+
+    @property
+    def window_start(self) -> datetime:
+        """Return the accepted window start. Never moves."""
+        return self.target.window_start
+
+    @property
+    def window_end(self) -> datetime:
+        """Return the accepted window end."""
+        return self.target.window_end
+
+    def actionable_at(self, moment: datetime) -> bool:
+        """Return whether the accepted window is open at ``moment``."""
+        return self.target.activatable_at(moment)
+
+    def stale_at(self, moment: datetime) -> bool:
+        """Return whether this run has outlived its last affirmation."""
+        return moment >= self.stale_after
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the persistable form. Only what re-execution would need."""
+        return {
+            "run_id": self.run_id,
+            "plan_id": self.plan_id,
+            "revision": self.revision,
+            "admitted_at": self.admitted_at.isoformat(),
+            "affirmed_at": self.affirmed_at.isoformat(),
+            "stale_after": self.stale_after.isoformat(),
+            "intent": self.target.intent,
+            "purpose": self.target.purpose,
+            "window_start": self.target.window_start.isoformat(),
+            "window_end": self.target.window_end.isoformat(),
+            "battery_target_kwh": self.target.battery_target_kwh,
+            "expected_grid_to_battery_kwh": self.target.expected_grid_to_battery_kwh,
+            "expected_pv_to_battery_kwh": self.target.expected_pv_to_battery_kwh,
+            "required_headroom_kwh": self.target.required_headroom_kwh,
+            "max_end_energy_kwh": self.target.max_end_energy_kwh,
+            "reserve_floor_kwh": self.target.reserve_floor_kwh,
+        }
+
+
+def affirms(carried: CarriedRun, published: Target) -> bool:
+    """Return whether ``published`` re-affirms the carried run.
+
+    **Same intent, and windows that overlap.** Rolling movement always overlaps:
+    the new start is one interval later, deep inside the accepted window. A
+    campaign that has genuinely moved elsewhere -- Stage A now wants to charge
+    tonight -- starts after the accepted window ends, and does not.
+
+    Purely temporal. No prices, no ranking, no judgement about which target is
+    better. Stage B is only preserving the continuity of something Stage A chose.
+
+    **This is an inference, not a cancellation signal**, and the contract cannot
+    do better: a withdrawn run and a rolled-forward run are both simply absent
+    from the next publication. Overlap is a good proxy and is deliberately not
+    described as more than that.
+
+    Overlap rather than a tighter key on ``window_end``, which for a
+    price-driven campaign is genuinely stable. A reserve-driven safety buy is
+    anchored to the head instead, so its end advances with its start -- and a
+    tighter key would mint a new identity every refresh for exactly those runs,
+    resetting their progress. The looser test is the one that preserves
+    continuity.
+    """
+    if published.intent != carried.intent:
+        return False
+    return published.window_start <= carried.window_end
+
+
+def admit(target: Target, now: datetime, *, revision: int = 1) -> CarriedRun:
+    """Return a new carried run for ``target``."""
+    return CarriedRun(
+        run_id=mint_run_id(target.intent, target.window_start, now),
+        plan_id=target.plan_id,
+        target=target,
+        revision=revision,
+        admitted_at=now,
+        affirmed_at=now,
+        stale_after=target.stale_after or (now + timedelta(minutes=STALE_MINUTES)),
+    )
+
+
+def affirm(carried: CarriedRun, published: Target, now: datetime) -> CarriedRun:
+    """Return the carried run re-affirmed by ``published``.
+
+    Refreshes the freshness deadline and records the affirmation. Bumps the
+    revision when Stage A has materially moved an executable figure, which is
+    informational: a reader should be able to see that the plan changed under a
+    run that is still the same run.
+
+    **The accepted figures are not overwritten.** They are what progress and the
+    grid ceiling are measured against, and swapping them mid-run would rebase
+    both. A change large enough to warrant abandoning the run is a supersession,
+    which is decided by direction rather than by magnitude.
+    """
+    moved = _materially_moved(carried.target, published)
+    return CarriedRun(
+        run_id=carried.run_id,
+        plan_id=carried.plan_id,
+        target=carried.target,
+        revision=carried.revision + (1 if moved else 0),
+        admitted_at=carried.admitted_at,
+        affirmed_at=now,
+        stale_after=published.stale_after or (now + timedelta(minutes=STALE_MINUTES)),
+    )
+
+
+def _materially_moved(accepted: Target, published: Target) -> bool:
+    """Return whether Stage A has moved an executable figure beyond its deadband.
+
+    The same deadband the publication layer uses for its own revisions, so the
+    two agree about what "material" means.
+
+    **Both window bounds are excluded, and the second one is measured rather than
+    assumed.** ``window_start`` advances every refresh because the horizon begins
+    at the next boundary -- that is the rolling horizon, not news, and reading it
+    as novelty is the mistake beta.19 made. ``window_end`` is subtler: for a
+    price-driven campaign it is pinned to an absolute interval and genuinely
+    stable, but a reserve-driven safety buy is anchored to the *head* of the run,
+    so its end advances with its start. A day-long runtime probe showed a real
+    campaign whose end moved every fifteen minutes, which turned the revision into
+    a refresh counter -- meaningless in the opposite direction to beta.19's, where
+    it never left 1.
+
+    So a revision means Stage A moved an *energy* figure. Distinguishing a slid
+    window end from a deliberately extended one would need a model of Stage A's
+    own arithmetic, and building one here would be Stage B inferring economics.
+    """
+    if abs(published.battery_target_kwh - accepted.battery_target_kwh) > BUCKET_KWH:
+        return True
+    for left, right in (
+        (accepted.expected_grid_to_battery_kwh, published.expected_grid_to_battery_kwh),
+        (accepted.max_end_energy_kwh, published.max_end_energy_kwh),
+    ):
+        if left is None or right is None:
+            if left is not right:
+                return True
+        elif abs(right - left) > BUCKET_KWH:
+            return True
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class CarryOutcome:
+    """What the carry-forward machine concluded this refresh."""
+
+    carried: CarriedRun | None
+    #: Why the previous run ended, when one did. ``None`` while it continues.
+    ended: str | None = None
+    #: The run that ended, kept so a shortfall can be reported against the target
+    #: it was actually trying to meet rather than against whatever is published
+    #: now.
+    ended_run: CarriedRun | None = None
+    #: Whether this refresh's publication re-affirmed the carried run.
+    affirmed: bool = False
+    admitted: bool = False
+
+
+def carry_forward(
+    carried: CarriedRun | None,
+    targets: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    now: datetime,
+    *,
+    executable_intents: frozenset[str] = frozenset({EXECUTION_INTENT_GRID_CHARGE}),
+) -> CarryOutcome:
+    """Return the carried run after this refresh's publication.
+
+    The state machine, in one place and in priority order. Every transition is
+    driven by an instant, an intent or a published figure -- never by a price and
+    never by a preference between two targets.
+    """
+    published = [
+        parsed
+        for parsed in (parse_target(raw) for raw in targets)
+        if parsed is not None and parsed.intent in executable_intents
+    ]
+
+    if carried is None:
+        candidate = actionable_target(targets, now)
+        if candidate is None or candidate.intent not in executable_intents:
+            return CarryOutcome(carried=None)
+        return CarryOutcome(carried=admit(candidate, now), admitted=True)
+
+    # A carried run outliving its own limits ends regardless of what was
+    # published: these are the bounds that keep a carried plan from becoming an
+    # indefinite one.
+    if carried.stale_at(now):
+        return CarryOutcome(
+            carried=None, ended=EXECUTION_STOP_STALE_PLAN, ended_run=carried
+        )
+    if now >= carried.window_end:
+        return CarryOutcome(
+            carried=None, ended=EXECUTION_STOP_WINDOW_ENDED, ended_run=carried
+        )
+
+    affirming = next((entry for entry in published if affirms(carried, entry)), None)
+    if affirming is not None:
+        return CarryOutcome(carried=affirm(carried, affirming, now), affirmed=True)
+
+    # Nothing re-affirmed it. Either Stage A moved this campaign elsewhere or
+    # dropped it; both are a withdrawal, and both are visible within one refresh.
+    return CarryOutcome(
+        carried=None, ended=EXECUTION_STOP_STAGE_A_HOLD, ended_run=carried
+    )
+
+
+# ===========================================================================
 # The rolling controller
 # ===========================================================================
 
@@ -530,6 +834,10 @@ class Demand:
     remaining_minutes: float
     ahead_kwh: float
     projected_end_kwh: float | None = None
+    #: The cumulative grid-energy cap for this run, and how much has been bought
+    #: against it. ``None`` when nothing caps it.
+    grid_cap_kwh: float | None = None
+    grid_charged_kwh: float = 0.0
 
     @property
     def reduced(self) -> bool:
@@ -602,6 +910,27 @@ def headroom_ceiling_kw(
     return allowance / (remaining_minutes / 60.0)
 
 
+def effective_grid_cap_kwh(
+    stage_a_ceiling_kwh: float | None, configured_budget_kwh: float
+) -> float | None:
+    """Return the cumulative grid-energy cap for one run, or ``None`` if uncapped.
+
+    Stage A's published figure is **always** the hard ceiling when it exists. The
+    configured budget only ever tightens it further, and only above zero.
+
+    The obvious formulation is wrong, and was caught in review: writing
+    ``min(stage_a_ceiling, configured)`` with a default of ``0.0`` yields a cap of
+    zero and forbids all charging. Zero means *the tightener is off*, not *buy
+    nothing* -- the same "absent is not zero" rule the headroom constraint and the
+    charge cutoff both follow.
+    """
+    ceiling = _finite(stage_a_ceiling_kwh)
+    configured = _finite(configured_budget_kwh) or 0.0
+    if configured > 0.0:
+        return configured if ceiling is None else min(ceiling, configured)
+    return ceiling
+
+
 def demand_for(
     target: Target,
     *,
@@ -609,6 +938,8 @@ def demand_for(
     progress: Progress,
     current_energy_kwh: float | None = None,
     remaining_expected_pv_kwh: float | None = None,
+    grid_charged_kwh: float | None = None,
+    configured_budget_kwh: float = 0.0,
 ) -> Demand:
     """Return what Stage B would ask for this refresh.
 
@@ -617,7 +948,14 @@ def demand_for(
     constraint that exists to *limit* charging decide how much charging to do.
     """
     remaining_kwh = max(0.0, target.battery_target_kwh - progress.realized_kwh)
-    remaining_minutes = max(0.0, (target.window_end - now).total_seconds() / 60.0)
+    # Measured from the window, not from ``now``. Before the window opens the two
+    # differ, and using ``now`` spread the target over window + lead -- so a
+    # 4 kWh / 60-minute target reported 3.2 kW, a rate that cannot deliver it, and
+    # the next refresh then had to *raise* power into the cooldown gate.
+    effective_now = max(now, target.window_start)
+    remaining_minutes = max(
+        0.0, (target.window_end - effective_now).total_seconds() / 60.0
+    )
     elapsed = max(0.0, (now - target.window_start).total_seconds() / 60.0)
     total = max(1e-9, (target.window_end - target.window_start).total_seconds() / 60.0)
     # Positive when ahead of a straight-line delivery of the same target.
@@ -660,6 +998,30 @@ def demand_for(
             stored + still_expected + max(0.0, charge_kw) * (remaining_minutes / 60.0)
         )
 
+    # The grid-energy ceiling, before the headroom cap so whichever binds harder
+    # wins and the reason names the right one. This bounds *what was bought*; the
+    # headroom cap bounds *what the pack holds*, and they are different questions:
+    # when production disappoints the headroom ceiling correctly rises, and
+    # without this the rolling controller would fill the extra room from the grid.
+    grid_cap_kwh = effective_grid_cap_kwh(
+        target.expected_grid_to_battery_kwh, configured_budget_kwh
+    )
+    bought = _finite(grid_charged_kwh) or 0.0
+    grid_exhausted = grid_cap_kwh is not None and bought >= grid_cap_kwh - 1e-9
+    if grid_exhausted:
+        return Demand(
+            rolling_kw=rolling_kw,
+            ceiling_kw=ceiling_kw,
+            required_kw=0.0,
+            reduction=EXECUTION_REDUCTION_BUDGET,
+            remaining_kwh=remaining_kwh,
+            remaining_minutes=remaining_minutes,
+            ahead_kwh=ahead_kwh,
+            projected_end_kwh=projected,
+            grid_cap_kwh=grid_cap_kwh,
+            grid_charged_kwh=bought,
+        )
+
     required_kw = rolling_kw
     if ceiling_kw is not None and ceiling_kw < rolling_kw:
         required_kw = max(0.0, ceiling_kw)
@@ -681,6 +1043,8 @@ def demand_for(
         remaining_minutes=remaining_minutes,
         ahead_kwh=ahead_kwh,
         projected_end_kwh=projected,
+        grid_cap_kwh=grid_cap_kwh,
+        grid_charged_kwh=bought,
     )
 
 
@@ -712,7 +1076,13 @@ class Decision:
 
     @property
     def wants_command(self) -> bool:
-        """Return whether a physical request exists this refresh."""
+        """Return whether a physical request exists this refresh.
+
+        ``prepared`` is deliberately absent from the list. A prepared decision has
+        a computed power and a valid target and still wants no command, because its
+        window has not opened -- and on this hardware sending one would move energy
+        immediately.
+        """
         return self.state in (EXECUTION_STATE_ARMED, EXECUTION_STATE_RUNNING) and (
             self.request_kw > 0.0
         )
@@ -728,7 +1098,12 @@ def decide(
     progress: Progress,
     current_energy_kwh: float | None = None,
     remaining_expected_pv_kwh: float | None = None,
-    running_plan_id: str | None = None,
+    grid_charged_kwh: float | None = None,
+    configured_budget_kwh: float = 0.0,
+    running_run_id: str | None = None,
+    carried: CarriedRun | None = None,
+    carry_ended: str | None = None,
+    ended_run: CarriedRun | None = None,
     inhibit_reason: str | None = None,
 ) -> Decision:
     """Return this refresh's Stage B decision.
@@ -749,6 +1124,13 @@ def decide(
     5. the window has closed;
     6. the target is met;
     7. otherwise, run.
+
+    **``carried`` is what makes activation reachable.** A freshly published target
+    always opens one interval from now, so evaluating the publication could only
+    ever produce ``prepared``. When a carried run is supplied it *is* the run under
+    evaluation, and its window is the admitted one -- which the passage of time can
+    actually open. With no carried run the behaviour is unchanged, so a published
+    run of an intent Stage B does not execute is still observed and diagnosed.
     """
     ownership = ownership_of(evidence)
     owned = ownership == OWNERSHIP_OWNED
@@ -795,38 +1177,55 @@ def decide(
             reset_required=True,
         )
 
-    target = actionable_target(targets, now)
+    # The carried run wins selection. It is the same intent one refresh older,
+    # and it is the only one whose window can be open.
+    target = carried.target if carried is not None else actionable_target(targets, now)
 
     if target is None:
         # Distinguish a window that ran out from a plan that was withdrawn. Both
         # stop, and both reset -- but the first has a shortfall to report and the
         # second does not, and reporting the wrong one sends a reader looking for a
         # fault that is not there.
-        expired = (
-            None
-            if running_plan_id is None
-            else target_by_plan_id(targets, running_plan_id)
+        # The carry-forward machine already knows why, so its verdict is
+        # preferred: it watched the run end, whereas this branch can only infer a
+        # reason from whatever happens to be published now.
+        expired = None if ended_run is None else ended_run.target
+        if expired is None:
+            # No carried run was supplied, so fall back to matching the publication
+            # directly. Only reachable on the direct path, where the identity the
+            # caller holds is a publication id rather than a minted run id.
+            expired = (
+                None
+                if running_run_id is None
+                else target_by_plan_id(targets, running_run_id)
+            )
+        ended = carry_ended == EXECUTION_STOP_WINDOW_ENDED or (
+            carry_ended is None and expired is not None and now >= expired.window_end
         )
-        ended = expired is not None and now >= expired.window_end
+        reason = carry_ended or (
+            EXECUTION_STOP_WINDOW_ENDED if ended else EXECUTION_STOP_STAGE_A_HOLD
+        )
         return Decision(
             state=EXECUTION_STATE_STOPPING if owned else EXECUTION_STATE_IDLE,
             ownership=ownership,
             target=expired,
             progress=progress,
-            stop_reason=(
-                (EXECUTION_STOP_WINDOW_ENDED if ended else EXECUTION_STOP_STAGE_A_HOLD)
-                if owned
-                else None
-            ),
+            stop_reason=reason if owned else None,
             reset_required=owned,
             clear_stale_marker=clear_marker,
             notes=(("the window closed before the target was met",) if ended else ()),
         )
 
-    if owned and running_plan_id is not None and running_plan_id != target.plan_id:
+    known = carried.run_id if carried is not None else target.plan_id
+    if owned and running_run_id is not None and running_run_id != known:
         # A different run. The old dispatch is ended before the new intent starts,
         # rather than being mutated into it -- a direction change especially must
         # not be expressed as a parameter edit.
+        #
+        # Against the **run** identity. Against the publication identity this fired
+        # every fifteen minutes for the whole of any owned campaign, because
+        # ``plan_id`` churns with the horizon -- stopping and resetting a run that
+        # nothing had replaced. It was unreachable only because ownership was.
         return Decision(
             state=EXECUTION_STATE_STOPPING,
             ownership=ownership,
@@ -836,7 +1235,12 @@ def decide(
             reset_required=True,
         )
 
-    if target.stale_at(now):
+    # The carried run's own deadline, which affirmation re-anchors, rather than
+    # the admitted publication's -- that one is frozen at admission and would
+    # expire under a run Stage A is still actively republishing. Carry-forward
+    # already ends a genuinely stale run, so for a carried run this is a backstop.
+    stale = carried.stale_at(now) if carried is not None else target.stale_at(now)
+    if stale:
         return Decision(
             state=EXECUTION_STATE_STOPPING if owned else EXECUTION_STATE_INHIBITED,
             ownership=ownership,
@@ -865,6 +1269,8 @@ def decide(
         progress=progress,
         current_energy_kwh=current_energy_kwh,
         remaining_expected_pv_kwh=remaining_expected_pv_kwh,
+        grid_charged_kwh=grid_charged_kwh,
+        configured_budget_kwh=configured_budget_kwh,
     )
 
     if demand.reduction == EXECUTION_REDUCTION_TARGET_MET:
@@ -878,6 +1284,24 @@ def decide(
             progress=progress,
             stop_reason=EXECUTION_STOP_TARGET_REACHED if owned else None,
             reset_required=owned,
+        )
+
+    if demand.reduction == EXECUTION_REDUCTION_BUDGET:
+        # All the grid energy this plan approved has been bought. Stop, and let
+        # Stage A decide whether more is worth buying -- that is an economic
+        # question and this layer does not answer them.
+        return Decision(
+            state=EXECUTION_STATE_STOPPING if owned else EXECUTION_STATE_IDLE,
+            ownership=ownership,
+            target=target,
+            demand=demand,
+            progress=progress,
+            stop_reason=EXECUTION_STOP_GRID_CEILING if owned else None,
+            reset_required=owned,
+            notes=(
+                "the approved grid energy for this run has been bought; awaiting a "
+                "fresh economic decision rather than making one",
+            ),
         )
 
     if demand.finished:
@@ -895,6 +1319,22 @@ def decide(
                 "reduced to zero by the Stage-A headroom constraint; awaiting a "
                 "fresh economic decision rather than making one",
             ),
+        )
+
+    if not target.activatable_at(now):
+        # The window has not opened. Everything is computed and published, and
+        # nothing may be sent -- because on this hardware activation delivers
+        # energy immediately, so "ready" and "go" cannot be the same state.
+        return Decision(
+            state=EXECUTION_STATE_PREPARED,
+            ownership=ownership,
+            target=target,
+            demand=demand,
+            progress=progress,
+            request_kw=0.0,
+            inhibit_reason=inhibit_reason,
+            clear_stale_marker=clear_marker,
+            notes=("the window has not opened; prepared but not activated",),
         )
 
     return Decision(
@@ -919,6 +1359,71 @@ def recovered(decision: Decision) -> Decision:
     """
     return replace(
         decision, notes=(*decision.notes, "progress reconstructed after a restart")
+    )
+
+
+def control_intent_for(
+    decision: Decision,
+    *,
+    floor_soc_percent: float,
+    ceiling_soc_percent: float | None,
+    horizon_minutes: int,
+    target_day: date,
+    start_index: int,
+    built_at: datetime,
+) -> ControlIntent | None:
+    """Return the command Stage B wants, or ``None`` to leave the path alone.
+
+    **This is the wire beta.19 was missing.** Stage B computed a power that reached
+    no actuator: the command was built from the Phase-3 reserve-guard plan, which
+    never charges, so flipping the barrier would have armed a discharge and ignored
+    the economic plan entirely.
+
+    Three properties make the direction guarantee structural rather than careful:
+
+    * the only action this function can return is ``ACTION_CHARGE``. There is no
+      branch that produces a discharge and no parameter that could select one;
+    * ``None`` for everything else -- ``serve_load`` keeps the existing
+      reserve-guard behaviour untouched, ``net_export`` has no primitive, and a
+      hold, a refusal or a prepared decision produce no command at all rather than
+      the opposite one;
+    * energy is expressed as an **unsigned** magnitude over the interval, which the
+      device layer maps to ``CHARGE_FAMILY``. Direction is the family, never a
+      sign. The raw dispatch surface takes signed power with the opposite
+      convention and Alpha EMS never writes it.
+
+    ``ceiling_soc_percent`` is carried through rather than derived here: a charge
+    with no establishable ceiling must be refused, and the refusal belongs at the
+    device boundary where the cutoff is actually computed.
+    """
+    if not decision.wants_command:
+        return None
+    target = decision.target
+    if target is None or target.intent != EXECUTION_INTENT_GRID_CHARGE:
+        return None
+    if not target.activatable_at(built_at):
+        # Belt and braces: ``wants_command`` already excludes ``prepared``, and
+        # this says the same thing about the window a second time. A single guard
+        # on the one path that can move energy early is a guard with a hole in it.
+        return None
+    power_kw = max(0.0, decision.request_kw)
+    if power_kw <= 0.0:
+        return None
+    return ControlIntent(
+        action=ACTION_CHARGE,
+        energy_ac_kwh=power_kw * INTERVAL_HOURS,
+        average_power_kw=power_kw,
+        interval_hours=INTERVAL_HOURS,
+        floor_soc_percent=floor_soc_percent,
+        energy_limit_bound=False,
+        horizon_minutes=horizon_minutes,
+        target_day=target_day,
+        start_index=start_index,
+        built_at=built_at,
+        reason=target.purpose,
+        policy="stage_b",
+        policy_version=1,
+        ceiling_soc_percent=ceiling_soc_percent,
     )
 
 
@@ -1066,6 +1571,38 @@ def as_dict(decision: Decision, *, mode: str, executed: bool) -> dict[str, Any]:
                     else round(demand.projected_end_kwh, 3)
                 ),
                 "reduction_reason": demand.reduction,
+                # **An attribution estimate, and the name says so.** There is no
+                # physical grid-to-battery channel to meter: the meter sees one net
+                # figure and cannot say which electron reached the pack. Production
+                # is credited first and the grid second, which is the order Stage A
+                # published the ceiling in, so the two are in the same terms.
+                "grid_charged_kwh_estimate": (
+                    None
+                    if demand.grid_charged_kwh is None
+                    else round(demand.grid_charged_kwh, 3)
+                ),
+                "grid_cap_kwh": (
+                    None
+                    if demand.grid_cap_kwh is None
+                    else round(demand.grid_cap_kwh, 3)
+                ),
+                "grid_remaining_kwh": (
+                    None
+                    if demand.grid_cap_kwh is None
+                    else round(
+                        max(
+                            0.0,
+                            demand.grid_cap_kwh - (demand.grid_charged_kwh or 0.0),
+                        ),
+                        3,
+                    )
+                ),
+                "grid_attribution_rule": (
+                    "an estimate from the measured balance, not a meter reading. "
+                    "grid_share = max(0, battery_charge - max(0, pv - house_load)), "
+                    "integrated and monotonic by construction. a cap of null means "
+                    "unconstrained, never zero"
+                ),
                 # Zero in this release, and it says so: the barrier is closed and
                 # no command is reachable.
                 "applied_kw": 0.0,

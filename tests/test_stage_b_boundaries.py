@@ -107,10 +107,25 @@ def test_the_controller_imports_no_price_or_economic_module() -> None:
             imported.update(alias.name.split(".")[-1] for alias in node.names)
 
     assert not (imported & forbidden), sorted(imported & forbidden)
-    # Only the constants module and the standard library.
-    assert imported <= {"const", "dataclasses", "datetime", "typing", "__future__"}, (
-        sorted(imported)
-    )
+    # The constants, the interval definition, the device-neutral intent shape, and
+    # the standard library. ``battery`` and ``control`` were added in beta.20 when
+    # Stage B became the command source: it has to express an interval and a
+    # ``ControlIntent``, and both of those modules are themselves pure and contain
+    # no economics. The forbidden set above is the load-bearing half of this
+    # assertion, and it has not moved.
+    assert imported <= {
+        "const",
+        "battery",
+        "control",
+        "dataclasses",
+        "datetime",
+        # Digests only, for the run identity. The same shape the publication id
+        # already uses -- a stable name for one accepted run, not a source of
+        # judgement about it.
+        "hashlib",
+        "typing",
+        "__future__",
+    }, sorted(imported)
 
 
 def test_the_controller_names_no_price_or_value_concept() -> None:
@@ -570,65 +585,100 @@ def test_a_run_starting_at_the_next_boundary_is_actionable_now() -> None:
 # ===========================================================================
 
 
-def test_arming_happens_before_the_window_opens_and_that_is_a_live_gate() -> None:
-    """**Recorded so beta.20 cannot proceed without noticing it.**
+def test_no_command_can_exist_before_the_window_opens() -> None:
+    """**A4. The inverse of the gate this test used to record.**
 
-    The imminence gate is required for the controller to select anything at all --
-    the economic horizon begins at the next boundary, so strict containment matches
-    nothing. But arming an AlphaESS dispatch starts it *immediately*, so the same
-    gate means a Live run would begin delivering energy before ``window_start``.
+    In beta.19 this asserted the defect: fifteen minutes before a window opened the
+    controller reached ``armed`` with a live request, and since arming an AlphaESS
+    dispatch starts it immediately, opening the barrier would have delivered energy
+    early. Hardware confirmed that on the real installation.
 
-    Preparing a command before a window and delivering energy inside one are
-    different things, and this release does not distinguish them. It does not need
-    to: it sends nothing. beta.20 does need to, and this test states the current
-    behaviour plainly so that release starts from a fact rather than a hope.
+    It now asserts the fix. Selection still looks one interval ahead -- it must, or
+    nothing is ever selected, because the economic horizon begins at the next
+    boundary -- but activation is strictly inside the window, and the two are
+    separate questions asked by separate methods.
 
-    **Not a defect in beta.19, and deliberately not fixed here** -- correcting it
-    changes when energy physically moves.
+    Checked at four offsets, and on the *command* rather than only the state,
+    because a state name is a label and a command list is what reaches an inverter.
     """
     from datetime import UTC, datetime, timedelta
 
+    from custom_components.alpha_ems_manager.const import (
+        EXECUTION_STATE_ARMED,
+        EXECUTION_STATE_PREPARED,
+    )
     from custom_components.alpha_ems_manager.execution import (
         OwnershipEvidence,
+        control_intent_for,
         decide,
         measure_progress,
+        parse_target,
     )
 
-    now = datetime(2026, 8, 24, 10, 30, tzinfo=UTC)
-    opens = now + timedelta(minutes=15)
+    opens = datetime(2026, 8, 24, 14, 0, tzinfo=UTC)
     raw = {
         "plan_id": "p",
         "revision": 1,
         "intent": "grid_charge",
         "purpose": "charge",
         "window_start": opens.isoformat(),
-        "window_end": (opens + timedelta(hours=4)).isoformat(),
-        "issued_at": now.isoformat(),
-        "stale_after": (now + timedelta(minutes=30)).isoformat(),
-        "battery_target_kwh": 10.0,
-        "average_power_kw": 2.5,
-        "first_power_kw": 2.5,
+        "window_end": (opens + timedelta(hours=2)).isoformat(),
+        "issued_at": (opens - timedelta(minutes=20)).isoformat(),
+        "stale_after": (opens + timedelta(hours=9)).isoformat(),
+        "battery_target_kwh": 8.0,
+        "average_power_kw": 4.0,
+        "first_power_kw": 4.0,
         "reserve_floor_kwh": 4.0,
     }
+    target = parse_target(raw)
+    assert target is not None
 
-    decision = decide(
-        mode_executes=True,
-        mode_off=False,
-        targets=[raw],
-        now=now,
-        evidence=OwnershipEvidence(dispatch_active=False, marker_on=False),
-        progress=measure_progress(accumulated_kwh=0.0, soc_delta_kwh=None),
-        current_energy_kwh=8.0,
-    )
+    def at(moment):
+        decision = decide(
+            mode_executes=True,
+            mode_off=False,
+            targets=[raw],
+            now=moment,
+            evidence=OwnershipEvidence(dispatch_active=False, marker_on=False),
+            progress=measure_progress(accumulated_kwh=0.0, soc_delta_kwh=None),
+            current_energy_kwh=8.0,
+        )
+        intent = control_intent_for(
+            decision,
+            floor_soc_percent=20.0,
+            ceiling_soc_percent=100.0,
+            horizon_minutes=20,
+            target_day=opens.date(),
+            start_index=56,
+            built_at=moment,
+        )
+        return decision, intent
 
-    # The measured fact: a command exists before the window opens.
-    assert decision.target is not None
-    assert now < decision.target.window_start
-    assert decision.wants_command is True
-    assert decision.request_kw > 0.0
+    # Fifteen minutes early: selected, computed, and refusing to act.
+    early, early_intent = at(opens - timedelta(minutes=15))
+    assert early.target is not None, "selection must still look one interval ahead"
+    assert early.state == EXECUTION_STATE_PREPARED
+    assert early.request_kw == 0.0
+    assert early.wants_command is False
+    assert early_intent is None, "no command may exist before the window opens"
 
-    # And the only reason that is safe today.
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    # One second early: still nothing.
+    barely, barely_intent = at(opens - timedelta(seconds=1))
+    assert barely.state == EXECUTION_STATE_PREPARED
+    assert barely_intent is None
+
+    # Exactly at the boundary: now it may act.
+    on_time, on_time_intent = at(opens)
+    assert on_time.state == EXECUTION_STATE_ARMED
+    assert on_time.request_kw > 0.0
+    assert on_time_intent is not None
+    assert on_time_intent.action == "charge"
+
+    # A few seconds late is acceptable and must still act -- a refresh lands just
+    # after the boundary, and starting a little late is the correct trade.
+    late, late_intent = at(opens + timedelta(seconds=20))
+    assert late.state == EXECUTION_STATE_ARMED
+    assert late_intent is not None
 
 
 def test_the_reset_cannot_clear_the_vendor_timer_and_that_is_a_live_gate() -> None:

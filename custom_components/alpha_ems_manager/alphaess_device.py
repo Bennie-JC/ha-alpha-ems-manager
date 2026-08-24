@@ -45,10 +45,16 @@ from .const import (
     CONTROL_CUTOFF_MIN_PERCENT,
     CONTROL_DURATION_STEP_MINUTES,
     CONTROL_MAX_DURATION_MINUTES,
+    CONTROL_MAX_POWER_KW,
     CONTROL_MIN_DURATION_MINUTES,
     CONTROL_MIN_POWER_KW,
     CONTROL_POWER_DECIMALS,
     CONTROL_POWER_STEP_KW,
+    CONTROL_REFUSE_DIRECTION_MISMATCH,
+    CONTROL_REFUSE_FOREIGN_FAMILY,
+    CONTROL_REFUSE_NEGATIVE_MAGNITUDE,
+    CONTROL_REFUSE_RAW_DISPATCH_WRITE,
+    CONTROL_REFUSE_SERVICE_NOT_PERMITTED,
 )
 from .control import ControlIntent
 
@@ -92,12 +98,14 @@ AUTOMATION_HOLD_MONITOR = "automation.alphaess_cutoff_soc_hold_monitoring"
 #: does not help either -- it cannot separate this integration from any other
 #: automation, and a restart discards it.
 #:
-#: **This constant is kept at false on purpose, and beta.19 does not flip it.**
-#: What beta.19 adds is a way to stop needing it: an owner marker written outside
+#: **This constant is kept at false on purpose, and no release has flipped it.**
+#: What beta.19 added was a way to stop needing it: an owner marker written outside
 #: the vendor package (:data:`BOOLEAN_EXECUTION_OWNER`), which records the one fact
-#: the surface cannot. Ownership is then positive evidence rather than inference,
-#: and the inference this constant describes stays forbidden -- a mutation test
-#: catches anything that starts deriving ownership from parameters again.
+#: the surface cannot. beta.20 supplies the second factor that marker was always
+#: meant to be paired with -- a persisted causal record tied to a real device start
+#: -- so ownership is positive evidence rather than inference. The inference this
+#: constant describes stays forbidden either way, and a mutation test catches
+#: anything that starts deriving ownership from parameters again.
 OWNERSHIP_PROVABLE: bool = False
 
 #: Features of the control surface that drive the battery on their own. If either
@@ -230,16 +238,31 @@ def device_power_kw(energy_ac_kwh: float, interval_hours: float) -> float:
     if energy_ac_kwh <= 0.0 or interval_hours <= 0.0:
         return 0.0
 
+    # **Bounded by what the inverter can express.** The rolling controller is
+    # allowed to raise power to catch up on a late run -- that is its job -- and
+    # with no headroom cap in force a run late in its window asks for
+    # ``remaining / remaining_hours``, which grows without limit as the denominator
+    # shrinks. A probe measured a real campaign reaching 21.68 kW against a 20 kW
+    # register.
+    #
+    # Clamping here rather than in the controller keeps the two concerns apart: how
+    # much energy is wanted is a Stage-B question, and what the register can hold is
+    # a property of the device. It is also the safe direction -- the invariant above
+    # is ``power * h <= e``, and lowering the power can only strengthen it.
+    #
+    # Without this the safety gate refused the command outright for exceeding the
+    # device maximum, so a late charge did not run at 20 kW; it did not run at all.
+    energy_ac_kwh = min(energy_ac_kwh, CONTROL_MAX_POWER_KW * interval_hours)
     steps = math.floor(energy_ac_kwh / interval_hours / CONTROL_POWER_STEP_KW + 1e-9)
     power = round(steps * CONTROL_POWER_STEP_KW, CONTROL_POWER_DECIMALS)
     while steps > 0 and power * interval_hours > energy_ac_kwh:
         steps -= 1
         power = round(steps * CONTROL_POWER_STEP_KW, CONTROL_POWER_DECIMALS)
-    return max(0.0, power)
+    return max(0.0, min(power, CONTROL_MAX_POWER_KW))
 
 
 def device_cutoff_percent(floor_soc_percent: float) -> int:
-    """Return the cutoff to command so the device never stops below the floor.
+    """Return the **discharge** cutoff, so the device never stops below the floor.
 
     The device's cutoff register truncates, so asking for exactly the floor lands
     a fraction of a percent below it. One extra percent compensates, and one is
@@ -250,11 +273,44 @@ def device_cutoff_percent(floor_soc_percent: float) -> int:
     all still gets the helper's minimum, which stops *higher* than they asked --
     conservative, and the decision layer's own clamp remains what actually bounds
     the energy.
+
+    **A charge must not use this.** Its rounding protects a *lower* bound, and on
+    a charge the cutoff is an *upper* one, so the +1 here would permit charging a
+    percent past the ceiling. See :func:`device_charge_cutoff_percent`.
     """
     if not math.isfinite(floor_soc_percent):
         return CONTROL_CUTOFF_MAX_PERCENT
     target = math.ceil(floor_soc_percent) + 1
     return min(CONTROL_CUTOFF_MAX_PERCENT, max(CONTROL_CUTOFF_MIN_PERCENT, target))
+
+
+def device_charge_cutoff_percent(ceiling_soc_percent: float | None) -> int | None:
+    """Return the **charge** cutoff, or ``None`` when none can be established.
+
+    Measured on the real installation: for a charge the cutoff is an *upper* state
+    of charge -- a run with cutoff 90 % while the pack was below 90 % charged
+    normally. So this is the mirror of :func:`device_cutoff_percent` in two ways,
+    and both matter.
+
+    **The rounding direction flips.** The register truncates, which lands at or
+    slightly *below* the figure asked for. For a lower bound that is the dangerous
+    direction and one percent is added to compensate; for an upper bound it is the
+    *conservative* direction -- it stops a fraction early -- so nothing is added.
+    Adding one here would permit charging a percent above the ceiling.
+
+    **There is no fallback.** ``None`` in, ``None`` out, and the caller refuses the
+    command. Substituting the discharge floor would write "stop at 21 %" to a pack
+    at 61 %; substituting zero forbids charging; substituting 100 % charges past a
+    ceiling the user chose. A refusal costs one window and says why.
+    """
+    if ceiling_soc_percent is None or not math.isfinite(ceiling_soc_percent):
+        return None
+    target = math.floor(ceiling_soc_percent)
+    if target < CONTROL_CUTOFF_MIN_PERCENT:
+        # Below the helper's own range there is nothing truthful to write: the
+        # device cannot express it, and clamping upward would charge past it.
+        return None
+    return min(CONTROL_CUTOFF_MAX_PERCENT, target)
 
 
 def device_duration_minutes(horizon_minutes: int) -> int:
@@ -392,10 +448,27 @@ def build_command(intent: ControlIntent) -> DeviceCommand:
         )
 
     power = device_power_kw(intent.energy_ac_kwh, intent.interval_hours)
+    cutoff = _cutoff_for(intent)
+    if cutoff is None:
+        # A charge with no establishable ceiling. Returned as a command that moves
+        # nothing, so it is refused by the ordinary "does this move the battery"
+        # path rather than by a special case, and no substituted bound is written.
+        return DeviceCommand(
+            action=intent.action,
+            power_kw=0.0,
+            cutoff_soc_percent=CONTROL_CUTOFF_MAX_PERCENT,
+            duration_minutes=device_duration_minutes(intent.horizon_minutes),
+            device_hold_flag=False,
+            energy_limit_bound=intent.energy_limit_bound,
+            allowed_energy_ac_kwh=intent.energy_ac_kwh,
+            commanded_energy_ac_kwh=0.0,
+            interval_hours=intent.interval_hours,
+            requested_power_kw=0.0,
+        )
     return DeviceCommand(
         action=intent.action,
         power_kw=power,
-        cutoff_soc_percent=device_cutoff_percent(intent.floor_soc_percent),
+        cutoff_soc_percent=cutoff,
         duration_minutes=device_duration_minutes(intent.horizon_minutes),
         device_hold_flag=False,
         energy_limit_bound=intent.energy_limit_bound,
@@ -404,6 +477,19 @@ def build_command(intent: ControlIntent) -> DeviceCommand:
         interval_hours=intent.interval_hours,
         requested_power_kw=power,
     )
+
+
+def _cutoff_for(intent: ControlIntent) -> int | None:
+    """Return the cutoff for this intent's direction, or ``None`` to refuse.
+
+    The one place the two semantics meet, and they never mix: a discharge asks the
+    floor helper, a charge asks the ceiling helper, and neither can reach the
+    other's. That separation is the whole fix -- beta.19 called the floor helper
+    for both directions.
+    """
+    if intent.action == ACTION_CHARGE:
+        return device_charge_cutoff_percent(intent.ceiling_soc_percent)
+    return device_cutoff_percent(intent.floor_soc_percent)
 
 
 def limit_command(command: DeviceCommand, max_power_kw: float) -> DeviceCommand:
@@ -540,6 +626,70 @@ def plan_commands(command: DeviceCommand) -> tuple[CommandStep, ...]:
         ),
         CommandStep(*SERVICE_TURN_ON, family.activate),
     )
+
+
+def write_refusal(command: DeviceCommand, steps: tuple[CommandStep, ...]) -> str | None:
+    """Return why this command list must not be sent, or ``None`` if it may be.
+
+    **Checked against the real entity list, not against the intention that built
+    it.** Layers above make a wrong-direction write impossible; this exists because
+    "impossible" is a property of today's code, and the whole point of a boundary
+    check is to survive tomorrow's.
+
+    Five refusals, each naming a mistake a future edit could plausibly make:
+
+    * a step touching the *other* direction's family -- the mistake that would
+      turn a charge into a discharge;
+    * a write to the raw dispatch surface, whose power field is **signed** and
+      whose sign convention is the opposite of the helpers'. Alpha EMS writes
+      helper families only, and mixing the two conventions is the classic version
+      of this error;
+    * a negative helper magnitude. The helper takes an unsigned battery rate --
+      measured: +1.0 kW charges -- so a negative value there is either a sign
+      confusion or a raw-surface value that has leaked in;
+    * a service outside the closed permitted set;
+    * an action with no family at all, arriving with steps attached.
+
+    Any of them refuses the **entire** list. There are no partial writes: the
+    activation step is last precisely so an interrupted sequence is inert, and
+    honouring half a malformed command would throw that away.
+    """
+    if not steps:
+        return None
+
+    family = FAMILIES.get(command.action)
+    if family is None:
+        return CONTROL_REFUSE_DIRECTION_MISMATCH
+
+    permitted = set(family.entities) | {BOOLEAN_EXECUTION_OWNER}
+    foreign_families = [
+        other for action, other in FAMILIES.items() if action != command.action
+    ]
+    foreign_entities = {
+        entity for other in foreign_families for entity in other.entities
+    }
+    raw_surface = {
+        SENSOR_DISPATCH_START,
+        SENSOR_DISPATCH_MODE,
+        SENSOR_DISPATCH_ACTIVE_POWER,
+        SENSOR_DISPATCH_SOC,
+        SENSOR_DISPATCH_TIME,
+        SENSOR_MAX_FEED_TO_GRID,
+    }
+
+    for step in steps:
+        if (step.domain, step.service) not in PERMITTED_SERVICES:
+            return CONTROL_REFUSE_SERVICE_NOT_PERMITTED
+        if step.entity_id in raw_surface:
+            return CONTROL_REFUSE_RAW_DISPATCH_WRITE
+        if step.entity_id in foreign_entities:
+            return CONTROL_REFUSE_FOREIGN_FAMILY
+        if step.entity_id not in permitted:
+            return CONTROL_REFUSE_FOREIGN_FAMILY
+        if step.entity_id == family.power and (step.value is None or step.value < 0.0):
+            return CONTROL_REFUSE_NEGATIVE_MAGNITUDE
+
+    return None
 
 
 def plan_reset(action: str) -> tuple[CommandStep, ...]:

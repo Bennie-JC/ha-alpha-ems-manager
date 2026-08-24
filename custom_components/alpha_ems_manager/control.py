@@ -79,7 +79,8 @@ class ControlIntent:
     #: definition of an interval stays in one place and nothing downstream has
     #: to divide.
     interval_hours: float
-    #: The user's configured floor. Used for the device-side backstop only.
+    #: The user's configured floor. The device-side backstop for a **discharge**
+    #: only, and structurally unusable by a charge -- see ``ceiling_soc_percent``.
     floor_soc_percent: float
     #: Whether the energy limit bound, rather than a power limit or nothing.
     energy_limit_bound: bool
@@ -95,6 +96,15 @@ class ControlIntent:
     reason: str
     policy: str
     policy_version: int
+    #: The applicable upper state of charge for a **charge**, in percent.
+    #:
+    #: ``None`` when no ceiling could be established, and that is not a licence to
+    #: substitute something: a charge with no valid ceiling is refused. Measured on
+    #: the real installation, a charge cutoff is an *upper* bound -- a run with
+    #: cutoff 90 % while the pack sat below 90 % charged normally -- so reusing the
+    #: discharge floor here would have written "stop at 21 %" to a pack already at
+    #: 61 %, and the first Live charge would simply not have run.
+    ceiling_soc_percent: float | None = None
 
     @property
     def moves_battery(self) -> bool:
@@ -109,6 +119,11 @@ class ControlIntent:
             "average_power_kw": round(self.average_power_kw, BATTERY_KW_PRECISION),
             "interval_hours": self.interval_hours,
             "floor_soc_percent": round(self.floor_soc_percent, BATTERY_SOC_PRECISION),
+            "ceiling_soc_percent": (
+                None
+                if self.ceiling_soc_percent is None
+                else round(self.ceiling_soc_percent, BATTERY_SOC_PRECISION)
+            ),
             "energy_limit_bound": self.energy_limit_bound,
             "horizon_minutes": self.horizon_minutes,
             "target_day": self.target_day.isoformat(),
@@ -170,6 +185,12 @@ def translate(
         average_power_kw=energy / INTERVAL_HOURS,
         interval_hours=INTERVAL_HOURS,
         floor_soc_percent=plan.reserve.configured_min_soc_percent,
+        # The pack's own maximum. Phase 4 only ever discharges, so this is unused
+        # on this path -- it is carried so the field has one definition rather
+        # than two, and so a charge built elsewhere cannot forget it.
+        ceiling_soc_percent=(
+            None if plan.state is None else plan.state.limits.max_soc_percent
+        ),
         energy_limit_bound=bool(
             _ENERGY_LIMIT_CONSTRAINTS.intersection(decision.constraints)
         ),
