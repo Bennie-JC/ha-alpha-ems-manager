@@ -9,6 +9,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.21] - 2026-08-25
+
+**A configured setting that did nothing, and a reported figure that misled.**
+Two narrow fixes, no change to how energy is allocated and no change to Stage B.
+
+**LIVE EXECUTION REMAINS DISABLED.** `CONTROL_EXECUTION_AVAILABLE` is still
+`False`. Phase-2 shadow observation of a complete real `grid_charge` window is
+still required before any Live commissioning is considered.
+
+### Fixed
+
+- **`grid_charge_margin_eur_per_kwh` never reached the solver.** The option was
+  configurable, `solve` accepted it and used it, `build_outcome` forwarded it, and
+  the executor function between the coordinator and the solve had no such
+  parameter — so the value was dropped and every solve ran at the `0.0` default.
+  A user who set a margin got no effect on planning.
+
+  Stock installs were unaffected, because the default *is* zero. That is also why
+  it survived a full test suite: every existing margin test calls `solve`
+  directly, so all of them passed while the setting did nothing in production.
+  The new tests go through the executor path instead, which is the layer that
+  dropped it.
+
+  `async_add_executor_job` passes **positionally**, so a missing parameter is a
+  silent no-op and a misplaced one is worse — it would have applied the fixed
+  trade gain as a per-kWh margin. There is now a structural test that the call
+  passes exactly as many arguments as the function declares, and a mutation test
+  for each failure separately.
+
+  **Zero remains exactly inert**, asserted across four price spreads on the whole
+  interval trajectory and the plan cost rather than on a summary. A positive
+  margin now raises the advantage a marginal grid-caused kilowatt-hour must earn
+  before it is bought: measured, a twelve-cent gross spread is taken at margin
+  `0.00` and refused at `0.10`, while a sixty-cent spread is still taken at
+  `0.25`. Export allocation is unaffected — the margin is charged on marginal
+  grid-caused *charging*, and selling is not charging.
+
+### Added
+
+- **A bounded per-quarter allocation breakdown for each published run**, in
+  diagnostics. Per quarter: the interval index, the action, both prices, battery
+  power as an unsigned magnitude with direction carried by the action, battery
+  charge and discharge energy, opening stored energy, site grid flows, the
+  marginal grid import and export the interval actually caused, its marginal cost
+  against doing nothing, that interval's reserve requirement, and — the field
+  that resolves the ambiguity — whether the quarter was **absorbing** production.
+
+  This exists because a window and a total cannot distinguish "the campaign spans
+  thirteen quarters" from "energy is spread across thirteen quarters", and those
+  are different plans. On a real shape the answer was two quarters buying at
+  10 kW inside eleven quarters of free production absorption, reported as one
+  campaign averaging 3.50 kW.
+
+  Bounded to a shared budget of forty-eight rows across at most eight runs — a
+  quarter of the full trajectory, longer than any real campaign — allocated in run
+  order so the runs a reader sees first are complete, with any shortfall stated
+  rather than silently trimmed. The full 192-row trajectory is still not
+  serialised.
+
+- **`peak_power_kw` on each published run**, a maximum over the same intervals
+  the run already sums.
+
+### Changed
+
+- **Activity no longer offers a campaign mean as the dispatch intensity.** Where
+  the peak differs materially from the mean it now says both — *"peak 8.00 kW,
+  campaign average 4.46 kW"* — and where they agree it still says one figure, so
+  the line is no noisier than before. Per-quarter detail stays in diagnostics.
+
+### Notes
+
+- **No allocation changed.** The dynamic program's recursion is byte-identical:
+  no objective change, no post-processing, no reallocation, no window shortening,
+  no change to reserve protection, switching-fee semantics or battery limits. A
+  separate investigation established that the optimizer already concentrates
+  buying and selling in the best feasible quarters, and that long windows are the
+  reserve trajectory and production absorption rather than dilution.
+- `execution.py`, `alphaess_device.py`, `alphaess_adapter.py`, `reserve.py`,
+  `policy.py`, `battery.py`, `simulation.py`, `realized.py`, `safety.py` and
+  `storage.py` are byte-identical to beta.20.
+- The permitted service set remains closed at **three**, with no timer service.
+
 ## [1.0.0-beta.20] - 2026-08-24
 
 **Phase 1 complete. Phase 2 shadow validation build.** The whole Stage-B command

@@ -1605,6 +1605,23 @@ ECONOMIC_POWER_PRECISION: Final = 3
 #: is worse than a count.
 MAX_ECONOMIC_RUNS_REPORTED: Final = 8
 
+#: How many per-quarter allocation rows the diagnostics may publish in total,
+#: across all reported runs.
+#:
+#: The full trajectory is 192 rows and publishing it was rightly refused. But
+#: without *any* per-quarter view there is no way to tell a broad reported window
+#: from energy genuinely spread across every quarter of it -- the two look
+#: identical from a window and a total, and that ambiguity cost a whole
+#: investigation. A campaign averaging 3.50 kW turned out to be two quarters of
+#: buying at 10 kW inside eleven quarters of free production absorption.
+#:
+#: Forty-eight is twelve hours of quarters: longer than any real campaign, a
+#: quarter of the full trajectory, and enough that truncation is the exception. It
+#: is a budget shared in run order rather than a per-run cap, so the first runs --
+#: the ones a reader is looking at -- are always complete, and any shortfall is
+#: reported rather than silently trimmed.
+MAX_ECONOMIC_RUN_INTERVALS_REPORTED: Final = 48
+
 #: What the optimiser wants to do. ``export`` and ``curtail_pv`` are economic
 #: identities read off the grid residual rather than separate commands: a
 #: discharge whose surplus reaches the meter is an export, and declined

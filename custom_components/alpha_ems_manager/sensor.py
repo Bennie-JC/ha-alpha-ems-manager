@@ -636,6 +636,7 @@ def _planned_runs(coordinator: AlphaEmsCoordinator) -> tuple[PlannedRun, ...]:
                     ),
                     power_kw=run.first_power_kw,
                     average_power_kw=run.average_power_kw,
+                    peak_power_kw=run.peak_power_kw,
                     end_utc=dt_util.as_utc(end),
                     charge_source=run.charge_source,
                     price_eur_kwh=run.average_price_eur_kwh,

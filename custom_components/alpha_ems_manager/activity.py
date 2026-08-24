@@ -191,6 +191,9 @@ class RunContent:
     value_eur: float
     refused: bool
     window: str
+    #: The largest power any single quarter commands. Defaulted and last, so the
+    #: dataclass ordering rule is not the thing that breaks.
+    peak_power_kw: float = 0.0
     #: Why the capability plan differs, when it does. Defaulted and last, so the
     #: dataclass ordering rule is not the thing that breaks.
     gap_reason: str = ECONOMIC_GAP_NONE
@@ -636,13 +639,30 @@ def _quantity(content: RunContent) -> str:
     battery energy; the battery movement; and, when the two differ, what actually
     reached the grid. A curtailment commands no battery power at all, so quoting
     ``0.00 kW`` beside it would read as a fault rather than as an absence.
+
+    **The mean is not the dispatch intensity, and saying only the mean implied it
+    was.** A campaign reading "3.50 kW average" bought at 10 kW in two quarters
+    and absorbed free production in eleven more; another read "5.50 kW average"
+    for eight quarters near 8 kW followed by a 1 kW reserve tail. Both are
+    correct plans that a single mean describes badly.
+
+    So the peak is named whenever it differs materially from the mean -- by the
+    same deadband the announcement policy uses, so one number appears on a flat
+    campaign and two only when the second carries information. The per-quarter
+    detail stays in diagnostics; this line is not the place for it.
     """
     if content.action == ECONOMIC_ACTION_CURTAIL:
         return f"{content.energy_kwh:.2f} kWh of production"
-    battery = (
-        f"{content.average_power_kw:.2f} kW average "
-        f"({content.battery_energy_kwh:.2f} kWh from the battery)"
+    varies = (
+        content.peak_power_kw - content.average_power_kw > ECONOMIC_DEADBAND_POWER_KW
     )
+    power = (
+        f"peak {content.peak_power_kw:.2f} kW, campaign average "
+        f"{content.average_power_kw:.2f} kW"
+        if varies
+        else f"{content.average_power_kw:.2f} kW average"
+    )
+    battery = f"{power} ({content.battery_energy_kwh:.2f} kWh from the battery)"
     if content.action != ECONOMIC_ACTION_EXPORT:
         return battery
     # An export is paid at the meter, so the meter figure has to be present --

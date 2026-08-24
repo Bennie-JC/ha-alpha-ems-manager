@@ -564,6 +564,7 @@ def _solve_economic(
     raw_reserve: tuple[float | None, ...],
     reserve_above_capacity_kwh: float,
     minimum_trade_gain_eur: float,
+    grid_charge_margin_eur_per_kwh: float,
     allow_grid_charging: bool,
     allow_battery_export: bool,
 ) -> EconomicOutcome | None:
@@ -572,6 +573,13 @@ def _solve_economic(
     Positional rather than keyword because ``async_add_executor_job`` passes
     positionally, and a module-level function rather than a method so nothing
     about the coordinator's state can be read from another thread.
+
+    **Both** economic settings are parameters, and that is the whole of the
+    beta.21 fix. ``grid_charge_margin_eur_per_kwh`` was read into the config and
+    accepted by ``solve``, and this signature was the gap between them: the
+    executor call passes positionally, so a parameter that is not here is a
+    setting that silently does nothing. Stock installs were unaffected because
+    the default is zero, which is exactly why it went unnoticed.
     """
     started = time.perf_counter()
     bucket_kwh, bucket_rule = _bucket_for(limits, floor_energy_kwh)
@@ -597,6 +605,7 @@ def _solve_economic(
         terminal_floor_kwh=terminal_floor_kwh,
         floor_energy_kwh=floor_energy_kwh,
         minimum_trade_gain_eur=minimum_trade_gain_eur,
+        grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
         allow_grid_charging=allow_grid_charging,
         allow_battery_export=allow_battery_export,
         reserve_above_capacity_kwh=reserve_above_capacity_kwh,
@@ -2262,6 +2271,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raw_reserve,
             max(0.0, above_capacity),
             self.config.minimum_trade_gain_eur,
+            self.config.grid_charge_margin_eur_per_kwh,
             self.config.allow_grid_charging,
             self.config.allow_battery_export,
         )

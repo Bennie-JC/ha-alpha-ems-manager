@@ -19,11 +19,11 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.20` — a public beta.**
+> **Current release: `1.0.0-beta.21` — a public beta.**
 >
 > Stage A is feature-complete. Stage B — the physical execution controller — is now
 > wired end to end: it builds the complete AlphaESS charge command, checks it, and
-> is refused at the final barrier. Covered by 3137 automated tests.
+> is refused at the final barrier. Covered by 3161 automated tests.
 >
 > **Nothing is executed.** No command can reach the inverter in this release, by a
 > constant in the source rather than by a setting. `applied_kw` is zero, `executed`
@@ -68,7 +68,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.20` is not offered.
+     dialog if `1.0.0-beta.21` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -476,6 +476,22 @@ Every planned run appears in the `economic_plan` block of a diagnostics download
 with all five energy boundaries stated separately — the two battery-side AC
 figures, the two grid-side ones, and the curtailment — because every euro in the
 payload is priced on grid energy and a reader has to be able to check that.
+
+**A note on upgrading to beta.21: a setting that did nothing now does
+something.**
+
+If you ever set **grid charge margin** above zero, it was being ignored — the
+value never reached the planner. It works now, so a non-zero margin will start
+refusing thin grid purchases it previously allowed. If you left it at zero, which
+is the default, nothing about your plan changes.
+
+A diagnostics download now also breaks each planned run down by quarter-hour. That
+is worth knowing about if a campaign has ever looked wider than it should: a
+thirteen-quarter charge window is often two quarters of buying inside a long band
+of storing free production, and the `absorbing` flag on each quarter says which is
+which. Activity now names the peak power beside the campaign average when the two
+differ, because the average alone read as though the battery were being run gently
+when it was not.
 
 **A note on upgrading to beta.20: the command exists now, and is still not
 sent.**

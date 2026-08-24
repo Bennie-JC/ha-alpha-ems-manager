@@ -152,6 +152,7 @@ from .const import (
     EXECUTION_INTENT_HOLD,
     EXECUTION_INTENT_NET_EXPORT,
     EXECUTION_INTENT_SERVE_LOAD,
+    MAX_ECONOMIC_RUN_INTERVALS_REPORTED,
     MAX_ECONOMIC_RUNS_REPORTED,
     MODE_CHARGE,
     MODE_DISCHARGE,
@@ -724,6 +725,14 @@ class EconomicRun:
     #: The grid flows and cost this run caused, each measured against the run's
     #: own idle counterfactual. Exact, not estimated -- see
     #: :attr:`EconomicInterval.marginal_grid_import_kwh`.
+    #: The largest battery power any single quarter of this run commands, AC.
+    #:
+    #: Beside the mean because a run legitimately varies quarter to quarter, and
+    #: the mean alone is actively misleading when it does: a real campaign
+    #: averaging 3.50 kW bought at 10 kW in two quarters and absorbed free
+    #: production in eleven more. A max over the same intervals the sums above
+    #: come from -- a reading, not a computation.
+    peak_power_kw: float = 0.0
     marginal_grid_import_kwh: float = 0.0
     marginal_grid_export_kwh: float = 0.0
     #: What the run cost versus leaving the battery alone through the same
@@ -1651,6 +1660,14 @@ def runs_from(intervals: tuple[EconomicInterval, ...]) -> tuple[EconomicRun, ...
                     )
                     / INTERVAL_HOURS
                 ),
+                peak_power_kw=max(
+                    (
+                        entry.battery_charge_ac_kwh + entry.battery_discharge_ac_kwh
+                        for entry in current
+                    ),
+                    default=0.0,
+                )
+                / INTERVAL_HOURS,
                 net_cash_flow_eur=-sum(e.cost_eur for e in current),
                 min_price_eur_kwh=min(known) if known else None,
                 max_price_eur_kwh=max(known) if known else None,
@@ -2163,7 +2180,13 @@ ECONOMIC_DECIDES_NOTHING: str = (
 )
 
 
-def _run_as_dict(run: EconomicRun, *, safety_buy: bool) -> dict[str, Any]:
+def _run_as_dict(
+    run: EconomicRun,
+    *,
+    safety_buy: bool,
+    intervals: list[dict[str, Any]] | None = None,
+    omitted: int = 0,
+) -> dict[str, Any]:
     """Return one planned run, bounded and flat.
 
     Every boundary is stated separately because a euro figure is only meaningful
@@ -2177,6 +2200,9 @@ def _run_as_dict(run: EconomicRun, *, safety_buy: bool) -> dict[str, Any]:
         "interval_count": run.interval_count,
         "energy_kwh": _round_kwh(run.energy_kwh),
         "first_power_kw": _round_kw(run.first_power_kw),
+        "peak_power_kw": _round_kw(run.peak_power_kw),
+        # A mean over the whole run. Published beside the peak rather than alone,
+        # because on a campaign that varies it describes no quarter of it.
         "average_power_kw": _round_kw(run.average_power_kw),
         # What the run cost against leaving the battery alone through the same
         # intervals. **This is the economics.** Negative means it saved money.
@@ -2207,7 +2233,123 @@ def _run_as_dict(run: EconomicRun, *, safety_buy: bool) -> dict[str, Any]:
             "apportioned: a charge whose energy came from production shows a "
             "small marginal import beside a large battery charge"
         ),
+        # **The per-quarter allocation, so a window can be audited rather than
+        # inferred.** ``average_power_kw`` above is a mean over the whole run and
+        # a run legitimately varies quarter to quarter -- on a real plan it read
+        # 3.50 kW for a campaign that bought at 10 kW in two quarters and absorbed
+        # free production in eleven more. Nothing here changes what was allocated.
+        "intervals": intervals,
+        "intervals_omitted": omitted,
+        "intervals_rule": (
+            "one row per quarter of this run, read off the solved plan. a broad "
+            "window is not the same thing as energy spread across it: check "
+            "battery_power_kw per quarter, and absorbing, which marks a quarter "
+            "that stored production and bought nothing. direction is the action "
+            "and power is an unsigned magnitude"
+        ),
     }
+
+
+def _interval_as_dict(
+    entry: EconomicInterval, reserve_kwh: float | None
+) -> dict[str, Any]:
+    """Return one quarter of a run's allocation, for auditing it.
+
+    **Every figure here already existed.** This is a reading of the solved plan,
+    not a computation over it: no economics is introduced, nothing is
+    apportioned, and no allocation is changed by publishing it. ``marginal_*`` are
+    the existing per-interval properties -- exact differences against that
+    interval's own idle counterfactual.
+
+    Power is an unsigned magnitude and ``action`` carries the direction, the same
+    convention the control surface uses. A signed power would be a second way to
+    express direction and the two would eventually disagree.
+    """
+    charge = entry.battery_charge_ac_kwh
+    discharge = entry.battery_discharge_ac_kwh
+    return {
+        "interval": entry.index,
+        "action": entry.action,
+        "import_price_eur_kwh": entry.import_price_eur_kwh,
+        "export_price_eur_kwh": entry.export_price_eur_kwh,
+        # Direction is the action; this is a magnitude.
+        "battery_power_kw": _round_kw(max(charge, discharge) / INTERVAL_HOURS),
+        "battery_charge_ac_kwh": _round_kwh(charge),
+        "battery_discharge_ac_kwh": _round_kwh(discharge),
+        "start_energy_dc_kwh": _round_kwh(entry.start_energy_dc_kwh),
+        # Site flows, then the part this interval actually caused.
+        "grid_import_kwh": _round_kwh(entry.grid_import_kwh),
+        "grid_export_kwh": _round_kwh(entry.grid_export_kwh),
+        "marginal_grid_import_kwh": _round_kwh(entry.marginal_grid_import_kwh),
+        "marginal_grid_export_kwh": _round_kwh(entry.marginal_grid_export_kwh),
+        # What this quarter cost against leaving the battery alone through it.
+        "marginal_cost_eur": _round_eur(entry.cost_eur - entry.idle_cost_eur),
+        # **The field that resolves the ambiguity.** True means the pack stored
+        # production the house could not use: real battery movement that bought
+        # nothing, so it widens a reported charge window without buying.
+        "absorbing": entry.absorbing,
+        "reserve_requirement_kwh": (
+            None if reserve_kwh is None else _round_kwh(reserve_kwh)
+        ),
+        "run_start": entry.run_start,
+    }
+
+
+def _run_intervals(
+    plan: EconomicPlan,
+    run: EconomicRun,
+    reserve: tuple[float, ...],
+    budget: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return this run's per-quarter rows within ``budget``, and how many were cut.
+
+    Runs are contiguous by construction, so the slice is the run. Truncation
+    takes from the tail and is reported, because a silently short list would read
+    as a short campaign -- the exact misreading this breakdown exists to prevent.
+    """
+    if budget <= 0:
+        return [], run.interval_count
+    entries = [
+        entry
+        for entry in plan.intervals
+        if run.start_index <= entry.index <= run.end_index
+    ]
+    omitted = max(0, len(entries) - budget)
+    rows = [
+        _interval_as_dict(
+            entry,
+            reserve[entry.index] if entry.index < len(reserve) else None,
+        )
+        for entry in entries[:budget]
+    ]
+    return rows, omitted
+
+
+def _runs_as_dicts(
+    outcome: EconomicOutcome,
+    desired: EconomicPlan,
+    runs: Sequence[EconomicRun],
+) -> list[dict[str, Any]]:
+    """Return the published runs, each with its per-quarter allocation.
+
+    The interval budget is shared in run order, so the runs a reader sees first
+    are the ones that are complete.
+    """
+    reserve = tuple(outcome.horizon.planning_reserve_kwh)
+    budget = MAX_ECONOMIC_RUN_INTERVALS_REPORTED
+    payload: list[dict[str, Any]] = []
+    for run in runs:
+        rows, omitted = _run_intervals(desired, run, reserve, budget)
+        budget -= len(rows)
+        payload.append(
+            _run_as_dict(
+                run,
+                safety_buy=run.start_index in outcome.safety_buy_runs,
+                intervals=rows,
+                omitted=omitted,
+            )
+        )
+    return payload
 
 
 def _plan_totals(plan: EconomicPlan) -> dict[str, Any]:
@@ -2688,10 +2830,7 @@ def economic_as_dict(
                 "state count; bucket_rule says which rule produced this lattice"
             ),
         },
-        "runs": [
-            _run_as_dict(run, safety_buy=run.start_index in outcome.safety_buy_runs)
-            for run in runs
-        ],
+        "runs": _runs_as_dicts(outcome, desired, runs),
         "runs_total": len(desired.runs),
         "basis": ECONOMIC_BASIS,
     }
