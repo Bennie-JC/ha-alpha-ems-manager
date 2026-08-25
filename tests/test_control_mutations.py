@@ -31,6 +31,7 @@ from custom_components.alpha_ems_manager.alphaess_device import (
 )
 from custom_components.alpha_ems_manager.battery import INTERVAL_HOURS
 from custom_components.alpha_ems_manager.const import (
+    ACTION_CHARGE,
     ACTION_DISCHARGE,
     CONTROL_MIN_POWER_KW,
     CONTROL_MODE_ACTIVE,
@@ -72,8 +73,18 @@ def surviving(check) -> bool:
 # ===========================================================================
 
 
-def test_lifting_the_release_barrier_is_caught() -> None:
-    """The headline invariant: nothing is ever authorized in this release."""
+def test_widening_the_barrier_to_discharge_is_caught() -> None:
+    """**The headline invariant, and beta.24 narrowed it rather than dropping it.**
+
+    Through beta.23 it read "nothing is ever authorized", and flipping the release
+    boolean was the mutation. beta.24 authorizes a charge, so the invariant that
+    protects a battery is the narrower one: **a discharge is never authorized**, and
+    the mutation that would break it is widening the executable-action set.
+
+    Asserted with every other gate open -- active mode, the enable on, a safe
+    verdict, commands planned -- so the direction check is provably the thing doing
+    the work.
+    """
 
     def guard() -> None:
         context = make_context(mode=CONTROL_MODE_ACTIVE, execution_enabled=True)
@@ -82,12 +93,34 @@ def test_lifting_the_release_barrier_is_caught() -> None:
             context,
             commands_planned=5,
             starts_or_increases=True,
+            action=ACTION_DISCHARGE,
         )
         assert decision.authorized is False
 
     guard()
-    with patched(safety, "CONTROL_EXECUTION_AVAILABLE", True):
+    with patched(safety, "CONTROL_EXECUTABLE_ACTIONS", frozenset({ACTION_DISCHARGE})):
         assert not surviving(guard)
+
+
+def test_a_charge_is_the_one_action_that_authorizes() -> None:
+    """The positive half, so the test above cannot pass by refusing everything.
+
+    A guard that refused every direction equally would satisfy the mutation test
+    and would also mean beta.24 executes nothing at all. This is the assertion that
+    stops that reading.
+    """
+    context = make_context(mode=CONTROL_MODE_ACTIVE, execution_enabled=True)
+    verdict = evaluate(make_intent(energy_ac_kwh=0.5), context)
+    assert verdict.safe is True
+
+    charge = authorize(
+        verdict,
+        context,
+        commands_planned=5,
+        starts_or_increases=True,
+        action=ACTION_CHARGE,
+    )
+    assert charge.authorized is True
 
 
 # ===========================================================================
@@ -1082,13 +1115,16 @@ def test_letting_the_clamp_reach_back_into_the_planner_is_caught() -> None:
 
 
 def test_making_execution_available_is_caught() -> None:
-    """Mutation: flip the release barrier now that clamped commands are eligible.
+    """Mutation: make a clamped **discharge** executable.
 
-    beta.15 makes ``eligible`` reachable far more often, which makes this the most
-    consequential constant in the repository. Two independent refusals stand
-    behind it, and both are asserted.
+    beta.15 makes ``eligible`` reachable far more often, and beta.24 opens the
+    barrier for a charge -- which together make this the most consequential
+    constant in the repository. The clamped command here is a discharge, so it must
+    be refused in shadow *and* in active, and the reason in active is now the
+    direction rather than the release.
     """
-    assert safety.CONTROL_EXECUTION_AVAILABLE is False
+    assert safety.CONTROL_EXECUTION_AVAILABLE is True
+    assert ACTION_DISCHARGE not in safety.CONTROL_EXECUTABLE_ACTIONS
 
     intent, requested, context, safe_kw = clamp_pieces()
     command = alphaess_device.limit_command(requested, safe_kw)
@@ -1118,7 +1154,8 @@ def test_every_mutation_in_this_file_is_reverted() -> None:
     Cheap insurance, and worth having: a mutation escaping its context manager
     would make everything after it meaningless, in a way that looks like success.
     """
-    assert safety.CONTROL_EXECUTION_AVAILABLE is False
+    assert safety.CONTROL_EXECUTION_AVAILABLE is True
+    assert frozenset({ACTION_CHARGE}) == safety.CONTROL_EXECUTABLE_ACTIONS
     assert safety.evaluate.__module__.endswith("safety")
     assert safety.authorize.__module__.endswith("safety")
     assert alphaess_device.OWNERSHIP_PROVABLE is False

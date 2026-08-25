@@ -19,23 +19,32 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.23` — a public beta.**
+> **Current release: `1.0.0-beta.24` — a public beta.**
 >
-> Stage A is feature-complete. Stage B — the physical execution controller — is now
-> wired end to end: it builds the complete AlphaESS charge command, checks it, and
-> is refused at the final barrier. Covered by 3235 automated tests.
+> Stage A is feature-complete. Stage B — the physical execution controller — is
+> wired end to end and, from beta.24, **can charge your battery**. Covered by 3322
+> automated tests.
 >
-> **Nothing is executed.** No command can reach the inverter in this release, by a
-> constant in the source rather than by a setting. `applied_kw` is zero, `executed`
-> is false, and the owner marker is never written.
+> **One action is executable: buying energy into the battery.** Discharging,
+> exporting and curtailing are calculated, published and explained, and are refused
+> at three independent boundaries before anything reaches the inverter. That is a
+> property of the source, not a setting you could clear by accident.
+>
+> **Charging does nothing until you ask for it twice.** The Control Mode select
+> must be set to *Live*, and command sending must be enabled in the options. A fresh
+> installation is `off`, an upgrade changes neither, and until both are set the
+> integration behaves exactly as it did before: it writes nothing at all.
 >
 > The learning and forecast model has still **not** been validated across enough
 > real-world complete days to be called stable. Treat it as something to run and
 > observe, not yet as something to depend on.
 >
-> It is safe in one important respect: it never writes to your inverter, never
-> issues a charge or discharge command, and cannot change how your system
-> behaves. The worst case is an inaccurate forecast.
+> In *off* and *shadow* it never writes to your inverter and cannot change how your
+> system behaves; the worst case is an inaccurate forecast. In *Live* it can buy
+> energy on a schedule it believes is cheap, and it can stop doing so — by reaching
+> the target, by running out of room, by the plan being withdrawn, by a safety
+> condition, or because you switched the mode back. It can never discharge or
+> export.
 >
 > **This integration is not in the HACS default repository.** Install it as a
 > HACS *custom repository* — see [Installation](#installation). A submission for
@@ -68,7 +77,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.23` is not offered.
+     dialog if `1.0.0-beta.24` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -186,12 +195,12 @@ Two new entities:
 | **Control Mode** | **Off**, **Shadow** or **Live**. Starts at Off. (The stored value behind "Live" is still `active`, so nothing that already reads it breaks.) |
 | **Control State** | `inhibited`, `eligible`, `idle` or `off` — what the pipeline decided, with the reason in its attributes. |
 
-**Shadow is the one to use.** It runs the *real* pipeline — the same translation,
-the same safety checks, the same command list `active` would use — and writes
-nothing. Its diagnostics answer a specific question: *would this command have
+**Shadow is the one to start with.** It runs the *real* pipeline — the same
+translation, the same safety checks, the same command list Live would use — and
+writes nothing. Its diagnostics answer a specific question: *would this command have
 been safe, and what exactly would it have sent?* That is why `Control State`
-distinguishes `inhibited` (a safety check refused) from `eligible` (nothing
-refused, and only the release barrier stopped it).
+distinguishes `inhibited` (a safety check refused) from `eligible` (nothing refused,
+and only the mode or the opt-in stopped it).
 
 Set it to `shadow` and watch it for a few weeks. Diagnostics shows which parts of
 your AlphaESS control surface were found, what your inverter is currently doing,
@@ -392,8 +401,10 @@ matter more than the state:
 - `capability_action` is what actuators that actually exist could produce. Export
   and photovoltaic curtailment have **no** primitive in this release, so a desired
   `export` will regularly show a capability of `discharge` or `hold`.
-- `execution_blocked_reason` is why nothing is sent. While the release barrier
-  stands it reads `execution_unavailable`, and no per-action reason may mask it.
+- `execution_blocked_reason` is why nothing is sent, deepest reason first. It
+  reads `execution_not_enabled` or `mode_not_active` until you turn both switches
+  on, and `live_charge_only` for an action this release does not execute -- which is
+  a different fact from `no_primitive_export`, and reported differently.
 
 **It is a different question from `Control State`, and they will disagree.**
 `Economic Action` answers "what is the cheapest thing to do with the battery?";
@@ -476,6 +487,31 @@ Every planned run appears in the `economic_plan` block of a diagnostics download
 with all five energy boundaries stated separately — the two battery-side AC
 figures, the two grid-side ones, and the curtailment — because every euro in the
 payload is priced on grid energy and a reader has to be able to check that.
+
+**A note on upgrading to beta.24: it can charge your battery now, if you ask
+it to twice.**
+
+This is the first release in which Alpha EMS can send a command to your inverter.
+It can do exactly one thing: **buy energy into the battery** when the plan says the
+price is worth it. It cannot discharge, cannot export and cannot curtail -- those
+are still calculated and explained, and refused before anything reaches the
+hardware.
+
+**Upgrading changes nothing on its own.** Two switches have to be on: the Control
+Mode select has to say *Live*, and command sending has to be enabled in the options.
+A fresh installation is `off`, and upgrading from beta.23 leaves both exactly as you
+had them. Until you set both, this release behaves like every one before it and
+writes nothing.
+
+If you do turn it on, it can also stop -- which is worth saying because for most of
+this release's development it could not. A charge stops when the target is reached,
+when the battery runs out of room, when the plan is withdrawn, when the window
+closes, when a safety condition appears, or when you switch Control Mode back to
+*Shadow* or *Off*. That last one is the abort: selecting it stops a charge Alpha EMS
+started, rather than merely declining to start another.
+
+The Activity feed stays short. One line when a charge is planned, one when it
+actually starts, one when it ends -- not one every quarter of an hour.
 
 **A note on upgrading to beta.23: when a charge plan stops, the log now says
 why.**
@@ -720,20 +756,22 @@ safe as asked". A reduced command reads `eligible`, and the `export_check` block
 of a diagnostics download says by how much: `requested_power_kw`,
 `safe_capacity_kw`, `safety_limited` and `final_command_power_kw`.
 
-None of this makes anything executable. This release still sends no command, and
-the Phase-8 `export` action — which deliberately *wants* grid export — remains
-advisory with no actuator at all. The clamp exists so export does not happen; it
-cannot be the thing that performs one.
+None of this makes a *discharge* executable. beta.24 executes a charge and nothing
+else, and the Phase-8 `export` action — which deliberately *wants* grid export —
+remains advisory with no actuator at all. The clamp exists so export does not
+happen; it cannot be the thing that performs one.
 
 ## What it does **not** do yet
 
-- ❌ No automatic battery control. It never writes to your inverter.
-- ❌ No charge or discharge decisions. A reserve is now *calculated* (Phase 7)
-  and nothing obeys it.
-- ❌ **No energy arbitrage or price-based trading is carried out.** Phase 8
-  Stage A *computes* one — including buying, selling and curtailment — and
-  executes none of it. No service call reaches the inverter, and export and
-  photovoltaic curtailment have no actuator at all.
+- ❌ No discharging, exporting or curtailment. Those are calculated and
+  explained, and refused at three independent boundaries before anything reaches
+  the inverter.
+- ✅ Charging *is* carried out since beta.24, in *Live* mode with command sending
+  enabled — and only that. A reserve is calculated (Phase 7) and the charge plan
+  is subject to it.
+- ❌ **No selling.** Phase 8 Stage A computes a full plan including selling and
+  curtailment and executes only the buying half of it; export and photovoltaic
+  curtailment have no actuator at all.
 - ❌ No EV charge scheduling. Phase 1 only *separates* EV consumption from the
   baseline; it never starts, stops or plans charging.
 - ❌ No Solcast-driven *optimisation*. The forecast reduces what the battery is
@@ -1270,13 +1308,15 @@ Beyond the Phase-1 scope listed at the top, these are the current honest caveats
 - **Beta status.** Real-world learning and forecast validation is ongoing. The
   model has not been observed across enough complete days, nor through a live
   daylight-saving transition, to justify a stable release.
-- **Phase 4 builds and validates the control path but cannot execute it.** This
-  is deliberate, and it is not only caution. Two things are unresolved. First,
-  nothing in the AlphaESS control surface records who armed a dispatch, so Alpha
-  EMS cannot prove a running one is its own — which blocks both stopping a
-  command and continuing one past a single fifteen-minute interval. Matching
-  power, cutoff or duration is *not* proof: the person most likely to have set
-  exactly those figures by hand is you, watching the shadow recommendation.
+- **Only charging executes, and only when you have asked for it twice.**
+  Discharging, exporting and curtailment are built, validated and refused. The
+  provenance problem that blocked all of it until beta.24 — nothing in the AlphaESS
+  control surface records *who* armed a dispatch — is solved with a marker outside
+  the vendor namespace plus a persisted causal record tied to the dispatch the
+  device itself reports. Matching power, cutoff or duration is still *not* proof:
+  the person most likely to have set exactly those figures by hand is you, watching
+  the shadow recommendation. A dispatch Alpha EMS cannot prove it started is never
+  touched, stopped or overwritten.
   Second, today's recommendation is the discharge that covers your predicted
   load, which your inverter already does by itself — and does better, because it
   tracks load continuously while a fixed-power command cannot. **Do not read

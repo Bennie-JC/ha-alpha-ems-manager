@@ -70,6 +70,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from .const import (
+    CONTROL_EXECUTABLE_ACTIONS,
     CONTROL_EXECUTION_AVAILABLE,
     ECONOMIC_ACTION_CHARGE,
     ECONOMIC_ACTION_CURTAIL,
@@ -112,6 +113,7 @@ from .const import (
     EXECUTION_INTENT_SERVE_LOAD,
     EXECUTION_STOP_EXECUTION_ERROR,
     EXECUTION_STOP_GRID_CEILING,
+    EXECUTION_STOP_HEADROOM_REACHED,
     EXECUTION_STOP_NO_CHARGE_CEILING,
     EXECUTION_STOP_OWNERSHIP_CONFLICT,
     EXECUTION_STOP_PLAN_REPLACED,
@@ -122,9 +124,11 @@ from .const import (
     EXECUTION_STOP_SWITCHED_OFF,
     EXECUTION_STOP_SWITCHED_TO_SHADOW,
     EXECUTION_STOP_TARGET_REACHED,
+    EXECUTION_STOP_TIMER_NOT_REFRESHED,
     EXECUTION_STOP_WINDOW_ENDED,
     MAX_ECONOMIC_RUNS_TRACKED,
 )
+from .execution import TARGET_TOLERANCE_KWH
 
 #: The name every entry is filed under. Fixed, so a user can filter the logbook on
 #: it, and deliberately not the entity's friendly name -- that is renameable and a
@@ -267,6 +271,24 @@ class ExecutionView:
     intent: str = ""
     stop_reason: str | None = None
     inhibit_reason: str | None = None
+    #: The Stage-B run identity, and the key the lifecycle is deduplicated on.
+    #:
+    #: **The run rather than the intent, and that is what makes beta.24's three
+    #: lines exactly three.** A run id is minted once when a run is admitted and is
+    #: stable for the whole campaign, while ``plan_id``, the revision, the window
+    #: and the requested power all churn every refresh. Keying on the intent -- the
+    #: beta.19 choice, kept for the reserve-guard path whose identity genuinely does
+    #: advance every quarter -- cannot tell one charge campaign from the next.
+    run_id: str | None = None
+    #: Whether a run is admitted and waiting for its window to open.
+    prepared: bool = False
+    #: Whether a write carrying an activation actually succeeded this refresh.
+    #:
+    #: **This, and nothing else, is what "started" may be said about.** Derived from
+    #: the controller state it would have said "started" for an *armed* decision --
+    #: computed, sent nothing -- which on a release that writes is the one claim
+    #: that must not be wrong.
+    activation_confirmed: bool = False
 
     @property
     def deviation_kwh(self) -> float:
@@ -297,6 +319,15 @@ class ExecutionMemory:
     #: discharging, or serving load becomes exporting. Those are worth a line. A
     #: window sliding forward under a campaign that is still running is not.
     started: str | None = None
+    #: The run whose plan, start and end have each been announced, at most once.
+    #:
+    #: Three keys rather than one, because the three events are independent: a run
+    #: can be planned and never start, or start and be stopped by something that
+    #: was not its own target. Each holds a ``run_id``, so a second campaign
+    #: announces itself and a hundred refreshes of the first do not.
+    planned_run: str | None = None
+    started_run: str | None = None
+    ended_run: str | None = None
     #: The inhibit reason last spoken about, so a standing condition is reported
     #: on the transition and then left alone. Repeating it every refresh is the
     #: exact spam this surface exists to avoid.
@@ -441,19 +472,27 @@ def _execution_entry(
 ) -> ActivityEntry | None:
     """Return an execution lifecycle line, or ``None`` when nothing changed.
 
-    Four things are worth saying and nothing else is: a run started, a run
-    stopped, a standing inhibit began or ended, and the mode changed. Each is a
-    transition, and each is said exactly once -- the memory is what makes a
-    six-hour run produce a start and a stop rather than twenty-four repetitions of
-    the same sentence.
+    **Three lines per run and nothing else**, plus the two standing conditions --
+    an inhibit and the mode. A run is planned once, starts once and ends once, each
+    keyed on its own ``run_id``, so a campaign spanning twenty refreshes produces
+    three entries rather than twenty.
+
+    Nothing here can be reached by a republication, an affirmation, a revision
+    bump, a power change, a budget change or a forecast change. That is structural
+    rather than filtered: those things are not among the conditions below, so there
+    is no path from them to a line.
     """
     memory = state.execution
+    run_id = execution.run_id
 
-    # A dispatch stopped, or turned into a different campaign. Said before
-    # anything else about it, because a stop that goes unrecorded leaves the last
-    # line standing as though it were still true.
-    if memory.started is not None and (
-        not execution.running or execution.intent != memory.started
+    # A dispatch stopped, or turned into a different campaign. Said before anything
+    # else about it, because a stop that goes unrecorded leaves the last line
+    # standing as though it were still true.
+    ended_already = run_id is not None and memory.ended_run == run_id
+    if (
+        memory.started is not None
+        and not ended_already
+        and (not execution.running or execution.intent != memory.started)
     ):
         return ActivityEntry(
             kind=(
@@ -465,15 +504,23 @@ def _execution_entry(
             state=state.with_execution(
                 ExecutionMemory(
                     started=None,
+                    planned_run=memory.planned_run,
+                    started_run=memory.started_run,
+                    ended_run=run_id or memory.ended_run,
                     inhibit_reason=memory.inhibit_reason,
                     mode=memory.mode,
                 )
             ),
         )
 
-    # A dispatch started. Once per run, keyed on the same identity the plan lines
-    # use, so a replan that keeps the run does not re-announce it.
-    if execution.running and execution.intent and memory.started != execution.intent:
+    # A dispatch started. **Once per run**, and in Live only once a write carrying
+    # an activation has actually succeeded -- an armed decision has computed a
+    # power and sent nothing, and calling that "started" would be the one claim a
+    # release that writes must not get wrong. Shadow says "would start" from the
+    # controller state, which is all it has and all it claims.
+    started_this_run = run_id is not None and memory.started_run == run_id
+    began = execution.activation_confirmed if execution.executed else execution.running
+    if began and execution.intent and not started_this_run:
         return ActivityEntry(
             kind=(
                 ECONOMIC_EVENT_STARTED
@@ -484,6 +531,28 @@ def _execution_entry(
             state=state.with_execution(
                 ExecutionMemory(
                     started=execution.intent,
+                    planned_run=memory.planned_run,
+                    started_run=run_id or memory.started_run,
+                    ended_run=memory.ended_run,
+                    inhibit_reason=memory.inhibit_reason,
+                    mode=memory.mode,
+                )
+            ),
+        )
+
+    # A run is admitted and its window has not opened. One line, roughly a quarter
+    # of an hour ahead, so a reader sees what is about to happen before it does.
+    planned_this_run = run_id is not None and memory.planned_run == run_id
+    if execution.prepared and run_id is not None and not planned_this_run:
+        return ActivityEntry(
+            kind=ECONOMIC_EVENT_PLANNED,
+            message=_prepared_message(execution),
+            state=state.with_execution(
+                ExecutionMemory(
+                    started=memory.started,
+                    planned_run=run_id,
+                    started_run=memory.started_run,
+                    ended_run=memory.ended_run,
                     inhibit_reason=memory.inhibit_reason,
                     mode=memory.mode,
                 )
@@ -503,6 +572,9 @@ def _execution_entry(
             state=state.with_execution(
                 ExecutionMemory(
                     started=memory.started,
+                    planned_run=memory.planned_run,
+                    started_run=memory.started_run,
+                    ended_run=memory.ended_run,
                     inhibit_reason=execution.inhibit_reason,
                     mode=memory.mode,
                 )
@@ -512,25 +584,46 @@ def _execution_entry(
     return None
 
 
+def _prepared_message(execution: ExecutionView) -> str:
+    """Return the line for a run that is admitted and waiting for its window.
+
+    Three facts and a clock: how much, roughly how fast, and when. Said about a
+    quarter of an hour before anything happens, which is when a reader can still do
+    something about it.
+
+    It does not explain where the plan came from, and it says nothing about a
+    revision, a publication or a horizon. A reader wants to know their battery is
+    about to buy 8.06 kWh between one and half past four.
+    """
+    subject = _STOP_SUBJECTS.get(execution.intent, "Plan")
+    parts = [f"{subject} planned", f"{execution.target_kwh:.2f} kWh"]
+    if execution.initial_power_kw > 0.0:
+        parts.append(f"{execution.initial_power_kw:.1f} kW")
+    if execution.window:
+        parts.append(execution.window)
+    line = " - ".join(parts)
+    # In Shadow this plan is going nowhere, and the line has to say so. Every entry
+    # in the log carries the disclaimer in Shadow; a "planned" line that omitted it
+    # would be the one place a reader could mistake a shadow plan for a live one.
+    return line if execution.executed else f"{line}, no command sent"
+
+
 def _started_message(execution: ExecutionView) -> str:
     """Return the line for a dispatch beginning.
 
-    Short, and honest about which of the two things happened. A Shadow run says
-    what it would have done; only a Live one says a command went out. Getting that
-    wrong would make this surface claim the battery moved when it did not, which
-    is the one thing it must never do.
+    Short, and honest about which of the two things happened. A Live line is only
+    reachable once an activation write has actually succeeded, so "started" is a
+    statement about the battery rather than about the controller. A Shadow run says
+    what it *would* have done, which is all it can claim.
     """
-    what = execution.intent.replace("_", " ")
-    window = f" during {execution.window}" if execution.window else ""
+    subject = _STOP_SUBJECTS.get(execution.intent, "Plan")
+    figures = f"{execution.target_kwh:.2f} kWh"
+    if execution.initial_power_kw > 0.0:
+        figures += f" - {execution.initial_power_kw:.1f} kW"
     if not execution.executed:
-        return (
-            f"Shadow: would {what} to a {execution.target_kwh:.2f} kWh battery "
-            f"target{window}. No command sent."
-        )
-    return (
-        f"Dispatch started: {what}, target {execution.target_kwh:.2f} kWh"
-        f"{window}, initial power {execution.initial_power_kw:.1f} kW."
-    )
+        return f"{subject} would start - {figures}, no command sent"
+    verb = "Grid charge started" if subject == "Charge" else f"{subject} started"
+    return f"{verb} - {figures}"
 
 
 #: What each stop reason is called in front of a user.
@@ -546,12 +639,13 @@ def _started_message(execution: ExecutionView) -> str:
 #: snake_case. A reader is told what happened to their battery, not which branch
 #: fired -- the branch is in diagnostics, where it belongs.
 _STOP_PHRASES: dict[str, str] = {
-    EXECUTION_STOP_STAGE_A_HOLD: "plan ended",
+    EXECUTION_STOP_STAGE_A_HOLD: "cancelled",
     EXECUTION_STOP_WINDOW_ENDED: "window ended",
-    EXECUTION_STOP_TARGET_REACHED: "target reached",
+    EXECUTION_STOP_TARGET_REACHED: "complete",
+    EXECUTION_STOP_HEADROOM_REACHED: "headroom",
     EXECUTION_STOP_PLAN_REPLACED: "plan replaced",
     EXECUTION_STOP_STALE_PLAN: "plan expired",
-    EXECUTION_STOP_GRID_CEILING: "grid limit reached",
+    EXECUTION_STOP_GRID_CEILING: "grid limit",
     EXECUTION_STOP_SWITCHED_TO_SHADOW: "switched to shadow",
     EXECUTION_STOP_SWITCHED_OFF: "switched off",
     # The five below are declared in the vocabulary and never assigned by the
@@ -562,7 +656,10 @@ _STOP_PHRASES: dict[str, str] = {
     EXECUTION_STOP_RESERVE_LIMIT: "reserve limit reached",
     EXECUTION_STOP_OWNERSHIP_CONFLICT: "ownership unclear",
     EXECUTION_STOP_EXECUTION_ERROR: "the command failed",
-    EXECUTION_STOP_NO_CHARGE_CEILING: "no charge limit available",
+    EXECUTION_STOP_NO_CHARGE_CEILING: "no charge limit",
+    # Reachable from beta.24: the device dead-man did not move when the run was
+    # re-armed, so the run is ended deliberately rather than left to expire.
+    EXECUTION_STOP_TIMER_NOT_REFRESHED: "timer not refreshed",
 }
 
 #: What the run was doing, in one word, from the intent it carried.
@@ -576,29 +673,55 @@ _STOP_SUBJECTS: dict[str, str] = {
 def _stopped_message(execution: ExecutionView) -> str:
     """Return the line for a run ending. Short, and specific about why.
 
-    One clause: what it was doing, why it stopped, and how far it got. A reader
-    scanning a timeline wants those three things and nothing else -- the reserve
-    trajectory, the publication identity and the branch that fired are all in
-    diagnostics.
+    Three shapes, because three kinds of ending read differently:
 
-    **Shadow still says that no command was sent**, in three words rather than a
-    sentence. Dropping it would make a shadow line and a live line identical, and
-    on a release whose whole claim is that it executes nothing, that is the one
-    fact the line cannot leave out. The exact phrase matters: a boundary test
-    requires every line in the log to disclaim execution from a fixed vocabulary,
-    so this uses that vocabulary rather than a shorter paraphrase of it.
+    * **complete** -- the plan was met. ``Charge complete - 8.06 kWh``, one figure
+      when delivered and asked-for agree inside the completion tolerance, because
+      printing both invites a reader to hunt for a difference that is not there;
+    * **cancelled** -- Stage A withdrew the plan. ``Charge cancelled - 1.76 / 8.06
+      kWh``. Nothing went wrong, and the word says so;
+    * **stopped** -- something bound. ``Charge stopped - headroom - 6.20 / 8.06
+      kWh``, and likewise for the window, the grid limit, freshness and the
+      dead-man.
 
-    A reached target quotes one figure, because the delivered and the asked-for
-    are the same number by definition and printing both invites a reader to look
-    for a difference that is not there.
+    A safety stop quotes no figures. The reason is the whole of the message, and a
+    reader chasing a decimal is a reader not reading the word "safety".
+
+    No internal vocabulary reaches any of it: no ``stage_a_hold``, no
+    ``max_end_energy_kwh``, no revision, no snake_case. The branch that fired is in
+    diagnostics, where it belongs.
+
+    **Shadow still says that no command was sent.** Dropping it would make a shadow
+    line and a live line identical, and on the modes this release ships that is the
+    one clause the line cannot lose. The exact phrase matters: a boundary test
+    requires every line in the log to disclaim execution from a fixed vocabulary.
     """
     subject = _STOP_SUBJECTS.get(execution.intent, "Plan")
-    reason = _STOP_PHRASES.get(execution.stop_reason or "", "plan ended")
-    if execution.stop_reason == EXECUTION_STOP_TARGET_REACHED:
-        figures = f"{execution.target_kwh:.2f} kWh"
+    reason = execution.stop_reason or ""
+    phrase = _STOP_PHRASES.get(reason, "plan ended")
+
+    if reason == EXECUTION_STOP_SAFETY:
+        line = f"{subject} stopped - safety"
+    elif reason == EXECUTION_STOP_EXECUTION_ERROR:
+        line = f"{subject} failed - command error"
+    elif reason == EXECUTION_STOP_TARGET_REACHED:
+        short_by = execution.target_kwh - execution.delivered_kwh
+        figures = (
+            f"{execution.target_kwh:.2f} kWh"
+            if short_by <= TARGET_TOLERANCE_KWH
+            else f"{execution.delivered_kwh:.2f} / {execution.target_kwh:.2f} kWh"
+        )
+        line = f"{subject} complete - {figures}"
+    elif reason == EXECUTION_STOP_STAGE_A_HOLD:
+        line = (
+            f"{subject} cancelled - {execution.delivered_kwh:.2f} / "
+            f"{execution.target_kwh:.2f} kWh"
+        )
     else:
-        figures = f"{execution.delivered_kwh:.2f} / {execution.target_kwh:.2f} kWh"
-    line = f"{subject} {reason} - {figures}"
+        line = (
+            f"{subject} stopped - {phrase} - {execution.delivered_kwh:.2f} / "
+            f"{execution.target_kwh:.2f} kWh"
+        )
     return line if execution.executed else f"{line}, no command sent"
 
 
@@ -747,21 +870,27 @@ def _source_clause(content: RunContent) -> str:
     return f", {phrase}"
 
 
-def _advisory_suffix() -> str:
-    """Return the advisory qualifier while nothing can be executed.
+def _advisory_suffix(action: str = "") -> str:
+    """Return the advisory disclaimer for a plan line, or nothing.
 
-    Behind the barrier rather than unconditional. Two messages appended it
-    unconditionally, which was harmless while the barrier could not move and would
-    have become a false statement the moment it did.
+    **Per action since beta.24, because the answer stopped being the same for
+    every direction.** Until beta.23 nothing executed, so every advice line
+    carried the disclaimer and one constant decided it. beta.24 executes a charge
+    and nothing else, so a charge line that still called itself advisory would be
+    false, and a discharge or export line that dropped the disclaimer would be
+    false in the more dangerous direction.
+
+    An unknown or absent action is treated as advisory. Claiming executability is
+    the one mistake worth being asymmetric about.
     """
-    return "" if CONTROL_EXECUTION_AVAILABLE else f" {_ADVISORY}"
+    return "" if action in CONTROL_EXECUTABLE_ACTIONS else f" {_ADVISORY}"
 
 
 def _ended_message(record: AnnouncedRun) -> str:
     """Return the line for a run whose window has passed."""
     return (
         f"has finished the planned window to {_verb(record.content.action)}"
-        f" ({record.content.window}).{_advisory_suffix()}"
+        f" ({record.content.window}).{_advisory_suffix(record.content.action)}"
     )
 
 
@@ -773,7 +902,7 @@ def _cancelled_message(record: AnnouncedRun) -> str:
     return (
         f"no longer plans to {_verb(record.content.action)}"
         f" ({record.content.window}); the plan changed before its window opened."
-        f"{_advisory_suffix()}"
+        f"{_advisory_suffix(record.content.action)}"
     )
 
 
@@ -827,7 +956,7 @@ def _message(kind: str, run: PlannedRun, *, now: datetime) -> str:
     if content.price_eur_kwh is not None:
         sentence += f" Price {content.price_eur_kwh:.4f} EUR/kWh."
 
-    sentence += _advisory_suffix()
+    sentence += _advisory_suffix(content.action)
     return sentence
 
 

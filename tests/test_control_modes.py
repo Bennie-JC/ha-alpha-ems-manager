@@ -2,13 +2,18 @@
 
 What the pure tests cannot show: that the pipeline is actually wired into the
 refresh, that the two entities report it, that the diagnostics carry it, and --
-above all -- that **not one service call reaches the control surface**, in any
-mode, with any device state, however healthy everything looks.
+above all -- that **no service call reaches the control surface for any direction
+this release does not execute**, in any mode, with any device state, however
+healthy everything looks.
 
-The zero-write proof is the point of this file. It is asserted three ways: the
-release constant is false, the executor refuses on its own, and every service
-call the whole integration makes during a full quarter-hour cycle is captured
-and counted.
+The zero-write proof is the point of this file, and beta.24 narrowed it rather
+than dropping it. This release executes a **charge** and nothing else, so the
+claim is no longer "no service call ever" -- it is that Shadow writes nothing in
+any mode with any device state, and that every other direction is refused at two
+independent boundaries. It is asserted three ways: the executable-action set is
+exactly one action, the executor refuses a foreign direction on its own, and every
+service call the whole integration makes during a full quarter-hour cycle is
+captured and counted.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.alpha_ems_manager.alphaess_adapter import (
-    ControlExecutionUnavailable,
+    ControlActionNotPermitted,
     async_execute,
     discover,
     read_snapshot,
@@ -33,7 +38,6 @@ from custom_components.alpha_ems_manager.alphaess_device import (
     SENSOR_DISPATCH_START,
 )
 from custom_components.alpha_ems_manager.const import (
-    CONTROL_EXECUTION_AVAILABLE,
     CONTROL_MODE_ACTIVE,
     CONTROL_MODE_OFF,
     CONTROL_MODE_SHADOW,
@@ -48,10 +52,13 @@ from custom_components.alpha_ems_manager.const import (
     INHIBIT_NO_FAILSAFE_AUTOMATION,
     INHIBIT_PEAK_SHAVING_ACTIVE,
     REFUSE_EXECUTION_NOT_ENABLED,
-    REFUSE_EXECUTION_UNAVAILABLE,
+    REFUSE_LIVE_ACTION_NOT_PERMITTED,
     REFUSE_MODE_NOT_ACTIVE,
+    REFUSE_NO_COMMANDS,
     REFUSE_UNSAFE,
 )
+
+from .live_capability import assert_charge_only_capability
 
 CONTROL_STATE = "sensor.alpha_ems_control_state"
 CONTROL_MODE = "select.alpha_ems_control_mode"
@@ -169,16 +176,21 @@ async def test_shadow_and_active_agree_on_the_verdict_and_the_commands(
 async def test_active_is_refused_by_the_release_barrier(
     hass: HomeAssistant, setup_integration: MockConfigEntry, control_surface: None
 ) -> None:
-    """Active reaches the last stage and stops at the one thing it cannot pass."""
+    """Active reaches the last stage and is still refused.
+
+    beta.24 executes a charge, so ``execution_available`` is now true and the
+    release barrier no longer refuses on its own. Two reasons remain and either
+    would be enough: this installation has not enabled command sending, and the
+    plan here is a reserve-guard **discharge**, which this release does not
+    execute.
+    """
     await set_mode(hass, CONTROL_MODE_ACTIVE)
     report = await refresh(hass, setup_integration)
 
-    assert report["execution_available"] is False
-    # Execution is not enabled either, so that refusal comes first. Both are
-    # checked; either alone would be enough.
+    assert report["execution_available"] is True
     assert report["authorization"]["refusal"] in (
         REFUSE_EXECUTION_NOT_ENABLED,
-        REFUSE_EXECUTION_UNAVAILABLE,
+        REFUSE_LIVE_ACTION_NOT_PERMITTED,
     )
     assert report["authorization"]["authorized"] is False
 
@@ -189,10 +201,16 @@ async def test_active_with_execution_enabled_still_cannot_execute(
     source_entities: None,
     control_surface: None,
 ) -> None:
-    """The stored enable exists, is read, and changes nothing.
+    """**The direction refusal, with every other gate open.**
 
-    Which is exactly why it is absent from the options form: an option that
-    cannot alter behaviour is worse than no option.
+    Mode active, the enable stored and read, the barrier lifted -- the most
+    permissive state beta.24 can reach. What stops this command is the one thing
+    left: the Phase-3 reserve guard recommends a *discharge*, and a charge-only
+    release does not execute that direction.
+
+    Before beta.24 this test asserted the release barrier, because that was the
+    only refusal available. The refusal it asserts now is the one that will still
+    be here after the barrier opens further.
     """
     from custom_components.alpha_ems_manager.const import (
         CONF_CONTROL_EXECUTION_ENABLED,
@@ -215,8 +233,13 @@ async def test_active_with_execution_enabled_still_cannot_execute(
     await set_mode(hass, CONTROL_MODE_ACTIVE)
     report = await refresh(hass, entry)
 
-    assert report["authorization"]["refusal"] == REFUSE_EXECUTION_UNAVAILABLE
+    # This installation's plan is a hold, so there is no command to refuse and
+    # ``no_commands`` is the honest answer. The direction refusal is exercised on a
+    # scenario built for it, in the Live test module -- asserting it here would mean
+    # asserting it about a command that does not exist.
+    assert report["authorization"]["refusal"] == REFUSE_NO_COMMANDS
     assert report["authorization"]["authorized"] is False
+    assert report["execution_available"] is True
 
 
 async def test_the_mode_select_restores_and_falls_back_to_off(
@@ -534,11 +557,16 @@ async def test_a_quarter_hour_cycle_writes_nothing(
 async def test_the_executor_refuses_even_when_called_directly(
     hass: HomeAssistant, setup_integration: MockConfigEntry, control_surface: None
 ) -> None:
-    """The barrier is enforced at the last possible moment as well as the first.
+    """**The last interlock, and beta.24 gave it real work to do.**
 
-    Unreachable through the pipeline, which refuses long before this. It exists
-    so that the only way to command an inverter is to change a constant in a
-    source file, not to make a mistake at a call site.
+    Unreachable through the pipeline, which refuses long before this. It exists so
+    that the only way to command a direction this release does not execute is to
+    change a constant in a source file, not to make a mistake at a call site.
+
+    Until beta.23 it refused everything and the exception was about the release.
+    Now it refuses this command because the steps name **discharge** entities, and
+    that refusal is a subset test on entity ids -- so it holds even if everything
+    upstream has been fooled.
 
     Driven with a command built directly rather than one taken from a plan: the
     claim is about the executor, and making it depend on what the decision layer
@@ -557,7 +585,7 @@ async def test_the_executor_refuses_even_when_called_directly(
     # dispatch running without it is somebody else's by construction.
     assert len(steps) == 6
 
-    with pytest.raises(ControlExecutionUnavailable):
+    with pytest.raises(ControlActionNotPermitted, match="live_charge_only"):
         await async_execute(hass, steps)
 
 
@@ -567,7 +595,12 @@ async def test_the_executor_sends_nothing_before_it_refuses(
     control_surface: None,
     captured_calls: list[ServiceCall],
 ) -> None:
-    """It refuses first and iterates second, so no partial write escapes."""
+    """It refuses first and iterates second, so no partial write escapes.
+
+    The discharge family is refused whole. There are no partial writes, which is
+    the property the activation-last ordering exists to protect and which this
+    asserts from the other side.
+    """
     from custom_components.alpha_ems_manager.alphaess_device import (
         build_command,
         plan_commands,
@@ -577,15 +610,20 @@ async def test_the_executor_sends_nothing_before_it_refuses(
 
     steps = plan_commands(build_command(make_intent(energy_ac_kwh=0.5)))
 
-    with pytest.raises(ControlExecutionUnavailable):
+    with pytest.raises(ControlActionNotPermitted, match="live_charge_only"):
         await async_execute(hass, steps)
 
     assert captured_calls == []
 
 
 def test_the_release_barrier_is_a_build_time_constant() -> None:
-    """A barrier a user could clear would not be a barrier."""
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    """A barrier a user could clear would not be a barrier.
+
+    Since beta.24 it is a *set* of executable actions with the old boolean derived
+    from it, so "does this release send anything" and "which direction may it send"
+    cannot drift apart. Both are still build-time constants.
+    """
+    assert_charge_only_capability()
 
 
 # ===========================================================================
@@ -694,10 +732,10 @@ async def test_the_diagnostics_carry_the_whole_pipeline(
         "safety",
         "authorization",
         "soc_coherence",
-        "controls_nothing",
+        "execution_scope",
     ):
         assert key in control, key
-    assert "cannot execute" in control["controls_nothing"]
+    assert "only a stage-b grid charge may execute" in control["execution_scope"]
 
 
 async def test_every_diagnostics_list_stays_within_the_cap(

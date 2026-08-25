@@ -42,7 +42,6 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.alpha_ems_manager.const import (
     CONF_SELECTED_SOLCAST_SITE_IDS,
-    CONTROL_EXECUTION_AVAILABLE,
     PV_SELECTION_ORIGIN_AUTO,
     PV_SELECTION_ORIGIN_STORED,
     PV_UNAVAILABLE_ENTRY_NOT_FOUND,
@@ -60,6 +59,7 @@ from custom_components.alpha_ems_manager.solcast_source import discover
 
 from .conftest import ACHTERKANT, VOORKANT, FakeSolcast
 from .forecast_helpers import NORMAL, local
+from .live_capability import assert_charge_only_capability
 from .test_pv_site_selection import drive, enable_forecast
 
 
@@ -636,10 +636,13 @@ async def test_the_fix_did_not_open_control_execution(
     await drive(coordinator)
     await hass.async_block_till_done()
 
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert_charge_only_capability()
     assert coordinator.pv_forecasts[NORMAL].available is True
     assert calls == []
-    assert coordinator.control_report["execution_available"] is False
+    # A usable PV source still authorizes nothing. The barrier is open for a
+    # charge since beta.24, which is why the zero-call assertion above carries the
+    # weight here rather than the flag.
+    assert coordinator.control_report["execution_available"] is True
     assert coordinator.control_report["authorization"]["authorized"] is False
 
 

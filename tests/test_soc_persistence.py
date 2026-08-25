@@ -214,7 +214,7 @@ async def test_the_document_declares_the_new_minor_version(
     document = hass_storage[f"alpha_ems_manager.{setup_integration.entry_id}.learning"]
 
     assert document["version"] == STORAGE_VERSION == 2
-    assert document["minor_version"] == STORAGE_MINOR_VERSION == 5
+    assert document["minor_version"] == STORAGE_MINOR_VERSION == 6
     assert document["data"]["days"][NORMAL.isoformat()]["s"][0] == 55.0
 
 

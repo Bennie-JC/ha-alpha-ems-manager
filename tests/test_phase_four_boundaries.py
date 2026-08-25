@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from .live_capability import assert_charge_only_capability
+
 COMPONENT_DIR = Path("custom_components/alpha_ems_manager")
 
 #: The pure control modules. Same standard as the Phase-3 four: no Home
@@ -396,11 +398,8 @@ def test_no_stop_path_exists() -> None:
 
 def test_execution_is_unavailable_in_this_release() -> None:
     """The single constant standing between the pipeline and the inverter."""
-    from custom_components.alpha_ems_manager.const import (
-        CONTROL_EXECUTION_AVAILABLE,
-    )
 
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert_charge_only_capability()
 
 
 def test_the_executor_refuses_on_its_own() -> None:

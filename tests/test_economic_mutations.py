@@ -79,6 +79,7 @@ from custom_components.alpha_ems_manager.economic import solve as economic_solve
 from custom_components.alpha_ems_manager.reserve import build_reserve
 from custom_components.alpha_ems_manager.simulation import IntervalDemand
 
+from .live_capability import assert_charge_only_capability
 from .test_economic_actions import outcome_for, reserve_deadline_horizon
 from .test_economic_model import (
     EIGHT,
@@ -1258,39 +1259,56 @@ def test_back_dating_an_elapsed_run_is_caught() -> None:
     assert next_activity(previous=None, runs=(running,), now=NOW) is not None
 
 
-def test_emitting_an_execution_started_event_is_caught() -> None:
-    """Mutation: let the Activity surface claim the battery began.
+def test_a_shadow_refresh_can_never_emit_an_execution_kind() -> None:
+    """Mutation: let the Activity surface claim the battery began, in Shadow.
 
-    The one thing it must never say while the release sends nothing.
+    Through beta.23 the guard was the release barrier and this asserted a refusal.
+    beta.24 executes a charge, so the kind itself is legitimate -- and the property
+    worth protecting moved with it: **Shadow** must still never emit it, whatever
+    the barrier says, because a shadow line indistinguishable from a live one is
+    the one thing this surface cannot produce.
+
+    Asserted against the chooser rather than the payload, which is where the
+    decision is actually made.
     """
     from custom_components.alpha_ems_manager.activity import (
         ActivityEntry,
         ActivityState,
+        ExecutionMemory,
+        ExecutionView,
+        _execution_entry,
         logbook_payload,
     )
     from custom_components.alpha_ems_manager.const import (
         ECONOMIC_EVENT_STARTED,
         ECONOMIC_EVENT_STOPPED,
+        ECONOMIC_EVENT_WOULD_START,
         ECONOMIC_EXECUTION_EVENT_KINDS,
     )
 
-    # beta.19 added ``stopped`` as its counterpart: ``started`` alone meant a
-    # stop could only be inferred from silence. Both are refused while the
-    # barrier stands, which is the property this test actually protects.
+    # beta.19 added ``stopped`` as its counterpart: ``started`` alone meant a stop
+    # could only be inferred from silence.
     assert ECONOMIC_EXECUTION_EVENT_KINDS == (
         ECONOMIC_EVENT_STARTED,
         ECONOMIC_EVENT_STOPPED,
     )
-    with pytest.raises(ValueError, match="executes nothing"):
-        logbook_payload(
-            ActivityEntry(
-                kind=ECONOMIC_EVENT_STARTED,
-                message="x",
-                state=ActivityState(),
-            ),
-            domain="alpha_ems_manager",
-            entity_id="sensor.x",
-        )
+
+    # A shadow run that is under way: nothing was sent, so it "would" start.
+    shadow = _execution_entry(
+        ActivityState(execution=ExecutionMemory()),
+        ExecutionView(running=True, executed=False, intent="grid_charge"),
+        now=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+    )
+    assert shadow is not None
+    assert shadow.kind == ECONOMIC_EVENT_WOULD_START
+
+    # And the payload accepts the live kind, because this release does execute.
+    payload = logbook_payload(
+        ActivityEntry(kind=ECONOMIC_EVENT_STARTED, message="x", state=ActivityState()),
+        domain="alpha_ems_manager",
+        entity_id="sensor.x",
+    )
+    assert payload["message"] == "x"
 
 
 def test_the_structural_contracts_are_unchanged_by_beta16() -> None:
@@ -1306,13 +1324,12 @@ def test_the_structural_contracts_are_unchanged_by_beta16() -> None:
     from custom_components.alpha_ems_manager.const import (
         ACTION_CHARGE,
         ACTION_DISCHARGE,
-        CONTROL_EXECUTION_AVAILABLE,
     )
 
     from .test_entity_contract import CONTRACT
 
     assert len(CONTRACT) == 13
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert_charge_only_capability()
     assert len(PERMITTED_SERVICES) == 3
     assert set(FAMILIES) == {ACTION_DISCHARGE, ACTION_CHARGE}
     for forbidden in ("force_export", "force_import", "pv_switch"):

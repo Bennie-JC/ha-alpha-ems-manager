@@ -44,14 +44,16 @@ from .alphaess_adapter import (
 )
 from .alphaess_device import (
     BOOLEAN_EXECUTION_OWNER,
+    CHARGE_FAMILY,
     FAMILIES,
+    action_refusal,
     build_command,
     device_power_kw,
     limit_command,
     plan_commands,
     plan_release_marker,
     plan_reset,
-    write_refusal,
+    plan_sustain,
 )
 from .api import load_forecast_from
 from .battery import INTERVAL_HOURS, BatteryLimits, sanitize_soc_percent
@@ -88,6 +90,7 @@ from .const import (
     CONF_SOLCAST_ENTRY_ID,
     CONF_USE_PV_FORECAST,
     CONTROL_EXECUTION_AVAILABLE,
+    CONTROL_MIN_POWER_KW,
     CONTROL_MODE_ACTIVE,
     CONTROL_MODE_OFF,
     CONTROL_MODE_OPTIONS,
@@ -110,6 +113,8 @@ from .const import (
     DEFAULT_MINIMUM_TRADE_GAIN_EUR,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     EV_ABSENCE_GRACE_REFRESHES,
+    EXECUTION_STOP_SAFETY,
+    EXECUTION_STOP_SWITCHED_OFF,
     EXECUTION_TARGET_STALE_MINUTES,
     INHIBIT_NO_DECISION,
     INHIBIT_NO_PLAN,
@@ -118,7 +123,10 @@ from .const import (
     MAX_CONTROL_EVENTS_REPORTED,
     MAX_SAMPLE_GAP_SECONDS,
     MIN_QUARTER_COVERAGE,
+    OWNERSHIP_NONE,
     OWNERSHIP_OWNED,
+    OWNERSHIP_PROVENANCE_SETTLING,
+    OWNERSHIP_UNPROVEN,
     PRICE_CROSS_CHECK_DISAGREES,
     PRICE_FLAG_EXPORT_CROSS_CHECK_FAILED,
     PRICE_FLAG_IMPORT_CROSS_CHECK_FAILED,
@@ -144,6 +152,7 @@ from .const import (
     PV_UNAVAILABLE_SERVICE_FAILED,
     PV_UNAVAILABLE_SERVICE_MISSING,
     QUARTER_MINUTES,
+    REFUSE_MODE_NOT_ACTIVE,
     SAFETY_SAMPLE_SECONDS,
     SELECT_INVERTER_AC_LIMIT,
 )
@@ -171,11 +180,16 @@ from .energy_balance import (
 from .execution import (
     CarriedRun,
     OwnershipEvidence,
+    action_for_intent,
     actionable_target,
+    carried_from_record,
     carry_forward,
     control_intent_for,
     decide,
     measure_progress,
+    ownership_of,
+    stale_marker,
+    target_as_published,
     withdrawal_basis,
 )
 from .execution import as_dict as execution_as_dict
@@ -247,7 +261,9 @@ from .safety import (
     ExecutionDecision,
     SafetyVerdict,
     absorbing_capacity_kw,
-    authorize,
+    authorize_marker_release,
+    authorize_reset,
+    authorize_start,
     evaluate,
     safe_discharge_power_kw,
 )
@@ -333,9 +349,17 @@ _ECONOMIC_LOG = "economic"
 
 #: The statement every control surface in this release repeats, because it is the
 #: single most important fact about it.
-_CONTROLS_NOTHING = (
-    "the control pipeline is fully evaluated but cannot execute: no command "
-    "reaches the inverter in this release"
+#: What this release will and will not send, in one sentence a reader can check.
+#:
+#: It said "no command reaches the inverter in this release" up to beta.23, which
+#: was true and is now not. Renaming the key would have broken every reader of the
+#: payload; leaving the sentence would have been worse than a broken key, because a
+#: stale reassurance is read as a current one.
+_EXECUTION_SCOPE = (
+    "the control pipeline is fully evaluated and only a stage-b grid charge may "
+    "execute: every other direction -- discharge, export, curtailment and the "
+    "phase-3 reserve guard -- is refused at the authorization stage and again at "
+    "the send site, and executes nothing"
 )
 
 
@@ -1024,6 +1048,20 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: Whether the pending steps stop a run rather than start one. A reset must
         #: never write a claim of ownership.
         self._pending_is_reset: bool = False
+        #: Whether the pending step list ends in an activation, so a *confirmed*
+        #: physical start can be distinguished from a computed one. Activity says
+        #: "started" only when a write carrying this actually succeeded.
+        self._pending_activates: bool = False
+        #: Set for exactly one refresh after an activation write lands.
+        self._activation_confirmed: bool = False
+        #: The dead-man deadline observed when the run was last re-armed, and the
+        #: run it belonged to. A sustain must move the first of these forward; if it
+        #: does not, the timer is not being refreshed and the run is stopped.
+        self._sustained_deadline: datetime | None = None
+        self._sustained_run_id: str | None = None
+        #: What the pending write would do, held between building and sending.
+        self._pending_deadline: datetime | None = None
+        self._pending_run_id: str | None = None
         #: What of the Solcast boundary was found on the last refresh, and what it
         #: said. Held for diagnostics so a user can see which sites exist, which
         #: are selected and which selected one has gone missing -- without a
@@ -2383,6 +2421,123 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
 
     @callback
+    def _off_report(self, now: datetime) -> dict[str, Any]:
+        """Return the Off payload, having first stopped a dispatch of our own.
+
+        Deliberately narrow. Off does not run Stage A, does not run the economics,
+        does not admit a run and does not sustain one -- it reads the control surface
+        and the persisted record only far enough to answer one question: is there a
+        dispatch here that Alpha EMS started and still owns?
+
+        If there is, the reason is not in doubt and needs no state machine to derive:
+        the user selected Off while we were charging, so the reason is
+        ``user_switched_off`` and the response is the full charge reset. If there is
+        not -- the common case, and every refresh after the first -- nothing is read
+        further and nothing is written.
+        """
+        snapshot = read_snapshot(self.hass)
+        evidence = OwnershipEvidence(
+            dispatch_active=bool(snapshot.dispatch_active),
+            marker_on=bool(snapshot.owner_marker),
+            record=self.store.execution_record,
+            dispatch_start=_dispatch_start_instant(snapshot, now),
+            run_id=self._owned_run_id(),
+            now=now,
+        )
+        ownership = ownership_of(evidence)
+        reset_action = self._owned_run_action()
+        commands: tuple[Any, ...] = ()
+        decision = ExecutionDecision(False, REFUSE_MODE_NOT_ACTIVE)
+        source = None
+
+        if ownership == OWNERSHIP_OWNED:
+            commands = plan_reset(reset_action) if reset_action else ()
+            refusal = action_refusal(reset_action, commands) if commands else None
+            if refusal is not None:
+                commands = ()
+            decision = authorize_reset(
+                ownership=ownership,
+                stopping_action=reset_action,
+                stop_reason=EXECUTION_STOP_SWITCHED_OFF,
+                steps_planned=len(commands),
+            )
+            source = "off_reset"
+        elif stale_marker(evidence):
+            # A marker with nothing behind it. Clearing it is not an ownership claim
+            # and must not be blocked by the mode, or a marker left on by a crash
+            # would latch there for as long as the user stays in Off.
+            commands = plan_release_marker()
+            decision = authorize_marker_release(
+                marker_is_stale=stale_marker(evidence),
+                steps_planned=len(commands),
+            )
+            source = "off_marker_release"
+
+        self._pending_commands = commands
+        self._pending_power_kw = None
+        self._pending_command = None
+        self._pending_snapshot = snapshot
+        self._pending_is_reset = bool(commands)
+        self._pending_activates = False
+        self._pending_deadline = None
+        self._pending_run_id = None
+
+        return {
+            "mode": CONTROL_MODE_OFF,
+            "state": CONTROL_STATE_OFF,
+            "execution_available": CONTROL_EXECUTION_AVAILABLE,
+            "execution_enabled": self.config.control_execution_enabled,
+            "authorization": decision.as_dict(),
+            "commands_planned": len(commands),
+            "device": snapshot.as_dict(),
+            "ownership": {"state": ownership},
+            "write_boundary": {
+                "action": reset_action if source == "off_reset" else None,
+                "source": source,
+                "steps": [step.as_dict() for step in commands],
+                "stop_reason": (
+                    EXECUTION_STOP_SWITCHED_OFF if source == "off_reset" else None
+                ),
+            },
+            "off_semantics": (
+                "off means this integration attempts no control and starts nothing. "
+                "it does stop a dispatch it started itself and still owns, once, "
+                "because the alternative is a charge the user cannot switch off. a "
+                "foreign or unproven dispatch is never touched, and after the "
+                "cleanup lands every refresh writes nothing"
+            ),
+            "execution_scope": _EXECUTION_SCOPE,
+        }
+
+    @callback
+    def _owned_run_action(self) -> str | None:
+        """Return the battery action the persisted record says we armed.
+
+        **The authoritative source for what a reset stops**, and the only one that
+        is available when a reset is needed. Every alternative is absent on at least
+        one real stop path: the current command is ``None`` on all of them, the
+        carried run is ``None`` on a withdrawal, and the ended run is absent on a
+        mode change, a safety stop or a dead-man failure.
+
+        This one is present by construction. ``ownership == owned`` requires
+        ``record_matches``, which requires the record to name the run being executed
+        -- so whenever a reset is entitled to run, the record exists and describes
+        what Alpha EMS armed.
+
+        ``None`` when the record has no usable action, and the caller must fail
+        closed. Never inferred from anything else and never defaulted.
+        """
+        record = self.store.execution_record
+        if not isinstance(record, dict):
+            return None
+        action = record.get("action")
+        if isinstance(action, str) and action:
+            return action
+        # A record written before the action was stored. Derived from the intent it
+        # does carry rather than guessed -- the mapping is total and fails closed.
+        return action_for_intent(record.get("intent"))
+
+    @callback
     def _owned_run_id(self) -> str | None:
         """Return the run a persisted causal record claims, if any."""
         record = self.store.execution_record
@@ -2402,13 +2557,30 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         alternative ordering would leave a dispatch running that nothing could
         prove was ours.
 
-        It records what was intended and what the device said at the moment of
-        writing. Ownership is only granted later, when a subsequent readback shows
-        a dispatch whose start instant matches -- so this cannot claim a dispatch
-        Alpha EMS did not cause.
+        **The dispatch start is deliberately left empty**, and beta.24 made that
+        explicit rather than incidental. This runs before the dispatch (re)starts,
+        so whatever the register says now belongs to the *previous* activation --
+        recording it would tie the claim to the wrong dispatch, which on a sustaining
+        re-arm is precisely the dispatch that is about to be replaced.
+        ``_stamp_dispatch_start`` completes the record from the readback once the
+        dispatch it caused actually exists.
+
+        Ownership is only granted later, when that readback lands -- so this cannot
+        claim a dispatch Alpha EMS did not cause.
         """
-        observed = _dispatch_start_instant(snapshot, now)
+        del snapshot
         self.store.execution_record = {
+            # **The run itself, since beta.24, so a restart can adopt it.**
+            # Without these a restart met a live dispatch of ours with a freshly
+            # minted run id, ownership read ``unproven`` for a contradiction rather
+            # than a real doubt, and the charge could be neither continued nor
+            # stopped. Stored as the published payload so the reconstruction is a
+            # round trip rather than a summary -- a serialiser that dropped the
+            # headroom cap would restore a run allowed to charge past its ceiling.
+            "target": target_as_published(run.target),
+            "admitted_at": run.admitted_at.isoformat(),
+            "affirmed_at": run.affirmed_at.isoformat(),
+            "stale_after": run.stale_after.isoformat(),
             # The run identity, so the record still names the right run after the
             # horizon has rolled several times and every published ``plan_id`` has
             # changed. The admitting publication is kept beside it for tracing.
@@ -2416,15 +2588,144 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "plan_id": run.plan_id,
             "revision": run.revision,
             "intent": run.intent,
+            # **What a later reset will stop.** Derived once, here, so the stop path
+            # reads a record of what was armed rather than reconstructing it from a
+            # command that no longer exists.
+            "action": action_for_intent(run.intent),
             "power_kw": None if command is None else command.power_kw,
             "cutoff_soc_percent": (
                 None if command is None else command.cutoff_soc_percent
             ),
             "duration_minutes": None if command is None else command.duration_minutes,
             "written_at": now.isoformat(),
-            "dispatch_start": None if observed is None else observed.isoformat(),
+            "dispatch_start": None,
         }
         self.store.schedule_save()
+
+    @callback
+    def _deadman_is_stale(self, snapshot: Any, run_id: str | None) -> bool:
+        """Return whether the last re-arm failed to move the device dead-man.
+
+        **A measurement, not an assumption, and that is the whole point.** The one
+        physical behaviour beta.24 could not verify in advance is whether
+        re-activating an already-active dispatch refreshes the helper timer. Rather
+        than depending on it, each sustain records the deadline it saw and the next
+        refresh checks that it moved.
+
+        Conservative in both directions. It answers ``False`` unless there really is
+        a previous sustain for *this* run to compare against -- a missing timer
+        reading is "no evidence it advanced", which must not become "it failed",
+        because that would stop a healthy run on a temporarily unavailable entity.
+        And it answers ``True`` only on a deadline that has not moved forward at all.
+        """
+        if run_id is None or self._sustained_run_id != run_id:
+            return False
+        previous = self._sustained_deadline
+        if previous is None:
+            return False
+        current = None if snapshot is None else snapshot.charge_timer_finishes_at
+        if current is None:
+            return False
+        return current <= previous
+
+    @callback
+    def _power_moved_materially(self, command: Any) -> bool:
+        """Return whether the power helper needs rewriting.
+
+        Measured against the power actually **written**, not against the power last
+        computed, and on the *quantised* figure the device would receive -- two
+        rolling requests that differ by less than one device step are the same
+        command as far as the inverter is concerned.
+
+        The deadband is :data:`CONTROL_MIN_POWER_KW`, which already means "smaller
+        than this is not a command" everywhere else in this integration. A second
+        threshold with its own constant would be a second thing to keep in step.
+
+        No previous write means there is nothing to compare against, so the answer
+        is yes: that is an arm, not a sustain.
+        """
+        last = self._last_control_power_kw
+        if last is None:
+            return True
+        return abs(float(command.power_kw) - float(last)) >= CONTROL_MIN_POWER_KW
+
+    @property
+    def activation_confirmed(self) -> bool:
+        """Return whether an activation write succeeded on this refresh.
+
+        Read by the Activity surface, which may only say a run *started* when a
+        command carrying an activation actually landed. True for one refresh.
+        """
+        return self._activation_confirmed
+
+    @callback
+    def _adopt_persisted_run(self, snapshot: Any) -> None:
+        """Take up the run a live dispatch belongs to, if the record can prove it.
+
+        Called on every refresh and does nothing on almost all of them: it acts
+        only when nothing is carried *and* a dispatch is running *and* the marker is
+        on -- which together is the restart case and very little else.
+
+        **When the record cannot prove which run is running, nothing happens here,
+        and that silence is the design.** A record written before beta.24 carries no
+        target to rebuild. The tempting next step is to stop the dispatch anyway, and
+        it is exactly the step this project has refused since Phase 4: a reset is a
+        physical write, and issuing one against a dispatch whose provenance we cannot
+        establish is the thing the foreign/unproven rule exists to prevent. So the
+        charge is left to the device dead-man, ownership reports ``unproven``, the
+        marker is **not** released -- releasing it would assert a conclusion we do
+        not have -- and the evidence is reconciled later by the ordinary stale-marker
+        path, once there is nothing running behind it.
+        """
+        if self._carried is not None:
+            return
+        if snapshot is None or not snapshot.dispatch_active:
+            return
+        if not snapshot.owner_marker:
+            return
+        adopted = carried_from_record(self.store.execution_record)
+        if adopted is not None:
+            self._carried = adopted
+
+    @callback
+    def _stamp_dispatch_start(self, evidence: Any, now: datetime) -> bool:
+        """Complete our own record with the dispatch it caused, once.
+
+        **The narrowest thing that makes a Live charge stoppable.** The record is
+        written *before* the writes, so the device reports no ``dispatch_start``
+        yet and the record stores ``None``. Requiring an exact match from there is
+        unsatisfiable: ownership would never leave ``unproven``, ``reset_required``
+        is gated on ``owned``, and Alpha EMS would arm a charge it could never stop.
+
+        Four conditions, and every one of them is doing work:
+
+        * the record is **ours** and names the run being executed -- so this is
+          completing a claim, not making one;
+        * it carries no start yet -- so a completed record is never rewritten, and
+          the exact comparison governs from then on;
+        * the marker is on and a dispatch is running -- the two factors, unchanged;
+        * the dispatch **began when we wrote** -- so one that merely happens to be
+          running now cannot be adopted. Measured between the write and the device's
+          own start instant, which is the pair that is actually causally linked.
+
+        Returns whether anything was stamped, so the caller can say so.
+        """
+        record = self.store.execution_record
+        if not isinstance(record, dict) or record.get("dispatch_start") is not None:
+            return False
+        observed = evidence.dispatch_start
+        # **Asked of the evidence rather than re-derived here**, so the stamp and the
+        # ownership rule cannot disagree about what a settling claim is. Two copies
+        # of that test is one too many, and the copy that drifted would be this one.
+        if observed is None:
+            return False
+        if evidence.record_provenance != OWNERSHIP_PROVENANCE_SETTLING:
+            return False
+        record["dispatch_start"] = observed.isoformat()
+        record["stamped_at"] = now.isoformat()
+        self.store.execution_record = record
+        self.store.schedule_save()
+        return True
 
     @callback
     def _clear_execution_record(self) -> None:
@@ -2585,6 +2886,16 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # This reads *this* refresh's targets -- the ordering pinned in beta.19 --
         # so the run being evaluated is never a refresh behind the publication that
         # affirmed it.
+        # **Adopt before carrying, on the first refresh after a restart.**
+        # A restart discards the carried run and keeps the record. Carrying from
+        # ``None`` would mint a *new* run id against a dispatch that is still
+        # running, so ownership would read ``unproven`` for a contradiction rather
+        # than a real doubt -- and the charge could be neither continued nor
+        # stopped. Adopting first makes the run we are executing the run we started.
+        #
+        # Only while a dispatch is actually running: a record left behind by a
+        # completed run must not resurrect it.
+        self._adopt_persisted_run(snapshot)
         outcome = carry_forward(self._carried, self.execution_targets, now)
         self._carried = outcome.carried
         carried = outcome.carried
@@ -2603,7 +2914,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Alpha EMS would have inhibited itself the moment it armed anything.
             dispatch_start=_dispatch_start_instant(snapshot, now),
             run_id=None if carried is None else carried.run_id,
+            # Read once, so the settle window is measured against this refresh
+            # rather than against whenever a property happens to be evaluated.
+            now=now,
         )
+        # Complete our own claim with the dispatch it caused, before the decision
+        # reads ownership. Nothing else may write to the record here.
+        stamped = self._stamp_dispatch_start(evidence, now)
+        if stamped:
+            evidence = replace(evidence, record=self.store.execution_record)
         # **On the refresh a run ends, report the run that ended.** Keyed on the
         # ended run, so the accumulators are read rather than reset -- otherwise the
         # closing figures read 0.00 against the target, which is what put "0.00 /
@@ -2645,6 +2964,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             carried=carried,
             carry_ended=outcome.ended,
             ended_run=outcome.ended_run,
+            # Measured, not assumed: the last re-arm either moved the device
+            # dead-man forward or it did not, and the run ends deliberately if not.
+            deadman_stale=self._deadman_is_stale(
+                snapshot, None if carried is None else carried.run_id
+            ),
         )
         # Held so ``_stage_b_intent`` builds from the same decision this report
         # describes, rather than deciding twice and risking a disagreement.
@@ -4043,6 +4367,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if report is None:
             return
+        # One refresh only. Cleared before anything can set it again, so a stale
+        # true cannot make a later refresh claim a start it did not make.
+        self._activation_confirmed = False
         authorization = report.get("authorization") or {}
         if not authorization.get("authorized"):
             return
@@ -4114,6 +4441,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _mark_execution_applied(report, self._pending_power_kw)
             self._last_control_write = now
             self._last_control_power_kw = self._pending_power_kw
+            # **"Started" means a write carrying an activation succeeded**, and this
+            # is the only place that can know it. Deriving it from the controller
+            # state would say "started" for an *armed* decision -- computed, sent
+            # nothing -- which is the one claim a release that writes must not get
+            # wrong.
+            self._activation_confirmed = self._pending_activates
+            if self._pending_activates:
+                # Remember what the dead-man read before this activation, so the
+                # next refresh can check that it moved.
+                self._sustained_deadline = self._pending_deadline
+                self._sustained_run_id = self._pending_run_id
             # **The claim is released only once the stop has actually landed.**
             # Clearing it while building the report would have been simpler and
             # would abandon a dispatch that is still running: with the record gone
@@ -4122,6 +4460,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # run on permanently, which is the very fault F16 named.
             if self._pending_is_reset:
                 self._clear_execution_record()
+                # A stopped run has no dead-man to keep alive, and leaving the
+                # observation behind would make the next run's first sustain compare
+                # against a deadline from a run that no longer exists.
+                self._sustained_deadline = None
+                self._sustained_run_id = None
 
     def _build_control_report_safely(
         self,
@@ -4185,25 +4528,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         mode = self.control_mode
         if mode == CONTROL_MODE_OFF:
-            # No intent, no gate, no command planning, and nothing read from the
-            # control surface. Off means this integration is not attempting
-            # control at all.
-            return {
-                "mode": mode,
-                "state": CONTROL_STATE_OFF,
-                "execution_available": CONTROL_EXECUTION_AVAILABLE,
-                "execution_enabled": self.config.control_execution_enabled,
-                "off_semantics": (
-                    "off means this integration attempts no control and writes "
-                    "nothing; it does not mean an inverter reverts, and in this "
-                    "release the distinction cannot arise because nothing here "
-                    "can start a dispatch. it does still read whether the "
-                    "inverter is storing surplus production, because a projected "
-                    "state of charge that assumed the opposite would be wrong -- "
-                    "reading is not controlling"
-                ),
-                "controls_nothing": _CONTROLS_NOTHING,
-            }
+            # No intent, no gate, no economics and no new run. Off means this
+            # integration is not attempting control.
+            #
+            # **It does clean up after itself, once.** Until the amendment Off
+            # returned here before reading the control surface, so a charge Alpha
+            # EMS had started in Live and still owned would keep running -- the user
+            # selecting Off could not stop it, which is the opposite of what
+            # selecting Off means. So Off now looks for a dispatch of its own and
+            # stops it; after that it is silent, and every later refresh returns
+            # from here having written nothing.
+            return self._off_report(now)
 
         capability = discover(self.hass)
         snapshot = read_snapshot(self.hass)
@@ -4224,7 +4559,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Stage B first, because for a grid charge it is the authority. Computed
         # before the command so its intent can *be* the command.
         stage_b = self._stage_b_report(plan=plan, snapshot=snapshot, now=now, mode=mode)
-        owned = stage_b.get("ownership", {}).get("state") == OWNERSHIP_OWNED
+        ownership_state = (stage_b.get("ownership") or {}).get("state")
+        owned = ownership_state == OWNERSHIP_OWNED
         charge_intent = self._stage_b_intent(plan=plan, now=now)
 
         # **The command source, and the one place it is decided.**
@@ -4238,7 +4574,25 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # power reached no actuator and opening the barrier would have armed a
         # discharge while the economic plan asked to buy.
         intent = charge_intent
-        if intent is None:
+        # **The reserve guard is suppressed while Stage B holds a run**, and this
+        # is one of the two changes that make charge-only Live safe rather than
+        # merely intended.
+        #
+        # The fallback exists so that a refresh with nothing to charge keeps the
+        # Phase-3 behaviour byte-for-byte. But Stage B returns no intent on a
+        # refresh where its own run is *waiting* -- ownership settling, a window not
+        # yet open, a request reduced to nothing -- and on those refreshes the
+        # fallback would hand the wheel to a layer that only ever discharges. In
+        # Live that is a discharge command issued into a charge Alpha EMS is running
+        # itself.
+        #
+        # So while a run is carried, or while a dispatch of ours is running or
+        # protected, there is no second opinion. Outside that, nothing changes.
+        stage_b_holds_the_run = self._carried is not None or (
+            ownership_state in (OWNERSHIP_OWNED, OWNERSHIP_UNPROVEN)
+            and self.store.execution_record is not None
+        )
+        if intent is None and not stage_b_holds_the_run:
             intent = translate(
                 plan, now=now, horizon_minutes=self.config.control_horizon_minutes
             )
@@ -4288,23 +4642,128 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             command = limit_command(requested, safe_power_kw)
         if command is not None and command is not requested:
             context = replace(context, device_power_kw=command.power_kw)
-        commands = plan_commands(command) if command is not None else ()
-        # Layer 3 of the direction interlock: checked against the entity list
-        # itself, not against the intention that built it. A malformed command is
-        # refused whole -- there are no partial writes.
-        refusal = None if command is None else write_refusal(command, commands)
+        # **Two obligations, and beta.24 keeps them apart.** An earlier draft
+        # gated the whole re-arm on a material power change, which is wrong: a
+        # charge holding steady at 3.0 kW would never re-arm, so its dead-man would
+        # never be refreshed and the dispatch would expire mid-run while this
+        # controller believed it was still going. Constant power is the *common*
+        # case, so that would have hit the first real campaign.
+        #
+        # The dead-man is refreshed on **every** refresh of an owned, active run,
+        # whatever the figures say. The power helper is rewritten only when the
+        # quantised power has actually moved -- writing a helper a value it already
+        # holds is a service call that buys nothing.
+        # Which run the persisted record names, read once. Not an ownership
+        # derivation -- ownership is ``ownership_of`` and nothing else -- but the
+        # identity check that makes "the same run" mean the same run.
+        recorded_run_id = self._owned_run_id()
+        carried_run_id = self._carried.run_id if self._carried is not None else None
+        sustaining = (
+            command is not None
+            and command.moves_battery
+            and owned
+            and bool(snapshot is not None and snapshot.dispatch_active)
+            and recorded_run_id is not None
+            and recorded_run_id == carried_run_id
+            and not self._power_moved_materially(command)
+        )
+        # **Which operation this refresh performs, decided before anything is
+        # built.** Until the amendment the order was inverted: a start was
+        # authorised, and then the step list was swapped for a reset afterwards --
+        # so the thing authorised was not the thing sent, and the reset was judged
+        # by the start path's questions. Both faults come from that ordering, so
+        # the ordering is what changed.
+        #
+        # A safety verdict that has turned unsafe under a dispatch of ours is
+        # itself a stop condition. "Do not start this" and "do not stop what is
+        # already running" look alike and are opposites; the second is never right.
+        verdict = evaluate(intent, context)
+        dispatch_active = bool(snapshot is not None and snapshot.dispatch_active)
+        result = stage_b.get("result") or {}
+        stop_reason = result.get("stop_reason")
+        unsafe_while_owned = owned and dispatch_active and not verdict.safe
+        if unsafe_while_owned and not stop_reason:
+            stop_reason = EXECUTION_STOP_SAFETY
+        resetting = owned and bool(result.get("reset_required") or unsafe_while_owned)
+        # The ownership layer's own verdict, read rather than recomputed. There is
+        # one definition of "a marker with nothing behind it" -- ``stale_marker`` in
+        # the module that holds the evidence -- and neither this function nor
+        # ``safety`` is allowed a second one.
+        marker_is_stale = bool(
+            (stage_b.get("ownership") or {}).get("clear_stale_marker")
+        )
+        releasing = not resetting and not owned and marker_is_stale
+
+        # **The action of the run being stopped, from the record of arming it.**
+        # Never from ``command``, which is ``None`` on every stopping refresh -- that
+        # is what made the "reset" a lone marker release. Ownership already requires
+        # the record to name the run being executed, so when a reset is entitled to
+        # run the record is the proof of what it is stopping. Absent or unpermitted
+        # fails closed; it is never defaulted to a charge.
+        reset_action = self._owned_run_action()
+
+        if resetting:
+            commands = plan_reset(reset_action) if reset_action else ()
+        elif releasing:
+            commands = plan_release_marker()
+        elif command is None:
+            commands = ()
+        elif sustaining:
+            commands = plan_sustain(command)
+        else:
+            commands = plan_commands(command)
+
+        # Layer 3 of the direction interlock, and it now guards the reset list too:
+        # checked against the entity list itself, not against the intention that
+        # built it. A malformed command is refused whole -- there are no partial
+        # writes.
+        if resetting:
+            checked = reset_action
+        elif releasing:
+            # The marker alone belongs to no family, and validating it against one
+            # would refuse the one write that is safe without a claim.
+            checked = None
+        else:
+            checked = None if command is None else command.action
+        refusal = None
+        if commands and checked is not None:
+            refusal = action_refusal(checked, commands)
         if refusal is not None:
             commands = ()
         stage_b["write_boundary"] = {
             "refusal": refusal,
-            "action": None if command is None else command.action,
-            "family": (
-                None
-                if command is None or command.action not in FAMILIES
-                else FAMILIES[command.action].activate
-            ),
+            # The action of whatever is being sent. On a reset that is the action
+            # the record says we armed, which is the whole point: a stopping refresh
+            # has no command to take it from.
+            "action": checked,
+            "family": (None if checked not in FAMILIES else FAMILIES[checked].activate),
             "steps": [step.as_dict() for step in commands],
-            "source": "stage_b" if charge_intent is not None else "reserve_guard",
+            "source": (
+                "stage_b_reset"
+                if resetting
+                else "stale_marker_release"
+                if releasing
+                else "stage_b"
+                if charge_intent is not None
+                else "reserve_guard"
+            ),
+            "sequence": (
+                "reset"
+                if resetting
+                else "marker_release"
+                if releasing
+                else "sustain"
+                if sustaining
+                else "arm"
+            ),
+            "reset_action": reset_action,
+            "stop_reason": stop_reason,
+            "deadman_minutes": (None if command is None else command.duration_minutes),
+            "timer_finishes_at": (
+                None
+                if snapshot is None or snapshot.charge_timer_finishes_at is None
+                else snapshot.charge_timer_finishes_at.isoformat()
+            ),
             "rule": (
                 "direction is the helper family and the magnitude is unsigned. the "
                 "raw dispatch surface takes signed power with the opposite "
@@ -4314,49 +4773,55 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
         }
 
-        verdict = evaluate(intent, context)
-        starts_or_increases = (
-            command is not None
-            and command.moves_battery
-            and (
-                self._last_control_power_kw is None
-                or command.power_kw > self._last_control_power_kw
+        # **Each operation is authorised on its own terms, and the thing authorised
+        # is the thing sent.** Three questions, and they are genuinely different:
+        # "may we begin or continue moving energy", "may we return a dispatch we own
+        # to rest", and "may we clear a marker with nothing behind it". Until the
+        # amendment all three went through the first one, so the last two were
+        # refused every time -- and the step list was swapped afterwards, so the
+        # answer did not even describe the question.
+        if resetting:
+            decision = authorize_reset(
+                ownership=ownership_state or OWNERSHIP_NONE,
+                stopping_action=reset_action,
+                stop_reason=stop_reason,
+                steps_planned=len(commands),
             )
-        )
-        decision = authorize(
-            verdict,
-            context,
-            commands_planned=len(commands),
-            starts_or_increases=starts_or_increases,
-        )
+        elif releasing:
+            decision = authorize_marker_release(
+                marker_is_stale=marker_is_stale,
+                steps_planned=len(commands),
+            )
+        else:
+            # **A sustaining refresh is a continuation, not a start.** The cooldown
+            # is a quarter of an hour and so is the refresh interval, so a re-arm
+            # sits exactly on the boundary -- and a cooldown that refused one would
+            # expire the run it was protecting.
+            starts_or_increases = (
+                command is not None
+                and command.moves_battery
+                and not sustaining
+                and (
+                    self._last_control_power_kw is None
+                    or command.power_kw > self._last_control_power_kw
+                )
+            )
+            decision = authorize_start(
+                verdict,
+                context,
+                commands_planned=len(commands),
+                starts_or_increases=starts_or_increases,
+                action=None if command is None else command.action,
+            )
 
         state = CONTROL_STATE_INHIBITED
-        if verdict.safe:
+        if resetting or releasing:
+            # A stop is not an eligibility question. Reporting ``inhibited`` because
+            # the world is unsafe would describe the condition that *caused* the
+            # stop as though it had prevented it.
             state = CONTROL_STATE_ELIGIBLE if commands else CONTROL_STATE_IDLE
-
-        # F5/F16: the stop path. ``plan_reset`` and ``plan_release_marker`` were
-        # written in beta.19 and never called, so nothing could stop an owned run
-        # or release the marker that arming sets -- it would have latched on.
-        #
-        # Only ever for a dispatch ownership has been *established* for. A foreign
-        # or unproven one is never reset, and a stale marker is released on its
-        # own, which is the one write that is safe without a claim.
-        result = stage_b.get("result") or {}
-        if owned and result.get("reset_required"):
-            action = (stage_b.get("write_boundary") or {}).get("action")
-            commands = plan_reset(action if isinstance(action, str) else "")
-            stage_b["write_boundary"] = {
-                **(stage_b.get("write_boundary") or {}),
-                "steps": [step.as_dict() for step in commands],
-                "source": "stage_b_reset",
-            }
-        elif not owned and (stage_b.get("ownership") or {}).get("clear_stale_marker"):
-            commands = plan_release_marker()
-            stage_b["write_boundary"] = {
-                **(stage_b.get("write_boundary") or {}),
-                "steps": [step.as_dict() for step in commands],
-                "source": "stale_marker_release",
-            }
+        elif verdict.safe:
+            state = CONTROL_STATE_ELIGIBLE if commands else CONTROL_STATE_IDLE
 
         self._record_control_event(now, state, verdict, decision)
         # Held for the one async method that would send them. Not published and
@@ -4370,6 +4835,18 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pending_is_reset = (stage_b.get("write_boundary") or {}).get(
             "source"
         ) in ("stage_b_reset", "stale_marker_release")
+        # Whether this list would physically start or re-start a dispatch. Read from
+        # the steps rather than from the intention, so "started" can only ever be
+        # said about a list that actually carries an activation.
+        self._pending_activates = any(
+            step.entity_id == CHARGE_FAMILY.activate for step in commands
+        )
+        # What the dead-man read *before* this write. Compared against the reading
+        # after it, next refresh.
+        self._pending_deadline = (
+            None if snapshot is None else snapshot.charge_timer_finishes_at
+        )
+        self._pending_run_id = carried_run_id
 
         return {
             "mode": mode,
@@ -4406,7 +4883,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "clamp, so a safely reduced power in shadow is the power active "
                 "would have sent"
             ),
-            "controls_nothing": _CONTROLS_NOTHING,
+            "execution_scope": _EXECUTION_SCOPE,
         }
 
     @callback

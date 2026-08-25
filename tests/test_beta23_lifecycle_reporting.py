@@ -473,12 +473,14 @@ def test_the_incident_now_reads_as_a_sentence_about_a_battery() -> None:
     The disclaimer stays -- while the barrier stands, a Shadow line that reads like
     a Live one is the one thing this release cannot publish.
     """
-    assert line() == "Charge plan ended - 1.76 / 8.06 kWh, no command sent"
+    # beta.24 renamed the withdrawal outcome: "cancelled" is what a withdrawn plan
+    # is, and "plan ended" said nothing about which of six endings had happened.
+    assert line() == "Charge cancelled - 1.76 / 8.06 kWh, no command sent"
 
 
 def test_a_live_line_drops_the_disclaimer_and_nothing_else() -> None:
     """Same three facts. The difference between the modes is one clause."""
-    assert line(executed=True) == "Charge plan ended - 1.76 / 8.06 kWh"
+    assert line(executed=True) == "Charge cancelled - 1.76 / 8.06 kWh"
 
 
 def test_the_reasons_a_reader_must_tell_apart_read_differently() -> None:
@@ -489,32 +491,42 @@ def test_the_reasons_a_reader_must_tell_apart_read_differently() -> None:
 
     assert len(set(sentences.values())) == len(REACHABLE)
     assert sentences[EXECUTION_STOP_STAGE_A_HOLD] == (
-        "Charge plan ended - 1.76 / 8.06 kWh"
+        "Charge cancelled - 1.76 / 8.06 kWh"
     )
     assert sentences[EXECUTION_STOP_WINDOW_ENDED] == (
-        "Charge window ended - 1.76 / 8.06 kWh"
+        "Charge stopped - window ended - 1.76 / 8.06 kWh"
     )
+    # Short of the target here, so both figures are quoted. The one-figure form is
+    # asserted on its own below.
     assert sentences[EXECUTION_STOP_TARGET_REACHED] == (
-        "Charge target reached - 8.06 kWh"
+        "Charge complete - 1.76 / 8.06 kWh"
     )
     assert sentences[EXECUTION_STOP_PLAN_REPLACED] == (
-        "Charge plan replaced - 1.76 / 8.06 kWh"
+        "Charge stopped - plan replaced - 1.76 / 8.06 kWh"
     )
     assert sentences[EXECUTION_STOP_STALE_PLAN] == (
-        "Charge plan expired - 1.76 / 8.06 kWh"
+        "Charge stopped - plan expired - 1.76 / 8.06 kWh"
     )
     assert sentences[EXECUTION_STOP_GRID_CEILING] == (
-        "Charge grid limit reached - 1.76 / 8.06 kWh"
+        "Charge stopped - grid limit - 1.76 / 8.06 kWh"
     )
 
 
 def test_a_reached_target_quotes_one_figure() -> None:
-    """Delivered and asked-for are the same number by definition, and printing both
-    invites a reader to hunt for a difference that is not there."""
-    reached = line(stop_reason=EXECUTION_STOP_TARGET_REACHED, executed=True)
+    """Inside the completion tolerance the two figures are the same number, and
+    printing both invites a reader to hunt for a difference that is not there.
 
-    assert reached.count("/") == 0
-    assert line(executed=True).count("/") == 1
+    Outside it they are genuinely different and both are quoted: a run that stopped
+    at 1.76 of 8.06 did not complete, whatever branch reported it.
+    """
+    met = line(
+        stop_reason=EXECUTION_STOP_TARGET_REACHED, delivered_kwh=8.02, executed=True
+    )
+    short = line(stop_reason=EXECUTION_STOP_TARGET_REACHED, executed=True)
+
+    assert met == "Charge complete - 8.06 kWh"
+    assert met.count("/") == 0
+    assert short.count("/") == 1
 
 
 def test_the_subject_follows_the_intent() -> None:
@@ -571,7 +583,9 @@ def test_the_line_stays_one_short_clause() -> None:
             rendered = line(stop_reason=reason, executed=executed)
 
             assert not rendered.endswith("."), rendered
-            assert len(rendered) <= 72, rendered
+            # The longest legitimate form is 73 characters, and the bound is set
+            # just above it so a new phrase cannot quietly grow into a paragraph.
+            assert len(rendered) <= 76, rendered
             assert "because" not in rendered.lower(), rendered
             assert "\n" not in rendered, rendered
 
@@ -579,7 +593,7 @@ def test_the_line_stays_one_short_clause() -> None:
 def test_an_unknown_constant_still_produces_a_sentence() -> None:
     """The fallback stays reachable in principle and unreachable in practice."""
     assert line(stop_reason="a_reason_from_the_future", executed=True) == (
-        "Charge plan ended - 1.76 / 8.06 kWh"
+        "Charge stopped - plan ended - 1.76 / 8.06 kWh"
     )
 
 
@@ -636,14 +650,11 @@ def test_a_known_reason_falling_back_to_the_generic_phrase_is_caught() -> None:
     """Only an unknown constant may reach the fallback."""
     generic = line(stop_reason="a_reason_from_the_future", executed=True)
 
+    # beta.24 gave withdrawal its own word, so no reachable reason shares the
+    # fallback phrase any more -- there is no longer an exception to make.
+    assert activity_module._STOP_PHRASES[EXECUTION_STOP_STAGE_A_HOLD] == "cancelled"
     for reason in REACHABLE:
-        rendered = line(stop_reason=reason, executed=True)
-        if reason == EXECUTION_STOP_STAGE_A_HOLD:
-            # Withdrawal owns the phrase the fallback borrows, so it is the one
-            # reason that legitimately matches -- and it is a real mapping.
-            assert activity_module._STOP_PHRASES[reason] == "plan ended"
-            continue
-        assert rendered != generic, reason
+        assert line(stop_reason=reason, executed=True) != generic, reason
 
 
 def test_treating_the_export_recommendation_as_a_supersession_is_caught() -> None:

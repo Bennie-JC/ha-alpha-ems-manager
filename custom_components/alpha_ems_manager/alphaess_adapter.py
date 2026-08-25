@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from homeassistant.const import STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
@@ -30,6 +31,7 @@ from .alphaess_device import (
     BOOLEAN_PEAK_SHAVING,
     CHARGE_FAMILY,
     DISCHARGE_FAMILY,
+    FAMILIES,
     OWNERSHIP_PROVABLE,
     REQUIRED_ENTITIES,
     SENSOR_DISPATCH_ACTIVE_POWER,
@@ -41,9 +43,12 @@ from .alphaess_device import (
     CommandStep,
 )
 from .const import (
+    CONTROL_EXECUTABLE_ACTIONS,
     CONTROL_EXECUTION_AVAILABLE,
+    CONTROL_REFUSE_ACTION_NOT_EXECUTABLE,
     MAX_CONTROL_EVENTS_REPORTED,
 )
+from .execution import instant_of
 from .normalization import parse_numeric
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,6 +65,31 @@ class ControlExecutionUnavailable(RuntimeError):
     the first, and so a future caller who wires past the authorization step gets
     a loud failure instead of a quiet inverter command.
     """
+
+
+class ControlActionNotPermitted(RuntimeError):
+    """Raised when a step would write outside the actions this release executes.
+
+    **The last interlock, and the only one that reads the wire rather than the
+    intention.** Every check above it reasons about a ``DeviceCommand``; this one
+    compares entity ids against the set beta.24 may touch, so a command that lies
+    about its own action is refused anyway.
+
+    One subset test catches a discharge, an export, a raw-dispatch write, the
+    wrong helper family and an entity nobody recognises. It carries the offending
+    ids, so a reader is told *what* was refused rather than merely that something
+    was.
+    """
+
+    def __init__(self, reason: str, entity_ids: tuple[str, ...]) -> None:
+        """Store the refusal and the steps that caused it."""
+        permitted = sorted(CONTROL_EXECUTABLE_ACTIONS) or ["nothing"]
+        super().__init__(
+            f"{reason}: this release executes {', '.join(permitted)} and these "
+            f"steps fall outside it: {', '.join(entity_ids)}"
+        )
+        self.reason = reason
+        self.entity_ids = entity_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +200,20 @@ class DeviceSnapshot:
     #: entity does not exist, which is not the same as "off": a missing marker
     #: means ownership cannot be established at all.
     owner_marker: bool | None = None
+    #: Whether the charge family's dead-man timer is running, and when it ends.
+    #:
+    #: **Read since beta.24, and read for one reason: to check a claim instead of
+    #: trusting it.** A run continues only because each refresh re-arms it, and
+    #: whether re-activating an already-active dispatch refreshes that timer is a
+    #: property of the control surface rather than of this integration. With
+    #: ``finishes_at`` in hand the controller compares one refresh against the
+    #: next and *knows*, rather than assuming and finding out when a charge stops
+    #: early.
+    #:
+    #: ``None`` for either field means the timer could not be read, which is
+    #: treated as "no evidence it advanced" rather than as agreement.
+    charge_timer_active: bool | None = None
+    charge_timer_finishes_at: datetime | None = None
 
     @property
     def marker_present(self) -> bool:
@@ -188,6 +232,19 @@ class DeviceSnapshot:
             "active_modes": list(self.active_modes[:MAX_CONTROL_EVENTS_REPORTED]),
             "owner_marker": self.owner_marker,
             "owner_marker_entity": BOOLEAN_EXECUTION_OWNER,
+            "charge_timer_active": self.charge_timer_active,
+            "charge_timer_finishes_at": (
+                None
+                if self.charge_timer_finishes_at is None
+                else self.charge_timer_finishes_at.isoformat()
+            ),
+            "charge_timer_entity": CHARGE_FAMILY.timer,
+            "charge_timer_rule": (
+                "the device dead-man, read rather than assumed. a sustaining "
+                "re-arm must move finishes_at forward; if it does not, the run "
+                "is ending whatever the controller believes, so it is stopped "
+                "deliberately instead of silently"
+            ),
             # Ownership of a *running* dispatch, from the marker alone. The
             # controller requires a matching causal record on top of this before
             # it will act, so this field is evidence rather than a verdict.
@@ -267,6 +324,11 @@ def read_snapshot(hass: HomeAssistant) -> DeviceSnapshot:
     # surface settles, and during that window the safe reading is the pessimistic
     # one.
     marker = _state_of(hass, BOOLEAN_EXECUTION_OWNER)
+    timer_state = hass.states.get(CHARGE_FAMILY.timer)
+    timer_active = None if timer_state is None else timer_state.state == "active"
+    finishes_at = None
+    if timer_state is not None:
+        finishes_at = instant_of(timer_state.attributes.get("finishes_at"))
     return DeviceSnapshot(
         dispatch_active=bool(start) or bool(active_modes),
         dispatch_start=start,
@@ -279,7 +341,27 @@ def read_snapshot(hass: HomeAssistant) -> DeviceSnapshot:
         # marker there is no way to establish ownership, and the controller must
         # treat a running dispatch as foreign rather than assume it is free.
         owner_marker=None if marker is None else marker == STATE_ON,
+        charge_timer_active=timer_active,
+        charge_timer_finishes_at=finishes_at,
     )
+
+
+@callback
+def steps_outside_capability(steps: tuple[CommandStep, ...]) -> tuple[str, ...]:
+    """Return the entity ids this release may not write, in order.
+
+    Built from :data:`CONTROL_EXECUTABLE_ACTIONS` rather than from a hardcoded
+    family, so widening the barrier later widens this with it and cannot leave a
+    stale interlock behind. The owner marker is always permitted: it is not a
+    direction, it is how a direction becomes attributable, and releasing it is the
+    one write that is safe without a claim.
+    """
+    permitted = {BOOLEAN_EXECUTION_OWNER}
+    for action in CONTROL_EXECUTABLE_ACTIONS:
+        family = FAMILIES.get(action)
+        if family is not None:
+            permitted.update(family.entities)
+    return tuple(step.entity_id for step in steps if step.entity_id not in permitted)
 
 
 async def async_execute(hass: HomeAssistant, steps: tuple[CommandStep, ...]) -> int:
@@ -293,6 +375,13 @@ async def async_execute(hass: HomeAssistant, steps: tuple[CommandStep, ...]) -> 
     The order the steps arrive in is the order they are sent, and the planner
     guarantees the activation boolean is last -- so an interruption partway
     through leaves inert parameters rather than a half-formed command.
+
+    **Two refusals, and the second is the one that matters in beta.24.** The first
+    is the release barrier, unchanged. The second is a subset test on the entity
+    ids: this release charges, so the only entities it may write are the charge
+    family and the owner marker. It reads no action field and trusts no caller,
+    which is why it survives a defect upstream -- a discharge that somehow reaches
+    here names discharge entities, and naming them is enough to be refused.
     """
     if not CONTROL_EXECUTION_AVAILABLE:
         raise ControlExecutionUnavailable(
@@ -300,6 +389,9 @@ async def async_execute(hass: HomeAssistant, steps: tuple[CommandStep, ...]) -> 
             "pipeline is built and validated, but no command may reach the "
             "inverter until ownership and continuation are resolved"
         )
+    outside = steps_outside_capability(steps)
+    if outside:
+        raise ControlActionNotPermitted(CONTROL_REFUSE_ACTION_NOT_EXECUTABLE, outside)
 
     sent = 0
     for step in steps:

@@ -71,6 +71,7 @@ from .const import (
     CONTROL_COOLDOWN_SECONDS,
     CONTROL_CUTOFF_MAX_PERCENT,
     CONTROL_CUTOFF_MIN_PERCENT,
+    CONTROL_EXECUTABLE_ACTIONS,
     CONTROL_EXECUTION_AVAILABLE,
     CONTROL_MAX_POWER_KW,
     CONTROL_MIN_POWER_KW,
@@ -102,11 +103,17 @@ from .const import (
     INHIBIT_WOULD_EXPORT,
     MAX_CONTROL_HORIZON_MINUTES,
     MIN_CONTROL_HORIZON_MINUTES,
+    OWNERSHIP_OWNED,
     REFUSE_COOLDOWN,
     REFUSE_EXECUTION_NOT_ENABLED,
     REFUSE_EXECUTION_UNAVAILABLE,
+    REFUSE_LIVE_ACTION_NOT_PERMITTED,
+    REFUSE_MARKER_STILL_DISPATCHING,
     REFUSE_MODE_NOT_ACTIVE,
     REFUSE_NO_COMMANDS,
+    REFUSE_RESET_ACTION_UNKNOWN,
+    REFUSE_RESET_NOT_OWNED,
+    REFUSE_RESET_WITHOUT_REASON,
     REFUSE_UNSAFE,
 )
 from .control import ControlIntent
@@ -532,22 +539,128 @@ def evaluate(intent: ControlIntent | None, context: ControlContext) -> SafetyVer
     return SafetyVerdict(True, None, tuple(checks))
 
 
-def authorize(
+def authorize_reset(
+    *,
+    ownership: str,
+    stopping_action: str | None,
+    stop_reason: str | None,
+    steps_planned: int,
+) -> ExecutionDecision:
+    """Return whether an owned dispatch may be returned to rest.
+
+    **A different question from :func:`authorize_start`, and it has to be.** That
+    one asks "should we begin moving energy?" and answers it with an intent, a
+    verdict, a mode and an opt-in. None of those exist on a stopping refresh, so
+    asking the first question about the second operation refuses it every time --
+    which is exactly what beta.24 was measured doing, on every stop path it has.
+
+    This asks one thing: *is Alpha EMS entitled to stop this dispatch?* It is,
+    when it can prove the dispatch is its own.
+
+    What it deliberately does **not** require, each for its own reason:
+
+    * **an intent** -- a stop is not an economic command, and inventing one to
+      satisfy a gate would be lying to the gate;
+    * **a safe verdict** -- if a running charge has become unsafe, stopping it *is*
+      the safe action. A verdict that blocked the response to itself would be the
+      most dangerous check in the system;
+    * **``mode == active``** -- the user selecting Shadow or Off is the stop
+      request. Refusing it for not being in Live is circular;
+    * **the opt-in** -- a user revoking permission mid-run must not thereby make a
+      running charge unstoppable. Revocation cannot be the thing that strands it;
+    * **the cooldown** -- a rate limit may delay a start. It may never delay a stop.
+
+    What it does require is stronger than all five put together: a dispatch this
+    integration can *prove* it caused. Foreign and unproven are not that, and stay
+    untouchable.
+    """
+    if not CONTROL_EXECUTION_AVAILABLE:
+        return ExecutionDecision(False, REFUSE_EXECUTION_UNAVAILABLE)
+    if ownership != OWNERSHIP_OWNED:
+        return ExecutionDecision(False, REFUSE_RESET_NOT_OWNED)
+    if stopping_action is None:
+        # Fails closed. A missing action is never defaulted to a charge: guessing
+        # what to stop is how a stop becomes a start in the other direction.
+        return ExecutionDecision(False, REFUSE_RESET_ACTION_UNKNOWN)
+    if stopping_action not in CONTROL_EXECUTABLE_ACTIONS:
+        return ExecutionDecision(False, REFUSE_LIVE_ACTION_NOT_PERMITTED)
+    if not stop_reason:
+        return ExecutionDecision(False, REFUSE_RESET_WITHOUT_REASON)
+    if steps_planned <= 0:
+        return ExecutionDecision(False, REFUSE_NO_COMMANDS)
+    return ExecutionDecision(True, None)
+
+
+def authorize_marker_release(
+    *,
+    marker_is_stale: bool,
+    steps_planned: int,
+) -> ExecutionDecision:
+    """Return whether a marker with nothing behind it may be cleared.
+
+    **Separate from :func:`authorize_reset` on purpose.** "Release a marker behind
+    nothing" and "stop a dispatch we own" are different entitlements, and folding
+    them together is how one quietly acquires the other's permissions -- a single
+    function with a ``kind`` flag would have one condition set covering two
+    operations, which is the shape of the fault this whole amendment exists to fix.
+
+    Clearing a stale marker is not an ownership claim: there is nothing to claim.
+    That is why it needs no proof and no mode, and why it must be reachable in
+    Shadow and in Off -- a marker left on by a crash would otherwise latch there for
+    good.
+
+    The one thing it must never do is release a marker while a dispatch is still
+    running behind it -- that would assert a conclusion nobody has, and leave a
+    dispatch nothing can later prove or stop. **Which is why staleness arrives here
+    as a verdict rather than as evidence.** An earlier draft took ``marker_on`` and
+    ``dispatch_active`` and combined them here, which put a second definition of
+    "stale" in a module that must not decide ownership at all. There is one
+    definition, ``execution.stale_marker``, and this is told its answer.
+    """
+    if not CONTROL_EXECUTION_AVAILABLE:
+        return ExecutionDecision(False, REFUSE_EXECUTION_UNAVAILABLE)
+    if not marker_is_stale:
+        return ExecutionDecision(False, REFUSE_MARKER_STILL_DISPATCHING)
+    if steps_planned <= 0:
+        return ExecutionDecision(False, REFUSE_NO_COMMANDS)
+    return ExecutionDecision(True, None)
+
+
+def authorize_start(
     verdict: SafetyVerdict,
     context: ControlContext,
     *,
     commands_planned: int,
     starts_or_increases: bool,
+    action: str | None = None,
 ) -> ExecutionDecision:
     """Return whether a safe command may actually be sent.
 
-    The only mode-aware stage, and the only one that can stop a write for a
-    reason that is not a hazard.
+    **Permission to *begin or continue* moving energy**, and since beta.24 that is
+    all it answers. It used to authorise stops as well, and it refused every one of
+    them: a stop has no economic intent, so the verdict was unsafe; the user
+    selecting Shadow *is* the stop request, so the mode check was circular; and a
+    rate limit that delays a stop is a rate limit doing harm. See
+    :func:`authorize_reset` for the other question.
 
-    ``CONTROL_EXECUTION_AVAILABLE`` is checked here and is false in this
-    release, so nothing reaches the inverter however the rest of the pipeline
-    answers. It is a build-time constant rather than a setting because a release
-    barrier a user could clear is not a barrier.
+    The only mode-aware stage of the start path, and the only one that can stop a
+    write for a reason that is not a hazard.
+
+    ``CONTROL_EXECUTION_AVAILABLE`` is a build-time constant rather than a setting,
+    because a release barrier a user could clear is not a barrier. Since beta.24 it
+    is *derived* from :data:`CONTROL_EXECUTABLE_ACTIONS`, so "does this release
+    send anything" and "which direction may it send" cannot drift apart.
+
+    ``action`` answers the second of those questions, and this stage had no answer
+    to it before beta.24. The command source falls back to the Phase-3 reserve
+    guard whenever Stage B has no charge to make, and the reserve guard
+    discharges -- so a direction-blind authorisation would have permitted a
+    discharge on the first refresh of a charge-only release. ``None`` is refused
+    rather than waved through: an authorisation that cannot name what it is
+    authorising is not one.
+
+    Ordered most-fundamental-first, so a reader is told the deepest reason rather
+    than whichever one a particular refresh happened to reach.
     """
     if not verdict.safe:
         return ExecutionDecision(False, REFUSE_UNSAFE, verdict.inhibit_reason)
@@ -559,6 +672,8 @@ def authorize(
         return ExecutionDecision(False, REFUSE_EXECUTION_UNAVAILABLE)
     if commands_planned <= 0:
         return ExecutionDecision(False, REFUSE_NO_COMMANDS)
+    if action not in CONTROL_EXECUTABLE_ACTIONS:
+        return ExecutionDecision(False, REFUSE_LIVE_ACTION_NOT_PERMITTED)
     # A command that reduces battery movement is exempt: reducing can only
     # reduce risk, and delaying a reduction is the one thing a rate limit must
     # never do. No previous write means nothing to cool down from, which is not
@@ -568,3 +683,12 @@ def authorize(
         if since is not None and since < CONTROL_COOLDOWN_SECONDS:
             return ExecutionDecision(False, REFUSE_COOLDOWN)
     return ExecutionDecision(True, None)
+
+
+#: The old name, kept so every existing caller keeps meaning what it meant.
+#:
+#: beta.24 split authorisation in two and this one is the *start* path. Renaming it
+#: without an alias would have silently repointed every call site at a function
+#: whose contract had just narrowed, which is the sort of change that looks like a
+#: rename and behaves like a rewrite.
+authorize = authorize_start

@@ -25,7 +25,6 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.alpha_ems_manager.const import (
     CONF_FRANK_ENTRY_ID,
-    CONTROL_EXECUTION_AVAILABLE,
     DOMAIN_FRANK,
     FRANK_KEY_CURRENT_PRICE,
     FRANK_KEY_CURRENT_RETURN_PRICE,
@@ -59,6 +58,7 @@ from .frank_capture import (
     synthetic_block,
     synthetic_day,
 )
+from .live_capability import assert_charge_only_capability
 
 TOMORROW = NORMAL + timedelta(days=1)
 
@@ -144,7 +144,7 @@ async def test_reading_prices_calls_no_service_at_all(
 
     assert async_call.await_count == 0
     assert today_price(coordinator).available is True
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert_charge_only_capability()
 
 
 # --- capability, from facts ----------------------------------------------------

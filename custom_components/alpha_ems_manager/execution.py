@@ -64,6 +64,7 @@ from .const import (
     EXECUTION_BASIS_BOTH,
     EXECUTION_BASIS_SOC_DELTA,
     EXECUTION_BASIS_UNAVAILABLE,
+    EXECUTION_INTENT_ACTIONS,
     EXECUTION_INTENT_GRID_CHARGE,
     EXECUTION_INTENT_HOLD,
     EXECUTION_INTENT_NET_EXPORT,
@@ -84,17 +85,21 @@ from .const import (
     EXECUTION_STATE_STOPPING,
     EXECUTION_STATE_UNPROVEN,
     EXECUTION_STOP_GRID_CEILING,
+    EXECUTION_STOP_HEADROOM_REACHED,
     EXECUTION_STOP_PLAN_REPLACED,
     EXECUTION_STOP_STAGE_A_HOLD,
     EXECUTION_STOP_STALE_PLAN,
     EXECUTION_STOP_SWITCHED_OFF,
     EXECUTION_STOP_SWITCHED_TO_SHADOW,
     EXECUTION_STOP_TARGET_REACHED,
+    EXECUTION_STOP_TIMER_NOT_REFRESHED,
     EXECUTION_STOP_WINDOW_ENDED,
     EXECUTION_TARGET_STALE_MINUTES,
     OWNERSHIP_FOREIGN,
     OWNERSHIP_NONE,
     OWNERSHIP_OWNED,
+    OWNERSHIP_PROVENANCE_EXACT,
+    OWNERSHIP_PROVENANCE_SETTLING,
     OWNERSHIP_UNPROVEN,
 )
 from .control import ControlIntent
@@ -127,6 +132,37 @@ ACTIONABLE_LEAD_MINUTES: float = 15.0
 #: corroborating condition, and a loose one would corroborate anything.
 OWNERSHIP_START_TOLERANCE_SECONDS: float = 120.0
 
+#: How long after our write a dispatch may *begin* and still be ours.
+#:
+#: **The narrowest weakening of the two-factor rule that makes a Live charge
+#: stoppable, and it is a weakening, so it is bounded and named.** The causal
+#: record is written *before* the writes -- deliberately, so a mid-sequence
+#: failure cannot leave a dispatch nothing can prove -- which means the device
+#: reports no ``dispatch_start`` yet and the record stores ``None``. Requiring an
+#: exact match from that state is unsatisfiable: ownership would stay ``unproven``
+#: for the life of the run, ``reset_required`` is gated on ``owned``, and Alpha
+#: EMS would arm a charge it could never stop.
+#:
+#: So a record of ours, naming the run being executed, is accepted when the
+#: dispatch the device reports **began at the moment we wrote** -- within this
+#: window of it. That is a genuine causal chain, not the parameter matching this
+#: project rejects: the dispatch started because we wrote, and the device's own
+#: start instant says so.
+#:
+#: **Measured against the dispatch start, not against how long ago we wrote**, and
+#: that distinction was a real error caught in testing. An earlier version compared
+#: ``now - written_at`` against this window, which can never succeed: the record is
+#: written on one refresh and the dispatch is first observed on the *next*, a
+#: quarter of an hour later, so a three-minute window closed before the evidence
+#: arrived and ownership never left ``unproven``. Comparing the two instants that
+#: are actually causally linked works regardless of the refresh interval, and stays
+#: tight.
+#:
+#: **The residual, stated rather than buried:** a dispatch a person started by hand
+#: within this window of one of our writes, with our marker already on, would be
+#: adopted. Three minutes, and the marker lives outside the vendor namespace.
+OWNERSHIP_CLAIM_WINDOW_SECONDS: float = 180.0
+
 #: Characters of the run identity. Same width as a publication id, so the two are
 #: visually comparable in a diagnostics download without being confusable.
 RUN_ID_CHARS: int = ECONOMIC_FINGERPRINT_CHARS
@@ -149,8 +185,13 @@ def _finite(value: Any) -> float | None:
     return number
 
 
-def _instant(value: Any) -> datetime | None:
-    """Return an ISO-8601 string as a datetime, or ``None`` if it is not one."""
+def instant_of(value: Any) -> datetime | None:
+    """Return an ISO-8601 string as a datetime, or ``None`` if it is not one.
+
+    Public since beta.24 because the device adapter has the same job -- reading a
+    timer's ``finishes_at`` -- and two parsers would eventually disagree about
+    what a timestamp is.
+    """
     if isinstance(value, datetime):
         return value
     if not isinstance(value, str):
@@ -201,31 +242,78 @@ class OwnershipEvidence:
         """Return whether a causal record exists at all."""
         return isinstance(self.record, dict) and bool(self.record)
 
+    #: When this evidence was read, so a record can be aged. ``None`` disables
+    #: the settle path entirely, which is the conservative direction.
+    now: datetime | None = None
+
+    @property
+    def record_names_this_run(self) -> bool:
+        """Return whether the record names the run being executed."""
+        if not self.record_present:
+            return False
+        recorded_run = (self.record or {}).get("run_id")
+        if not isinstance(recorded_run, str) or not recorded_run:
+            return False
+        return self.run_id is None or recorded_run == self.run_id
+
+    @property
+    def record_provenance(self) -> str | None:
+        """Return *how* ownership was established, or ``None`` if it was not.
+
+        Published so a reader can tell an exact match from a settling one rather
+        than having to infer which of the two granted control.
+
+        ``exact`` -- the dispatch the inverter reports is the one the record says
+        was armed. The steady state, and the only one that survives a device
+        restart or a register reset.
+
+        ``settling`` -- our own record, naming this run, and a dispatch that *began
+        when we wrote it*. Covers the refresh after an arm or a sustaining re-arm, in
+        which the recorded start is absent or has legitimately moved because we moved
+        it. Bounded by :data:`OWNERSHIP_CLAIM_WINDOW_SECONDS`, measured between the
+        write and the dispatch start rather than between the write and now.
+        """
+        # Both factors, before either kind of match is considered. ``ownership_of``
+        # would refuse a marker-less dispatch as foreign before reaching here, but a
+        # property that reports a match without the marker is a misleading property,
+        # and this one is published in diagnostics.
+        if not self.marker_on or not self.dispatch_active:
+            return None
+        if not self.record_names_this_run:
+            return None
+        record = self.record or {}
+        observed = instant_of(record.get("dispatch_start"))
+        if observed is not None and self.dispatch_start is not None:
+            delta = abs((self.dispatch_start - observed).total_seconds())
+            if delta <= OWNERSHIP_START_TOLERANCE_SECONDS:
+                return OWNERSHIP_PROVENANCE_EXACT
+        # The settle path. It requires the running dispatch to have *begun* when we
+        # wrote, so it cannot adopt one that merely happens to be running now.
+        written = instant_of(record.get("written_at"))
+        if written is None or self.dispatch_start is None:
+            return None
+        lag = (self.dispatch_start - written).total_seconds()
+        # A small negative lag is allowed: the register resolves to whole seconds
+        # and the surface can report a start a moment before our write completes.
+        if -OWNERSHIP_START_TOLERANCE_SECONDS <= lag <= OWNERSHIP_CLAIM_WINDOW_SECONDS:
+            return OWNERSHIP_PROVENANCE_SETTLING
+        return None
+
     @property
     def record_matches(self) -> bool:
         """Return whether the record can be tied to the live dispatch.
 
-        Requires the record to name a run, that run to be the one being
-        executed, and -- when both instants are known -- the dispatch the inverter
-        reports to be the one the record says was armed.
+        Requires the record to name a run, that run to be the one being executed,
+        and either an exact agreement about which dispatch is running or a
+        bounded settle window after our own write. See
+        :attr:`record_provenance`, which is where the two are separated, and
+        :data:`OWNERSHIP_CLAIM_WINDOW_SECONDS` for why the second exists at all.
 
-        A missing ``dispatch_start`` on the device is not treated as a match. The
-        settle window after arming genuinely does not report one, and reading
-        silence as agreement would grant ownership on the strength of nothing.
+        A missing ``dispatch_start`` is still never read as agreement on its own.
+        The settle path does not read it: it reads *our own record's age*, which is
+        evidence of a different kind.
         """
-        if not self.record_present:
-            return False
-        record = self.record or {}
-        recorded_run = record.get("run_id")
-        if not isinstance(recorded_run, str) or not recorded_run:
-            return False
-        if self.run_id is not None and recorded_run != self.run_id:
-            return False
-        observed = _instant(record.get("dispatch_start"))
-        if observed is None or self.dispatch_start is None:
-            return False
-        delta = abs((self.dispatch_start - observed).total_seconds())
-        return delta <= OWNERSHIP_START_TOLERANCE_SECONDS
+        return self.record_provenance is not None
 
 
 def ownership_of(evidence: OwnershipEvidence) -> str:
@@ -460,8 +548,8 @@ def parse_target(raw: dict[str, Any]) -> Target | None:
     """
     plan_id = raw.get("plan_id")
     intent = raw.get("intent")
-    opens = _instant(raw.get("window_start"))
-    closes = _instant(raw.get("window_end"))
+    opens = instant_of(raw.get("window_start"))
+    closes = instant_of(raw.get("window_end"))
     battery = _finite(raw.get("battery_target_kwh"))
     if not isinstance(plan_id, str) or not isinstance(intent, str):
         return None
@@ -479,8 +567,8 @@ def parse_target(raw: dict[str, Any]) -> Target | None:
         purpose=str(raw.get("purpose") or intent),
         window_start=opens,
         window_end=closes,
-        issued_at=_instant(raw.get("issued_at")),
-        stale_after=_instant(raw.get("stale_after")),
+        issued_at=instant_of(raw.get("issued_at")),
+        stale_after=instant_of(raw.get("stale_after")),
         battery_target_kwh=max(0.0, battery),
         grid_target_kwh=_finite(raw.get("grid_target_kwh")),
         average_power_kw=mean_kw,
@@ -499,7 +587,7 @@ def parse_target(raw: dict[str, Any]) -> Target | None:
         ),
         required_headroom_kwh=_finite(raw.get("required_headroom_kwh")),
         max_end_energy_kwh=_finite(raw.get("max_end_energy_kwh")),
-        headroom_until=_instant(raw.get("headroom_until")),
+        headroom_until=instant_of(raw.get("headroom_until")),
     )
 
 
@@ -673,6 +761,109 @@ def affirms(carried: CarriedRun, published: Target) -> bool:
     if published.intent != carried.intent:
         return False
     return published.window_start <= carried.window_end
+
+
+def action_for_intent(intent: str | None) -> str | None:
+    """Return the battery action an intent becomes, or ``None`` if it has none.
+
+    **Read at arm time, so a reset needs no inference at all.** The stop path has no
+    command to look at -- that is what made the reset plan a marker release and
+    nothing else -- so what it stops has to come from a record of what was armed.
+    Deriving the action once, here, and persisting it means the reset reads a fact
+    rather than reconstructing one.
+
+    ``None`` for anything unmapped, and the caller must fail closed. ``serve_load``
+    keeps the Phase-3 reserve-guard behaviour and ``net_export`` has no primitive,
+    so neither is something Alpha EMS can own -- or stop.
+    """
+    if not isinstance(intent, str):
+        return None
+    return EXECUTION_INTENT_ACTIONS.get(intent)
+
+
+def target_as_published(target: Target) -> dict[str, Any]:
+    """Return ``target`` in the shape Stage A published it, exactly.
+
+    **A round trip, not a summary**, and it exists so a restart can reconstruct the
+    run a live dispatch belongs to. ``parse_target(target_as_published(t))`` is
+    ``t`` -- asserted rather than described, because a serialiser that quietly
+    dropped the headroom cap would restore a run allowed to charge past a ceiling
+    the user chose.
+
+    Instants go out as ISO-8601 strings, which is what the persisted document holds
+    and what ``parse_target`` reads back.
+    """
+
+    def moment(value: datetime | None) -> str | None:
+        return None if value is None else value.isoformat()
+
+    return {
+        "plan_id": target.plan_id,
+        "revision": target.revision,
+        "intent": target.intent,
+        "purpose": target.purpose,
+        "window_start": moment(target.window_start),
+        "window_end": moment(target.window_end),
+        "issued_at": moment(target.issued_at),
+        "stale_after": moment(target.stale_after),
+        "battery_target_kwh": target.battery_target_kwh,
+        "grid_target_kwh": target.grid_target_kwh,
+        "average_power_kw": target.average_power_kw,
+        "first_power_kw": target.first_power_kw,
+        "reserve_floor_kwh": target.reserve_floor_kwh,
+        "expected_pv_production_kwh": target.expected_pv_production_kwh,
+        "expected_house_load_kwh": target.expected_house_load_kwh,
+        "expected_pv_to_battery_kwh": target.expected_pv_to_battery_kwh,
+        "expected_grid_to_battery_kwh": target.expected_grid_to_battery_kwh,
+        "charge_source": target.charge_source,
+        "required_headroom_kwh": target.required_headroom_kwh,
+        "max_end_energy_kwh": target.max_end_energy_kwh,
+        "headroom_until": moment(target.headroom_until),
+    }
+
+
+def carried_from_record(record: dict[str, Any] | None) -> CarriedRun | None:
+    """Return the run a persisted causal record describes, or ``None``.
+
+    **Adoption after a restart, and ``None`` is a defined answer rather than a
+    failure.** A restart discards the carried run but keeps the record, so without
+    this a live dispatch of ours would be met by a freshly minted run with a
+    different id -- ownership would read ``unproven`` for a contradiction rather
+    than for a real doubt, and the run could be neither continued nor stopped.
+
+    ``None`` means *this record cannot prove which run is running*: a record written
+    before beta.24 carries no target to rebuild, and one whose payload no longer
+    parses is not going to be guessed at. The caller must then write nothing at all
+    while a dispatch is active -- see the restart rule in ``coordinator``. Returning
+    a half-built run here so that something could be reset would be the same
+    mistake as resetting a dispatch we cannot attribute.
+    """
+    if not isinstance(record, dict):
+        return None
+    run_id = record.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        return None
+    raw = record.get("target")
+    if not isinstance(raw, dict):
+        return None
+    target = parse_target(raw)
+    if target is None:
+        return None
+    admitted = instant_of(record.get("admitted_at"))
+    affirmed = instant_of(record.get("affirmed_at")) or admitted
+    stale = instant_of(record.get("stale_after"))
+    if admitted is None or affirmed is None or stale is None:
+        return None
+    revision = record.get("revision")
+    return CarriedRun(
+        run_id=run_id,
+        plan_id=str(record.get("plan_id") or target.plan_id),
+        target=target,
+        revision=revision if isinstance(revision, int) and revision > 0 else 1,
+        admitted_at=admitted,
+        affirmed_at=affirmed,
+        stale_after=stale,
+    )
 
 
 def admit(target: Target, now: datetime, *, revision: int = 1) -> CarriedRun:
@@ -1179,6 +1370,7 @@ def decide(
     carry_ended: str | None = None,
     ended_run: CarriedRun | None = None,
     inhibit_reason: str | None = None,
+    deadman_stale: bool = False,
 ) -> Decision:
     """Return this refresh's Stage B decision, and say so when a run ended.
 
@@ -1219,6 +1411,7 @@ def decide(
         carry_ended=carry_ended,
         ended_run=ended_run,
         inhibit_reason=inhibit_reason,
+        deadman_stale=deadman_stale,
     )
     if carry_ended is not None and decision.stop_reason is None:
         return replace(decision, stop_reason=carry_ended)
@@ -1243,6 +1436,7 @@ def _decide(
     carry_ended: str | None = None,
     ended_run: CarriedRun | None = None,
     inhibit_reason: str | None = None,
+    deadman_stale: bool = False,
 ) -> Decision:
     """Return this refresh's Stage B decision.
 
@@ -1313,6 +1507,31 @@ def _decide(
             progress=progress,
             stop_reason=EXECUTION_STOP_SWITCHED_TO_SHADOW,
             reset_required=True,
+        )
+
+    if owned and deadman_stale:
+        # **The dead-man did not move when the run was re-armed.**
+        #
+        # A run continues only because each refresh re-arms it against a
+        # twenty-minute device timer. Whether re-activating an already-active
+        # dispatch refreshes that timer is a property of the control surface rather
+        # than of this integration, so it is measured instead of assumed -- and when
+        # the measurement says no, the run is about to end whatever this controller
+        # believes. Ending it deliberately is the honest response: the alternative is
+        # a controller reporting a charge that has already stopped.
+        #
+        # Checked high, above target selection, because a run whose dead-man is not
+        # being refreshed should not have its next setpoint computed.
+        return Decision(
+            state=EXECUTION_STATE_STOPPING,
+            ownership=ownership,
+            progress=progress,
+            stop_reason=EXECUTION_STOP_TIMER_NOT_REFRESHED,
+            reset_required=True,
+            notes=(
+                "the device dead-man did not advance when the run was re-armed, "
+                "so the dispatch is stopped rather than assumed to continue",
+            ),
         )
 
     # The carried run wins selection. It is the same intent one refresh older,
@@ -1463,13 +1682,18 @@ def _decide(
     if demand.finished:
         # Reduced all the way to nothing by the headroom cap: hold, and let Stage A
         # decide whether the remaining energy is still worth buying.
+        #
+        # Its own reason since beta.24. It reported ``target_reached``, which stops
+        # and resets identically but tells a reader the plan was met when in fact
+        # the pack ran out of room -- and on a sunny capped run that is the
+        # difference between "bought what was asked" and "stopped short".
         return Decision(
             state=EXECUTION_STATE_STOPPING if owned else EXECUTION_STATE_IDLE,
             ownership=ownership,
             target=target,
             demand=demand,
             progress=progress,
-            stop_reason=EXECUTION_STOP_TARGET_REACHED,
+            stop_reason=EXECUTION_STOP_HEADROOM_REACHED,
             reset_required=owned,
             notes=(
                 "reduced to zero by the Stage-A headroom constraint; awaiting a "
@@ -1803,9 +2027,11 @@ def as_dict(decision: Decision, *, mode: str, executed: bool) -> dict[str, Any]:
             "inhibit_reason": decision.inhibit_reason,
         },
         "notes": list(decision.notes),
-        "controls_nothing": (
-            "Stage B computes the command a Live run would send and sends none. "
-            "the execution barrier is closed, applied_kw is always zero, and no "
-            "service call is reachable from this path in this release"
+        "execution_scope": (
+            "since beta.24 this is the one path that can execute, and only for a "
+            "grid charge. in shadow it computes the command a live run would send "
+            "and sends none, so applied_kw is zero; in live a charge may be sent "
+            "and every other direction is refused twice over. the field was called "
+            "controls_nothing while that was true of every release"
         ),
     }

@@ -941,26 +941,41 @@ async def test_shadow_and_active_clamp_identically(
 async def test_a_clamped_command_still_reaches_no_service(
     hass, setup_integration, control_surface, captured_calls
 ) -> None:
-    """The barrier is downstream of everything above it.
+    """**A clamped discharge reaches no service, and beta.24 strengthened why.**
 
-    Asserted in **active** mode with a clamped, eligible, safe command -- the
-    most permissive state the release can reach -- so this is the strongest form
-    of the zero-actuation promise for this change.
+    Asserted in **active** mode with a clamped, eligible, safe command -- the most
+    permissive state the release can reach. Through beta.23 the release barrier
+    refused it because nothing at all executed. beta.24 executes a charge, so the
+    barrier no longer refuses on its own, and this command is refused for the
+    reason that actually applies to it: it is a **discharge**, and this release
+    does not execute that direction.
+
+    Two independent reasons stand in front of this command, and the deepest one
+    wins: the user has not enabled command sending, so it is refused before the
+    direction is even reached. That ordering *is* the upgrade-safety proof -- an
+    installation that upgrades to beta.24 without opting in cannot execute
+    anything. The direction refusal is exercised on its own, with the opt-in on, in
+    the Live test module.
     """
     from custom_components.alpha_ems_manager.const import (
+        ACTION_DISCHARGE,
+        CONTROL_EXECUTABLE_ACTIONS,
         CONTROL_EXECUTION_AVAILABLE,
         CONTROL_MODE_ACTIVE,
+        REFUSE_EXECUTION_NOT_ENABLED,
     )
 
     report = await drive_control(
         hass, setup_integration, import_w=400, mode=CONTROL_MODE_ACTIVE
     )
 
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert CONTROL_EXECUTION_AVAILABLE is True
+    assert ACTION_DISCHARGE not in CONTROL_EXECUTABLE_ACTIONS
     assert report["state"] == CONTROL_STATE_ELIGIBLE
     assert report["command"]["safety_limited"] is True
     assert report["commands_planned"] > 0
     assert report["authorization"]["authorized"] is False
+    assert report["authorization"]["refusal"] == REFUSE_EXECUTION_NOT_ENABLED
     assert report["last_write"] is None
     assert captured_calls == []
 
@@ -1126,10 +1141,12 @@ def test_the_clamp_changed_no_persisted_schema() -> None:
         STORAGE_MINOR_VERSION,
     )
 
-    # 5 since beta.19: Stage B remembers published revisions and one causal
-    # ownership record. Neither is a control figure -- the assertions below still
-    # forbid a command, a safety verdict or a power from reaching either store.
-    assert STORAGE_MINOR_VERSION == 5
+    # 6 since beta.24: Stage B remembers published revisions and one causal
+    # ownership record, which now carries the admitted window and target so a
+    # restart can reconstruct the run rather than mint a competing one. None of
+    # that is a control figure -- the assertions below still forbid a command, a
+    # safety verdict or a power from reaching either store.
+    assert STORAGE_MINOR_VERSION == 6
     assert FORECAST_STORAGE_MINOR_VERSION == 7
 
     for module in (storage, history_store):

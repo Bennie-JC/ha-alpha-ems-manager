@@ -9,6 +9,138 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.24] - 2026-08-25
+
+**The first release that can charge your battery -- and stop.** Live execution is
+enabled for exactly one action: a Stage-B `grid_charge`. Discharging, exporting and
+curtailing remain advisory and are refused at three independent boundaries.
+
+**Charging does nothing until you ask for it twice**: Control Mode set to *Live*,
+and command sending enabled in the options. A fresh installation is `off` and an
+upgrade changes neither.
+
+### Added
+
+- **Live charge execution, gated by a set rather than a flag.** The release barrier
+  is now `CONTROL_EXECUTABLE_ACTIONS`, a frozen set containing one action, with the
+  old boolean derived from it. Tracing what flipping that boolean would actually
+  permit is what forced this shape: the command source falls back to the Phase-3
+  reserve guard whenever Stage B has no charge to make, `authorize` had no direction
+  check, and the device-level check only compared a command against its *own*
+  family. A single `True` would have authorised reserve-guard **discharges** on the
+  first refresh with nothing to buy.
+
+  Charge-only is enforced four times over: Stage B can only express a charge; the
+  reserve-guard fallback is suppressed while Stage B holds a run; authorisation
+  refuses an action outside the set; and the send site refuses any step naming an
+  entity outside the charge family and the owner marker. The last of those is a
+  subset test on entity ids -- it reads no action field and trusts no caller, so it
+  survives a defect upstream.
+
+- **Ownership becomes provable.** The causal record is completed from the device's
+  own dispatch readback rather than guessed at write time, so a charge Alpha EMS
+  arms is a charge it can later stop. A restart adopts the run a live dispatch
+  belongs to instead of minting a competing one -- and where the persisted evidence
+  cannot prove which run is running, it writes **nothing at all** and lets the
+  device dead-man end the dispatch, which is the conservative direction and the
+  invariant this project has held since Phase 4.
+
+- **The device dead-man is refreshed unconditionally.** Every refresh of an owned,
+  active run rewrites the duration and re-issues activation, whether or not the
+  requested power moved. An earlier design gated that on a power change, which would
+  mean a charge holding steady at 3.0 kW never re-arms, its dead-man is never
+  refreshed, and the dispatch expires mid-run while the controller believes it is
+  still going. Constant power is the *common* case.
+
+  The power helper itself is written only when the quantised power has actually
+  moved, because writing a helper a value it already holds is a service call that
+  buys nothing.
+
+- **Whether the timer actually refreshed is measured, not assumed.** Re-activating
+  an already-active dispatch is the one physical behaviour that could not be
+  verified in advance, so the helper timer's `finishes_at` is read every refresh and
+  compared. If it does not advance, the run is stopped and said so -- there is
+  deliberately no deactivate-and-reactivate fallback, because the moment to
+  improvise an unobserved write pattern is not the moment the controller has just
+  discovered its assumption was wrong.
+
+- **Concise Activity for a Live run.** One line when a charge is planned, one when
+  it physically starts, one when it ends, each at most once per run:
+
+  ```
+  Charge planned - 8.06 kWh - 2.3 kW - 13:00-16:30
+  Grid charge started - 8.06 kWh - 2.3 kW
+  Charge complete - 8.06 kWh
+  ```
+
+  "Started" means an activation write succeeded. Deriving it from the controller
+  state would announce a start for an *armed* decision -- computed, sent nothing --
+  which on a release that writes is the one claim that must not be wrong. A
+  sustaining refresh, a power change, a republication and a revision bump all
+  produce silence.
+
+### Fixed
+
+- **A stop was authorised through the machinery built for a start, so no stop could
+  reach the inverter.** Found by executing rather than by reading: it lived in the
+  gap between "the controller decided to stop" and "the stop reached the wire", and
+  every release before this one was correct to have no wire. Measured on every stop
+  path -- target reached, withdrawal, safety, dead-man, Live to Shadow, Live to
+  Off -- as zero service calls with Force Charging still on.
+
+  Three faults compounded. The reset was planned with the action of *this refresh's*
+  command, which is absent on any stopping refresh, so it planned a lone marker
+  release -- it would have **released ownership of a live dispatch**. The safety gate
+  returns unsafe whenever there is no intent, and a stop has none. And the mode
+  check refused a reset after the user had selected Shadow, which is circular: that
+  selection *is* the stop request.
+
+  Stops now have their own entitlement. It requires proof of ownership, the action
+  from the record of what was armed, and a real stop reason -- and deliberately not
+  an intent, a safety verdict, the active mode, the opt-in or the cooldown. A rate
+  limit may delay a start; it may never delay a stop. The rule is that a reset may
+  be more reachable than a start, but only for a dispatch Alpha EMS can prove it
+  owns; foreign and unproven dispatches stay untouchable.
+
+  Selecting *Shadow* or *Off* now stops a charge we own, releases the marker last,
+  and clears the causal record only once the stop has actually landed.
+
+- **The reset list was built after the authorisation that permitted it**, so the
+  thing authorised was not the thing sent. The operation is now decided first, then
+  built, validated and authorised.
+
+- **A safety condition can no longer prevent a stop.** "Do not start this" and "do
+  not stop what is already running" look alike and are opposites. An unsafe verdict
+  while we own an active dispatch is now itself a stop condition, and the reset
+  authorisation never reads the verdict -- so an unsafe world cannot block the
+  response to itself.
+
+- **A headroom stop reports as one.** It reported `target_reached`, which told a
+  reader the plan had been met when in fact the pack had run out of room. On a sunny
+  capped run those are different outcomes and now read differently.
+
+### Preserved
+
+No Stage-A allocation change, no reserve economics change, no optimizer change, no
+carry-forward or supersession semantic change, no R2 change, no grid-budget or
+headroom arithmetic change, no new permitted service and no `timer.cancel`.
+`economic.py`, `reserve.py`, `policy.py`, `battery.py`, `simulation.py`,
+`realized.py`, `storage.py` and `control.py` are byte-identical to beta.23, and the
+carry-forward, ownership, command-planning and gate functions were compared body by
+body against it.
+
+### Known and outstanding
+
+- **Whether re-activation refreshes the device dead-man is unproven on hardware.**
+  The software detects failure and stops rather than assuming success. This is the
+  first thing to watch on a real Live run.
+- **R2 remains open.** Withdrawal is inferred from the absence of an affirming
+  publication, so a transient absence would still discard a carried run.
+- **beta.22's capped-charge observation is still outstanding**: a naturally
+  occurring charge run with a non-null `max_end_energy_kwh`.
+- A restart whose persisted evidence cannot prove ownership leaves one charge to the
+  device dead-man. Bounded by `control_horizon_minutes`, and deliberate.
+
 ## [1.0.0-beta.23] - 2026-08-25
 
 **A carried run ended correctly and could not say why.** Reporting only. The

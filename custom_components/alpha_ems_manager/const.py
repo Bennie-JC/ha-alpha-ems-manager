@@ -181,7 +181,16 @@ STORAGE_VERSION: Final = 2
 #:   beta.19 defined the record but never wrote one, so no stored document in
 #:   existence contains the older shape. There is nothing to migrate, and bumping
 #:   the version would claim a compatibility boundary that was never crossed.
-STORAGE_MINOR_VERSION: Final = 5
+#:
+#:   v1.0.0-beta.24 adds the admitted window and the battery target to that
+#:   record, because a restart that finds a dispatch still running has to be able
+#:   to reconstruct the run it belongs to rather than mint a competing one. This
+#:   time the minor version *does* move: beta.24 is the first release that writes
+#:   records at all, but a document written by a beta.24 build and read by a later
+#:   one must be distinguishable from one that predates the fields. A record
+#:   without them is read as insufficient evidence, which is a defined state
+#:   rather than an error -- see the restart rule in ``coordinator``.
+STORAGE_MINOR_VERSION: Final = 6
 STORAGE_KEY_TEMPLATE: Final = f"{DOMAIN}.{{entry_id}}.learning"
 
 #: Config-entry schema version. v1 was the previous integration's source model,
@@ -778,22 +787,33 @@ MAX_BINDING_INTERVALS_REPORTED: Final = 16
 
 # --- Phase 4: the execution barrier -------------------------------------------
 
+#: Which battery actions this release may physically execute.
+#:
+#: **The release barrier, and it is a set rather than a flag.** Until beta.24 it
+#: was a boolean, and tracing what flipping it would actually permit is what
+#: forced this shape: the command source falls back to the Phase-3 reserve guard
+#: whenever Stage B has no charge intent, ``authorize`` never looked at the
+#: direction, and ``write_refusal`` only checks a command against *its own*
+#: family. So a single ``True`` would have authorised reserve-guard **discharges**
+#: on the first refresh with no charge to make -- which is not what "enable
+#: execution" was ever meant to mean.
+#:
+#: A set says the true thing instead. beta.24 permits exactly one action, and
+#: everything else -- discharge, export, curtailment, the reserve guard -- is
+#: refused by the same mechanism that permits the charge, rather than by an
+#: upstream accident that a later edit could undo.
+#:
+#: ``frozenset()`` reproduces every release up to beta.23 exactly, so "executes
+#: nothing" remains representable, and the barrier cannot be half-opened.
+CONTROL_EXECUTABLE_ACTIONS: Final = frozenset({ACTION_CHARGE})
+
 #: Whether real execution is permitted to leave this release at all.
 #:
-#: The release barrier, and the reason ``async_execute`` is unreachable rather
-#: than merely disabled. The whole active path is built, imported and tested,
-#: and this constant is the single thing standing between it and the inverter.
-#:
-#: Flipping it is **not** sufficient to enable real control. Two prerequisites
-#: are unresolved, and both are recorded here so they cannot be forgotten:
-#:
-#: 1. **Provenance.** Nothing in the control surface records who armed a
-#:    dispatch, so Alpha EMS cannot prove it created one. Without that proof a
-#:    stop or a continuation could act on a dispatch a person started by hand.
-#: 2. **Continuation.** Because any active dispatch is therefore treated as
-#:    foreign, a dispatch Alpha EMS itself armed would inhibit it at the next
-#:    refresh -- so no multi-interval command is expressible yet.
-CONTROL_EXECUTION_AVAILABLE: Final = False
+#: **Derived, so it can never disagree with the set above.** Every reader of this
+#: constant asks the same question -- "does this release send anything?" -- and
+#: keeps working unchanged. Which action it may send is a separate question with a
+#: separate answer, and conflating them is what made the old boolean dangerous.
+CONTROL_EXECUTION_AVAILABLE: Final = bool(CONTROL_EXECUTABLE_ACTIONS)
 
 # --- Phase 4: control modes ---------------------------------------------------
 
@@ -1042,6 +1062,35 @@ REFUSE_EXECUTION_UNAVAILABLE: Final = "execution_unavailable"
 REFUSE_COOLDOWN: Final = "cooldown"
 #: There was nothing to send.
 REFUSE_NO_COMMANDS: Final = "no_commands"
+#: The action is outside :data:`CONTROL_EXECUTABLE_ACTIONS`.
+#:
+#: Not a hazard and not a mode problem: the command is well-formed and may be
+#: perfectly safe, and this release simply does not execute that direction. Named
+#: for what a reader needs to know rather than for the constant that decided it.
+REFUSE_LIVE_ACTION_NOT_PERMITTED: Final = "live_charge_only"
+#: A reset was asked for a dispatch Alpha EMS cannot prove it owns.
+#:
+#: The whole entitlement of the stop path, and the reason it can afford to ignore
+#: the mode, the opt-in and the safety verdict: it is gated on the strongest fact in
+#: the system instead of on the weakest three.
+REFUSE_RESET_NOT_OWNED: Final = "reset_not_owned"
+#: A reset was asked with no stop condition behind it.
+#:
+#: A reset is a response to something. Without a reason it is a write looking for a
+#: justification, which is the shape of every accident this project is built to
+#: avoid.
+REFUSE_RESET_WITHOUT_REASON: Final = "reset_without_reason"
+#: The owned run's action could not be established from the persisted record.
+#:
+#: Fails closed: no reset is planned and the device dead-man ends the dispatch. A
+#: missing action is never defaulted to a charge -- guessing what to stop is how a
+#: stop becomes a start in the other direction.
+REFUSE_RESET_ACTION_UNKNOWN: Final = "reset_action_unknown"
+#: A marker release was asked while a dispatch is still running behind it.
+#:
+#: Releasing it there would assert an ownership conclusion nobody has, and leave a
+#: dispatch nothing can later prove or stop.
+REFUSE_MARKER_STILL_DISPATCHING: Final = "marker_still_dispatching"
 
 CONTROL_REFUSAL_REASONS: Final = (
     REFUSE_UNSAFE,
@@ -1703,6 +1752,12 @@ ECONOMIC_BLOCKED_NOT_ENABLED: Final = "execution_not_enabled"
 ECONOMIC_BLOCKED_MODE_NOT_ACTIVE: Final = "mode_not_active"
 ECONOMIC_BLOCKED_NO_PRIMITIVE_EXPORT: Final = "no_primitive_export"
 ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL: Final = "no_primitive_curtail"
+#: The recommendation is a direction this release does not execute.
+#:
+#: Distinct from ``no_primitive_*``, which means no actuator exists at all. A
+#: discharge has a perfectly good actuator; beta.24 simply does not use it yet, and
+#: telling a reader "no primitive" would send them looking for missing hardware.
+ECONOMIC_BLOCKED_LIVE_CHARGE_ONLY: Final = "live_charge_only"
 
 #: Why the capability plan differs from the desired one. Diagnostics only: the
 #: entity shows the two actions and lets them speak for themselves.
@@ -1861,6 +1916,19 @@ EXECUTION_INTENT_SERVE_LOAD: Final = "serve_load"
 EXECUTION_INTENT_NET_EXPORT: Final = "net_export"
 EXECUTION_INTENT_HOLD: Final = "hold"
 
+#: Which battery action each Stage-B intent becomes, where one exists.
+#:
+#: **Total and explicit, because a reset reads it to decide what to stop.** The
+#: mapping was implicit in ``control_intent_for`` -- it returns ``ACTION_CHARGE`` for
+#: a grid charge and ``None`` for everything else -- which is fine for building a
+#: command and useless for the stop path, where there is no command to read.
+#:
+#: An intent absent from this map has no action, and the caller must fail closed
+#: rather than guess. ``serve_load`` and ``net_export`` are deliberately absent:
+#: the first keeps the Phase-3 reserve-guard behaviour and the second has no
+#: primitive at all, so neither is something Alpha EMS can own or stop.
+EXECUTION_INTENT_ACTIONS: Final = {EXECUTION_INTENT_GRID_CHARGE: ACTION_CHARGE}
+
 EXECUTION_INTENTS: Final = (
     EXECUTION_INTENT_GRID_CHARGE,
     EXECUTION_INTENT_SERVE_LOAD,
@@ -1927,6 +1995,17 @@ EXECUTION_STATES: Final = (
 #: alone, while an unproven one might be ours and must *still* be left alone --
 #: but the second is a fault to report rather than a normal condition.
 OWNERSHIP_NONE: Final = "none"
+
+#: How ownership was established, so a reader is not left to infer it.
+#:
+#: ``exact`` is the steady state: the dispatch the inverter reports is the one the
+#: persisted record says was armed. ``settling`` covers the refresh after Alpha EMS
+#: itself armed or re-armed, where the recorded start is absent or has moved
+#: because we moved it -- bounded by ``OWNERSHIP_CLAIM_WINDOW_SECONDS``, and the
+#: narrower of the two by design. Published side by side because "owned" alone
+#: would hide which evidence carried the decision.
+OWNERSHIP_PROVENANCE_EXACT: Final = "exact"
+OWNERSHIP_PROVENANCE_SETTLING: Final = "settling"
 OWNERSHIP_OWNED: Final = "owned"
 OWNERSHIP_FOREIGN: Final = "foreign"
 OWNERSHIP_UNPROVEN: Final = "unproven"
@@ -1949,6 +2028,13 @@ CONTROL_REFUSE_FOREIGN_FAMILY: Final = "foreign_family_entity"
 CONTROL_REFUSE_RAW_DISPATCH_WRITE: Final = "raw_dispatch_write"
 CONTROL_REFUSE_NEGATIVE_MAGNITUDE: Final = "negative_helper_magnitude"
 CONTROL_REFUSE_SERVICE_NOT_PERMITTED: Final = "service_not_permitted"
+#: A step outside the entity set this release may write.
+#:
+#: The last interlock, checked against the step list itself at the send site. It
+#: names no action and reads no intent -- a subset test on entity ids, which is
+#: why it catches a discharge, an export, a raw-dispatch write and an unknown
+#: entity with one comparison and cannot be fooled by a mislabelled command.
+CONTROL_REFUSE_ACTION_NOT_EXECUTABLE: Final = "live_charge_only"
 
 CONTROL_WRITE_REFUSALS: Final = (
     CONTROL_REFUSE_DIRECTION_MISMATCH,
@@ -2019,8 +2105,28 @@ EXECUTION_STOP_GRID_CEILING: Final = "grid_energy_ceiling"
 #: No valid charge ceiling could be established, so the charge was refused
 #: rather than given a substituted bound. See ``CONTROL_CUTOFF_MIN_PERCENT``.
 EXECUTION_STOP_NO_CHARGE_CEILING: Final = "no_charge_ceiling"
+#: A sustaining re-arm did not demonstrably advance the device dead-man.
+#:
+#: The controller refreshes every fifteen minutes against a twenty-minute
+#: dead-man, so a run continues only because each refresh re-arms it. Whether
+#: re-activating an already-active dispatch actually refreshes that timer is a
+#: property of the control surface rather than of this integration, so it is
+#: **measured** every refresh instead of assumed. When the timer does not move,
+#: the honest conclusion is that the run is about to end whatever the controller
+#: believes, so it is ended deliberately and said out loud.
+EXECUTION_STOP_TIMER_NOT_REFRESHED: Final = "deadman_not_refreshed"
+#: The Stage-A headroom cap reduced the request to nothing.
+#:
+#: Distinguished from ``target_reached`` since beta.24, because they are different
+#: outcomes and a reader needs to tell them apart: one bought what the plan asked
+#: for, the other stopped short because the pack ran out of room. Both stop, both
+#: reset, and neither is a fault -- but "complete" and "stopped for headroom" are
+#: not the same sentence.
+EXECUTION_STOP_HEADROOM_REACHED: Final = "headroom_reached"
 
 EXECUTION_STOP_REASONS: Final = (
+    EXECUTION_STOP_TIMER_NOT_REFRESHED,
+    EXECUTION_STOP_HEADROOM_REACHED,
     EXECUTION_STOP_GRID_CEILING,
     EXECUTION_STOP_NO_CHARGE_CEILING,
     EXECUTION_STOP_TARGET_REACHED,

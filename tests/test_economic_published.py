@@ -25,6 +25,7 @@ from custom_components.alpha_ems_manager.activity import ACTIVITY_NAME
 from custom_components.alpha_ems_manager.const import (
     ECONOMIC_ACTION_OPTIONS,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+    ECONOMIC_BLOCKED_NOT_ENABLED,
     ECONOMIC_BUCKET_BAND_KWH,
     ECONOMIC_MODEL_VERSION,
 )
@@ -36,6 +37,7 @@ from custom_components.alpha_ems_manager.economic import TERMINAL_BASIS
 from .conftest import FakeFrank
 from .forecast_helpers import NORMAL, history_before, local, refresh_at, seed
 from .frank_capture import synthetic_day
+from .live_capability import assert_charge_only_capability
 
 ECONOMIC_ENTITY = "sensor.alpha_ems_economic_action"
 
@@ -167,17 +169,20 @@ async def test_the_capability_action_is_published_beside_the_desired_one(
     """Both, always. A desired action alone would be ambiguous about what can happen.
 
     ``capability_action`` is what implemented actuators could produce -- computed
-    *before* the global execution barrier, and therefore not a claim that anything
-    was or could be executed in this release.
+    *before* the execution barrier, and therefore not a claim that anything was or
+    could be executed.
+
+    The blocked reason is the deepest one that applies. This installation has not
+    enabled command sending, so that is the answer -- and it staying the answer
+    across the beta.24 upgrade is the upgrade-safety property: opening the barrier
+    for a charge changes nothing for someone who never opted in.
     """
     await drive(setup_integration.runtime_data, frank)
 
     attributes = attributes_of(hass, ECONOMIC_ENTITY)
 
     assert attributes["capability_action"] in set(ECONOMIC_ACTION_OPTIONS)
-    assert (
-        attributes["execution_blocked_reason"] == ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE
-    )
+    assert attributes["execution_blocked_reason"] == ECONOMIC_BLOCKED_NOT_ENABLED
 
 
 async def test_the_economic_entity_exposes_no_array_at_all(
@@ -545,4 +550,8 @@ async def test_the_economic_plan_does_not_reach_the_control_report(
 
     assert "economic" not in report
     assert "desired_action" not in report
-    assert report.get("execution_available") is False
+    # The barrier is open for a charge since beta.24. What this test protects is
+    # unchanged: no trading decision appears in the control report, so none is one
+    # refactor away from being executed.
+    assert report.get("execution_available") is True
+    assert_charge_only_capability()

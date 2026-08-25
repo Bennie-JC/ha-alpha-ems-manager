@@ -22,7 +22,6 @@ from custom_components.alpha_ems_manager.alphaess_device import (
     BOOLEAN_PEAK_SHAVING,
 )
 from custom_components.alpha_ems_manager.const import (
-    CONTROL_EXECUTION_AVAILABLE,
     PV_ABSORPTION_DISPATCH_ACTIVE,
     PV_ABSORPTION_EXCESS_EXPORT,
     PV_ABSORPTION_NO_SUPPRESSING_FEATURE,
@@ -33,6 +32,7 @@ from custom_components.alpha_ems_manager.const import (
 
 from .conftest import ACHTERKANT, VOORKANT, FakeSolcast
 from .forecast_helpers import NORMAL
+from .live_capability import assert_charge_only_capability
 from .test_pv_site_selection import drive, enable_forecast
 
 #: Phase-1 and Phase-2 entities. Not one of these may move because a PV forecast
@@ -341,7 +341,7 @@ async def test_execution_remains_structurally_unavailable(
 
     from .test_control_modes import set_mode
 
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert_charge_only_capability()
 
     enable_forecast(setup_integration, hass, solcast_config_entry)
     await hass.config_entries.async_reload(setup_integration.entry_id)
@@ -350,7 +350,9 @@ async def test_execution_remains_structurally_unavailable(
     await drive(coordinator)
 
     report = coordinator.control_report
-    assert report["execution_available"] is False
+    # The barrier is open for a charge since beta.24. Obligation 8 is unchanged:
+    # a PV source cannot authorize anything, and this plan is not a charge.
+    assert report["execution_available"] is True
     assert report["authorization"]["authorized"] is False
 
 

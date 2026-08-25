@@ -50,7 +50,6 @@ from custom_components.alpha_ems_manager.const import (
     CONTROL_CUTOFF_MAX_PERCENT,
     CONTROL_CUTOFF_MIN_PERCENT,
     CONTROL_CUTOFF_PERCENT_PER_BIT,
-    CONTROL_EXECUTION_AVAILABLE,
     CONTROL_HOLD_MONITOR_WINDOW_W,
     CONTROL_INHIBIT_REASONS,
     CONTROL_MAX_POWER_KW,
@@ -90,7 +89,7 @@ from custom_components.alpha_ems_manager.const import (
     MIN_CONTROL_HORIZON_MINUTES,
     REFUSE_COOLDOWN,
     REFUSE_EXECUTION_NOT_ENABLED,
-    REFUSE_EXECUTION_UNAVAILABLE,
+    REFUSE_LIVE_ACTION_NOT_PERMITTED,
     REFUSE_MODE_NOT_ACTIVE,
     REFUSE_NO_COMMANDS,
     REFUSE_UNSAFE,
@@ -107,6 +106,8 @@ from custom_components.alpha_ems_manager.safety import (
     authorize,
     evaluate,
 )
+
+from .live_capability import assert_charge_only_capability
 
 NOW = datetime(2026, 8, 20, 12, 0, 5, tzinfo=UTC)
 TODAY = date(2026, 8, 20)
@@ -908,8 +909,35 @@ def test_active_without_the_enable_is_refused() -> None:
     assert decision.refusal == REFUSE_EXECUTION_NOT_ENABLED
 
 
-def test_active_with_the_enable_is_still_refused_by_the_release_barrier() -> None:
-    """The last line, and in this release the one that always holds."""
+def test_active_with_the_enable_is_still_refused_for_a_discharge() -> None:
+    """**The last line, and beta.24 changed which line that is.**
+
+    Every gate open -- safe verdict, active mode, the enable on, commands planned,
+    the release barrier lifted -- and a discharge is still refused, because this
+    release does not execute that direction. Through beta.23 the release barrier
+    was the answer here; it no longer is, and the refusal that replaced it is the
+    one that still means something.
+    """
+    decision = authorize(
+        _safe_verdict(),
+        make_context(mode=CONTROL_MODE_ACTIVE, execution_enabled=True),
+        commands_planned=5,
+        starts_or_increases=True,
+        action=ACTION_DISCHARGE,
+    )
+
+    assert_charge_only_capability()
+    assert decision.authorized is False
+    assert decision.refusal == REFUSE_LIVE_ACTION_NOT_PERMITTED
+
+
+def test_an_unnamed_action_is_refused_rather_than_waved_through() -> None:
+    """An authorisation that cannot say what it authorises is not one.
+
+    ``action`` defaults to ``None`` so every existing caller keeps compiling, and
+    ``None`` must be the *refusing* default -- otherwise a call site that forgot to
+    pass it would silently gain permission for every direction.
+    """
     decision = authorize(
         _safe_verdict(),
         make_context(mode=CONTROL_MODE_ACTIVE, execution_enabled=True),
@@ -917,9 +945,8 @@ def test_active_with_the_enable_is_still_refused_by_the_release_barrier() -> Non
         starts_or_increases=True,
     )
 
-    assert CONTROL_EXECUTION_AVAILABLE is False
     assert decision.authorized is False
-    assert decision.refusal == REFUSE_EXECUTION_UNAVAILABLE
+    assert decision.refusal == REFUSE_LIVE_ACTION_NOT_PERMITTED
 
 
 def test_authorization_can_only_subtract() -> None:
@@ -978,48 +1005,62 @@ def test_an_empty_command_list_is_a_no_op_rather_than_a_hazard() -> None:
     decision = authorize(
         verdict, context, commands_planned=0, starts_or_increases=False
     )
-    # The release barrier is reached first, which is itself the point: even the
-    # no-op path cannot get past it.
-    assert decision.refusal == REFUSE_EXECUTION_UNAVAILABLE
+    # Reported for what it is. The command count is checked before the direction,
+    # so a hold that plans nothing is "no commands" rather than "wrong direction" --
+    # which is the readable answer, because there was no direction to get wrong.
+    assert decision.refusal == REFUSE_NO_COMMANDS
 
 
-def test_no_commands_is_reachable_when_the_barrier_is_lifted() -> None:
-    """Proven against the ordering directly, since the barrier hides it.
+def test_the_refusals_after_the_barrier_are_reachable_and_ordered() -> None:
+    """No longer proven through a patch: beta.24 reaches these for real.
 
-    Kept because a later release will lift the barrier, and the refusal after it
-    must already be correct.
+    Written when the barrier hid everything behind it, and kept because the
+    ordering it pins is now live. A charge with commands planned is authorized; the
+    same charge with nothing planned is "no commands"; a discharge is refused for
+    its direction.
     """
-    import custom_components.alpha_ems_manager.safety as safety_module
-
     context = make_context(mode=CONTROL_MODE_ACTIVE, execution_enabled=True)
     verdict = _safe_verdict()
 
-    original = safety_module.CONTROL_EXECUTION_AVAILABLE
-    safety_module.CONTROL_EXECUTION_AVAILABLE = True
-    try:
-        assert (
-            authorize(
-                verdict, context, commands_planned=0, starts_or_increases=False
-            ).refusal
-            == REFUSE_NO_COMMANDS
-        )
-        assert (
-            authorize(
-                verdict,
-                context,
-                commands_planned=5,
-                starts_or_increases=True,
-            ).authorized
-            is True
-        )
-    finally:
-        safety_module.CONTROL_EXECUTION_AVAILABLE = original
+    assert (
+        authorize(
+            verdict,
+            context,
+            commands_planned=0,
+            starts_or_increases=False,
+            action=ACTION_CHARGE,
+        ).refusal
+        == REFUSE_NO_COMMANDS
+    )
+    assert (
+        authorize(
+            verdict,
+            context,
+            commands_planned=5,
+            starts_or_increases=True,
+            action=ACTION_CHARGE,
+        ).authorized
+        is True
+    )
+    assert (
+        authorize(
+            verdict,
+            context,
+            commands_planned=5,
+            starts_or_increases=True,
+            action=ACTION_DISCHARGE,
+        ).refusal
+        == REFUSE_LIVE_ACTION_NOT_PERMITTED
+    )
 
 
 def test_a_cooldown_holds_a_rising_command_but_never_a_falling_one() -> None:
-    """Reducing battery movement can only reduce risk, so it is never delayed."""
-    import custom_components.alpha_ems_manager.safety as safety_module
+    """Reducing battery movement can only reduce risk, so it is never delayed.
 
+    No longer behind a patched barrier: beta.24 reaches this gate for real, which
+    is also why the cooldown finally matters. Driven with a charge, because the
+    direction check sits after it and a discharge would never get this far.
+    """
     verdict = _safe_verdict()
     recent = make_context(
         mode=CONTROL_MODE_ACTIVE,
@@ -1027,48 +1068,46 @@ def test_a_cooldown_holds_a_rising_command_but_never_a_falling_one() -> None:
         seconds_since_last_write=CONTROL_COOLDOWN_SECONDS - 1,
     )
 
-    original = safety_module.CONTROL_EXECUTION_AVAILABLE
-    safety_module.CONTROL_EXECUTION_AVAILABLE = True
-    try:
-        assert (
-            authorize(
-                verdict, recent, commands_planned=5, starts_or_increases=True
-            ).refusal
-            == REFUSE_COOLDOWN
-        )
-        assert (
-            authorize(
-                verdict, recent, commands_planned=5, starts_or_increases=False
-            ).authorized
-            is True
-        )
-    finally:
-        safety_module.CONTROL_EXECUTION_AVAILABLE = original
+    assert (
+        authorize(
+            verdict,
+            recent,
+            commands_planned=5,
+            starts_or_increases=True,
+            action=ACTION_CHARGE,
+        ).refusal
+        == REFUSE_COOLDOWN
+    )
+    assert (
+        authorize(
+            verdict,
+            recent,
+            commands_planned=5,
+            starts_or_increases=False,
+            action=ACTION_CHARGE,
+        ).authorized
+        is True
+    )
 
 
 def test_no_previous_write_is_not_a_cooldown() -> None:
     """Nothing to cool down from is not the same as a write zero seconds ago."""
-    import custom_components.alpha_ems_manager.safety as safety_module
-
     context = make_context(
         mode=CONTROL_MODE_ACTIVE,
         execution_enabled=True,
         seconds_since_last_write=None,
     )
-    original = safety_module.CONTROL_EXECUTION_AVAILABLE
-    safety_module.CONTROL_EXECUTION_AVAILABLE = True
-    try:
-        assert (
-            authorize(
-                _safe_verdict(),
-                context,
-                commands_planned=5,
-                starts_or_increases=True,
-            ).authorized
-            is True
-        )
-    finally:
-        safety_module.CONTROL_EXECUTION_AVAILABLE = original
+
+    assert (
+        authorize(
+            _safe_verdict(),
+            context,
+            commands_planned=5,
+            starts_or_increases=True,
+            action=ACTION_CHARGE,
+        ).authorized
+        is True
+    )
 
 
 # ===========================================================================

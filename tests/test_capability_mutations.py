@@ -33,6 +33,7 @@ from custom_components.alpha_ems_manager.solcast_source import discover
 
 from .conftest import FakeSolcast
 from .forecast_helpers import NORMAL
+from .live_capability import assert_charge_only_capability
 from .test_pv_site_selection import drive, enable_forecast
 
 
@@ -337,11 +338,8 @@ def test_no_mutating_action_was_introduced_by_the_fix(forbidden: str) -> None:
 
 def test_the_execution_barrier_is_untouched() -> None:
     """A usable PV source has nothing to do with reaching an inverter."""
-    from custom_components.alpha_ems_manager.const import (
-        CONTROL_EXECUTION_AVAILABLE,
-    )
 
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert_charge_only_capability()
 
 
 async def test_a_recovered_source_still_writes_nothing(

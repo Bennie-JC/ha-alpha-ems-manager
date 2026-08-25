@@ -26,7 +26,6 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.alpha_ems_manager.alphaess_device import OWNERSHIP_PROVABLE
 from custom_components.alpha_ems_manager.const import (
-    CONTROL_EXECUTION_AVAILABLE,
     CONTROL_MODE_ACTIVE,
     FRANK_FORBIDDEN_SERVICES,
 )
@@ -34,6 +33,7 @@ from custom_components.alpha_ems_manager.const import (
 from .conftest import FakeFrank
 from .forecast_helpers import NORMAL, local, refresh_at
 from .frank_capture import synthetic_day
+from .live_capability import assert_charge_only_capability
 from .test_control_modes import set_mode
 from .test_price_capability import TOMORROW, drive
 
@@ -272,7 +272,7 @@ async def test_a_healthy_price_source_in_active_mode_still_commands_nothing(
 
     assert async_call.await_count == 0
     assert coordinator.data["control"]["mode"] == CONTROL_MODE_ACTIVE
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert_charge_only_capability()
     assert OWNERSHIP_PROVABLE is False
     assert coordinator.price_forecasts[NORMAL].available is True
 

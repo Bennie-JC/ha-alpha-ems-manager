@@ -19,7 +19,6 @@ from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.alpha_ems_manager.const import (
-    CONTROL_EXECUTION_AVAILABLE,
     CONTROL_MODE_ACTIVE,
     RESERVE_CONFIGURED,
 )
@@ -28,6 +27,7 @@ from custom_components.alpha_ems_manager.diagnostics import (
 )
 
 from .forecast_helpers import NORMAL, history_before, local, refresh_at, seed
+from .live_capability import assert_charge_only_capability
 
 RESERVE_ENTITY = "sensor.alpha_ems_dynamic_battery_reserve"
 
@@ -410,7 +410,7 @@ async def test_a_reserve_shortfall_commands_nothing_in_active_mode(
     plan = coordinator.battery_plan
     report = (await diagnostics_at_noon(hass, setup_integration))["reserve"]
 
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert_charge_only_capability()
     assert report["shortfall"]["reserve_shortfall_kwh"] > 0.0
     assert plan.decision.action != "charge"
     assert call.await_count == 0

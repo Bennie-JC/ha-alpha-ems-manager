@@ -37,7 +37,6 @@ from custom_components.alpha_ems_manager.alphaess_device import (
     PERMITTED_SERVICES,
 )
 from custom_components.alpha_ems_manager.const import (
-    CONTROL_EXECUTION_AVAILABLE,
     ECONOMIC_ADVICE_EVENT_KINDS,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     ECONOMIC_EVENT_CANCELLED,
@@ -47,6 +46,7 @@ from custom_components.alpha_ems_manager.const import (
     ECONOMIC_EXECUTION_EVENT_KINDS,
 )
 
+from .live_capability import assert_charge_only_capability
 from .test_phase_four_boundaries import (
     FLASH_BACKED_HELPERS,
     GRID_RATE_ACTUATORS,
@@ -92,9 +92,15 @@ def test_the_boundary_check_sees_the_real_modules() -> None:
 # -- the global barrier ------------------------------------------------------
 
 
-def test_execution_is_still_unavailable_in_this_release() -> None:
-    """The one flag Stage A rests on. Nothing below it can be relaxed alone."""
-    assert CONTROL_EXECUTION_AVAILABLE is False
+def test_only_a_charge_is_executable_in_this_release() -> None:
+    """The capability Stage A rests on. Nothing below it can be relaxed alone.
+
+    Stage A plans charges, discharges, exports and curtailment. beta.24 executes
+    the first of those and refuses the rest, so what Stage A rests on is no longer
+    a flag but a set -- and every action it can recommend other than a charge must
+    still be outside it.
+    """
+    assert_charge_only_capability()
 
 
 def test_the_blocked_reason_is_the_barrier_and_nothing_finer() -> None:
@@ -387,11 +393,17 @@ def test_the_event_kinds_partition_into_advice_and_execution() -> None:
 
 
 @pytest.mark.parametrize("kind", ECONOMIC_EXECUTION_EVENT_KINDS)
-def test_an_execution_event_is_refused_while_the_barrier_stands(kind: str) -> None:
-    """A line reading "charge started" on a release that sends nothing is a lie.
+def test_an_execution_event_is_accepted_now_that_a_charge_executes(kind: str) -> None:
+    """**The guard did not move; the world it guards against did.**
 
-    A guard rather than an assumption. Nothing can produce one today; if a later
-    change makes it possible, the refusal is what stops the claim.
+    A line reading "charge started" on a release that sends nothing is a lie, and
+    through beta.23 the refusal was what stopped it. beta.24 sends a charge, so the
+    kind is legitimate -- and the refusal still stands behind it, keyed on the
+    barrier rather than on a version, so a release that goes back to sending
+    nothing goes back to refusing it.
+
+    Shadow is answered separately and structurally: it emits ``would_start`` and
+    ``would_stop``, never these kinds.
     """
     entry = activity_module.ActivityEntry(
         kind=kind,
@@ -399,10 +411,11 @@ def test_an_execution_event_is_refused_while_the_barrier_stands(kind: str) -> No
         state=activity_module.ActivityState(),
     )
 
-    with pytest.raises(ValueError, match="executes nothing"):
-        activity_module.logbook_payload(
-            entry, domain="alpha_ems_manager", entity_id="sensor.x"
-        )
+    payload = activity_module.logbook_payload(
+        entry, domain="alpha_ems_manager", entity_id="sensor.x"
+    )
+    assert payload["message"] == "anything"
+    assert payload["name"] == activity_module.ACTIVITY_NAME
 
 
 @pytest.mark.parametrize("kind", ECONOMIC_ADVICE_EVENT_KINDS)
@@ -490,7 +503,6 @@ async def test_the_economic_surface_writes_nothing_in_active_mode(
     from homeassistant.const import EVENT_LOGBOOK_ENTRY
 
     from custom_components.alpha_ems_manager.const import (
-        CONTROL_EXECUTION_AVAILABLE,
         CONTROL_MODE_ACTIVE,
     )
 
@@ -524,7 +536,7 @@ async def test_the_economic_surface_writes_nothing_in_active_mode(
 
     # And it wrote nothing.
     assert economic_service_calls == []
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert_charge_only_capability()
     assert (coordinator.control_report or {}).get("last_write") is None
     for entry in logbook:
         assert entry["name"] == activity_module.ACTIVITY_NAME

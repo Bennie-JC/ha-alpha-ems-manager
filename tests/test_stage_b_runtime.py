@@ -22,7 +22,6 @@ from custom_components.alpha_ems_manager.alphaess_device import (
     DISCHARGE_FAMILY,
 )
 from custom_components.alpha_ems_manager.const import (
-    CONTROL_EXECUTION_AVAILABLE,
     CONTROL_MODE_ACTIVE,
     CONTROL_MODE_OFF,
     CONTROL_MODE_SHADOW,
@@ -31,6 +30,7 @@ from custom_components.alpha_ems_manager.const import (
 
 from .forecast_helpers import NORMAL, history_before, local, refresh_at, seed
 from .frank_capture import synthetic_day
+from .live_capability import assert_charge_only_capability
 from .test_control_modes import set_mode
 from .test_economic_published import allow_trading
 
@@ -83,7 +83,7 @@ async def test_a_shadow_day_writes_nothing_and_never_claims_ownership(
 
     # And it wrote nothing at all.
     assert writes == []
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert_charge_only_capability()
     # Including the marker, which is the write that would create a claim.
     assert hass.states.get(BOOLEAN_EXECUTION_OWNER).state == "off"
     # And the two fields a send would set are still untouched.
@@ -104,7 +104,7 @@ async def test_the_execution_block_says_nothing_was_applied(
     report = (coordinator.control_report or {}).get("execution") or {}
 
     assert report
-    assert "controls_nothing" in report
+    assert "execution_scope" in report
     power = report.get("power")
     if power is not None:
         assert power["applied_kw"] == 0.0
@@ -253,9 +253,16 @@ async def test_a_long_run_does_not_produce_a_line_every_quarter(
 ) -> None:
     """**The requirement that the feed is not a fifteen-minute log.**
 
-    Twelve refreshes across three hours. Routine rolling corrections must be
-    silent, so the number of distinct lines has to be far below the number of
-    refreshes -- and no line may repeat.
+    Twelve refreshes across three hours, spanning two charge campaigns -- the first
+    reaches its window end and a second is admitted. Routine rolling corrections
+    must be silent.
+
+    **Counted per run since beta.24, which is sharper than counting unique lines.**
+    The old assertion was that no message repeated, and it was a proxy: with three
+    lifecycle events keyed on ``run_id``, two campaigns whose figures happen to
+    match legitimately produce the same sentence twice, ninety minutes apart. Two
+    real events are not spam. What is actually forbidden is a *run* saying anything
+    more than once, so that is what is asserted.
     """
     from homeassistant.const import EVENT_LOGBOOK_ENTRY
 
@@ -263,19 +270,36 @@ async def test_a_long_run_does_not_produce_a_line_every_quarter(
     hass.bus.async_listen(EVENT_LOGBOOK_ENTRY, lambda event: logbook.append(event.data))
     coordinator = await prepared(hass, setup_integration, frank, CONTROL_MODE_ACTIVE)
 
+    runs: list[str] = []
     for quarter in range(12):
         await refresh_at(
             coordinator, local(NORMAL, 10 + quarter // 4, (quarter % 4) * 15)
         )
+        execution = (coordinator.control_report or {}).get("execution") or {}
+        run_id = ((execution.get("carried") or {}).get("run") or {}).get("run_id")
+        if isinstance(run_id, str) and run_id not in runs:
+            runs.append(run_id)
 
     messages = [entry["message"] for entry in logbook]
+    # The execution surface, told apart from the Phase-3 advice lines by its own
+    # vocabulary. Those churn with the reserve window and always have.
+    lifecycle = [
+        m for m in messages if m.startswith(("Charge ", "Discharge ", "Export "))
+    ]
 
     # Something was said, or the silence proves nothing.
     assert messages
-    # Nothing was said twice.
-    assert len(messages) == len(set(messages)), messages
-    # And far fewer lines than refreshes.
-    assert len(messages) < 12, messages
+    assert lifecycle
+    # Two campaigns, and at most one planned, one start and one end for each.
+    assert len(runs) == 2, runs
+    assert len(lifecycle) <= 3 * len(runs), lifecycle
+    # Nothing about the ten routine refreshes in between.
+    assert len(lifecycle) < 12, lifecycle
+    # One planned line and one start line per campaign at most. A third of either
+    # would mean the deduplication key had stopped identifying the run -- which is
+    # the failure this replaced the uniqueness assertion to catch.
+    assert sum(1 for m in lifecycle if " planned - " in m) <= len(runs), lifecycle
+    assert sum(1 for m in lifecycle if " would start - " in m) <= len(runs), lifecycle
     assert writes == []
 
 
@@ -355,7 +379,7 @@ async def test_the_document_declares_the_new_minor_and_stays_readable(
     document = hass_storage[f"alpha_ems_manager.{setup_integration.entry_id}.learning"]
 
     assert document["version"] == 2
-    assert document["minor_version"] == STORAGE_MINOR_VERSION == 5
+    assert document["minor_version"] == STORAGE_MINOR_VERSION == 6
     # The learning history is untouched by any of this.
     assert "days" in document["data"]
 

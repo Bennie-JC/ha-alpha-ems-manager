@@ -29,8 +29,9 @@ from custom_components.alpha_ems_manager.alphaess_device import (
 from custom_components.alpha_ems_manager.const import (
     ACTION_CHARGE,
     ACTION_DISCHARGE,
-    CONTROL_EXECUTION_AVAILABLE,
 )
+
+from .live_capability import assert_charge_only_capability
 
 SOURCE = pathlib.Path(execution_module.__file__).read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
@@ -337,9 +338,13 @@ def test_the_controller_never_decides_whether_to_execute() -> None:
     assert "execution_enabled" not in SOURCE
 
 
-def test_execution_remains_unavailable_in_this_release() -> None:
-    """beta.19 builds the controller. beta.20 is a separately approved change."""
-    assert CONTROL_EXECUTION_AVAILABLE is False
+def test_only_a_grid_charge_is_executable_in_this_release() -> None:
+    """beta.19 built the controller; beta.24 lets one direction out of it.
+
+    Stage B is the only path that can execute, and only for a charge. Every other
+    direction it can describe stays outside the executable set.
+    """
+    assert_charge_only_capability()
 
 
 def test_the_permitted_service_set_did_not_grow() -> None:
@@ -474,7 +479,21 @@ def test_ownership_is_still_not_derived_from_parameters() -> None:
 
 
 def test_the_ownership_verdict_is_supplied_to_the_gate_not_derived_by_it() -> None:
-    """``safety`` must not learn how to decide ownership."""
+    """``safety`` must not learn how to decide ownership.
+
+    **Named against the evidence rather than against the vocabulary**, and beta.24
+    forced that distinction. The check used to forbid any word containing "marker"
+    or "record" anywhere in the module, which was a fine proxy while nothing here
+    mentioned either. The stop path has an operation whose subject genuinely *is*
+    the owner marker -- releasing one that has nothing behind it -- and a test that
+    banned the word would have been satisfied by calling it something else, which is
+    obfuscation rather than safety.
+
+    So the invariant is stated directly: this module may be *told* a verdict, and it
+    may not reach the evidence a verdict is made from. The denied names are the
+    evidence's own fields and the two functions that decide, so no rename can
+    satisfy this list -- only actually reading the evidence would break it.
+    """
     from custom_components.alpha_ems_manager import safety
 
     source = inspect.getsource(safety)
@@ -484,15 +503,33 @@ def test_the_ownership_verdict_is_supplied_to_the_gate_not_derived_by_it() -> No
             words.add(node.id)
         elif isinstance(node, ast.Attribute):
             words.add(node.attr)
+        elif isinstance(node, ast.arg):
+            words.add(node.arg)
 
-    # The verdict is read.
+    # The verdicts are read: an ownership state, and whether a marker is stale.
     assert "dispatch_owned" in words
-    # The evidence is not: no marker, no record, no ownership function reaches
-    # here, so this module cannot begin deciding ownership for itself.
-    assert "OwnershipEvidence" not in words
-    assert "ownership_of" not in words
-    assert not any("marker" in word.lower() for word in words), sorted(words)
-    assert not any("record" in word.lower() for word in words)
+
+    # The evidence is not. These are ``OwnershipEvidence``'s own fields and
+    # properties, plus the two functions that turn them into a verdict -- so this
+    # module cannot begin deciding ownership for itself.
+    #
+    # ``dispatch_active`` is deliberately absent from the list even though the
+    # evidence carries one: ``ControlContext`` has carried its own since Phase 4,
+    # and the gate has always read it to refuse a command over a running dispatch.
+    # Denying the *name* would fail an invariant that predates this file.
+    for denied in (
+        "OwnershipEvidence",
+        "ownership_of",
+        "stale_marker",
+        "marker_on",
+        "dispatch_start",
+        "record",
+        "record_present",
+        "record_matches",
+        "record_provenance",
+        "record_names_this_run",
+    ):
+        assert denied not in words, denied
 
 
 def test_a_foreign_dispatch_still_inhibits() -> None:

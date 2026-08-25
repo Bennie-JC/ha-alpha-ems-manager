@@ -628,8 +628,64 @@ def plan_commands(command: DeviceCommand) -> tuple[CommandStep, ...]:
     )
 
 
+def plan_sustain(command: DeviceCommand) -> tuple[CommandStep, ...]:
+    """Return the steps that keep an already-armed dispatch alive.
+
+    **The dead-man refresh, and it is a different sequence from arming because it
+    has a different job.** The controller refreshes every fifteen minutes against a
+    twenty-minute dead-man, so a run continues only because each refresh re-arms
+    it. What that needs is the duration rewritten and activation re-issued; it does
+    **not** need the power rewritten, and writing a helper a value it already holds
+    is a service call that buys nothing.
+
+    The cutoff *is* re-asserted. It is an upper bound on state of charge, and if the
+    configured ceiling has moved since the run was armed, a sustain that skipped it
+    would keep charging against the old one. One call to keep a safety bound current
+    is worth making.
+
+    No marker step: ownership is established by the time a sustain is reachable, and
+    turning an already-on boolean on again says nothing. No power step, which is the
+    whole point -- see :func:`plan_commands` for the arming sequence, which writes
+    everything and is used whenever the power has materially moved.
+
+    **Activation is last here too.** Same reason as arming: it is what triggers the
+    device write, so it must observe settled values.
+    """
+    if not command.moves_battery:
+        return ()
+    family = FAMILIES[command.action]
+    return (
+        CommandStep(
+            *SERVICE_SET_VALUE,
+            family.cutoff_soc,
+            float(command.cutoff_soc_percent),
+        ),
+        CommandStep(
+            *SERVICE_SET_VALUE,
+            family.duration,
+            float(command.duration_minutes),
+        ),
+        CommandStep(
+            *(SERVICE_TURN_ON if command.device_hold_flag else SERVICE_TURN_OFF),
+            family.hold,
+        ),
+        CommandStep(*SERVICE_TURN_ON, family.activate),
+    )
+
+
 def write_refusal(command: DeviceCommand, steps: tuple[CommandStep, ...]) -> str | None:
-    """Return why this command list must not be sent, or ``None`` if it may be.
+    """Return why this command's step list must not be sent.
+
+    A thin reading of :func:`action_refusal`, which is where the checks live. The
+    two exist separately because a **reset** has no ``DeviceCommand`` -- a stopping
+    refresh builds no command at all -- and the alternative was handing this
+    function an object shaped like one, which is a lie told to a safety check.
+    """
+    return action_refusal(command.action, steps)
+
+
+def action_refusal(action: str, steps: tuple[CommandStep, ...]) -> str | None:
+    """Return why this step list must not be sent, or ``None`` if it may be.
 
     **Checked against the real entity list, not against the intention that built
     it.** Layers above make a wrong-direction write impossible; this exists because
@@ -657,13 +713,13 @@ def write_refusal(command: DeviceCommand, steps: tuple[CommandStep, ...]) -> str
     if not steps:
         return None
 
-    family = FAMILIES.get(command.action)
+    family = FAMILIES.get(action)
     if family is None:
         return CONTROL_REFUSE_DIRECTION_MISMATCH
 
     permitted = set(family.entities) | {BOOLEAN_EXECUTION_OWNER}
     foreign_families = [
-        other for action, other in FAMILIES.items() if action != command.action
+        other for other_action, other in FAMILIES.items() if other_action != action
     ]
     foreign_entities = {
         entity for other in foreign_families for entity in other.entities

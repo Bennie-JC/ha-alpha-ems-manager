@@ -76,6 +76,7 @@ from .const import (
     BATTERY_KW_PRECISION,
     BATTERY_KWH_PRECISION,
     BATTERY_SOC_PRECISION,
+    CONTROL_EXECUTABLE_ACTIONS,
     CONTROL_EXECUTION_AVAILABLE,
     CONTROL_MODE_ACTIVE,
     CONTROL_STATE_OPTIONS,
@@ -85,6 +86,7 @@ from .const import (
     ECONOMIC_ACTION_OPTIONS,
     ECONOMIC_ACTION_SAFETY_BUY,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+    ECONOMIC_BLOCKED_LIVE_CHARGE_ONLY,
     ECONOMIC_BLOCKED_MODE_NOT_ACTIVE,
     ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL,
     ECONOMIC_BLOCKED_NO_PRIMITIVE_EXPORT,
@@ -92,6 +94,7 @@ from .const import (
     ECONOMIC_EUR_PRECISION,
     ECONOMIC_GAP_NONE,
     EXECUTION_STATE_ARMED,
+    EXECUTION_STATE_PREPARED,
     EXECUTION_STATE_RUNNING,
     FORECAST_ERROR_WINDOW_DAYS,
     NAME,
@@ -717,6 +720,16 @@ def _execution_view(coordinator: AlphaEmsCoordinator) -> ExecutionView | None:
         intent=intent,
         stop_reason=(report.get("result") or {}).get("stop_reason"),
         inhibit_reason=(report.get("result") or {}).get("inhibit_reason"),
+        # The run identity, which is what the lifecycle is deduplicated on. Taken
+        # from the carried run rather than from the publication: ``plan_id`` churns
+        # every refresh as the horizon rolls, and keying three once-per-run events
+        # on a churning id would produce three lines per quarter of an hour.
+        run_id=((report.get("carried") or {}).get("run") or {}).get("run_id"),
+        # A run admitted and waiting for its window. One line, then silence.
+        prepared=report.get("state") == EXECUTION_STATE_PREPARED,
+        # Set for exactly one refresh, and only after a write carrying an
+        # activation actually succeeded.
+        activation_confirmed=bool(coordinator.activation_confirmed),
     )
 
 
@@ -737,23 +750,33 @@ def _execution_window(opens: object, closes: object) -> str:
 def _economic_blocked_reason(coordinator: AlphaEmsCoordinator) -> str:
     """Return why nothing is sent, most fundamental reason first.
 
-    The global barrier wins. While ``CONTROL_EXECUTION_AVAILABLE`` is false this
-    is the only value the field can take, and that is the point: no per-action
-    reason may mask the fact that the release sends nothing.
+    Ordered so a reader is told the deepest reason rather than the first one this
+    refresh happened to hit. A release that sends nothing at all must say so before
+    it starts naming per-action reasons, or "no primitive for export" would read as
+    the only thing standing in the way.
+
+    Since beta.24 a charge *is* sent, so the deepest reasons are the ones the user
+    controls -- the enable and the mode -- and below them the direction: an action
+    outside :data:`CONTROL_EXECUTABLE_ACTIONS` is blocked for being that action, not
+    for lacking an actuator.
     """
     if not CONTROL_EXECUTION_AVAILABLE:
         return ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE
-    if not coordinator.config.control_execution_enabled:  # pragma: no cover
+    if not coordinator.config.control_execution_enabled:
         return ECONOMIC_BLOCKED_NOT_ENABLED
-    if coordinator.control_mode != CONTROL_MODE_ACTIVE:  # pragma: no cover
+    if coordinator.control_mode != CONTROL_MODE_ACTIVE:
         return ECONOMIC_BLOCKED_MODE_NOT_ACTIVE
-    outcome = _economic_outcome(coordinator)  # pragma: no cover
-    if outcome is not None:  # pragma: no cover
+    outcome = _economic_outcome(coordinator)
+    if outcome is not None:
+        # A missing actuator is a different fact from a direction this release does
+        # not execute, and they must not be reported as the same thing.
         if outcome.action == ECONOMIC_ACTION_EXPORT:
             return ECONOMIC_BLOCKED_NO_PRIMITIVE_EXPORT
         if outcome.action == ECONOMIC_ACTION_CURTAIL:
             return ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL
-    return ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE  # pragma: no cover
+        if outcome.action not in CONTROL_EXECUTABLE_ACTIONS:
+            return ECONOMIC_BLOCKED_LIVE_CHARGE_ONLY
+    return ECONOMIC_BLOCKED_LIVE_CHARGE_ONLY
 
 
 def _economic_window(coordinator: AlphaEmsCoordinator, run: Any) -> str | None:

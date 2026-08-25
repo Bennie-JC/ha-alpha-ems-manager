@@ -153,7 +153,10 @@ def test_a_run_within_one_interval_is_announced_once(lead_minutes: float) -> Non
     assert entry.kind == ECONOMIC_EVENT_PLANNED
     assert "plans to charge the battery" in entry.message
     assert "6.50 kWh" in entry.message
-    assert "Advisory only" in entry.message
+    # A charge is executable since beta.24, so this line is not advisory. It still
+    # must not read as though the battery had already moved.
+    assert "Advisory only" not in entry.message
+    assert "started" not in entry.message
 
 
 def test_the_lead_time_is_exactly_one_planning_interval() -> None:
@@ -502,20 +505,46 @@ def test_a_charge_run_says_where_its_energy_comes_from() -> None:
     assert "almost entirely from your own production" in entry.message
 
 
-def test_every_entry_carries_the_advisory_qualifier() -> None:
-    """No wording may imply the battery did anything."""
-    run = make_run(start_minutes=10)
+def test_an_unexecutable_action_still_carries_the_advisory_qualifier() -> None:
+    """**The invariant, and beta.24 narrowed it rather than dropping it.**
+
+    Until beta.23 nothing executed, so every advice line disclaimed. beta.24
+    executes a charge, so a charge line that still called itself advisory would be
+    false -- but a discharge or an export is as advisory as it ever was, and that
+    is the direction where a missing disclaimer would matter.
+    """
+    for action in (ECONOMIC_ACTION_DISCHARGE, ECONOMIC_ACTION_EXPORT):
+        run = make_run(start_minutes=10, action=action)
+        planned = next_activity(previous=None, runs=(run,), now=NOW)
+        cancelled = next_activity(previous=planned.state, runs=(), now=NOW)
+        ended = next_activity(
+            previous=announce(
+                make_run(start_minutes=-10, duration_minutes=30, action=action)
+            ),
+            runs=(),
+            now=NOW + timedelta(minutes=45),
+        )
+
+        for entry in (planned, cancelled, ended):
+            assert entry is not None
+            assert "Advisory only: this release sends no command." in entry.message
+            assert "started" not in entry.message
+
+
+def test_a_charge_advice_line_no_longer_claims_to_be_advisory() -> None:
+    """It can execute now, so saying otherwise would be the false statement.
+
+    The other half of the old invariant survives untouched: an advice line still
+    never claims the battery moved. Planning to charge is not charging, and this is
+    the surface where those two are easiest to confuse.
+    """
+    run = make_run(start_minutes=10, action=ECONOMIC_ACTION_CHARGE)
     planned = next_activity(previous=None, runs=(run,), now=NOW)
     cancelled = next_activity(previous=planned.state, runs=(), now=NOW)
-    ended = next_activity(
-        previous=announce(make_run(start_minutes=-10, duration_minutes=30)),
-        runs=(),
-        now=NOW + timedelta(minutes=45),
-    )
 
-    for entry in (planned, cancelled, ended):
+    for entry in (planned, cancelled):
         assert entry is not None
-        assert "Advisory only: this release sends no command." in entry.message
+        assert "Advisory only" not in entry.message
         assert "started" not in entry.message
 
 
@@ -552,17 +581,26 @@ def test_a_forecast_gap_does_not_claim_the_action_is_impossible() -> None:
     assert "best available action is to" in entry.message
 
 
-def test_the_execution_kind_is_still_refused() -> None:
-    """``started`` remains the one thing this surface may never say."""
+def test_the_execution_kind_is_accepted_only_because_this_release_executes() -> None:
+    """**The guard is unchanged; the world it guards against is what moved.**
+
+    Through beta.23 this surface could never say ``started``, and the refusal was
+    the proof. beta.24 executes a charge, so the kind is accepted -- and the guard
+    still stands behind it, keyed on the barrier rather than on a version, so a
+    release that goes back to executing nothing goes back to refusing it.
+
+    Shadow is a separate question and is answered elsewhere: it emits
+    ``would_start``, never this kind, whatever the barrier says.
+    """
     from custom_components.alpha_ems_manager.activity import ActivityEntry
 
-    assert CONTROL_EXECUTION_AVAILABLE is False
+    assert CONTROL_EXECUTION_AVAILABLE is True
     entry = ActivityEntry(
         kind=ECONOMIC_EVENT_STARTED, message="anything", state=ActivityState()
     )
 
-    with pytest.raises(ValueError, match="executes nothing"):
-        logbook_payload(entry, domain="alpha_ems_manager", entity_id="sensor.x")
+    payload = logbook_payload(entry, domain="alpha_ems_manager", entity_id="sensor.x")
+    assert payload["message"] == "anything"
 
 
 def test_cancelled_is_now_an_advice_kind_and_is_accepted() -> None:

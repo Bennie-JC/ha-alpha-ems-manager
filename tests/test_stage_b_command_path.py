@@ -20,7 +20,7 @@ from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.alpha_ems_manager.alphaess_adapter import (
-    ControlExecutionUnavailable,
+    ControlActionNotPermitted,
     async_execute,
 )
 from custom_components.alpha_ems_manager.alphaess_device import (
@@ -32,7 +32,6 @@ from custom_components.alpha_ems_manager.alphaess_device import (
 from custom_components.alpha_ems_manager.const import (
     ACTION_CHARGE,
     CONTROL_CUTOFF_MAX_PERCENT,
-    CONTROL_EXECUTION_AVAILABLE,
     CONTROL_MAX_POWER_KW,
     CONTROL_MIN_POWER_KW,
     CONTROL_MODE_ACTIVE,
@@ -40,6 +39,7 @@ from custom_components.alpha_ems_manager.const import (
 )
 
 from .forecast_helpers import NORMAL, local, refresh_at
+from .live_capability import assert_charge_only_capability
 from .test_stage_b_runtime import prepared
 
 pytestmark = pytest.mark.usefixtures("control_surface")
@@ -131,18 +131,25 @@ async def test_the_stage_b_charge_command_forms_completely_and_is_refused(
         assert (block.get("ownership") or {}).get("state") != OWNERSHIP_OWNED
 
 
-async def test_the_completed_command_is_refused_by_the_last_barrier_as_one_unit(
+async def test_the_completed_charge_command_reaches_the_wire_in_order(
     hass: HomeAssistant,
     setup_integration: MockConfigEntry,
     frank,
     writes: list,
 ) -> None:
-    """The final barrier, handed the real command rather than a constructed one.
+    """**The Live positive path, and the first test in this project to expect writes.**
 
-    The pipeline refuses earlier -- ``authorize`` checks the mode, the option and
-    the release constant -- so this drives the last gate directly with the exact
-    step list a Live refresh would hand it. Whole-command refusal is the property
-    under test: six steps in, zero service calls out, no partial write.
+    Through beta.23 this same command was handed to the last barrier and refused;
+    the test asserted six steps in and zero service calls out. beta.24 executes a
+    charge, so the honest assertion is the opposite one -- and it has to be, because
+    a release that claims to charge and cannot demonstrate a service call is not
+    demonstrating anything.
+
+    The step list is the real one a Live refresh built, not a constructed fixture.
+    What is asserted is the *ordering* the safety argument rests on: the marker
+    first so an interruption leaves a clearable stale marker rather than an
+    unattributable dispatch, the parameters next, and **activation last** so the
+    numbers are settled before anything moves.
     """
     coordinator = await prepared(hass, setup_integration, frank, CONTROL_MODE_ACTIVE)
     await sweep(coordinator, CAMPAIGN[:2])
@@ -151,12 +158,52 @@ async def test_the_completed_command_is_refused_by_the_last_barrier_as_one_unit(
     assert len(commands) == 6
     assert commands[-1].entity_id == CHARGE_FAMILY.activate
 
-    with pytest.raises(ControlExecutionUnavailable):
-        await async_execute(hass, commands)
+    sent = await async_execute(hass, commands)
 
-    assert writes == []
-    assert CONTROL_EXECUTION_AVAILABLE is False
-    assert hass.states.get(BOOLEAN_EXECUTION_OWNER).state == "off"
+    assert sent == 6
+    assert [call.data["entity_id"] for call in writes] == [
+        BOOLEAN_EXECUTION_OWNER,
+        CHARGE_FAMILY.power,
+        CHARGE_FAMILY.cutoff_soc,
+        CHARGE_FAMILY.duration,
+        CHARGE_FAMILY.hold,
+        CHARGE_FAMILY.activate,
+    ]
+    # Nothing from the other direction, and nothing from the raw surface.
+    assert not [
+        call
+        for call in writes
+        if call.data["entity_id"] in set(DISCHARGE_FAMILY.entities)
+    ]
+    assert_charge_only_capability()
+
+
+async def test_the_same_step_list_for_a_discharge_is_refused_as_one_unit(
+    hass: HomeAssistant,
+) -> None:
+    """The negative half, and it must be asserted on the *same* boundary.
+
+    Whole-command refusal is the property: the discharge equivalent of the list
+    above goes in and **zero** service calls come out. There are no partial writes,
+    which is what makes the activation-last ordering worth having.
+    """
+    from custom_components.alpha_ems_manager.alphaess_device import (
+        build_command,
+        plan_commands,
+    )
+
+    from .test_control_pipeline import make_intent
+
+    steps = plan_commands(build_command(make_intent(energy_ac_kwh=0.5)))
+    assert len(steps) == 6
+
+    with pytest.raises(ControlActionNotPermitted) as raised:
+        await async_execute(hass, steps)
+
+    assert raised.value.reason == "live_charge_only"
+    assert set(raised.value.entity_ids) == set(DISCHARGE_FAMILY.entities) - {
+        DISCHARGE_FAMILY.timer
+    }
 
 
 async def test_only_the_three_permitted_services_can_appear_in_a_command(
