@@ -176,6 +176,7 @@ from .execution import (
     control_intent_for,
     decide,
     measure_progress,
+    withdrawal_basis,
 )
 from .execution import as_dict as execution_as_dict
 from .forecast import (
@@ -943,6 +944,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: The most recent Stage B decision, so the command and the published
         #: report describe the same refresh.
         self._stage_b_decision: Any = None
+        #: The last carried run that ended, and why. **Session-local and never
+        #: persisted**: it records what this session observed, and a restart
+        #: legitimately forgets it rather than restating a stale claim as a fact.
+        #:
+        #: It exists because ``carried.ended_reason`` is truthful for exactly one
+        #: refresh. A real diagnostics download taken three refreshes after a
+        #: withdrawal carried nothing at all about it, so answering "why did the
+        #: run stop?" meant reconstructing it from two snapshots and the event ring.
+        self._last_ended: dict[str, Any] | None = None
         #: The Stage-A target Stage B has accepted and is carrying, if any.
         #:
         #: Deliberately **not** persisted. A carried run is a prediction admitted
@@ -2333,6 +2343,46 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     @callback
+    def _remember_ended_run(
+        self, reason: str, run: Any, plan: Any, now: datetime
+    ) -> None:
+        """Hold why the carried run ended, so a later refresh can still say.
+
+        Written only when a run actually ends -- never on an affirmation, a rolling
+        publication, a prepared state or an ordinary armed refresh -- so the record
+        always describes a real lifecycle event rather than the latest refresh.
+
+        The progress figures are read for the *ended* run's own key, which is still
+        the accumulator's key at this moment, so they are its closing figures and
+        not the next run's opening ones.
+        """
+        progress = self._execution_progress(run.run_id, plan)
+        realized = max(0.0, float(progress.realized_kwh))
+        target = float(run.target.battery_target_kwh)
+        self._last_ended = {
+            "reason": reason,
+            "run_id": run.run_id,
+            "plan_id": run.plan_id,
+            "intent": run.intent,
+            "ended_at": now.isoformat(),
+            "battery_target_kwh": round(target, 3),
+            "battery_realized_kwh": round(realized, 3),
+            "remaining_battery_kwh": round(max(0.0, target - realized), 3),
+            "window_start": run.window_start.isoformat(),
+            "window_end": run.window_end.isoformat(),
+            # What the lifecycle machine observed, restated in one token.
+            "withdrawal_basis": withdrawal_basis(reason, run.intent),
+            "rule": (
+                "the last carried run that ended, and why. session-local and not "
+                "persisted, so a restart forgets it rather than restating a stale "
+                "claim. written only when a run actually ends, never on an "
+                "affirmation or an ordinary refresh. withdrawal_basis restates the "
+                "branch that fired and is diagnostics only -- it is not a signal "
+                "Stage A sent, because the contract carries none"
+            ),
+        }
+
+    @callback
     def _owned_run_id(self) -> str | None:
         """Return the run a persisted causal record claims, if any."""
         record = self.store.execution_record
@@ -2538,6 +2588,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         outcome = carry_forward(self._carried, self.execution_targets, now)
         self._carried = outcome.carried
         carried = outcome.carried
+        if outcome.ended is not None and outcome.ended_run is not None:
+            self._remember_ended_run(outcome.ended, outcome.ended_run, plan, now)
         evidence = OwnershipEvidence(
             dispatch_active=bool(snapshot is not None and snapshot.dispatch_active),
             # A marker that does not exist is not a marker that is off: without it
@@ -2552,10 +2604,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             dispatch_start=_dispatch_start_instant(snapshot, now),
             run_id=None if carried is None else carried.run_id,
         )
+        # **On the refresh a run ends, report the run that ended.** Keyed on the
+        # ended run, so the accumulators are read rather than reset -- otherwise the
+        # closing figures read 0.00 against the target, which is what put "0.00 /
+        # 8.06 kWh" in front of a run that had delivered 1.76.
+        finishing = carried or outcome.ended_run
         progress = (
             measure_progress(accumulated_kwh=None, soc_delta_kwh=None)
-            if carried is None
-            else self._execution_progress(carried.run_id, plan)
+            if finishing is None
+            else self._execution_progress(finishing.run_id, plan)
         )
         decision = decide(
             # Shadow and off are both non-executing; only ``active`` would send.
@@ -2646,6 +2703,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "affirmed_by_this_publication": outcome.affirmed,
             "admitted_this_refresh": outcome.admitted,
             "ended_reason": outcome.ended,
+            # Truthful on the ending refresh only, which is why ``last_ended``
+            # exists beside it.
+            "last_ended": self._last_ended,
             "window_open": None if carried is None else carried.actionable_at(now),
             "rule": (
                 "a published target always opens one interval from now, so the run "

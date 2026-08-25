@@ -19,11 +19,11 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.22` — a public beta.**
+> **Current release: `1.0.0-beta.23` — a public beta.**
 >
 > Stage A is feature-complete. Stage B — the physical execution controller — is now
 > wired end to end: it builds the complete AlphaESS charge command, checks it, and
-> is refused at the final barrier. Covered by 3188 automated tests.
+> is refused at the final barrier. Covered by 3235 automated tests.
 >
 > **Nothing is executed.** No command can reach the inverter in this release, by a
 > constant in the source rather than by a setting. `applied_kw` is zero, `executed`
@@ -68,7 +68,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.22` is not offered.
+     dialog if `1.0.0-beta.23` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -477,6 +477,32 @@ with all five energy boundaries stated separately — the two battery-side AC
 figures, the two grid-side ones, and the curtailment — because every euro in the
 payload is priced on grid energy and a reader has to be able to check that.
 
+**A note on upgrading to beta.23: when a charge plan stops, the log now says
+why.**
+
+Nothing about *when* a plan stops has changed. What changed is that the reason is
+reported.
+
+A real charge run for 8.06 kWh ended an hour and a half before its window closed
+and the log said only "Shadow run finished: plan ended." The decision was right --
+the battery had filled from the sun, there was no longer room for the rest of the
+purchase, and the plan was withdrawn -- but nothing in the download said so, and an
+`export` recommendation appearing at the same moment made it look as though one plan
+had cancelled the other. It had not; both were consequences of a full battery.
+
+Three things caused that silence, and all three are fixed: the reason was being
+discarded unless Alpha EMS owned the dispatch, which in shadow it never does; the
+reason survived only the single refresh it happened on, so a download taken later
+carried nothing; and the log had one generic phrase for every possible ending.
+
+Lifecycle lines are now short and specific -- `Charge plan ended - 1.76 / 8.06 kWh,
+no command sent` -- and a download keeps the last ended run under
+`execution.carried.last_ended`, so you can ask why hours afterwards. That record is
+**per session**: restarting Home Assistant clears it, deliberately, rather than
+leaving an old claim standing as though it were still being observed.
+
+Nothing else moved. Live execution is still disabled.
+
 **A note on upgrading to beta.22: three diagnostics figures were wrong, and
 one of them was costing you charge.**
 
@@ -561,6 +587,17 @@ never stop its own run.
 against what actually happened, how much has reached the battery, what power the
 controller would have asked for, and why it is not asking for more. `applied_kw` is
 always zero there, and `executed` is always false.
+
+Since beta.23 that section also answers *why the last run stopped*, which it could
+not before. `result.stop_reason` is filled in whenever a run ends, and
+`carried.last_ended` keeps the last one -- its reason, identity, intent, window,
+target, what reached the battery and what was left -- so a download taken hours
+later still answers the question. `carried.ended_reason` beside it is truthful for
+the single refresh the run ended on, which is why the record exists.
+
+`last_ended` is **session-local and not written to disk**. A restart forgets it, on
+purpose: it records what this session watched happen, and a retained claim that
+outlived its session would be a stale fact wearing the clothes of a current one.
 
 **A note on upgrading to beta.18: the battery will sell in the evening now.**
 

@@ -107,6 +107,22 @@ from .const import (
     ECONOMIC_REASON_NO_ACTION,
     ECONOMIC_REASON_RESERVE_RECOVERY,
     ECONOMIC_REASON_SAFETY_BUY,
+    EXECUTION_INTENT_GRID_CHARGE,
+    EXECUTION_INTENT_NET_EXPORT,
+    EXECUTION_INTENT_SERVE_LOAD,
+    EXECUTION_STOP_EXECUTION_ERROR,
+    EXECUTION_STOP_GRID_CEILING,
+    EXECUTION_STOP_NO_CHARGE_CEILING,
+    EXECUTION_STOP_OWNERSHIP_CONFLICT,
+    EXECUTION_STOP_PLAN_REPLACED,
+    EXECUTION_STOP_RESERVE_LIMIT,
+    EXECUTION_STOP_SAFETY,
+    EXECUTION_STOP_STAGE_A_HOLD,
+    EXECUTION_STOP_STALE_PLAN,
+    EXECUTION_STOP_SWITCHED_OFF,
+    EXECUTION_STOP_SWITCHED_TO_SHADOW,
+    EXECUTION_STOP_TARGET_REACHED,
+    EXECUTION_STOP_WINDOW_ENDED,
     MAX_ECONOMIC_RUNS_TRACKED,
 )
 
@@ -517,28 +533,73 @@ def _started_message(execution: ExecutionView) -> str:
     )
 
 
-def _stopped_message(execution: ExecutionView) -> str:
-    """Return the line for a run ending.
+#: What each stop reason is called in front of a user.
+#:
+#: **The whole of the wording layer, and until beta.23 there was none.** The line
+#: read ``execution.stop_reason or "plan ended"``, so a real reason rendered as its
+#: raw constant -- "Dispatch stopped: grid_energy_ceiling." -- and an absent one
+#: rendered as the fallback. Since the reason was ownership-gated and no mode can
+#: reach ownership, the fallback was the only thing that ever printed, for every
+#: reason the controller computes.
+#:
+#: No internal vocabulary reaches this surface: no module names, no state names, no
+#: snake_case. A reader is told what happened to their battery, not which branch
+#: fired -- the branch is in diagnostics, where it belongs.
+_STOP_PHRASES: dict[str, str] = {
+    EXECUTION_STOP_STAGE_A_HOLD: "plan ended",
+    EXECUTION_STOP_WINDOW_ENDED: "window ended",
+    EXECUTION_STOP_TARGET_REACHED: "target reached",
+    EXECUTION_STOP_PLAN_REPLACED: "plan replaced",
+    EXECUTION_STOP_STALE_PLAN: "plan expired",
+    EXECUTION_STOP_GRID_CEILING: "grid limit reached",
+    EXECUTION_STOP_SWITCHED_TO_SHADOW: "switched to shadow",
+    EXECUTION_STOP_SWITCHED_OFF: "switched off",
+    # The five below are declared in the vocabulary and never assigned by the
+    # controller. They carry a phrase so that no identifier can ever leak into a
+    # sentence if one of them starts being emitted, and they are deliberately
+    # plain rather than reassuring.
+    EXECUTION_STOP_SAFETY: "stopped for safety",
+    EXECUTION_STOP_RESERVE_LIMIT: "reserve limit reached",
+    EXECUTION_STOP_OWNERSHIP_CONFLICT: "ownership unclear",
+    EXECUTION_STOP_EXECUTION_ERROR: "the command failed",
+    EXECUTION_STOP_NO_CHARGE_CEILING: "no charge limit available",
+}
 
-    **The two cases report different things, and that is the point.** A Live run
-    delivered energy, so it reports what arrived against what was asked for. A
-    shadow run delivered nothing -- no command was sent, so the battery did
-    whatever it was going to do anyway -- and reporting a "delivered" figure
-    beside a target would dress that in the clothes of a measurement. So shadow
-    names the target it was tracking and stops there.
+#: What the run was doing, in one word, from the intent it carried.
+_STOP_SUBJECTS: dict[str, str] = {
+    EXECUTION_INTENT_GRID_CHARGE: "Charge",
+    EXECUTION_INTENT_SERVE_LOAD: "Discharge",
+    EXECUTION_INTENT_NET_EXPORT: "Export",
+}
+
+
+def _stopped_message(execution: ExecutionView) -> str:
+    """Return the line for a run ending. Short, and specific about why.
+
+    One clause: what it was doing, why it stopped, and how far it got. A reader
+    scanning a timeline wants those three things and nothing else -- the reserve
+    trajectory, the publication identity and the branch that fired are all in
+    diagnostics.
+
+    **Shadow still says that no command was sent**, in three words rather than a
+    sentence. Dropping it would make a shadow line and a live line identical, and
+    on a release whose whole claim is that it executes nothing, that is the one
+    fact the line cannot leave out. The exact phrase matters: a boundary test
+    requires every line in the log to disclaim execution from a fixed vocabulary,
+    so this uses that vocabulary rather than a shorter paraphrase of it.
+
+    A reached target quotes one figure, because the delivered and the asked-for
+    are the same number by definition and printing both invites a reader to look
+    for a difference that is not there.
     """
-    reason = execution.stop_reason or "plan ended"
-    if not execution.executed:
-        return (
-            f"Shadow run finished: {reason}. It was tracking a "
-            f"{execution.target_kwh:.2f} kWh target; no command was sent, so "
-            f"nothing was executed."
-        )
-    return (
-        f"Dispatch stopped: {reason}. "
-        f"{execution.delivered_kwh:.2f} / {execution.target_kwh:.2f} kWh "
-        f"(deviation {execution.deviation_kwh:+.2f} kWh)."
-    )
+    subject = _STOP_SUBJECTS.get(execution.intent, "Plan")
+    reason = _STOP_PHRASES.get(execution.stop_reason or "", "plan ended")
+    if execution.stop_reason == EXECUTION_STOP_TARGET_REACHED:
+        figures = f"{execution.target_kwh:.2f} kWh"
+    else:
+        figures = f"{execution.delivered_kwh:.2f} / {execution.target_kwh:.2f} kWh"
+    line = f"{subject} {reason} - {figures}"
+    return line if execution.executed else f"{line}, no command sent"
 
 
 def _due(run: PlannedRun, *, now: datetime) -> bool:

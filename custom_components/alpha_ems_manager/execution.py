@@ -1079,6 +1079,30 @@ def demand_for(
     )
 
 
+def withdrawal_basis(reason: str | None, intent: str | None) -> str | None:
+    """Return what the lifecycle machine actually observed, in one token.
+
+    Diagnostics only, and named so it cannot be mistaken for a signal Stage A
+    sent. It reads nothing new: each value restates the branch that fired, so a
+    reader of a later snapshot can tell *withdrawal by absence* from *the window
+    running out* without reconstructing it from timestamps.
+
+    ``None`` for reasons that are self-explanatory or that describe a mode change
+    rather than an observation about a publication.
+    """
+    if reason == EXECUTION_STOP_STAGE_A_HOLD:
+        # The specific thing that was missing, including which intent, because
+        # "withdrawn" alone leaves a reader asking withdrawn from what.
+        return f"no_affirming_{intent or 'executable'}_publication"
+    if reason == EXECUTION_STOP_WINDOW_ENDED:
+        return "admitted_window_end_passed"
+    if reason == EXECUTION_STOP_STALE_PLAN:
+        return "freshness_deadline_passed_without_affirmation"
+    if reason == EXECUTION_STOP_PLAN_REPLACED:
+        return "a_different_run_was_running"
+    return None
+
+
 # ===========================================================================
 # The state machine
 # ===========================================================================
@@ -1099,7 +1123,25 @@ class Decision:
     demand: Demand | None = None
     progress: Progress | None = None
     request_kw: float = 0.0
+    #: Why a run ended, whenever one did. **Reported regardless of ownership**,
+    #: and that is a correction rather than a preference.
+    #:
+    #: Until beta.23 every branch read ``stop_reason=<reason> if owned else None``.
+    #: Shadow never acquires ownership by design, and with the release barrier
+    #: closed no mode can reach it at all -- so the field was always ``None`` in
+    #: practice and the Activity surface could only ever print its fallback. On a
+    #: real withdrawal the correct reason was computed one line above and thrown
+    #: away by the ternary, while ``target`` on the adjacent line was kept: one
+    #: decision contradicting itself, and the reason the observed line said
+    #: nothing useful.
+    #:
+    #: It authorises nothing. Two readers exist -- the Activity wording and the
+    #: diagnostics payload -- and a structural test pins that. The physical stop is
+    #: driven by :attr:`reset_required`, which keeps its ownership gate and is
+    #: re-checked at its only call site.
     stop_reason: str | None = None
+    #: Whether an owned dispatch has to be physically stopped. **Still gated on
+    #: ownership**, deliberately: there is nothing to reset when nothing is ours.
     reset_required: bool = False
     clear_stale_marker: bool = False
     inhibit_reason: str | None = None
@@ -1120,6 +1162,70 @@ class Decision:
 
 
 def decide(
+    *,
+    mode_executes: bool,
+    mode_off: bool,
+    targets: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    now: datetime,
+    evidence: OwnershipEvidence,
+    progress: Progress,
+    current_energy_kwh: float | None = None,
+    remaining_expected_pv_kwh: float | None = None,
+    grid_charged_kwh: float | None = None,
+    configured_budget_kwh: float = 0.0,
+    charge_efficiency: float | None = None,
+    running_run_id: str | None = None,
+    carried: CarriedRun | None = None,
+    carry_ended: str | None = None,
+    ended_run: CarriedRun | None = None,
+    inhibit_reason: str | None = None,
+) -> Decision:
+    """Return this refresh's Stage B decision, and say so when a run ended.
+
+    **A thin shell over the state machine, and it exists because of one refresh.**
+    The carry-forward machine *watched* the carried run end and named the reason,
+    but the state machine reaches that reason only through the branch it takes when
+    no target is selectable. ``execution_targets`` carries every run the plan
+    contains -- a ``net_export`` recommendation included -- so on the refresh a
+    charge campaign is withdrawn an unrelated publication can be actionable,
+    another branch is taken, and the verdict is dropped. That is the same defect as
+    the ownership gate wearing different clothes: the reason is computed, and then
+    thrown away.
+
+    Filled in here rather than in each branch, so a branch added later cannot
+    forget it. **Only where the machine named no reason of its own**: a reason the
+    machine reached describes the target it actually selected, and replacing it
+    would trade one true statement for another. The withdrawal is not lost in that
+    case either -- the coordinator records it from the carry outcome directly,
+    before this function is called.
+
+    It adds a reason and changes nothing else. ``reset_required``, ``state``,
+    ``request_kw`` and the target are whatever the machine decided.
+    """
+    decision = _decide(
+        mode_executes=mode_executes,
+        mode_off=mode_off,
+        targets=targets,
+        now=now,
+        evidence=evidence,
+        progress=progress,
+        current_energy_kwh=current_energy_kwh,
+        remaining_expected_pv_kwh=remaining_expected_pv_kwh,
+        grid_charged_kwh=grid_charged_kwh,
+        configured_budget_kwh=configured_budget_kwh,
+        charge_efficiency=charge_efficiency,
+        running_run_id=running_run_id,
+        carried=carried,
+        carry_ended=carry_ended,
+        ended_run=ended_run,
+        inhibit_reason=inhibit_reason,
+    )
+    if carry_ended is not None and decision.stop_reason is None:
+        return replace(decision, stop_reason=carry_ended)
+    return decision
+
+
+def _decide(
     *,
     mode_executes: bool,
     mode_off: bool,
@@ -1194,7 +1300,7 @@ def decide(
             state=EXECUTION_STATE_STOPPING if owned else EXECUTION_STATE_IDLE,
             ownership=ownership,
             progress=progress,
-            stop_reason=EXECUTION_STOP_SWITCHED_OFF if owned else None,
+            stop_reason=EXECUTION_STOP_SWITCHED_OFF,
             reset_required=owned,
             clear_stale_marker=clear_marker,
         )
@@ -1237,12 +1343,29 @@ def decide(
         reason = carry_ended or (
             EXECUTION_STOP_WINDOW_ENDED if ended else EXECUTION_STOP_STAGE_A_HOLD
         )
+        # **A reason exists when a run ended, not merely when there is no target.**
+        # An idle controller with nothing carried, nothing running and no record of
+        # a run never stopped anything, so it has nothing to report -- and saying
+        # "the plan was withdrawn" there would invent a plan to have withdrawn.
+        # Ownership used to hide this by accident; the honest test is whether
+        # something ended: we own a live dispatch, the carry machine ended a run,
+        # the ended run is identifiable, or a record names one that was running.
+        #
+        # Note the shape -- ``owned or ...``. The old condition was ``owned``
+        # alone, so this can only ever *add* a reason where there was none. No
+        # case that reported one before reports nothing now.
+        stopped = (
+            owned
+            or carry_ended is not None
+            or expired is not None
+            or running_run_id is not None
+        )
         return Decision(
             state=EXECUTION_STATE_STOPPING if owned else EXECUTION_STATE_IDLE,
             ownership=ownership,
             target=expired,
             progress=progress,
-            stop_reason=reason if owned else None,
+            stop_reason=reason if stopped else None,
             reset_required=owned,
             clear_stale_marker=clear_marker,
             notes=(("the window closed before the target was met",) if ended else ()),
@@ -1278,7 +1401,7 @@ def decide(
             ownership=ownership,
             target=target,
             progress=progress,
-            stop_reason=EXECUTION_STOP_STALE_PLAN if owned else None,
+            stop_reason=EXECUTION_STOP_STALE_PLAN,
             reset_required=owned,
             inhibit_reason=None if owned else "stale_target",
             clear_stale_marker=clear_marker,
@@ -1291,7 +1414,7 @@ def decide(
             ownership=ownership,
             target=target,
             progress=progress,
-            stop_reason=EXECUTION_STOP_WINDOW_ENDED if owned else None,
+            stop_reason=EXECUTION_STOP_WINDOW_ENDED,
             reset_required=owned,
         )
 
@@ -1315,7 +1438,7 @@ def decide(
             target=target,
             demand=demand,
             progress=progress,
-            stop_reason=EXECUTION_STOP_TARGET_REACHED if owned else None,
+            stop_reason=EXECUTION_STOP_TARGET_REACHED,
             reset_required=owned,
         )
 
@@ -1329,7 +1452,7 @@ def decide(
             target=target,
             demand=demand,
             progress=progress,
-            stop_reason=EXECUTION_STOP_GRID_CEILING if owned else None,
+            stop_reason=EXECUTION_STOP_GRID_CEILING,
             reset_required=owned,
             notes=(
                 "the approved grid energy for this run has been bought; awaiting a "
@@ -1346,7 +1469,7 @@ def decide(
             target=target,
             demand=demand,
             progress=progress,
-            stop_reason=EXECUTION_STOP_TARGET_REACHED if owned else None,
+            stop_reason=EXECUTION_STOP_TARGET_REACHED,
             reset_required=owned,
             notes=(
                 "reduced to zero by the Stage-A headroom constraint; awaiting a "

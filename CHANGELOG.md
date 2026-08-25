@@ -9,6 +9,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.23] - 2026-08-25
+
+**A carried run ended correctly and could not say why.** Reporting only. The
+lifecycle, the economics and the carry-forward rules are unchanged.
+
+**LIVE EXECUTION REMAINS DISABLED.** `CONTROL_EXECUTION_AVAILABLE` is still
+`False`. beta.23 is published for continued Phase-2 Shadow observation.
+
+### Fixed
+
+- **Shadow could not report why a run stopped, for any reason at all.** Every
+  branch of the controller read `stop_reason=<reason> if owned else None`. Shadow
+  never acquires ownership by design, and with the release barrier closed no mode
+  can reach it -- so the field was always absent in practice, and the one fallback
+  phrase was the only wording the Activity log could ever produce, for all eight
+  reasons the controller computes.
+
+  The sharpest form of it was a single decision contradicting itself: the correct
+  reason was computed one line above and discarded by the ternary, while the
+  target on the adjacent line was kept. That is why a real log line carried the
+  8.06 kWh figure and no reason beside it.
+
+  The reason is now reported regardless of ownership. It authorises nothing -- it
+  has two readers, the wording layer and the diagnostics payload, and a structural
+  test pins that. The physical stop is driven by `reset_required`, which keeps its
+  ownership gate and its call-site check.
+
+- **The end reason survived exactly one refresh.** `carried.ended_reason` is set
+  only on the refresh a run ends, so a diagnostics download taken later carried
+  nothing about it and the answer had to be reconstructed from two snapshots and
+  the event ring. `execution.carried.last_ended` now retains the last ended run --
+  reason, identity, intent, window, target, realized, remaining and the basis the
+  lifecycle machine observed.
+
+  Session-local and deliberately **not** persisted: it records what this session
+  saw, and a restart forgets it rather than restating a stale claim as a fact. It
+  is written only when a run actually ends, never on an affirmation or an ordinary
+  refresh.
+
+- **An unrelated publication could hide the end reason.** The machine reaches the
+  withdrawal reason only through the branch it takes when nothing is selectable.
+  The Stage-B target list carries every run the plan contains, an `export`
+  recommendation included, so on the refresh a charge campaign was withdrawn
+  another publication could be actionable, another branch was taken, and the
+  verdict the carry machine had *watched* was dropped. Filled in once now, in a
+  shell around the state machine, so a branch added later cannot forget it. It
+  adds a reason and moves no other field.
+
+- **Lifecycle Activity lines were a paragraph, or an identifier.** The wording was
+  one line: the reason or a fallback. In Shadow it printed the fallback inside a
+  three-clause sentence; in Live it would have interpolated the raw constant, as
+  in "Dispatch stopped: grid_energy_ceiling." Each of the thirteen declared
+  reasons now has its own plain phrase, and the line is one short clause -- what
+  the battery was doing, why it stopped, and how far it got.
+
+  A Shadow line still states that no command was sent. On a release whose whole
+  claim is that it executes nothing, that is the one clause it cannot lose.
+
+### Added
+
+- **The real 8.06 kWh incident as a regression sequence.** On 2026-08-25 a carried
+  `grid_charge` run for 8.06 kWh, admitted 12:50 with a window of 13:00-16:30,
+  ended at the 15:00 refresh with ninety minutes left and 6.30 kWh outstanding,
+  reporting only "Shadow run finished: plan ended." while the Economic Action
+  became `export`.
+
+  Nothing was wrong with the decision. The pack had filled 3.43 kWh from
+  production, headroom became binding, and the remaining 6.30 kWh no longer
+  fitted; Stage A stopped publishing the campaign and the run was withdrawn. The
+  export recommendation neither affirmed nor superseded anything -- an export is
+  not an executable Stage-B intent, so it was never a candidate. The two events
+  were consequences of one cause, not cause and effect.
+
+  The whole sequence is now replayed as a test, through the real controller and
+  again through the real coordinator report, and every reason the controller can
+  assign is asserted at ownership `none` -- the mode the release actually runs in,
+  and the arm the previous stop-reason tests never exercised.
+
+### Preserved
+
+No Stage-A allocation change, no reserve economics change, no grid-budget change,
+no ownership change, no carry-forward or supersession semantic change, no actuator
+mapping change, no new permitted service, and no storage migration. `const.py`,
+`economic.py`, `reserve.py`, `policy.py`, `battery.py`, `simulation.py`,
+`realized.py`, `safety.py`, `storage.py`, `alphaess_device.py` and
+`alphaess_adapter.py` are byte-identical to beta.22.
+
+### Phase-2 status
+
+**R2 is not solved and is not addressed here.** Withdrawal is still *inferred*
+from the absence of an affirming publication, because the Stage-A contract carries
+no tombstone. A transient absence -- one refresh without a publication, then the
+campaign returns -- would still discard the run identity and reset its progress
+and grid budget. Changing that needs its own evidence and its own approval; no
+hysteresis, grace period or delayed withdrawal was added.
+
+Still outstanding from beta.22: **a naturally occurring capped charge run with a
+non-null `max_end_energy_kwh`**. The corrected headroom cap has never been
+exercised on real hardware. Do not manufacture that run by adjusting Stage A.
+
 ## [1.0.0-beta.22] - 2026-08-25
 
 **A real Shadow diagnostics download, and the four things it caught.** No new
