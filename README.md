@@ -19,11 +19,11 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.21` — a public beta.**
+> **Current release: `1.0.0-beta.22` — a public beta.**
 >
 > Stage A is feature-complete. Stage B — the physical execution controller — is now
 > wired end to end: it builds the complete AlphaESS charge command, checks it, and
-> is refused at the final barrier. Covered by 3161 automated tests.
+> is refused at the final barrier. Covered by 3188 automated tests.
 >
 > **Nothing is executed.** No command can reach the inverter in this release, by a
 > constant in the source rather than by a setting. `applied_kw` is zero, `executed`
@@ -68,7 +68,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.21` is not offered.
+     dialog if `1.0.0-beta.22` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -476,6 +476,25 @@ Every planned run appears in the `economic_plan` block of a diagnostics download
 with all five energy boundaries stated separately — the two battery-side AC
 figures, the two grid-side ones, and the curtailment — because every euro in the
 payload is priced on grid energy and a reader has to be able to check that.
+
+**A note on upgrading to beta.22: three diagnostics figures were wrong, and
+one of them was costing you charge.**
+
+A real diagnostics download caught four things. The one that changed behaviour: on
+a charge run where the plan sets a stored-energy ceiling, the controller was
+subtracting the expected production twice and finishing well short of what the
+plan approved — on a worked example, 12.85 kWh where the plan asked for 18. That is
+fixed. It could only ever charge *less* than intended, so nothing was ever at risk;
+it just quietly declined most of a sunny day's approved charging.
+
+The other three are diagnostics. `projected_end_energy_kwh` was counting expected
+production twice and once published 31.9 kWh for a 22 kWh battery. The per-quarter
+reserve requirement was lining up against the wrong quarter. And the two `revision`
+numbers in the same payload are both correct but were not labelled — the top-level
+one is the plan revision frozen when the run was accepted, and `carried.run.revision`
+is the live count since; there is now a rule field beside them saying so.
+
+Nothing else moved. Live execution is still disabled.
 
 **A note on upgrading to beta.21: a setting that did nothing now does
 something.**

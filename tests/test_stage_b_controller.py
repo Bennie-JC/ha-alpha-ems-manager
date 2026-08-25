@@ -20,6 +20,7 @@ silently under-deliver a plan Stage A chose every time a cloud passed.
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -156,7 +157,6 @@ def test_an_absent_headroom_constraint_means_unconstrained_not_zero() -> None:
         headroom_ceiling_kw(
             target,
             current_energy_kwh=6.0,
-            remaining_expected_pv_kwh=8.94,
             remaining_minutes=180.0,
         )
         is None
@@ -362,48 +362,144 @@ def test_reaching_the_target_stops_immediately() -> None:
 # ===========================================================================
 
 
-def test_the_headroom_cap_is_stage_a_arithmetic_and_nothing_else() -> None:
-    """Allowance over remaining time, from three published numbers.
+def test_the_headroom_cap_lands_the_pack_exactly_where_stage_a_chose() -> None:
+    """Allowance over remaining time, from two published numbers.
 
-    Stage A decided the pack should land on 18.00 kWh knowing what production was
-    forecast afterwards. Six kilowatt-hours are stored and 8.94 are still expected
-    from the sun, so 3.06 remain for the grid to supply -- over three hours, a
-    1.02 kW cap.
+    **Corrected in beta.22, and the old arithmetic is worth stating.** It read
+    ``max_end - stored - remaining_expected_pv``, on the reasoning that production
+    would arrive independently and only the grid's share needed capping. But
+    ``max_end_energy_kwh`` is the optimizer's own projected stored energy off the
+    chosen trajectory -- ``start_energy_dc_kwh + battery_delta_dc_kwh`` -- so it
+    already contains that production. Subtracting it removed the same energy
+    twice, and the pack finished short by exactly the production the plan meant to
+    store.
+
+    The invariant now, asserted from several starting points below: holding the cap
+    for the rest of the window lands the pack on ``max_end_energy_kwh`` exactly.
+    The allowance is DC and the cap is an AC power, so the crossing is made once.
     """
     target = target_of()
+    one_way = math.sqrt(0.9)
 
     ceiling = headroom_ceiling_kw(
         target,
         current_energy_kwh=6.0,
-        remaining_expected_pv_kwh=8.94,
+        remaining_minutes=180.0,
+        charge_efficiency=one_way,
+    )
+
+    assert ceiling == pytest.approx(((18.0 - 6.0) / one_way) / 3.0)
+    # And the property that matters, rather than the formula restated.
+    assert 6.0 + ceiling * 3.0 * one_way == pytest.approx(18.0)
+
+
+@pytest.mark.parametrize("stored", [6.0, 12.0, 15.0, 17.5])
+def test_the_cap_lands_on_the_ceiling_from_any_starting_point(stored: float) -> None:
+    """One invariant, swept, because a formula can be right about one case."""
+    one_way = math.sqrt(0.9)
+    ceiling = headroom_ceiling_kw(
+        target_of(),
+        current_energy_kwh=stored,
+        remaining_minutes=180.0,
+        charge_efficiency=one_way,
+    )
+
+    assert stored + ceiling * 3.0 * one_way == pytest.approx(18.0)
+
+
+def test_without_an_efficiency_the_cap_errs_toward_charging_less() -> None:
+    """A bound whose job is to stop an overfill takes the conservative reading.
+
+    The DC allowance used unconverted is smaller than the AC power that would
+    deliver it, so the pack lands short rather than over. Absent is not a
+    substituted value, and for this one figure short is the safe direction.
+    """
+    one_way = math.sqrt(0.9)
+    converted = headroom_ceiling_kw(
+        target_of(),
+        current_energy_kwh=6.0,
+        remaining_minutes=180.0,
+        charge_efficiency=one_way,
+    )
+    bare = headroom_ceiling_kw(
+        target_of(),
+        current_energy_kwh=6.0,
         remaining_minutes=180.0,
     )
 
-    assert ceiling == pytest.approx((18.0 - 6.0 - 8.94) / 3.0)
-    assert ceiling == pytest.approx(1.02)
+    assert bare < converted
+    assert 6.0 + bare * 3.0 * one_way < 18.0
 
 
 def test_production_ahead_of_forecast_shrinks_the_cap_to_zero() -> None:
     """**The canonical case, and the reason the constraint exists.**
 
-    An old cheap-grid charge target is still live while Stage A expects
-    substantial production before a later window. If the sun is filling the pack
-    faster than forecast, the room left for bought energy shrinks -- and reaches
-    nothing, which means stop. The production Stage A meant to absorb is not
-    displaced by charging the pack full early.
+    If the sun is filling the pack faster than the plan assumed, the room left for
+    bought energy shrinks -- and reaches nothing, which means stop. The production
+    Stage A meant to absorb is not displaced by charging the pack full early.
+
+    **The behaviour is unchanged by beta.22; the mechanism is better.** It used to
+    respond to the production *forecast*, subtracting what was still expected. It
+    now responds to the stored energy actually *measured*: production running ahead
+    shows up as a fuller pack, the allowance closes, and the cap reaches zero. A
+    cap that shrinks because the sun really did arrive is a stronger guarantee than
+    one that shrinks because the sun was predicted to.
     """
+    one_way = math.sqrt(0.9)
     target = target_of()
 
-    # The pack is already at 15 kWh and 8.94 more are still expected: together
-    # that overshoots the 18.00 kWh Stage A chose to land on.
-    ceiling = headroom_ceiling_kw(
-        target,
-        current_energy_kwh=15.0,
-        remaining_expected_pv_kwh=8.94,
-        remaining_minutes=180.0,
+    # Production has already carried the pack to the landing figure Stage A chose.
+    assert (
+        headroom_ceiling_kw(
+            target,
+            current_energy_kwh=18.0,
+            remaining_minutes=180.0,
+            charge_efficiency=one_way,
+        )
+        == 0.0
+    )
+    # And past it, which is not a negative allowance.
+    assert (
+        headroom_ceiling_kw(
+            target,
+            current_energy_kwh=19.5,
+            remaining_minutes=180.0,
+            charge_efficiency=one_way,
+        )
+        == 0.0
     )
 
-    assert ceiling == 0.0
+
+def test_the_worked_headroom_case_ends_near_the_ceiling_not_far_below_it() -> None:
+    """**The regression that pins what the double subtraction cost.**
+
+    A 22 kWh pack holding 10, a landing figure of 18, five kilowatt-hours of
+    production expected inside the window and eight still to deliver. The old
+    arithmetic capped at 0.75 kW and finished at 12.85 -- five kilowatt-hours short
+    of the plan, purely because five of the approved charging happened to originate
+    from the sun. The corrected cap allows 2.108 kW and reaches 18.00.
+    """
+    one_way = math.sqrt(0.9)
+    target = target_of(max_end_energy_kwh=18.0)
+    hours = 4.0
+
+    old_cap = (18.0 - 10.0 - 5.0) / hours
+    new_cap = headroom_ceiling_kw(
+        target,
+        current_energy_kwh=10.0,
+        remaining_minutes=hours * 60.0,
+        charge_efficiency=one_way,
+    )
+
+    assert old_cap == pytest.approx(0.75)
+    assert 10.0 + old_cap * hours * one_way == pytest.approx(12.85, abs=5e-3)
+
+    assert new_cap == pytest.approx(2.108, abs=5e-3)
+    assert 10.0 + new_cap * hours * one_way == pytest.approx(18.0)
+
+    # And it still only ever reduces: the run needs 2.0 kW, which is under the cap,
+    # so the cap changes nothing here.
+    assert new_cap > 8.0 / hours
 
 
 def test_the_cap_can_only_lower_what_the_rolling_controller_asked_for() -> None:

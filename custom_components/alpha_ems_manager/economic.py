@@ -2298,7 +2298,7 @@ def _interval_as_dict(
 def _run_intervals(
     plan: EconomicPlan,
     run: EconomicRun,
-    reserve: tuple[float, ...],
+    reserve: Mapping[int, float],
     budget: int,
 ) -> tuple[list[dict[str, Any]], int]:
     """Return this run's per-quarter rows within ``budget``, and how many were cut.
@@ -2316,11 +2316,7 @@ def _run_intervals(
     ]
     omitted = max(0, len(entries) - budget)
     rows = [
-        _interval_as_dict(
-            entry,
-            reserve[entry.index] if entry.index < len(reserve) else None,
-        )
-        for entry in entries[:budget]
+        _interval_as_dict(entry, reserve.get(entry.index)) for entry in entries[:budget]
     ]
     return rows, omitted
 
@@ -2335,7 +2331,22 @@ def _runs_as_dicts(
     The interval budget is shared in run order, so the runs a reader sees first
     are the ones that are complete.
     """
-    reserve = tuple(outcome.horizon.planning_reserve_kwh)
+    # **Keyed by the absolute interval index, because that is what a run
+    # carries.** ``planning_reserve_kwh`` is a list positioned by *horizon
+    # offset*, and beta.21 indexed it with the interval's own index -- so on a
+    # horizon starting at interval 44 every published requirement was the one
+    # belonging forty-four intervals later, and everything past the horizon
+    # length read ``null``. A real snapshot showed interval 44 carrying 12.39 kWh
+    # where its requirement was 5.67. Zipping against ``demands`` removes the
+    # possibility: both sides now name the same interval.
+    reserve = {
+        demand.index: value
+        for demand, value in zip(
+            outcome.horizon.demands,
+            outcome.horizon.planning_reserve_kwh,
+            strict=False,
+        )
+    }
     budget = MAX_ECONOMIC_RUN_INTERVALS_REPORTED
     payload: list[dict[str, Any]] = []
     for run in runs:

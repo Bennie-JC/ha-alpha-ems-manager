@@ -2575,6 +2575,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
             grid_charged_kwh=self._execution_grid_kwh,
             configured_budget_kwh=self.config.grid_charge_budget_kwh,
+            # The pack's own one-way figure, so the headroom allowance and the
+            # projected stored energy cross the AC/DC boundary exactly once.
+            # Stage B holds no efficiency of its own: a second copy of a physical
+            # constant is a second thing to keep in step.
+            charge_efficiency=(
+                None
+                if plan is None or plan.state is None
+                else plan.state.limits.charge_efficiency
+            ),
             running_run_id=self._owned_run_id(),
             carried=carried,
             carry_ended=outcome.ended,

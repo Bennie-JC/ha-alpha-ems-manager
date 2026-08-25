@@ -124,7 +124,6 @@ def test_the_controller_choosing_its_own_headroom_is_caught() -> None:
     ceiling = headroom_ceiling_kw(
         unconstrained,
         current_energy_kwh=17.9,
-        remaining_expected_pv_kwh=12.0,
         remaining_minutes=60.0,
     )
 

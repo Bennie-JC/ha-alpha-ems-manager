@@ -9,6 +9,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.22] - 2026-08-25
+
+**A real Shadow diagnostics download, and the four things it caught.** No new
+behaviour, no allocation change, and nothing that brings Live any closer.
+
+**LIVE EXECUTION REMAINS DISABLED.** `CONTROL_EXECUTION_AVAILABLE` is still
+`False`. beta.22 is published for continued Phase-2 Shadow observation.
+
+### Fixed
+
+- **`projected_end_energy_kwh` counted expected production twice, and mixed AC
+  with DC.** A snapshot published **31.946 kWh for a 22 kWh pack**. The formula
+  was `stored + expected_pv + remaining`, and the production term was already
+  *inside* the remaining delivery: `battery_target_kwh` is the sum of
+  `expected_pv_to_battery_kwh` and `expected_grid_to_battery_kwh`, both built from
+  the same run charge, so the production share is a component of the target rather
+  than an addition to it. The snapshot reconciled the error to 0.002 kWh.
+
+  It now reads stored energy plus the energy still to deliver, converted from AC
+  to DC exactly once using the pack's own efficiency. Where the conversion cannot
+  be made the field publishes `null` rather than a figure — mixing the two
+  boundaries unannounced is what produced the impossible number. The result is
+  **not** clamped to capacity: a projection above the pack ceiling says the plan's
+  remaining target does not fit, which is information a reader needs rather than a
+  fault to hide.
+
+  Diagnostics-only. The field had one reader and it was the payload.
+
+- **The Stage-B headroom cap subtracted expected production twice**, and this one
+  did affect what would be charged. `max_end_energy_kwh` is the optimizer's *own*
+  projected stored energy at the end of the run —
+  `start_energy_dc_kwh + battery_delta_dc_kwh` off the chosen trajectory — so it
+  already contains every kilowatt-hour the run charges. Subtracting the production
+  still expected inside the window removed the same energy a second time, and the
+  pack finished short by exactly the production the plan meant to store.
+
+  On a 22 kWh pack holding 10 with a landing figure of 18 and five kilowatt-hours
+  of production expected in the window, the old cap allowed 0.75 kW and finished at
+  **12.85 kWh**; the corrected cap allows 2.108 kW and reaches **18.00 kWh**. The
+  error was fail-safe — it could only under-charge — which is why it survived: on a
+  sunny capped run it quietly declined most of an approved plan.
+
+  The allowance is a DC stored-energy figure and the cap is compared against an AC
+  power, so that crossing is now made once as well. The invariant is asserted
+  rather than described: holding the cap lands the pack on `max_end_energy_kwh`
+  exactly, from any starting state. Stage B still only ever reduces or stops, and
+  an absent ceiling still means unconstrained.
+
+- **The per-quarter reserve requirement was read off the wrong axis.**
+  `planning_reserve_kwh` is positioned by horizon offset and beta.21 indexed it
+  with the interval's own index, so on a horizon starting at interval 44 every
+  published requirement belonged forty-four intervals later and everything past
+  the horizon length read `null`. The snapshot showed interval 44 carrying
+  12.39 kWh where its requirement was 5.67.
+
+  This one was introduced by beta.21's own observability feature, and the suite
+  could not see it: every synthetic horizon starts at interval 0 with a flat
+  reserve, so the two axes coincide. The regression now builds a horizon starting
+  at 44 with a varying reserve, and it was verified to fail with the bug
+  reintroduced. Diagnostics only — the solver always read the array correctly.
+
+- **Two revisions in one payload, both correct, neither labelled.** A snapshot
+  showed `execution.revision` of 13 beside `carried.run.revision` of 2. The first
+  is the Stage-A publication Stage B admitted, *frozen at admission* — a carried
+  run holds that publication by reference for its whole life, so the whole group
+  around it is frozen too, `stale_after` included. The second counts material
+  changes since admission.
+
+  It reached 13 legitimately: `plan_id` is `sha256(intent | window_start)` over an
+  absolute instant, so while a campaign still sits ahead of the horizon front its
+  identity is stable and Stage A's revision climbs as the forecast firms. No key
+  was renamed and the payload was not reshaped; an `admitted_publication_rule`
+  beside them names the frozen group and points at `carried.publication` and
+  `carried.run` for the live figures.
+
+### Added
+
+- **Regression coverage for the charge-setpoint tracking question.** A measured
+  helper test charged about 1.135 kW against a 1.0 kW setpoint, which raised
+  whether the corrected cap — now targeting `max_end_energy_kwh` exactly — needs a
+  margin. It does not, and no margin was added.
+
+  The excess is 135 W against the 177 W residual this project's own energy-balance
+  model already allows at those power levels, and a whole quarter-hour of it is
+  38 % of one step of the state-of-charge sensor, so one sample cannot establish a
+  ratio. More importantly the cap is recomputed every refresh from *measured*
+  stored energy, so an interval that charges above its setpoint arrives next
+  refresh as a fuller pack and the allowance closes by exactly that much. Only the
+  final interval is uncorrected, and that exposure is a quarter of one state-space
+  bucket for a run on schedule — inside the quantisation margin Stage A already
+  publishes as irreducible.
+
+  Two tests pin the reasoning rather than the numbers: that the cap stays
+  closed-loop on measured stored energy, and that one interval of tracking error
+  stays bounded against the installation's own lattice margin. If the cap ever
+  became open-loop, the first fails.
+
+### Preserved
+
+No Stage-A allocation change, no reserve economics change, no grid-budget change,
+no ownership change, no carry-forward semantic change, no actuator mapping change,
+no new permitted service. `reserve.py`, `policy.py`, `battery.py`,
+`simulation.py`, `realized.py`, `safety.py`, `storage.py`, `alphaess_device.py`
+and `alphaess_adapter.py` are byte-identical to beta.21, and the dynamic
+program's recursion is untouched.
+
+### Phase-2 status
+
+beta.22 is published for continued Phase-2 Shadow observation. The next required
+real-world evidence is **a naturally occurring capped charge run with a non-null
+`max_end_energy_kwh`** — the corrected cap has never been exercised on real
+hardware, because no snapshot so far has carried one. Two or three diagnostics
+snapshots taken during the same such run would settle it.
+
+Do not manufacture that run by adjusting Stage A.
+
 ## [1.0.0-beta.21] - 2026-08-25
 
 **A configured setting that did nothing, and a reported figure that misled.**

@@ -871,10 +871,10 @@ def headroom_ceiling_kw(
     target: Target,
     *,
     current_energy_kwh: float,
-    remaining_expected_pv_kwh: float,
     remaining_minutes: float,
+    charge_efficiency: float | None = None,
 ) -> float | None:
-    """Return the cap the Stage-A headroom constraint puts on active charging.
+    """Return the cap the Stage-A headroom constraint puts on charging.
 
     ``None`` when Stage A published no constraint. **Absent means unconstrained**,
     which is not the same as a cap of zero -- reading it that way would forbid the
@@ -883,30 +883,48 @@ def headroom_ceiling_kw(
     The arithmetic is deliberately dull, because every judgement in it was made by
     Stage A:
 
-        allowance = max_end_energy - current_energy - remaining_expected_pv
-        cap       = allowance / remaining_hours
+        allowance_dc = max_end_energy - current_energy
+        cap          = to_ac(allowance_dc) / remaining_hours
 
-    Stage A decided how much stored energy this plan should land on, knowing what
-    production was forecast afterwards. So the room still owed to production is
-    what is left once that landing figure has accounted for what is already in the
-    pack and what production is still expected to put there. Charge into the
-    remainder and no further.
+    ``max_end_energy_kwh`` is the **optimizer's own projected stored energy** at
+    the end of this run -- ``start_energy_dc_kwh + battery_delta_dc_kwh`` off the
+    chosen trajectory -- so it already contains every kilowatt-hour the run
+    charges, production and grid alike. The room left is therefore simply the gap
+    between it and what the pack holds now.
 
-    If production is running ahead of the forecast Stage A used, the allowance
-    shrinks and so does the cap -- reaching zero, which means stop. Nothing here
-    consults a price, an export window, or what any of it is worth.
+    **Until beta.22 this also subtracted the production still expected inside the
+    window, and that removed the same energy twice.** Stage A had already counted
+    it when it chose the landing figure, so the cap targeted
+    ``max_end - expected_pv`` and the pack finished short by exactly the
+    production the plan meant to store. On a sunny capped run that is most of the
+    target. The error was fail-safe -- it could only ever under-charge -- which is
+    why it survived: nothing overfilled and nothing complained.
+
+    The conversion is the second half of the same mistake. The allowance is a
+    **DC** stored-energy figure and the cap is compared against an **AC** rolling
+    power, so ``allowance_dc / hours`` was a DC quantity wearing AC units and
+    under-allowed by the efficiency again. ``charge_efficiency`` is the pack's own
+    one-way figure, threaded in rather than recomputed here.
+
+    With no efficiency to hand the DC allowance is used unconverted, which
+    under-allows: for a bound whose only job is to stop the pack overfilling, the
+    conservative reading is the safe one.
+
+    If production runs ahead of the forecast Stage A used, stored energy rises
+    faster, the allowance shrinks and so does the cap -- reaching zero, which
+    means stop. Nothing here consults a price, an export window, or what any of it
+    is worth.
     """
     if target.max_end_energy_kwh is None:
         return None
     if remaining_minutes <= 0.0:
         return 0.0
-    allowance = (
-        target.max_end_energy_kwh
-        - current_energy_kwh
-        - max(0.0, remaining_expected_pv_kwh)
-    )
+    allowance = target.max_end_energy_kwh - current_energy_kwh
     if allowance <= 0.0:
         return 0.0
+    if charge_efficiency is not None and charge_efficiency > 0.0:
+        # Storing one kWh DC costs ``1 / efficiency`` kWh AC at the terminals.
+        allowance = allowance / charge_efficiency
     return allowance / (remaining_minutes / 60.0)
 
 
@@ -940,6 +958,7 @@ def demand_for(
     remaining_expected_pv_kwh: float | None = None,
     grid_charged_kwh: float | None = None,
     configured_budget_kwh: float = 0.0,
+    charge_efficiency: float | None = None,
 ) -> Demand:
     """Return what Stage B would ask for this refresh.
 
@@ -982,21 +1001,33 @@ def demand_for(
     reduction = EXECUTION_REDUCTION_NONE
     stored = _finite(current_energy_kwh)
     if target.intent == EXECUTION_INTENT_GRID_CHARGE and stored is not None:
-        still_expected = (
-            0.0
-            if remaining_expected_pv_kwh is None
-            else max(0.0, remaining_expected_pv_kwh)
-        )
         ceiling_kw = headroom_ceiling_kw(
             target,
             current_energy_kwh=stored,
-            remaining_expected_pv_kwh=still_expected,
             remaining_minutes=remaining_minutes,
+            charge_efficiency=charge_efficiency,
         )
         charge_kw = rolling_kw if ceiling_kw is None else min(rolling_kw, ceiling_kw)
-        projected = (
-            stored + still_expected + max(0.0, charge_kw) * (remaining_minutes / 60.0)
-        )
+        # **Projected stored energy, and nothing else.** What the pack will hold
+        # at the end of the window if the intended power is held: the DC energy it
+        # holds now plus the AC energy still to deliver, converted once.
+        #
+        # beta.21 added the production still expected inside the window on top,
+        # and that production is already *inside* the remaining delivery --
+        # ``battery_target_kwh == expected_pv_to_battery_kwh +
+        # expected_grid_to_battery_kwh``, both built from the same run charge, so
+        # the PV share is a component of the target rather than an addition to it.
+        # A real snapshot published 31.946 kWh for a 22 kWh pack: 11.88 stored,
+        # 11.038 still to deliver, and 9.028 of production counted a second time.
+        #
+        # Reported as unavailable rather than approximated when the conversion
+        # cannot be made. A stored-energy figure that silently mixed AC into DC is
+        # what produced the impossible number in the first place.
+        delivery_ac = max(0.0, charge_kw) * (remaining_minutes / 60.0)
+        if charge_efficiency is not None and charge_efficiency > 0.0:
+            projected = stored + delivery_ac * charge_efficiency
+        else:
+            projected = None
 
     # The grid-energy ceiling, before the headroom cap so whichever binds harder
     # wins and the reason names the right one. This bounds *what was bought*; the
@@ -1100,6 +1131,7 @@ def decide(
     remaining_expected_pv_kwh: float | None = None,
     grid_charged_kwh: float | None = None,
     configured_budget_kwh: float = 0.0,
+    charge_efficiency: float | None = None,
     running_run_id: str | None = None,
     carried: CarriedRun | None = None,
     carry_ended: str | None = None,
@@ -1271,6 +1303,7 @@ def decide(
         remaining_expected_pv_kwh=remaining_expected_pv_kwh,
         grid_charged_kwh=grid_charged_kwh,
         configured_budget_kwh=configured_budget_kwh,
+        charge_efficiency=charge_efficiency,
     )
 
     if demand.reduction == EXECUTION_REDUCTION_TARGET_MET:
@@ -1478,6 +1511,24 @@ def as_dict(decision: Decision, *, mode: str, executed: bool) -> dict[str, Any]:
     return {
         "mode": mode,
         "state": decision.state,
+        # **Everything from here to ``target`` is frozen at admission.** These are
+        # read off the publication Stage B accepted, which a carried run holds by
+        # reference for its whole life -- so ``revision`` is the revision that
+        # publication carried when it was admitted and does not track the live one,
+        # and ``stale_after`` is the admission-time deadline rather than the live
+        # one. A real snapshot showed 13 here beside 2 in ``carried.run``: both
+        # correct, counting different things.
+        "admitted_publication_rule": (
+            "plan_id, revision, intent, purpose, window_start, window_end, "
+            "issued_at, stale_after and target are the Stage-A publication this "
+            "run was admitted from, frozen at admission and never re-read. "
+            "revision counts how many times Stage A had materially revised that "
+            "publication before Stage B accepted it. for the live figures see "
+            "carried.publication for what Stage A says now, and carried.run for "
+            "the run Stage B is executing -- carried.run.revision counts material "
+            "changes since admission and carried.run.stale_after is the deadline "
+            "re-anchored by every affirmation"
+        ),
         "plan_id": None if target is None else target.plan_id,
         "revision": None if target is None else target.revision,
         "intent": None if target is None else target.intent,
@@ -1569,6 +1620,16 @@ def as_dict(decision: Decision, *, mode: str, executed: bool) -> dict[str, Any]:
                     None
                     if demand.projected_end_kwh is None
                     else round(demand.projected_end_kwh, 3)
+                ),
+                "projected_end_energy_rule": (
+                    "projected stored energy in the pack at the end of the "
+                    "window, DC, if the requested power is held: stored energy "
+                    "now plus the energy still to deliver, converted from AC "
+                    "exactly once. the remaining delivery already includes the "
+                    "production Stage A expects to store, so expected production "
+                    "is not added again. null means the conversion could not be "
+                    "made, never zero. above the pack ceiling means the target "
+                    "does not fit, which is information rather than a fault"
                 ),
                 "reduction_reason": demand.reduction,
                 # **An attribution estimate, and the name says so.** There is no
