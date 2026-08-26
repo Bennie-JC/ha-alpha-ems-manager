@@ -31,6 +31,7 @@ from .alphaess_device import (
     BOOLEAN_PEAK_SHAVING,
     CHARGE_FAMILY,
     DISCHARGE_FAMILY,
+    DISPATCH_ENTITIES,
     FAMILIES,
     OWNERSHIP_PROVABLE,
     REQUIRED_ENTITIES,
@@ -41,9 +42,11 @@ from .alphaess_device import (
     SENSOR_DISPATCH_TIME,
     SENSOR_MAX_FEED_TO_GRID,
     CommandStep,
+    dispatch_refusal,
 )
 from .const import (
     CONTROL_EXECUTABLE_ACTIONS,
+    CONTROL_EXECUTABLE_DISPATCH_MODES,
     CONTROL_EXECUTION_AVAILABLE,
     CONTROL_REFUSE_ACTION_NOT_EXECUTABLE,
     MARKER_ABSENT,
@@ -409,6 +412,14 @@ def steps_outside_capability(steps: tuple[CommandStep, ...]) -> tuple[str, ...]:
         family = FAMILIES.get(action)
         if family is not None:
             permitted.update(family.entities)
+    # **The Dispatch surface is permitted by entity and constrained by value.**
+    # Direction on this surface is a signed *number*, not a choice of entity, so
+    # an entity subset test cannot express charge-only here at all -- that is
+    # :func:`dispatch_refusal`'s job, and it is checked beside this one rather
+    # than instead of it. Gated on the mode barrier so emptying that constant
+    # closes this surface too, and cannot leave a stale interlock behind.
+    if CONTROL_EXECUTABLE_DISPATCH_MODES:
+        permitted.update(DISPATCH_ENTITIES)
     return tuple(step.entity_id for step in steps if step.entity_id not in permitted)
 
 
@@ -440,12 +451,21 @@ async def async_execute(hass: HomeAssistant, steps: tuple[CommandStep, ...]) -> 
     outside = steps_outside_capability(steps)
     if outside:
         raise ControlActionNotPermitted(CONTROL_REFUSE_ACTION_NOT_EXECUTABLE, outside)
+    # The value half of the same boundary: a positive dispatch power or a mode
+    # outside the executable set, refused here whatever built the list.
+    refusal = dispatch_refusal(steps)
+    if refusal is not None:
+        raise ControlActionNotPermitted(
+            refusal, tuple(step.entity_id for step in steps)
+        )
 
     sent = 0
     for step in steps:
         data: dict[str, Any] = {"entity_id": step.entity_id}
         if step.value is not None:
             data["value"] = step.value
+        if step.option is not None:
+            data["option"] = step.option
         await hass.services.async_call(step.domain, step.service, data, blocking=True)
         sent += 1
     _LOGGER.debug("Control command sent as %d steps", sent)

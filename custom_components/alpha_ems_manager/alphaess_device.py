@@ -44,6 +44,7 @@ from .const import (
     CONTROL_CUTOFF_MAX_PERCENT,
     CONTROL_CUTOFF_MIN_PERCENT,
     CONTROL_DURATION_STEP_MINUTES,
+    CONTROL_EXECUTABLE_DISPATCH_MODES,
     CONTROL_MAX_DURATION_MINUTES,
     CONTROL_MAX_POWER_KW,
     CONTROL_MIN_DURATION_MINUTES,
@@ -51,6 +52,8 @@ from .const import (
     CONTROL_POWER_DECIMALS,
     CONTROL_POWER_STEP_KW,
     CONTROL_REFUSE_DIRECTION_MISMATCH,
+    CONTROL_REFUSE_DISPATCH_MODE,
+    CONTROL_REFUSE_DISPATCH_SIGN,
     CONTROL_REFUSE_FOREIGN_FAMILY,
     CONTROL_REFUSE_NEGATIVE_MAGNITUDE,
     CONTROL_REFUSE_RAW_DISPATCH_WRITE,
@@ -701,6 +704,11 @@ class CommandStep:
     service: str
     entity_id: str
     value: float | None = None
+    #: The option to select, for ``input_select.select_option``. Kept apart from
+    #: :attr:`value` rather than overloading it: the dispatch mode is chosen by a
+    #: *label* the vendor package parses a number out of, so a float would be the
+    #: wrong type and a stringified float would select nothing at all.
+    option: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the bounded diagnostics form."""
@@ -708,6 +716,8 @@ class CommandStep:
             "service": f"{self.domain}.{self.service}",
             "entity_id": self.entity_id,
         }
+        if self.option is not None:
+            payload["option"] = self.option
         if self.value is not None:
             payload["value"] = self.value
         return payload
@@ -845,6 +855,43 @@ def write_refusal(command: DeviceCommand, steps: tuple[CommandStep, ...]) -> str
     function an object shaped like one, which is a lie told to a safety check.
     """
     return action_refusal(command.action, steps)
+
+
+def dispatch_refusal(steps: tuple[CommandStep, ...]) -> str | None:
+    """Return why a Dispatch step list must not be sent, or ``None`` if it may be.
+
+    **The sign is part of the barrier, not a downstream check.** On the raw
+    Dispatch surface direction is a *value*, not an entity, so the entity subset
+    test that keeps a discharge off the helper families cannot see a wrong-way
+    dispatch at all. This is the check that can.
+
+    Two refusals:
+
+    * a **positive** power. Negative charges and positive discharges, so a
+      positive figure is the one thing beta.25 must never command. Zero is
+      permitted and has to be: it is what the direction gate produces when the
+      grid target would require a discharge, and it is what the cleanup writes.
+      Holding the battery still is the physical meaning of "do not discharge".
+    * a **mode** outside the executable set, compared by the exact package label.
+      The package parses the number out of the label, so a near-miss string
+      selects a different mode or none at all -- and modes 6 and 7 are not
+      controllable kW primitives in any case, because the package writes the power
+      register as a bare 32000 for anything outside modes 1, 2, 3 and 5.
+
+    Reads no action field and trusts no caller, for the same reason
+    :func:`action_refusal` does: "impossible" is a property of today code.
+    """
+    executable = {
+        DISPATCH_MODE_LABELS[mode]
+        for mode in CONTROL_EXECUTABLE_DISPATCH_MODES
+        if mode in DISPATCH_MODE_LABELS
+    }
+    for step in steps:
+        if step.entity_id == DISPATCH_POWER and (step.value or 0.0) > 0.0:
+            return CONTROL_REFUSE_DISPATCH_SIGN
+        if step.entity_id == DISPATCH_MODE_SELECT and step.option not in executable:
+            return CONTROL_REFUSE_DISPATCH_MODE
+    return None
 
 
 def action_refusal(action: str, steps: tuple[CommandStep, ...]) -> str | None:
@@ -987,6 +1034,134 @@ def plan_reset_cleanup(action: str | None) -> tuple[CommandStep, ...]:
         ),
         CommandStep(*SERVICE_TURN_OFF, family.hold),
         # Release ownership, having finished with it.
+        CommandStep(*SERVICE_TURN_OFF, BOOLEAN_EXECUTION_OWNER),
+    )
+
+
+# --- the Dispatch sequences ---------------------------------------------------
+#
+# **A separate surface, and separate builders.** The helper families take a
+# positive magnitude and carry direction in which family was written; raw Dispatch
+# takes a signed power. Nothing below is reachable from the family builders above
+# and nothing above is reachable from here, which is how the two sign conventions
+# are kept from ever meeting in one expression.
+
+
+def dispatch_mode_step(mode: int) -> CommandStep:
+    """Return the step that selects a dispatch mode by its exact package label.
+
+    Raises for a mode this integration has no label for, because a select that
+    silently sends nothing is worse than one that fails loudly: the package parses
+    the number out of the label, so a near-miss string chooses a different mode or
+    none at all.
+    """
+    label = DISPATCH_MODE_LABELS.get(mode)
+    if label is None:
+        raise KeyError(f"no package label is known for dispatch mode {mode}")
+    return CommandStep(*SERVICE_SELECT_OPTION, DISPATCH_MODE_SELECT, option=label)
+
+
+def plan_dispatch_arm(
+    *,
+    mode: int,
+    power_kw: float,
+    cutoff_soc_percent: int,
+    duration_minutes: int,
+    pv_enabled: bool = True,
+) -> tuple[CommandStep, ...]:
+    """Return stage two of a Dispatch arm: parameters settled, **enable last**.
+
+    Stage one is the ownership claim, which is :func:`plan_marker_claim` and is
+    shared with the helper path -- the marker is not part of either surface.
+
+    The enable is last for the reason it always was: it is edge-triggered, so it
+    is what makes the settled values take effect. The happy consequence is that an
+    interrupted sequence is inert rather than dangerous -- the numbers mean nothing
+    until the boolean changes, so a partial run commands nothing at all.
+
+    The PV switch is asserted rather than assumed. Its fail-safe state is **on**,
+    and a previous run of ours may have left it off; re-asserting one boolean is
+    cheaper than reasoning about who set it last.
+    """
+    return (
+        dispatch_mode_step(mode),
+        CommandStep(*SERVICE_SET_VALUE, DISPATCH_POWER, power_kw),
+        CommandStep(*SERVICE_SET_VALUE, DISPATCH_CUTOFF_SOC, float(cutoff_soc_percent)),
+        CommandStep(*SERVICE_SET_VALUE, DISPATCH_DURATION, float(duration_minutes)),
+        CommandStep(
+            *(SERVICE_TURN_ON if pv_enabled else SERVICE_TURN_OFF), DISPATCH_PV_SWITCH
+        ),
+        CommandStep(*SERVICE_TURN_ON, DISPATCH_ENABLE),
+    )
+
+
+def plan_dispatch_power(power_kw: float) -> tuple[CommandStep, ...]:
+    """Return the one step a physical correction is allowed to be.
+
+    **One entity, one write.** A power correction does not touch the duration --
+    that would re-arm the dead-man on a cadence the economics never chose -- and
+    does not touch the enable, because the dispatch stays on for the whole run.
+    """
+    return (CommandStep(*SERVICE_SET_VALUE, DISPATCH_POWER, power_kw),)
+
+
+def plan_dispatch_cutoff(cutoff_soc_percent: int) -> tuple[CommandStep, ...]:
+    """Return the step that moves the cutoff ceiling, live in mode 2 only."""
+    return (
+        CommandStep(*SERVICE_SET_VALUE, DISPATCH_CUTOFF_SOC, float(cutoff_soc_percent)),
+    )
+
+
+def plan_dispatch_rearm(duration_minutes: int) -> tuple[CommandStep, ...]:
+    """Return the step that re-arms the device dead-man.
+
+    Writing the duration while the dispatch is on rewrites the register **and**
+    performs ``timer.cancel`` plus ``timer.start``, so no enable toggle is needed.
+    But the vendor automation triggers on the ``input_number`` changing *state*, so
+    the value has to differ from the one already there -- see
+    :func:`dispatch.deadman_minutes`, which is what chooses it.
+    """
+    return (
+        CommandStep(*SERVICE_SET_VALUE, DISPATCH_DURATION, float(duration_minutes)),
+    )
+
+
+def plan_dispatch_stop() -> tuple[CommandStep, ...]:
+    """Return stage one of a Dispatch stop: switch it off, and nothing else.
+
+    Turning the enable off triggers the package own ``AlphaESS Dispatch Reset``,
+    which writes Dispatch Start = 0 -- so no reset button is needed and none is
+    added.
+
+    **This is also the whole of the emergency self-stop.** That authority grants
+    exactly this one operation, so it is exactly this function, and there is no
+    second definition of "the narrow stop" for it to drift away from.
+    """
+    return (CommandStep(*SERVICE_TURN_OFF, DISPATCH_ENABLE),)
+
+
+def plan_dispatch_cleanup() -> tuple[CommandStep, ...]:
+    """Return stage two of a Dispatch stop: resting values, then the marker.
+
+    Reachable only once the dispatch has been *observed* inactive. Setting power
+    to zero is not a stop, and this deliberately does more: a dispatch left armed
+    at zero still holds a duration, a cutoff and a timer, and the next run would
+    inherit them -- so a short run following a long one would silently acquire the
+    long one dead-man.
+
+    The PV switch is restored to **on**, its fail-safe state, and the marker goes
+    last: until it is off the dispatch is still owned, and releasing ownership
+    before finishing the cleanup would leave Alpha EMS unable to finish its own.
+    """
+    return (
+        CommandStep(*SERVICE_SET_VALUE, DISPATCH_POWER, 0.0),
+        CommandStep(
+            *SERVICE_SET_VALUE, DISPATCH_DURATION, float(CONTROL_MIN_DURATION_MINUTES)
+        ),
+        CommandStep(
+            *SERVICE_SET_VALUE, DISPATCH_CUTOFF_SOC, float(CONTROL_CUTOFF_MIN_PERCENT)
+        ),
+        CommandStep(*SERVICE_TURN_ON, DISPATCH_PV_SWITCH),
         CommandStep(*SERVICE_TURN_OFF, BOOLEAN_EXECUTION_OWNER),
     )
 
