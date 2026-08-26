@@ -527,7 +527,11 @@ def test_an_unexecutable_action_still_carries_the_advisory_qualifier() -> None:
 
         for entry in (planned, cancelled, ended):
             assert entry is not None
-            assert "Advisory only: this release sends no command." in entry.message
+            # **The qualifier survives; its wording had to change.** "This
+            # release sends no command" became false in beta.25, and a disclaimer
+            # a user learns to disbelieve is worse than none -- so it now names
+            # the *action* rather than the release.
+            assert "Advisory only: no command is sent for this action." in entry.message
             assert "started" not in entry.message
 
 

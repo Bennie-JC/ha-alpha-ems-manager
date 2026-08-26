@@ -580,8 +580,10 @@ def _economic_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any
                     "residual model, so production is included. No grid "
                     "connection or contractual limit is known to this "
                     "integration, so a reported peak may exceed what the "
-                    "connection can carry -- this release executes nothing, so "
-                    "it cannot cause a real flow"
+                    "connection can carry. beta.25 executes a charge, so a "
+                    "peak here can describe a real import -- the grid limit is "
+                    "applied as a final Stage-B reduction and is never fed back "
+                    "into the plan, which would make the residual a fixed point"
                 ),
             },
             # Read by nothing. Reported because the plan carries no margin for

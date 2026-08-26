@@ -252,14 +252,27 @@ def test_stale_after_is_anchored_to_the_issue_instant_not_the_window() -> None:
     assert target["window_end"] == CLOSES.isoformat()
 
 
-def test_the_contract_says_what_consumes_it_and_that_nothing_executes() -> None:
-    """Stage B reads this now. Nothing sends anything, and it still says so."""
+def test_the_contract_says_what_consumes_it_and_what_executes() -> None:
+    """Stage B reads this, and since beta.25 it executes part of it.
+
+    **The claim had to change because the release did.** "Nothing executes" was
+    the honest disclaimer through beta.23 and is now false: an authorised charge
+    reaches the inverter. What the rule must still do is say *which* half is
+    executable and which is refused -- a contract that claimed either "nothing
+    executes" or simply "this executes" would mislead in opposite directions.
+    """
     target = target_of(run_of(action=ECONOMIC_ACTION_CHARGE, charge=1.0))
 
     rule = target["contract_rule"]
     assert "Stage B" in rule
-    assert "sends nothing" in rule
-    assert "CONTROL_EXECUTION_AVAILABLE is false" in rule
+    # The executable half, named with the surface and the direction.
+    assert "charge" in rule
+    assert "mode 2" in rule
+    assert "negative power" in rule
+    # And the refused half, named too.
+    for refused in ("discharge", "export", "curtailment"):
+        assert refused in rule, refused
+    assert "refused" in rule
     # Freshness is enforced from beta.19, so the old disclaimer would be false.
     assert "enforced by nothing" not in rule
 

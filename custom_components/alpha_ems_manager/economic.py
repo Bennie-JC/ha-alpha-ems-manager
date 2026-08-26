@@ -2,7 +2,8 @@
 
 Phase 8 answers one question: given the prices, the load, the production and the
 reserve requirement that are *actually known*, what is the least-cost way to move
-the battery? It publishes the answer, and this release sends no command at all.
+the battery? It publishes the answer. Since beta.25 the buying half of it
+is executed; the selling half is still advisory.
 
 The objective, and why it is lexicographic
 ------------------------------------------
@@ -2223,8 +2224,8 @@ def desired_grid_kw_at(
 
 ECONOMIC_BASIS: str = (
     "the least-cost way through the prices, load and production that are "
-    "actually known, subject to the Phase-7 reserve. Advisory only: this "
-    "release sends no command to the inverter, and export and photovoltaic "
+    "actually known, subject to the Phase-7 reserve. beta.25 executes the "
+    "buying half of this plan and refuses the rest: export and photovoltaic "
     "curtailment have no actuator at all -- they are modelled so the strategy "
     "can be validated before anything is allowed to act on it"
 )
@@ -2625,9 +2626,11 @@ def execution_target(
             "1.3 kW of net export needed 2.2 kW of battery against 0.9 kW of load"
         ),
         "contract_rule": (
-            "consumed by the Stage B controller since beta.19, which computes "
-            "the command a Live run would send and sends nothing: "
-            "CONTROL_EXECUTION_AVAILABLE is false and no actuator is reachable. "
+            "consumed by the Stage B controller, which since beta.25 executes "
+            "an authorised charge on the Hillview Dispatch surface in mode 2 with "
+            "a negative power, and nothing else: discharge, export, curtailment "
+            "and modes 6 and 7 are refused at the authorisation and send "
+            "boundaries. "
             "identity is (intent, window_start) so a run keeps its plan_id as its "
             "remaining energy shrinks; revision increments when the target moves "
             "beyond the published deadband and survives a restart; stale_after is "
@@ -2900,7 +2903,8 @@ def economic_as_dict(
             "rather than horizon indices so identity survives replanning, with "
             "the battery-side and grid-side quantities in separate fields so a "
             "consumer cannot mistake one boundary for the other. nothing in "
-            "beta.18 consumes these and CONTROL_EXECUTION_AVAILABLE is false"
+            "the Stage B controller consumes these; only an authorised charge "
+            "is executable"
         ),
         "realized": realized or {"available": False, "reason": "not_computed"},
         "solver": {

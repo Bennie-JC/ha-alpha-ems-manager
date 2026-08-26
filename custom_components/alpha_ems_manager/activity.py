@@ -135,9 +135,14 @@ from .execution import TARGET_TOLERANCE_KWH
 #: filter built on it would silently stop matching.
 ACTIVITY_NAME = "Economic plan"
 
-#: The suffix that keeps an advisory entry honest. Appended whenever the global
-#: execution barrier stands, which in this release is always.
-_ADVISORY = "Advisory only: this release sends no command."
+#: The suffix that keeps an advisory entry honest. Appended whenever the action
+#: being described is one this release cannot execute.
+#:
+#: **No longer "always", since beta.25.** A charge reaches the inverter; a
+#: discharge, an export and a curtailment do not. Saying "this release sends no
+#: command" on every line would now be false on the lines that matter most, and a
+#: disclaimer a user learns to disbelieve is worse than none.
+_ADVISORY = "Advisory only: no command is sent for this action."
 
 #: How each action reads in a sentence, as a verb phrase.
 _VERBS = {
@@ -794,7 +799,7 @@ def logbook_payload(entry: ActivityEntry, *, domain: str, entity_id: str) -> dic
     if entry.kind in ECONOMIC_EXECUTION_EVENT_KINDS and not CONTROL_EXECUTION_AVAILABLE:
         raise ValueError(
             f"Activity refuses the {entry.kind!r} entry: it describes execution, "
-            "and this release executes nothing"
+            "and nothing is executable in this configuration"
         )
     return {
         "name": ACTIVITY_NAME,

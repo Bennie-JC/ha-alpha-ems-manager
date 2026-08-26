@@ -283,11 +283,27 @@ class OwnershipEvidence:
         it. Bounded by :data:`OWNERSHIP_CLAIM_WINDOW_SECONDS`, measured between the
         write and the dispatch start rather than between the write and now.
         """
-        # Both factors, before either kind of match is considered. ``ownership_of``
-        # would refuse a marker-less dispatch as foreign before reaching here, but a
-        # property that reports a match without the marker is a misleading property,
-        # and this one is published in diagnostics.
-        if not self.marker_on or not self.dispatch_active:
+        # Both factors, before either kind of match is considered. A property that
+        # reported a match without the marker would be a misleading property, and
+        # this one is published in diagnostics.
+        if not self.marker_on:
+            return None
+        return self._causal_provenance
+
+    @property
+    def _causal_provenance(self) -> str | None:
+        """Return the provenance the record alone supports, marker set aside.
+
+        **The marker is one of two factors; this is the other one on its own.**
+        Extracted so the degraded state can ask "does causation still hold?"
+        without either weakening :attr:`record_provenance` -- which is published
+        and must keep meaning both factors -- or growing a second copy of the
+        window arithmetic that could drift away from it.
+
+        Never a substitute for ownership. Its only caller is the degraded branch
+        of :func:`ownership_of`, which authorises one write and nothing else.
+        """
+        if not self.dispatch_active:
             return None
         if not self.record_names_this_run:
             return None
@@ -308,6 +324,16 @@ class OwnershipEvidence:
         if -OWNERSHIP_START_TOLERANCE_SECONDS <= lag <= OWNERSHIP_CLAIM_WINDOW_SECONDS:
             return OWNERSHIP_PROVENANCE_SETTLING
         return None
+
+    @property
+    def record_causation_holds(self) -> bool:
+        """Return whether the record still ties Alpha EMS to the running dispatch.
+
+        Marker aside, which is the whole point: this is the question the degraded
+        state turns on, and asking it through :attr:`record_matches` would be
+        circular because that requires the marker the degraded state has lost.
+        """
+        return self._causal_provenance is not None
 
     @property
     def record_matches(self) -> bool:
@@ -356,7 +382,7 @@ def ownership_of(evidence: OwnershipEvidence) -> str:
         # Its requirements are the same proof the foreign invariant demands, which
         # is why this does not weaken that either: a dispatch whose Alpha-EMS
         # causation cannot *still* be shown stays untouchable.
-        if evidence.record_matches and evidence.readback_compatible:
+        if evidence.record_causation_holds and evidence.readback_compatible:
             return OWNERSHIP_DEGRADED
         return OWNERSHIP_FOREIGN
     if not evidence.record_matches:

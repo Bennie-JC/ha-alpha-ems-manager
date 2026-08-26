@@ -405,6 +405,17 @@ _ECONOMIC_LOG = "economic"
 #: was true and is now not. Renaming the key would have broken every reader of the
 #: payload; leaving the sentence would have been worse than a broken key, because a
 #: stale reassurance is read as a current one.
+#: Distinguishes "use the record's own run" from "this run, which may be None".
+#: A bare ``None`` default cannot express both, and conflating them would let the
+#: Stage-B path silently fall back to the record when no run is carried.
+_UNSET_RUN = "<unset>"
+
+
+def carried_run_id_of(carried: Any) -> str | None:
+    """Return the carried run's id, or ``None`` when nothing is carried."""
+    return None if carried is None else carried.run_id
+
+
 _EXECUTION_SCOPE = (
     "the control pipeline is fully evaluated and only a stage-b grid charge may "
     "execute: every other direction -- discharge, export, curtailment and the "
@@ -1890,14 +1901,26 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return ownership_of(self._evidence_for(snapshot, now))
 
     @callback
-    def _evidence_for(self, snapshot: Any, now: datetime) -> OwnershipEvidence:
-        """Return the ownership evidence, including the signed readback."""
+    def _evidence_for(
+        self, snapshot: Any, now: datetime, *, run_id: str | None = _UNSET_RUN
+    ) -> OwnershipEvidence:
+        """Return the ownership evidence, including the signed readback.
+
+        **The signed readback is the field that must never be forgotten.** On the
+        Dispatch surface direction is a number, so evidence without it cannot tell
+        an owned charge from somebody else's discharge -- and a second copy of this
+        construction is how it came to be omitted once already.
+
+        ``run_id`` defaults to the record's own run so the physical tick and the
+        Off path agree; the Stage-B path passes the *carried* run, because there a
+        record naming a different run is contradictory rather than merely old.
+        """
         return OwnershipEvidence(
             dispatch_active=bool(snapshot is not None and snapshot.dispatch_active),
             marker_on=bool(snapshot is not None and snapshot.owner_marker),
             record=self.store.execution_record,
             dispatch_start=_dispatch_start_instant(snapshot, now),
-            run_id=self._owned_run_id(),
+            run_id=self._owned_run_id() if run_id is _UNSET_RUN else run_id,
             now=now,
             readback_compatible=bool(
                 snapshot is not None
@@ -2984,14 +3007,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         further and nothing is written.
         """
         snapshot = read_snapshot(self.hass)
-        evidence = OwnershipEvidence(
-            dispatch_active=bool(snapshot.dispatch_active),
-            marker_on=bool(snapshot.owner_marker),
-            record=self.store.execution_record,
-            dispatch_start=_dispatch_start_instant(snapshot, now),
-            run_id=self._owned_run_id(),
-            now=now,
-        )
+        # **One construction of the evidence, shared by every reader.** A second
+        # copy here would be a second place the signed readback could be
+        # forgotten -- which is exactly how the degraded state became unreachable
+        # the first time.
+        evidence = self._evidence_for(snapshot, now)
         ownership = ownership_of(evidence)
         reset_action = self._owned_run_action()
         commands: tuple[Any, ...] = ()
@@ -3489,23 +3509,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._forward = forward_authorisation(fresh)
         if carried is None:
             self._forward = None
-        evidence = OwnershipEvidence(
-            dispatch_active=bool(snapshot is not None and snapshot.dispatch_active),
-            # A marker that does not exist is not a marker that is off: without it
-            # ownership cannot be established at all, so a running dispatch reads
-            # as foreign rather than as free.
-            marker_on=bool(snapshot is not None and snapshot.owner_marker),
-            record=self.store.execution_record,
-            # Supplied since beta.20. Both were hardcoded ``None``, which made
-            # ``record_matches`` permanently false and ``owned`` unreachable -- so
-            # the continuation relaxation added in beta.19 could never fire, and
-            # Alpha EMS would have inhibited itself the moment it armed anything.
-            dispatch_start=_dispatch_start_instant(snapshot, now),
-            run_id=None if carried is None else carried.run_id,
-            # Read once, so the settle window is measured against this refresh
-            # rather than against whenever a property happens to be evaluated.
-            now=now,
-        )
+        # One construction, shared. See ``_evidence_for``: the run identity comes
+        # from the carried run, so a record naming a different run is
+        # contradictory rather than merely old.
+        evidence = self._evidence_for(snapshot, now, run_id=carried_run_id_of(carried))
         # Complete our own claim with the dispatch it caused, before the decision
         # reads ownership. Nothing else may write to the record here.
         stamped = self._stamp_dispatch_start(evidence, now)
@@ -5203,7 +5210,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "the battery plan are unaffected -- nothing in those paths "
                     "reads the control layer -- but the two control entities "
                     "will read unknown until it recovers. No command was sent; "
-                    "this release cannot send one"
+                    "no command was sent this refresh, and the physical controller "
+                    "holds its last applied setpoint until the layer recovers"
                 ),
             )
             _LOGGER.debug("Control report build failed", exc_info=True)
@@ -5269,6 +5277,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # one narrow write is authorised to end the run deliberately rather than
         # leaving it to the device dead-man.
         degraded = ownership_state == OWNERSHIP_DEGRADED
+        # Read once, so the emergency grant below and the ownership state above
+        # cannot disagree about the same snapshot.
+        evidence_now = self._evidence_for(snapshot, now)
         charge_intent = self._stage_b_intent(plan=plan, now=now)
 
         # **The command source, and the one place it is decided.**
@@ -5392,6 +5403,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if unsafe_while_owned and not stop_reason:
             stop_reason = EXECUTION_STOP_SAFETY
         resetting = owned and bool(result.get("reset_required") or unsafe_while_owned)
+        if degraded and not stop_reason:
+            stop_reason = EXECUTION_STOP_MARKER_LOST
         # The ownership layer's own verdict, read rather than recomputed. There is
         # one definition of "a marker with nothing behind it" -- ``stale_marker`` in
         # the module that holds the evidence -- and neither this function nor
@@ -5518,14 +5531,16 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             commands = ()
             stage_one = stage_two = ()
             verify = None
+        # **The physical controller, and the ring behind it.** Siblings of the
+        # write boundary rather than fields inside it: the boundary describes one
+        # sequence, and the controller describes the decision that produced it.
+        # Diagnostics are rarely captured at the moment production moved, so a
+        # download taken later has to be able to reconstruct the quarter rather
+        # than only describe the instant it was taken.
+        stage_b["controller"] = self._controller_block(setpoint, now)
+        stage_b["physical_decisions"] = list(self._physical_decisions)
         stage_b["write_boundary"] = {
             "refusal": refusal,
-            # **The physical controller, and the ring behind it.** Diagnostics
-            # are rarely captured at the moment production moved, so a download
-            # taken later has to be able to reconstruct the quarter rather than
-            # only describe the instant it was taken.
-            "controller": self._controller_block(setpoint, now),
-            "physical_decisions": list(self._physical_decisions),
             # **The two stages, published separately.** A reader has to be able
             # to see that the activation is not in the same stage as the claim,
             # because "activation last" and "activation only after the claim was
@@ -5557,7 +5572,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 else "reserve_guard"
             ),
             "sequence": (
-                "reset"
+                "emergency_self_stop"
+                if degraded
+                else "reset"
                 if resetting
                 else "marker_release"
                 if releasing
@@ -5589,7 +5606,31 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # amendment all three went through the first one, so the last two were
         # refused every time -- and the step list was swapped afterwards, so the
         # answer did not even describe the question.
-        if resetting:
+        if degraded:
+            # **A fourth question, and it has to be its own.** "May we stop a
+            # dispatch we still own" is ``authorize_reset``, and it requires
+            # ownership the degraded state has by definition lost. Asking it here
+            # would refuse every time; asking the *start* question would refuse
+            # for the wrong reason. This one grants exactly ``Dispatch enable ->
+            # OFF`` and refuses any list that is not precisely that.
+            decision = authorize_emergency_self_stop(
+                authorized=emergency_self_stop_authorized(
+                    dispatch_active=bool(
+                        snapshot is not None and snapshot.dispatch_active
+                    ),
+                    marker_present_and_on=bool(
+                        snapshot is not None and snapshot.owner_marker
+                    ),
+                    record_matches_run=evidence_now.record_causation_holds,
+                    readback_compatible=evidence_now.readback_compatible,
+                    contradicted=False,
+                ),
+                steps=tuple(step.entity_id for step in commands),
+                attempts_made=self._emergency_attempts,
+            )
+            if decision.authorized:
+                self._emergency_attempts += 1
+        elif resetting:
             decision = authorize_reset(
                 ownership=ownership_state or OWNERSHIP_NONE,
                 stopping_action=reset_action,
