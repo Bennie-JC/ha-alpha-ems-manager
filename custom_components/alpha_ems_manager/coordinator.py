@@ -1531,6 +1531,35 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_tick_reason = TICK_APPLIED
 
     @callback
+    def _live_kw(self) -> tuple[float, float, float] | None:
+        """Return ``(house_kw, pv_kw, grid_kw)`` now, or ``None`` if unusable.
+
+        **The unit and sign boundary, crossed exactly once.** ``PowerFlows`` is in
+        watts with import and export as separate non-negative fields, because the
+        sources disagree about signs and that disagreement is resolved before a
+        ``PowerFlows`` exists. The controller works in signed kilowatts, where
+        positive grid means import -- so the conversion happens here and nowhere
+        else.
+
+        ``None`` when house load or the meter cannot be read. **No fallback figure
+        is invented**: production is allowed to be absent and treated as zero,
+        because a missing photovoltaic forecast is a real configuration rather
+        than a fault, but an unknown house load or meter reading means the
+        controller does not know what it is correcting.
+        """
+        flows = self.read_flows()
+        if flows.house_load_w is None:
+            return None
+        if flows.grid_import_w is None and flows.grid_export_w is None:
+            return None
+        grid_w = (flows.grid_import_w or 0.0) - (flows.grid_export_w or 0.0)
+        return (
+            flows.house_load_w / 1000.0,
+            (flows.pv_w or 0.0) / 1000.0,
+            grid_w / 1000.0,
+        )
+
+    @callback
     def _blocking_conflicts(self, snapshot: Any) -> tuple[str, ...]:
         """Return the conflicting families that must prevent an arm.
 
@@ -1562,13 +1591,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if target is None or target.desired_grid_kw is None:
             return None
-        flows = self.read_flows()
-        if flows.house_kw is None:
+        live = self._live_kw()
+        if live is None:
             return None
+        house_kw, pv_kw, _grid_kw = live
         return decide_setpoint(
             desired_grid_kw=target.desired_grid_kw,
-            house_load_kw=flows.house_kw,
-            pv_kw=flows.pv_kw or 0.0,
+            house_load_kw=house_kw,
+            pv_kw=pv_kw,
             limits=self._charge_limits(target, now),
             last_applied_kw=self._applied_setpoint_kw,
             charge_only=True,
@@ -1739,6 +1769,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Append one physical decision to the bounded ring."""
         entry = {"controller_refresh_at": now.isoformat()}
         entry.update(decision.as_dict())
+        live = self._live_kw()
+        entry["actual_grid_kw"] = None if live is None else round(live[2], 3)
         entry["coherence_state"] = coherence.state
         entry["dispatch_power_deadband_kw"] = DISPATCH_POWER_DEADBAND_KW
         self._physical_decisions.append(entry)
@@ -1746,8 +1778,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @callback
     def _update_coherence(self, now: datetime) -> ControlCoherence:
         """Advance the control-grade coherence state by one physical tick."""
-        flows = self.read_flows()
-        available = flows.house_kw is not None and flows.grid_kw is not None
+        available = self._live_kw() is not None
         self._coherence = control_coherence(
             previous=self._coherence,
             now=now,
