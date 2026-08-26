@@ -76,6 +76,7 @@ from .const import (
     ACTION_DISCHARGE,
     BALANCE_MAX_SOURCE_AGE_SECONDS,
     BATTERY_MAX_SOC_PERCENT,
+    CAP_NONE,
     CONF_ALLOW_BATTERY_EXPORT,
     CONF_ALLOW_GRID_CHARGING,
     CONF_BATTERY_CAPACITY_KWH,
@@ -128,6 +129,7 @@ from .const import (
     DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     DEFAULT_GRID_POWER_SIGN,
     DEFAULT_MINIMUM_TRADE_GAIN_EUR,
+    DISPATCH_LIMIT_NONE,
     DISPATCH_POWER_DEADBAND_KW,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     EV_ABSENCE_GRACE_REFRESHES,
@@ -208,6 +210,7 @@ from .economic import (
     select_bucket_kwh,
 )
 from .energy_balance import (
+    COHERENCE_UNKNOWN,
     OUTCOME_SKIPPED_INCOHERENT,
     BalanceMonitor,
     BalanceSample,
@@ -223,12 +226,15 @@ from .execution import (
     OwnershipEvidence,
     action_for_intent,
     actionable_target,
+    affirms,
     carried_from_record,
     carry_forward,
     control_intent_for,
     decide,
+    forward_authorisation,
     measure_progress,
     ownership_of,
+    parse_target,
     remaining_authorised_kwh,
     stale_marker,
     target_as_published,
@@ -1531,6 +1537,95 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._applied_setpoint_kw = decision.applied_kw
         self._last_tick_reason = TICK_APPLIED
+
+    @callback
+    def _controller_block(self, setpoint: Any, now: datetime) -> dict[str, Any]:
+        """Return the physical controller's own diagnostics for this refresh.
+
+        Everything a reader needs to reconstruct one decision without rerunning
+        it, and the intermediate figures are kept apart on purpose: ``calculated``
+        before the clamps and ``applied`` after them is what makes a clamp
+        visible at all.
+        """
+        live = self._live_kw()
+        coherence = self._coherence or COHERENCE_UNKNOWN
+        payload: dict[str, Any] = {
+            "controller_refresh_at": now.isoformat(),
+            "house_load_kw": None if live is None else round(live[0], 3),
+            "pv_kw": None if live is None else round(live[1], 3),
+            "actual_grid_kw": None if live is None else round(live[2], 3),
+            "dispatch_power_deadband_kw": DISPATCH_POWER_DEADBAND_KW,
+            "last_tick_reason": self._last_tick_reason,
+            "applied_setpoint_kw": self._applied_setpoint_kw,
+            "lock_held": self._execution_lock.locked(),
+            "cadence_rule": (
+                "the economic target is refreshed every quarter; the physical "
+                "setpoint is corrected every sixty seconds against it. one "
+                "power write per tick at most, and the duration is re-armed "
+                "only on the economic cadence"
+            ),
+        }
+        if setpoint is None:
+            payload["desired_grid_kw"] = None
+            payload["dispatch_limited_by"] = DISPATCH_LIMIT_NONE
+            payload["update_needed"] = False
+        else:
+            payload.update(setpoint.as_dict())
+        payload.update(coherence.as_dict())
+        payload.update(self._authorisation_block())
+        return payload
+
+    @callback
+    def _authorisation_block(self) -> dict[str, Any]:
+        """Return the two-cap authorisation state, from :mod:`.execution`."""
+        forward = self._forward
+        block: dict[str, Any] = {
+            "forward_authorised_kwh": None,
+            "forward_from": None,
+            "delivered_since_forward_kwh": None,
+            "binding_cap": CAP_NONE,
+            "authorisation_rule": (
+                "two caps on separate domains, never one comparison across "
+                "origins: the frozen remainder runs from the admitted window "
+                "start, the forward allowance from the latest publication's own "
+                "boundary. it may only reduce an admitted run, never grow one"
+            ),
+        }
+        if forward is not None:
+            block.update(forward.as_dict())
+        decision = self._stage_b_decision
+        demand = None if decision is None else decision.demand
+        if demand is not None and demand.grid_cap_kwh is not None:
+            remaining = max(0.0, demand.grid_cap_kwh - demand.grid_charged_kwh)
+            revised, cap = remaining_authorised_kwh(
+                now=dt_util.now(),
+                frozen_remaining_kwh=remaining,
+                forward=forward,
+            )
+            block["binding_cap"] = cap
+            block["authorisation_reduced_by_replan"] = round(
+                max(0.0, remaining - revised), 3
+            )
+        return block
+
+    @callback
+    def _affirming_target(self, carried: Any) -> Any:
+        """Return the freshest published target for the carried run, or ``None``.
+
+        Matched on **intent and overlap**, exactly as ``affirms`` does, so the cap
+        is set from the publication that affirmed the run rather than from whatever
+        happens to be first in the list. Purely temporal: no price is read here,
+        because Stage B never chooses a window.
+        """
+        if carried is None:
+            return None
+        for raw in self.execution_targets or ():
+            target = parse_target(raw)
+            if target is None:
+                continue
+            if affirms(carried, target):
+                return target
+        return None
 
     @callback
     def _live_kw(self) -> tuple[float, float, float] | None:
@@ -3376,6 +3471,24 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         carried = outcome.carried
         if outcome.ended is not None and outcome.ended_run is not None:
             self._remember_ended_run(outcome.ended, outcome.ended_run, plan, now)
+        # **The forward cap, replaced on every affirmation.**
+        #
+        # An admitted run's energy figures are immutable, which is what let a
+        # Safety Buy admitted while tomorrow's prices were unknown keep delivering
+        # after cheaper prices arrived. This is the second cap: what the *latest*
+        # publication still wants, from *its* boundary onward.
+        #
+        # Replaced rather than accumulated, and that is what stops a healthy run
+        # being trimmed: while its boundary is still ahead the cap is inactive, and
+        # by the time the boundary passes a fresh affirmation has moved it on. It
+        # bites in the case it exists for -- a publication that wants materially
+        # less -- and when refreshes have stopped arriving.
+        if outcome.affirmed or outcome.admitted:
+            fresh = self._affirming_target(carried)
+            if fresh is not None:
+                self._forward = forward_authorisation(fresh)
+        if carried is None:
+            self._forward = None
         evidence = OwnershipEvidence(
             dispatch_active=bool(snapshot is not None and snapshot.dispatch_active),
             # A marker that does not exist is not a marker that is off: without it
@@ -5407,6 +5520,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             verify = None
         stage_b["write_boundary"] = {
             "refusal": refusal,
+            # **The physical controller, and the ring behind it.** Diagnostics
+            # are rarely captured at the moment production moved, so a download
+            # taken later has to be able to reconstruct the quarter rather than
+            # only describe the instant it was taken.
+            "controller": self._controller_block(setpoint, now),
+            "physical_decisions": list(self._physical_decisions),
             # **The two stages, published separately.** A reader has to be able
             # to see that the activation is not in the same stage as the claim,
             # because "activation last" and "activation only after the claim was
