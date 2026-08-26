@@ -9,10 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
-## [1.0.0-beta.24.1] - 2026-08-26
+## [1.0.0-beta.25] - 2026-08-26
 
 **A charge could be armed that Alpha EMS could provably never own, sustain or
 stop.** Ownership safety only; nothing else changed.
+
+This is the release planned as `beta.24.1`. It ships as `beta.25` because a
+four-part version is not a shape this project's version pattern accepts, and the
+pattern was not going to be widened to accommodate a name. The scope is exactly
+the hotfix scope: the previous execution architecture is deliberately untouched.
 
 ### Fixed
 
@@ -61,8 +66,10 @@ publishes.
 
 ### Testing
 
-3343 passed, 1 skipped. beta.24.1: 21. beta.24: 83. beta.23: 47. Mutation
-suites: 238, 0 survivors.
+3343 passed, 1 skipped. Ownership hotfix: 21. beta.24: 83. beta.23: 47.
+Mutation suites: 238, 0 survivors.
+
+None of it is hardware evidence.
 
 ### Known and outstanding
 
