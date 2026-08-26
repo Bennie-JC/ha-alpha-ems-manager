@@ -474,6 +474,18 @@ class Target:
     average_power_kw: float
     first_power_kw: float
     reserve_floor_kwh: float
+    #: The signed grid target for the current quarter, in kW. ``> 0`` intended net
+    #: import, ``< 0`` intended net export.
+    #:
+    #: **The beta.25 contract, and deliberately not merged with**
+    #: :attr:`grid_target_kwh`. That field is an export *energy*, published only
+    #: for a net-export intent so a consumer cannot mistake one boundary for the
+    #: other by reading whichever is non-zero. This one is a *rate*, published for
+    #: any intent, and the two are never defaulted from each other.
+    #:
+    #: ``None`` means Stage A published no meter target, and Stage B must then
+    #: physically control nothing rather than assume zero.
+    desired_grid_kw: float | None = None
     #: The charge-window balance. Absent for anything but a charge.
     expected_pv_production_kwh: float | None = None
     expected_house_load_kwh: float | None = None
@@ -571,6 +583,7 @@ def parse_target(raw: dict[str, Any]) -> Target | None:
         stale_after=instant_of(raw.get("stale_after")),
         battery_target_kwh=max(0.0, battery),
         grid_target_kwh=_finite(raw.get("grid_target_kwh")),
+        desired_grid_kw=_finite(raw.get("desired_grid_kw")),
         average_power_kw=mean_kw,
         # Falls back to the mean rather than to zero: a controller with no first
         # figure should start at the run's average, not refuse to start.
@@ -808,6 +821,7 @@ def target_as_published(target: Target) -> dict[str, Any]:
         "stale_after": moment(target.stale_after),
         "battery_target_kwh": target.battery_target_kwh,
         "grid_target_kwh": target.grid_target_kwh,
+        "desired_grid_kw": target.desired_grid_kw,
         "average_power_kw": target.average_power_kw,
         "first_power_kw": target.first_power_kw,
         "reserve_floor_kwh": target.reserve_floor_kwh,

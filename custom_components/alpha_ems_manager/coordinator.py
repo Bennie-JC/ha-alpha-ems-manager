@@ -170,6 +170,7 @@ from .economic import (
     build_horizon,
     build_outcome,
     build_physics_table,
+    desired_grid_kw_at,
     execution_revision,
     execution_target,
     fingerprint_settings,
@@ -3216,6 +3217,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return max(0.0, ceiling - end_energy), end_energy, absorbs_at
 
         targets: list[dict[str, Any]] = []
+        # Diagnostics only, and from a solve that already happened.
+        attribution = outcome.safety_buy_attribution
         for run in outcome.desired.runs:
             opens = moment(run.start_index)
             closes = moment(run.end_index + 1)
@@ -3244,6 +3247,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 required_headroom_kwh=headroom,
                 max_end_energy_kwh=max_end,
                 headroom_until=until,
+                # **The meter target for the quarter the window opens on**, read
+                # off the solved plan own per-interval grid energies. The run
+                # first interval, matching ``first_power_kw`` beside it: a run
+                # legitimately varies quarter to quarter, and Stage B freezes the
+                # figure for the quarter it is executing rather than averaging a
+                # run it has not reached the end of.
+                desired_grid_kw=desired_grid_kw_at(
+                    outcome.desired.intervals, run.start_index
+                ),
+                safety_buy_kwh=attribution.get(run.start_index, (None, None))[0],
+                economic_buy_kwh=attribution.get(run.start_index, (None, None))[1],
             )
             target["revision"] = execution_revision(
                 previous.get(target["plan_id"]), target

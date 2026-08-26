@@ -97,7 +97,7 @@ import json
 import math
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
@@ -1779,6 +1779,10 @@ class EconomicOutcome:
     #: one where alignment regressed a direction keeps the beta.16 bucket.
     bucket_rule: str = ECONOMIC_BUCKET_RULE_CONSTANT
     safety_buy_runs: tuple[int, ...] = ()
+    #: Per charge run, ``(safety_buy_kwh, economic_buy_kwh)``, keyed by start
+    #: index. Diagnostics only: nothing in :func:`solve` reads it, and it is
+    #: derived from a solve that already happened rather than a new one.
+    safety_buy_attribution: dict[int, tuple[float, float]] = field(default_factory=dict)
 
     # -- what the entity reads --------------------------------------------
 
@@ -2120,26 +2124,41 @@ def build_outcome(
         table_ms=table_ms,
         solve_ms=solve_ms,
         safety_buy_runs=_safety_buy_runs(desired, relaxed, table.bucket_kwh),
+        safety_buy_attribution=_safety_buy_attribution(desired, relaxed),
     )
 
 
-def _safety_buy_runs(
-    desired: EconomicPlan, relaxed: EconomicPlan, bucket_kwh: float
-) -> tuple[int, ...]:
-    """Return the start indices of charge runs that exist because of the reserve.
+def _safety_buy_attribution(
+    desired: EconomicPlan, relaxed: EconomicPlan
+) -> dict[int, tuple[float, float]]:
+    """Return, per charge run, how much of it the reserve is responsible for.
 
-    Attributed by comparison rather than by inspection of prices: a charge run is
-    reserve-driven when the same horizon, solved with the reserve relaxed to the
-    configured floor, charges materially less over the same intervals. That is a
-    statement about *why* the charge is there, which a price threshold could never
-    make -- a cheap interval and a reserve deadline often coincide.
+    Keyed by start index, valued ``(safety_buy_kwh, economic_buy_kwh)``.
+
+    Attributed by comparison rather than by inspection of prices: a charge is
+    reserve-driven to the extent that the same horizon, solved with the reserve
+    relaxed to the configured floor, charges *less* over the same intervals. That
+    is a statement about **why** the charge is there, which a price threshold
+    could never make -- a cheap interval and a reserve deadline often coincide.
+
+    **The relaxed solve already happens.** Until beta.25 the difference was
+    computed here, compared against one bucket, and then thrown away, so the split
+    a user actually wants needed no new solve and no change to the objective --
+    only that the figure be returned instead of a boolean.
+
+    **Documented limitation, not papered over.** The relaxed solve is free to move
+    economically desirable charging to *different* intervals, so these are
+    "reserve-attributable and economic energy **within this run window**", not a
+    globally exact decomposition. The diagnostics say so in the field own rule
+    string, because a figure that looks exact and is not is worse than one that
+    admits its boundary.
     """
     if not relaxed.available:
-        return ()
+        return {}
     relaxed_by_index = {
         entry.index: entry.battery_charge_ac_kwh for entry in relaxed.intervals
     }
-    found: list[int] = []
+    found: dict[int, tuple[float, float]] = {}
     for run in desired.runs:
         if run.action != ECONOMIC_ACTION_CHARGE:
             continue
@@ -2147,9 +2166,56 @@ def _safety_buy_runs(
             relaxed_by_index.get(index, 0.0)
             for index in range(run.start_index, run.end_index + 1)
         )
-        if run.battery_charge_ac_kwh - relaxed_charge > bucket_kwh:
-            found.append(run.start_index)
-    return tuple(found)
+        # Both clamped into the run own charge, so they always sum to it and
+        # neither can go negative when the relaxed solve buys *more* here.
+        economic = max(0.0, min(relaxed_charge, run.battery_charge_ac_kwh))
+        safety = max(0.0, run.battery_charge_ac_kwh - economic)
+        found[run.start_index] = (safety, economic)
+    return found
+
+
+def _safety_buy_runs(
+    desired: EconomicPlan, relaxed: EconomicPlan, bucket_kwh: float
+) -> tuple[int, ...]:
+    """Return the start indices of charge runs that exist because of the reserve.
+
+    Derived from :func:`_safety_buy_attribution` so the label and the published
+    figures can never disagree: a run is a safety buy exactly when the energy
+    attributed to the reserve exceeds one state-space bucket, which is the same
+    threshold beta.16 used and is unchanged.
+    """
+    attribution = _safety_buy_attribution(desired, relaxed)
+    return tuple(
+        index
+        for index, (safety, _economic) in sorted(attribution.items())
+        if safety > bucket_kwh
+    )
+
+
+def desired_grid_kw_at(
+    intervals: tuple[EconomicInterval, ...], index: int
+) -> float | None:
+    """Return the signed grid target for one interval, or ``None`` if absent.
+
+    ``> 0`` is intended net **import**, ``< 0`` intended net **export**, matching
+    the sign convention in :mod:`.dispatch`.
+
+    Read off the solved plan own per-interval grid energies -- which already exist
+    and are already what the cost was computed from -- and converted to a rate.
+    Never parsed out of a reason string, and never inferred from the action: an
+    action says which direction the *battery* moves, and this is a **meter**
+    quantity.
+
+    A quarter average of a forecast, and it has to be: Stage A solves in quarter
+    energies. Stage B holds it fixed for the quarter and follows it with live
+    measurements, which is exactly the point -- the average is the *money* the plan
+    authorised, and the instantaneous setpoint is how that money is spent as
+    production and load move.
+    """
+    for entry in intervals:
+        if entry.index == index:
+            return (entry.grid_import_kwh - entry.grid_export_kwh) / INTERVAL_HOURS
+    return None
 
 
 # -- reporting ---------------------------------------------------------------
@@ -2424,6 +2490,9 @@ def execution_target(
     required_headroom_kwh: float | None = None,
     max_end_energy_kwh: float | None = None,
     headroom_until: datetime | None = None,
+    desired_grid_kw: float | None = None,
+    safety_buy_kwh: float | None = None,
+    economic_buy_kwh: float | None = None,
 ) -> dict[str, Any]:
     """Return the machine-readable target a future Stage B would consume.
 
@@ -2492,6 +2561,24 @@ def execution_target(
             _round_kwh(run.grid_export_kwh)
             if intent == EXECUTION_INTENT_NET_EXPORT
             else None
+        ),
+        # **The signed grid target for the current quarter, and the beta.25
+        # contract.** A *rate*, not an energy, and deliberately a separate field
+        # from ``grid_target_kwh`` above -- that one is an export energy, present
+        # only for a net-export intent, and merging the two is exactly the
+        # confusion its own comment guards against. Positive is intended import,
+        # negative intended export.
+        "desired_grid_kw": _round_kw(desired_grid_kw),
+        # What the reserve is responsible for, and what it is not. Both within
+        # this run window; see ``_safety_buy_attribution`` for why that boundary
+        # is stated rather than glossed.
+        "safety_buy_kwh": _round_kwh(safety_buy_kwh),
+        "economic_buy_kwh": _round_kwh(economic_buy_kwh),
+        "buy_attribution_rule": (
+            "reserve-attributable and economic energy within this run window, "
+            "from the reserve-relaxed counterfactual the plan already solves. "
+            "not a globally exact decomposition: the relaxed solve may move "
+            "economic charging to other quarters"
         ),
         # The run mean. Named "initial" since beta.14 and never was; kept
         # unchanged for compatibility, with the honest figure beside it.
