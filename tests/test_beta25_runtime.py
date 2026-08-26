@@ -211,6 +211,44 @@ async def test_a_skipped_tick_is_not_queued(
     assert live_surface.calls == []
 
 
+async def test_the_quarter_sequence_holds_the_lock_against_a_tick(
+    hass: HomeAssistant,
+    config_data: dict,
+    source_entities: None,
+    frank,
+    live_surface: LiveSurface,
+    monkeypatch,
+) -> None:
+    """**Both write paths are inside the lock, not just the tick.**
+
+    Found by reviewing the finished code rather than by a failing test: the
+    sixty-second tick took the lock from the start, and the quarter-boundary
+    sequence did not. That is the interleaving that matters most -- mode, power,
+    cutoff and duration must all be settled before the enable, so a correction
+    landing in the middle of an arm would arm a dispatch against half-written
+    values.
+
+    Asserted by observing the lock from inside the sequence: if the quarter path
+    did not hold it, a tick firing at that moment would be free to write.
+    """
+    from custom_components.alpha_ems_manager import coordinator as module
+
+    coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
+    seen: list[bool] = []
+    original = module.async_execute
+
+    async def watched(hass_arg, steps):
+        # Sampled at the moment of every send, in every sequence.
+        seen.append(coordinator._execution_lock.locked())
+        return await original(hass_arg, steps)
+
+    monkeypatch.setattr(module, "async_execute", watched)
+    await step_once(hass, coordinator, live_surface, hour=10, minute=46)
+
+    assert seen, "the quarter refresh should have sent something"
+    assert all(seen), "every send must happen with the lock held"
+
+
 async def test_the_lock_is_released_when_a_sequence_raises(
     hass: HomeAssistant,
     config_data: dict,

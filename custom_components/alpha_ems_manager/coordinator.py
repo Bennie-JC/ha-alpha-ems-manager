@@ -5061,11 +5061,26 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         verify = self._pending_verify
         landed = True
         try:  # pragma: no cover - the barrier makes this unreachable
-            if stage_one:
-                await async_execute(self.hass, stage_one)
-                landed = verify is None or self._staged_write_landed(verify)
-            if landed and stage_two:
-                await async_execute(self.hass, stage_two)
+            # **The quarter-boundary sequence takes the lock too.**
+            #
+            # It is the *other* write path, and the one whose interleaving would
+            # be worst: mode, power, cutoff and duration must all be settled
+            # before the enable, so a sixty-second correction landing in the
+            # middle would arm a dispatch against half-written values. Held
+            # across the readback as well, because a verification that runs after
+            # the lock is released is reading a world another sequence may
+            # already have moved.
+            #
+            # No re-entry: this path is reached from the refresh, which never
+            # holds the lock, and the tick's own sequences use
+            # ``_async_send_locked`` inside their held section rather than
+            # re-acquiring it here.
+            async with self._execution_lock:
+                if stage_one:
+                    await async_execute(self.hass, stage_one)
+                    landed = verify is None or self._staged_write_landed(verify)
+                if landed and stage_two:
+                    await async_execute(self.hass, stage_two)
         except ControlExecutionUnavailable:
             # The expected outcome while the barrier stands, and recorded rather
             # than swallowed: a release that believes it sent something is worse
