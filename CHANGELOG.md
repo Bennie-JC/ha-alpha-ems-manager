@@ -12,14 +12,22 @@ Nothing yet.
 ## [1.0.0-beta.25] - 2026-08-26
 
 **Two stages in one version.** The ownership hotfix planned as beta.24.1 and the
-first half of the Dispatch-surface rewrite. `beta.24.1` is not a shape this
-project's version pattern accepts, so both ship under one number; they are
-separate commits.
+complete Dispatch-surface rewrite. `beta.24.1` is not a shape this project's
+version pattern accepts, so both ship under one number -- and the hotfix is a
+distinct commit (`e1b4d18`) so it can be reviewed, tested and if necessary
+released on its own.
 
-**The Live execution path is unchanged.** Everything beta.25 adds is built,
-gated and tested, and nothing drives an actuator yet: the Live charge still runs
-through the Force Charging helper family exactly as it did in beta.24. See
-*Known and outstanding* -- this is deliberately stated rather than implied.
+**The Live actuator family has changed, and the cutover is atomic.** A Live
+charge now executes on the real Hillview Dispatch surface in mode 2 with a
+negative power. Arm, sustain, stop and the new sixty-second correction all moved
+together: there is no state in which a start uses one surface and a stop the
+other, because that state cannot be reasoned about.
+
+The Force Charging and Force Discharging helpers are still *read* -- they are two
+of the six conflicting families the vendor automation would silently switch off --
+and the reserve-guard discharge is still *planned* for shadow reporting. Neither
+is a Live path: no release executes a discharge, and it stays refused at both
+boundaries.
 
 ### Fixed -- ownership safety
 
@@ -114,6 +122,40 @@ through the Force Charging helper family exactly as it did in beta.24. See
   with the figures: quantities within this run window, not a globally exact
   decomposition, because the relaxed solve may move economic charging elsewhere.
 
+### Added -- the runtime
+
+- **A sixty-second physical controller on the existing safety cadence.** No new
+  timer and no faster loop. It reads the frozen `desired_grid_kw` for the quarter
+  it is in and moves the setpoint toward it; it never re-runs prices, admits a
+  run, re-ranks a window or re-arms the dead-man. Every refusal is recorded, since
+  a controller that did nothing and said nothing is indistinguishable from one
+  that is not running.
+
+- **One execution lock over every actuator sequence** -- start, live update,
+  emergency self-stop, normal stop and the quarter-boundary writes. Until now
+  there was a single write path so nothing needed serialising; a Home Assistant
+  timer callback is not serialised against a coordinator refresh, and without the
+  lock a correction could land between the mode and the enable and arm a dispatch
+  against half-written values. The tick acquires non-blocking and **skips rather
+  than queues**: a correction computed while a sequence was running describes a
+  world that no longer exists by the time the lock frees.
+
+- **Ownership gained a `degraded` state, and it is never called owned.** Marker
+  off still means not owned. What the state adds is that causation may still be
+  provable, which authorises exactly one write -- `Dispatch enable -> OFF` --
+  through a fourth entitlement of its own. `authorize_reset` requires the
+  ownership this state has lost, and the start question would refuse for the wrong
+  reason.
+
+- **Two fragilities the migration exposed, both real.** The causal record was
+  rewritten on every non-stopping refresh, which cleared its `dispatch_start`
+  stamp each time; that was survivable only because the old sustain re-issued the
+  activation boolean, so the device restamped its own start instant to match.
+  beta.25's sustain deliberately leaves the enable alone, so without the fix
+  ownership fell to `unproven` on the second refresh and a charge became
+  unstoppable while still running. And the dead-man observation was keyed on
+  activation for the same reason, so it was taken once at the arm and never again.
+
 ### Added -- three safety layers
 
 - **Control-grade sensor coherence**, on its own threshold.
@@ -144,6 +186,13 @@ through the Force Charging helper family exactly as it did in beta.24. See
   6.0 kWh run to about 4.5. Strictly subtractive -- carry-forward can reduce a run
   or leave it alone, never grow one.
 
+### Testing
+
+3533 passed, 1 skipped. beta.25: 184. beta.24.1: 21. beta.24: 83. beta.23: 47.
+Stage-B gate family: 200. Mutation suites: 238, 0 survivors.
+
+None of it is hardware evidence. See *Known and outstanding*.
+
 ### Preserved
 
 Stage-A economics are **unchanged**, and that is a finding rather than an
@@ -162,11 +211,10 @@ charge-only interlock, G.1/G.2 sustain, headroom, the grid budget, Activity,
 
 ### Known and outstanding
 
-- **The beta.25 integration layer is not implemented.** The sixty-second physical
-  controller, the shared execution lock, the ownership `degraded` state machine,
-  the coherence and downward-revision wiring, and the flight-recorder ring are all
-  absent, and the Live charge path still uses the Force Charging helper family.
-  Every layer above is pure, gated and tested; none of it drives hardware.
+- **Not one line of this is hardware-proven.** Every claim above is from the
+  automated suite. The staged hardware validation in the release notes exists
+  because a controller that writes every sixty seconds has more ways to be wrong
+  on a real inverter than a controller that wrote once a quarter.
 - **Not hardware-proven.** The ownership fix should be validated first, and the
   first thing to confirm is that the capability refuses while the helper is
   absent.
