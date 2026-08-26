@@ -23,6 +23,7 @@ from custom_components.alpha_ems_manager import alphaess_adapter
 from custom_components.alpha_ems_manager.alphaess_device import (
     BOOLEAN_EXECUTION_OWNER,
     CHARGE_FAMILY,
+    DISPATCH_ENABLE,
     plan_arm_parameters,
     plan_marker_claim,
     plan_reset_cleanup,
@@ -90,7 +91,7 @@ async def test_m1_a_missing_marker_is_still_caught_without_the_capability_check(
 
     written = sent_entities(deaf_surface)
     assert set(written) <= {BOOLEAN_EXECUTION_OWNER}, written
-    assert hass.states.get(CHARGE_FAMILY.activate).state == "off"
+    assert hass.states.get(DISPATCH_ENABLE).state == "off"
     assert coordinator.store.execution_record is None
 
 
@@ -121,7 +122,7 @@ async def test_m2_disabling_the_readback_check_is_what_lets_the_activation_throu
     await drive_live_charge(hass, config_data, frank, deaf_surface, quarters=4)
 
     written = sent_entities(deaf_surface)
-    assert CHARGE_FAMILY.activate in written, written
+    assert DISPATCH_ENABLE in written, written
 
 
 # -- M3: the evidence is dropped on an unverified stop -----------------------
@@ -147,7 +148,7 @@ async def test_m3_an_unverified_stop_does_not_clear_the_record(
 
     type(coordinator)._clear_execution_record = watched
     try:
-        deaf_surface.deaf.add(CHARGE_FAMILY.activate)
+        deaf_surface.deaf.add(DISPATCH_ENABLE)
         await set_mode(hass, CONTROL_MODE_SHADOW)
         await step_once(hass, coordinator, deaf_surface)
     finally:
@@ -174,7 +175,7 @@ async def test_m3_clearing_it_would_strand_the_run(
     from .test_control_modes import set_mode
 
     coordinator = await owned_live_charge(hass, config_data, frank, deaf_surface)
-    deaf_surface.deaf.add(CHARGE_FAMILY.activate)
+    deaf_surface.deaf.add(DISPATCH_ENABLE)
     await set_mode(hass, CONTROL_MODE_SHADOW)
     await step_once(hass, coordinator, deaf_surface)
 

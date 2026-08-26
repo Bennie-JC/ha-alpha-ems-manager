@@ -27,6 +27,13 @@ from custom_components.alpha_ems_manager.alphaess_device import (
     BOOLEAN_EXECUTION_OWNER,
     CHARGE_FAMILY,
     DISCHARGE_FAMILY,
+    DISPATCH_CUTOFF_SOC,
+    DISPATCH_DURATION,
+    DISPATCH_ENABLE,
+    DISPATCH_MODE_LABELS,
+    DISPATCH_MODE_SELECT,
+    DISPATCH_POWER,
+    DISPATCH_PV_SWITCH,
     PERMITTED_SERVICES,
 )
 from custom_components.alpha_ems_manager.const import (
@@ -90,27 +97,42 @@ async def test_the_stage_b_charge_command_forms_completely_and_is_refused(
         record = boundary(block)
         # 1. the intent is a charge, and Stage B is where it came from.
         assert record["action"] == ACTION_CHARGE
-        # 2. it resolved to the charge family, by family and not by a sign.
+        # 2. it resolved to the charge family, which is still how the *action*
+        #    is named -- the Dispatch surface is how it is executed.
         assert record["family"] == CHARGE_FAMILY.activate
         steps = record["steps"]
-        # 3. a complete ordered command: marker first, activation last.
-        assert len(steps) == 6, steps
+        # 3. a complete ordered command: marker first, enable last. Seven steps
+        #    since beta.25, because the Dispatch arm also selects a mode and
+        #    asserts the photovoltaic switch.
+        assert len(steps) == 7, steps
         assert steps[0]["entity_id"] == BOOLEAN_EXECUTION_OWNER
-        assert steps[-1]["entity_id"] == CHARGE_FAMILY.activate
+        assert steps[-1]["entity_id"] == DISPATCH_ENABLE
         entities = {step["entity_id"] for step in steps}
-        # 4. no entity of the opposite family anywhere in it.
+        # 4. no entity of the opposite family anywhere in it -- and no helper
+        #    family at all, since Dispatch is the one Live actuator.
         assert not entities & set(DISCHARGE_FAMILY.entities)
-        # 5. a positive unsigned magnitude the register can hold.
+        assert not entities & set(CHARGE_FAMILY.entities)
+        # 5. **the mode is selected by its exact package label**, because the
+        #    package parses the number out of the string.
+        modes = [
+            step["option"]
+            for step in steps
+            if step["entity_id"] == DISPATCH_MODE_SELECT
+        ]
+        assert modes == [DISPATCH_MODE_LABELS[2]], modes
+        # 6. **a signed magnitude, and it is negative.** The opposite convention
+        #    from the helper families, which take an unsigned magnitude and carry
+        #    direction in which family was written. A charge on this surface is a
+        #    negative number, and a positive one is refused at the send site.
         powers = [
-            step["value"] for step in steps if step["entity_id"] == CHARGE_FAMILY.power
+            step["value"] for step in steps if step["entity_id"] == DISPATCH_POWER
         ]
         assert len(powers) == 1
-        assert CONTROL_MIN_POWER_KW <= powers[0] <= CONTROL_MAX_POWER_KW
+        assert powers[0] < 0.0, powers
+        assert CONTROL_MIN_POWER_KW <= -powers[0] <= CONTROL_MAX_POWER_KW
         # 6. a cutoff that is an *upper* bound, not the discharge floor.
         cutoffs = [
-            step["value"]
-            for step in steps
-            if step["entity_id"] == CHARGE_FAMILY.cutoff_soc
+            step["value"] for step in steps if step["entity_id"] == DISPATCH_CUTOFF_SOC
         ]
         assert len(cutoffs) == 1
         assert cutoffs[0] == CONTROL_CUTOFF_MAX_PERCENT
@@ -155,19 +177,28 @@ async def test_the_completed_charge_command_reaches_the_wire_in_order(
     await sweep(coordinator, CAMPAIGN[:2])
 
     commands = coordinator._pending_commands
-    assert len(commands) == 6
-    assert commands[-1].entity_id == CHARGE_FAMILY.activate
+    assert len(commands) == 7
+    assert commands[-1].entity_id == DISPATCH_ENABLE
 
     sent = await async_execute(hass, commands)
 
-    assert sent == 6
+    assert sent == 7
     assert [call.data["entity_id"] for call in writes] == [
+        # The claim first, so an interruption leaves a clearable stale marker
+        # rather than an unattributable dispatch.
         BOOLEAN_EXECUTION_OWNER,
-        CHARGE_FAMILY.power,
-        CHARGE_FAMILY.cutoff_soc,
-        CHARGE_FAMILY.duration,
-        CHARGE_FAMILY.hold,
-        CHARGE_FAMILY.activate,
+        # The mode before the power, because the power register is only honoured
+        # in some modes -- writing a rate into an undecided mode commands nothing.
+        DISPATCH_MODE_SELECT,
+        DISPATCH_POWER,
+        DISPATCH_CUTOFF_SOC,
+        DISPATCH_DURATION,
+        # The photovoltaic switch asserted to its fail-safe on, in case a previous
+        # run of ours left it off.
+        DISPATCH_PV_SWITCH,
+        # **The enable last**, because it is edge-triggered: it is what makes the
+        # settled values take effect.
+        DISPATCH_ENABLE,
     ]
     # Nothing from the other direction, and nothing from the raw surface.
     assert not [
@@ -227,10 +258,22 @@ async def test_only_the_permitted_services_can_appear_in_a_command(
             domain, service = step["service"].split(".")
             assert (domain, service) in PERMITTED_SERVICES
             assert "timer" not in step["entity_id"]
-            # The raw dispatch surface takes signed power with the opposite
-            # convention. It is never a write target.
+            # **The read-only dispatch sensors are never a write target**, and
+            # that is unchanged: ``sensor.alphaess_dispatch_*`` is the device's own
+            # readback. The *writable* Dispatch helpers are a different surface.
+            assert "sensor." not in step["entity_id"]
             assert "dispatch_active_power" not in step["entity_id"]
-            assert step.get("value") is None or step["value"] >= 0.0
+            # **The sign rule is per surface, not global.** Helper families take an
+            # unsigned magnitude; the Dispatch power is signed and a charge is
+            # negative. Asserting one rule across both is what would let a charge
+            # be commanded as a discharge.
+            value = step.get("value")
+            if value is None:
+                continue
+            if step["entity_id"] == DISPATCH_POWER:
+                assert value <= 0.0, step
+            else:
+                assert value >= 0.0, step
 
 
 # ===========================================================================

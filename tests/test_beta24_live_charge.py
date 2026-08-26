@@ -1770,9 +1770,7 @@ async def test_a_deadman_that_did_not_advance_stops_the_charge(
     )
     # No deactivate-and-reactivate anywhere: the run ends, it is not cycled.
     enables = [
-        call
-        for call in live_surface.calls
-        if call.data["entity_id"] == DISPATCH_ENABLE
+        call for call in live_surface.calls if call.data["entity_id"] == DISPATCH_ENABLE
     ]
     assert [call.service for call in enables] == ["turn_off"]
 

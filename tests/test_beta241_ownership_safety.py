@@ -39,6 +39,7 @@ from custom_components.alpha_ems_manager.alphaess_adapter import (
 from custom_components.alpha_ems_manager.alphaess_device import (
     BOOLEAN_EXECUTION_OWNER,
     CHARGE_FAMILY,
+    DISPATCH_ENABLE,
     REQUIRED_ENTITIES,
     plan_arm_parameters,
     plan_commands,
@@ -53,8 +54,8 @@ from custom_components.alpha_ems_manager.const import (
     CONTROL_REFUSE_MARKER_NOT_VERIFIED,
     CONTROL_REFUSE_STOP_NOT_VERIFIED,
     EXECUTION_STOP_SWITCHED_TO_SHADOW,
+    EXECUTION_VERIFY_DISPATCH_INACTIVE,
     EXECUTION_VERIFY_MARKER_ON,
-    EXECUTION_VERIFY_NO_FAMILY_ACTIVE,
     INHIBIT_MISSING_CONTROL_ENTITY,
     MARKER_ABSENT,
     MARKER_OFF,
@@ -252,7 +253,7 @@ async def test_a_missing_marker_refuses_live_and_writes_nothing(
     )
 
     assert live_surface.calls == []
-    assert hass.states.get(CHARGE_FAMILY.activate).state == "off"
+    assert hass.states.get(DISPATCH_ENABLE).state == "off"
     assert coordinator.store.execution_record is None
     assert all(row["authorized"] is not True for row in trace), trace
 
@@ -279,7 +280,7 @@ async def test_an_unavailable_marker_refuses_live_and_writes_nothing(
     )
 
     assert live_surface.calls == []
-    assert hass.states.get(CHARGE_FAMILY.activate).state == "off"
+    assert hass.states.get(DISPATCH_ENABLE).state == "off"
     assert coordinator.store.execution_record is None
     assert all(row["authorized"] is not True for row in trace), trace
 
@@ -317,7 +318,7 @@ async def test_an_unverified_claim_never_reaches_the_activation(
     written = sent_entities(deaf_surface)
     assert written, "stage one should have been attempted"
     assert set(written) == {BOOLEAN_EXECUTION_OWNER}, written
-    assert hass.states.get(CHARGE_FAMILY.activate).state == "off"
+    assert hass.states.get(DISPATCH_ENABLE).state == "off"
     assert coordinator.store.execution_record is None
 
     execution = (coordinator.control_report or {}).get("execution") or {}
@@ -374,13 +375,13 @@ async def test_an_unverified_stop_withholds_cleanup_and_keeps_the_evidence(
     from .test_control_modes import set_mode
 
     coordinator = await owned_live_charge(hass, config_data, frank, deaf_surface)
-    deaf_surface.deaf.add(CHARGE_FAMILY.activate)
+    deaf_surface.deaf.add(DISPATCH_ENABLE)
 
     await set_mode(hass, CONTROL_MODE_SHADOW)
     report = await step_once(hass, coordinator, deaf_surface)
 
     written = sent_entities(deaf_surface)
-    assert written == [CHARGE_FAMILY.activate], written
+    assert written == [DISPATCH_ENABLE], written
     assert hass.states.get(BOOLEAN_EXECUTION_OWNER).state == "on"
     assert coordinator.store.execution_record is not None
 
@@ -405,7 +406,7 @@ async def test_a_verified_stop_completes_and_releases_the_marker_last(
     from .test_control_modes import set_mode
 
     coordinator = await owned_live_charge(hass, config_data, frank, deaf_surface)
-    deaf_surface.deaf.add(CHARGE_FAMILY.activate)
+    deaf_surface.deaf.add(DISPATCH_ENABLE)
     await set_mode(hass, CONTROL_MODE_SHADOW)
     await step_once(hass, coordinator, deaf_surface)
     assert coordinator.store.execution_record is not None
@@ -416,15 +417,17 @@ async def test_a_verified_stop_completes_and_releases_the_marker_last(
     report = await step_once(hass, coordinator, deaf_surface, hour=11, minute=0)
 
     written = sent_entities(deaf_surface)
-    assert written[0] == CHARGE_FAMILY.activate, written
+    assert written[0] == DISPATCH_ENABLE, written
     assert written[-1] == BOOLEAN_EXECUTION_OWNER, written
-    assert hass.states.get(CHARGE_FAMILY.activate).state == "off"
+    assert hass.states.get(DISPATCH_ENABLE).state == "off"
     assert hass.states.get(BOOLEAN_EXECUTION_OWNER).state == "off"
     assert coordinator.store.execution_record is None
 
     execution = report.get("execution") or {}
     boundary = execution.get("write_boundary") or {}
-    assert boundary.get("stage_verification") == EXECUTION_VERIFY_NO_FAMILY_ACTIVE
+    # **The Dispatch enable, not the helper families.** The check follows the
+    # surface being stopped, and beta.25 stops Dispatch.
+    assert boundary.get("stage_verification") == EXECUTION_VERIFY_DISPATCH_INACTIVE
     assert (execution.get("result") or {}).get(
         "stop_reason"
     ) == EXECUTION_STOP_SWITCHED_TO_SHADOW
