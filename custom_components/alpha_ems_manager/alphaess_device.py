@@ -108,10 +108,132 @@ AUTOMATION_HOLD_MONITOR = "automation.alphaess_cutoff_soc_hold_monitoring"
 #: anything that starts deriving ownership from parameters again.
 OWNERSHIP_PROVABLE: bool = False
 
-#: Features of the control surface that drive the battery on their own. If either
-#: is on, Alpha EMS stands down rather than switching it off.
+#: Features of the control surface that drive the battery on their own. If any of
+#: them is on, Alpha EMS stands down rather than switching it off.
+#:
+#: **All six, since beta.25.** The repository modelled four; the package source
+#: shows ``AlphaESS Dispatch`` turns off six families before arming and cancels
+#: their timers. Two of them -- force import and force export -- were missing, and
+#: a feature Alpha EMS does not know about is a feature it would have silently
+#: destroyed by arming over it.
 BOOLEAN_EXCESS_EXPORT = "input_boolean.alphaess_helper_excess_export"
 BOOLEAN_PEAK_SHAVING = "input_boolean.alphaess_helper_peak_shaving"
+BOOLEAN_FORCE_IMPORT = "input_boolean.alphaess_helper_force_import"
+BOOLEAN_FORCE_EXPORT = "input_boolean.alphaess_helper_force_export"
+
+#: The exact six the vendor automation disables, with the activation boolean each
+#: one is recognised by. Ordered so diagnostics name them consistently.
+#:
+#: The charge and discharge families appear here as well as in :data:`FAMILIES`:
+#: they are conflicts when somebody *else* turned them on, and ours when the
+#: causal record says so. The distinction is ownership, never the entity.
+CONFLICTING_FAMILIES: tuple[tuple[str, str], ...] = (
+    ("force_charging", "input_boolean.alphaess_helper_force_charging"),
+    ("force_discharging", "input_boolean.alphaess_helper_force_discharging"),
+    ("force_import", BOOLEAN_FORCE_IMPORT),
+    ("force_export", BOOLEAN_FORCE_EXPORT),
+    ("excess_export", BOOLEAN_EXCESS_EXPORT),
+    ("peak_shaving", BOOLEAN_PEAK_SHAVING),
+)
+
+#: The hold and pause companions the package cancels alongside each family.
+#: Read for diagnosis only: a companion on with its family off is not a conflict,
+#: because nothing is driving the battery.
+CONFLICTING_COMPANIONS: tuple[str, ...] = (
+    "input_boolean.alphaess_helper_force_charging_hold",
+    "input_boolean.alphaess_helper_force_discharging_hold",
+    "input_boolean.alphaess_helper_excess_export_pause",
+    "input_boolean.alphaess_helper_peak_shaving_pause",
+)
+
+# --- the writable Dispatch surface -------------------------------------------
+#
+# **Read from the published Hillview package, not guessed.** Every entity below
+# appears in ``integration_alpha_ess.yaml``; the register each one drives is noted
+# because the encoding is what constrains the design rather than decorating it.
+#
+# The ``sensor.alphaess_dispatch_*`` entities are the device own readback and are
+# **read-only** -- writing one is refused at the send site as a raw-dispatch write,
+# and has been since Phase 4.
+
+#: Arms the dispatch. Edge-triggered: ``on`` arms, and ``off`` triggers the
+#: package own ``AlphaESS Dispatch Reset``, which writes Dispatch Start = 0. So no
+#: reset button is needed and none is added.
+DISPATCH_ENABLE = "input_boolean.alphaess_helper_dispatch"
+
+#: The mode. An ``input_select`` whose *label* the package parses the number out
+#: of, so the exact strings are load-bearing.
+DISPATCH_MODE_SELECT = "input_select.alphaess_helper_dispatch_mode"
+
+#: Signed power, -20..20 kW in steps of 0.1. Register ``0x0881 = 32000 + watts``.
+#:
+#: **Negative charges and positive discharges**, which is the opposite convention
+#: from the helper families: those take a positive magnitude and carry direction in
+#: which family was written. The two surfaces must never share a sign rule.
+#:
+#: Honoured in modes 1, 2, 3 and 5 only. In any other mode the package writes the
+#: register as a bare ``32000``, which is zero watts -- so a mode outside that set
+#: is not a controllable kW primitive at all.
+DISPATCH_POWER = "input_number.alphaess_helper_dispatch_power"
+
+#: Cutoff state of charge, 4..100 percent in steps of 1. Register
+#: ``0x0886 = percent / 0.392``. Live in **mode 2 only**.
+DISPATCH_CUTOFF_SOC = "input_number.alphaess_helper_dispatch_cutoff_soc"
+
+#: Duration in minutes, 0..480 in steps of **5**. Register
+#: ``0x0887 = minutes * 60``.
+#:
+#: Writing it while the dispatch is on rewrites the register *and* performs
+#: ``timer.cancel`` + ``timer.start`` -- so the dead-man is re-armable live with no
+#: enable toggle. But the automation triggers on a **state change**, so writing the
+#: same value fires nothing. See :data:`DISPATCH_DEADMAN_MINUTES`.
+DISPATCH_DURATION = "input_number.alphaess_helper_dispatch_duration"
+
+#: Whether photovoltaic production is enabled during the dispatch. The package
+#: ships it **on**, and on is the fail-safe state.
+DISPATCH_PV_SWITCH = "input_boolean.alphaess_helper_dispatch_pv_switch"
+
+#: The dead-man, readable. ``finishes_at`` is compared across refreshes so a
+#: re-arm is measured rather than assumed.
+DISPATCH_TIMER = "timer.alphaess_helper_dispatch_timer"
+
+#: Every writable Dispatch entity, for the send-site subset test.
+DISPATCH_ENTITIES: tuple[str, ...] = (
+    DISPATCH_ENABLE,
+    DISPATCH_MODE_SELECT,
+    DISPATCH_POWER,
+    DISPATCH_CUTOFF_SOC,
+    DISPATCH_DURATION,
+    DISPATCH_PV_SWITCH,
+)
+
+#: The mode labels, exactly as the package spells them.
+#:
+#: The number is parsed out of the label, so a label that is merely *close*
+#: selects a different mode or none at all. They are written here once and never
+#: rebuilt from the number.
+DISPATCH_MODE_LABELS: dict[int, str] = {
+    2: "State of Charge Control (2)",
+    6: "Optimise Consumption (6)",
+    7: "Maximise Consumption (7)",
+}
+
+#: The one mode beta.25 may select in Live, and the only one that takes both a
+#: signed power and a live cutoff.
+DISPATCH_MODE_SOC_CONTROL: int = 2
+
+#: The dead-man, and the alternation that makes it re-armable.
+#:
+#: **The alternation is a workaround for a state-change trigger, not a policy.**
+#: The vendor automation fires on the ``input_number`` changing state, so writing
+#: the same duration twice re-arms nothing and the run would expire silently.
+#: There is no cleaner path: the package exposes no ``script:`` section and no
+#: service or event that re-triggers the duration automation.
+#:
+#: Both values sit on the helper 5-minute step. The semantic dead-man remains
+#: approximately twenty minutes; the twenty-five is not a longer run, not more
+#: energy and not a different horizon.
+DISPATCH_DEADMAN_MINUTES: tuple[int, int] = (20, 25)
 
 #: The owner marker. Not an AlphaESS helper, and that is the whole point.
 #:
@@ -556,13 +678,18 @@ def limit_command(command: DeviceCommand, max_power_kw: float) -> DeviceCommand:
 # --- the command list ---------------------------------------------------------
 
 SERVICE_SET_VALUE = ("input_number", "set_value")
+#: The one service beta.25 adds, and it is added because the mode is an
+#: ``input_select`` whose label the package parses. Nothing else needs it.
+#: ``input_button.press`` is deliberately **not** added: turning the enable
+#: boolean off already triggers the package reset.
+SERVICE_SELECT_OPTION = ("input_select", "select_option")
 SERVICE_TURN_ON = ("input_boolean", "turn_on")
 SERVICE_TURN_OFF = ("input_boolean", "turn_off")
 
 #: Every service this integration is permitted to call, as a closed set. A
 #: structural test compares the real calls in the package against exactly this.
 PERMITTED_SERVICES: frozenset[tuple[str, str]] = frozenset(
-    {SERVICE_SET_VALUE, SERVICE_TURN_ON, SERVICE_TURN_OFF}
+    {SERVICE_SET_VALUE, SERVICE_TURN_ON, SERVICE_TURN_OFF, SERVICE_SELECT_OPTION}
 )
 
 

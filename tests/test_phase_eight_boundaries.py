@@ -168,15 +168,23 @@ def test_no_phase_eight_module_names_a_grid_rate_actuator(actuator: str) -> None
         assert actuator not in module_source(name), (name, actuator)
 
 
-def test_the_permitted_service_set_did_not_grow() -> None:
-    """Three services, unchanged by this phase."""
-    assert len(PERMITTED_SERVICES) == 3
+def test_the_permitted_service_set_is_exactly_these_four() -> None:
+    """The closed set, named member by member rather than counted.
+
+    Three until beta.25, which adds ``input_select.select_option`` and nothing
+    else: the dispatch mode is an ``input_select`` whose label the vendor package
+    parses the mode number out of. Deliberately not ``input_button.press`` --
+    turning the enable boolean off already triggers the package own reset, so a
+    button would widen the surface and buy nothing.
+    """
+    assert len(PERMITTED_SERVICES) == 4
     assert (
         frozenset(
             {
                 ("input_number", "set_value"),
                 ("input_boolean", "turn_on"),
                 ("input_boolean", "turn_off"),
+                ("input_select", "select_option"),
             }
         )
         == PERMITTED_SERVICES
@@ -477,7 +485,7 @@ def economic_service_calls(hass) -> list:
 
     for domain, service in PERMITTED_SERVICES:
         hass.services.async_register(domain, service, record)
-    assert len(set(PERMITTED_SERVICES)) == 3
+    assert len(set(PERMITTED_SERVICES)) == 4
     return calls
 
 

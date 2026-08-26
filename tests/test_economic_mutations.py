@@ -1330,7 +1330,7 @@ def test_the_structural_contracts_are_unchanged_by_beta16() -> None:
 
     assert len(CONTRACT) == 13
     assert_charge_only_capability()
-    assert len(PERMITTED_SERVICES) == 3
+    assert len(PERMITTED_SERVICES) == 4
     assert set(FAMILIES) == {ACTION_DISCHARGE, ACTION_CHARGE}
     for forbidden in ("force_export", "force_import", "pv_switch"):
         assert forbidden not in str(sorted(FAMILIES))

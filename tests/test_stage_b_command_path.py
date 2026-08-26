@@ -206,7 +206,7 @@ async def test_the_same_step_list_for_a_discharge_is_refused_as_one_unit(
     }
 
 
-async def test_only_the_three_permitted_services_can_appear_in_a_command(
+async def test_only_the_permitted_services_can_appear_in_a_command(
     hass: HomeAssistant,
     setup_integration: MockConfigEntry,
     frank,
@@ -221,7 +221,7 @@ async def test_only_the_three_permitted_services_can_appear_in_a_command(
     coordinator = await prepared(hass, setup_integration, frank, CONTROL_MODE_ACTIVE)
     blocks = await sweep(coordinator, CAMPAIGN)
 
-    assert len(set(PERMITTED_SERVICES)) == 3
+    assert len(set(PERMITTED_SERVICES)) == 4
     for block in blocks:
         for step in boundary(block).get("steps") or []:
             domain, service = step["service"].split(".")

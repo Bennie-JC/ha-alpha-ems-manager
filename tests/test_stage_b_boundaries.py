@@ -349,7 +349,7 @@ def test_only_a_grid_charge_is_executable_in_this_release() -> None:
 
 def test_the_permitted_service_set_did_not_grow() -> None:
     """The owner marker costs nothing: ``turn_on``/``turn_off`` were already in."""
-    assert len(PERMITTED_SERVICES) == 3
+    assert len(PERMITTED_SERVICES) == 4
     assert ("input_boolean", "turn_on") in PERMITTED_SERVICES
     assert ("input_boolean", "turn_off") in PERMITTED_SERVICES
 

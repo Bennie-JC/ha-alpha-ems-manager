@@ -316,9 +316,63 @@ def test_no_flash_backed_helper_is_ever_named(helper: str) -> None:
 
 
 @pytest.mark.parametrize("actuator", GRID_RATE_ACTUATORS)
-def test_no_grid_rate_actuator_is_ever_named(actuator: str) -> None:
-    """A battery decision is never expressed as a grid-rate command."""
+def test_no_grid_rate_actuator_is_ever_commanded(actuator: str) -> None:
+    """A battery decision is never expressed as a grid-rate command.
+
+    **Narrowed in beta.25 from "never named" to "never commanded", and that is
+    what the rule always protected.** Force import and force export compensate
+    for house load and generation internally, so commanding one from a battery
+    figure is wrong by the size of the house load -- the danger is the *write*.
+
+    beta.25 has to name them for the opposite reason. The vendor Dispatch
+    automation silently turns six families off before arming, two of which are
+    these, so Alpha EMS now detects them and **refuses to arm** rather than
+    destroying a feature the user selected. Detecting a thing in order to stand
+    down is the inverse of commanding it, and a test that forbade the string
+    would have forbidden the safer behaviour.
+
+    So the assertion is behavioural, and it is stronger than the textual one it
+    replaces: the actuator may not belong to a controllable family, may not be
+    produced by any planner, and must be actively refused at the send site.
+    """
+    from custom_components.alpha_ems_manager.alphaess_adapter import (
+        steps_outside_capability,
+    )
+    from custom_components.alpha_ems_manager.alphaess_device import (
+        FAMILIES,
+        SERVICE_TURN_ON,
+        CommandStep,
+    )
+
+    entity = f"input_boolean.alphaess_helper_{actuator}"
+
+    # Not a controllable family, so no decision can be expressed through it.
+    for family in FAMILIES.values():
+        assert entity not in family.entities, actuator
+
+    # And refused at the last interlock, which reads entity ids and trusts nobody.
+    step = CommandStep(*SERVICE_TURN_ON, entity)
+    assert steps_outside_capability((step,)) == (entity,), actuator
+
+
+@pytest.mark.parametrize("actuator", GRID_RATE_ACTUATORS)
+def test_a_grid_rate_actuator_is_only_named_as_a_conflict(actuator: str) -> None:
+    """And the only place it may be named is the stand-down list.
+
+    Keeps the narrowing honest: the string is still forbidden everywhere except
+    the conflict declaration it was added for, so it cannot quietly reappear in a
+    command path.
+    """
+    from custom_components.alpha_ems_manager.alphaess_device import (
+        CONFLICTING_FAMILIES,
+    )
+
+    declared = {entity for _, entity in CONFLICTING_FAMILIES}
+    assert any(actuator in entity for entity in declared), actuator
+
     for path in sorted(COMPONENT_DIR.glob("*.py")):
+        if path.name == "alphaess_device.py":
+            continue
         assert actuator not in path.read_text(encoding="utf-8"), path.name
 
 

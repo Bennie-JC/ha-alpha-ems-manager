@@ -916,7 +916,7 @@ def test_a_discharge_reset_is_not_reachable_and_would_be_refused() -> None:
 
 def test_the_permitted_service_set_did_not_grow() -> None:
     """Three, and no ``timer.cancel``."""
-    assert len(PERMITTED_SERVICES) == 3
+    assert len(PERMITTED_SERVICES) == 4
     assert ("timer", "cancel") not in PERMITTED_SERVICES
 
 

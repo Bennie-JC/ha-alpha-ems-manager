@@ -190,7 +190,15 @@ def writes(hass: HomeAssistant) -> list:
 
     for domain, service in PERMITTED_SERVICES:
         hass.services.async_register(domain, service, record)
-    assert len(set(PERMITTED_SERVICES)) == 3
+    # **Four since beta.25, and the count is asserted rather than trusted.**
+    # The point of the number is not the number: it is that the set is closed and
+    # small enough for every member to be recorded here, so a zero-write
+    # assertion cannot pass because a call went somewhere unwatched. beta.25 adds
+    # ``input_select.select_option`` and nothing else -- the dispatch mode is an
+    # ``input_select`` whose label the vendor package parses -- and deliberately
+    # not ``input_button.press``, because turning the enable boolean off already
+    # triggers the package reset.
+    assert len(set(PERMITTED_SERVICES)) == 4
     return calls
 
 

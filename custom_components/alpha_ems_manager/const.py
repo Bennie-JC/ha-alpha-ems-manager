@@ -2063,6 +2063,137 @@ MARKER_STATES: Final = (
 #: this set on purpose: it is the state every arm *starts* from.
 MARKER_STATES_UNUSABLE: Final = (MARKER_ABSENT, MARKER_UNAVAILABLE)
 
+# --- beta.25: the physical controller ----------------------------------------
+
+#: The smallest change in commanded power worth a service call, in kW.
+#:
+#: Two device steps. Quantise **first**, then compare: -2.00 and -2.04 land on the
+#: same 0.1 kW step and writing the second buys nothing, while -2.0 to -2.3 is a
+#: real correction. Well below any economically meaningful excursion, so a large
+#: error is never hidden by it -- and ``dispatch_limited_by`` names a clamp when a
+#: clamp, rather than the deadband, is what held the setpoint still.
+DISPATCH_POWER_DEADBAND_KW: Final = 0.2
+
+#: The device power resolution, in kW. Every commanded figure is a multiple of it.
+DISPATCH_POWER_STEP_KW: Final = 0.1
+
+#: How fresh a measurement must be to actuate on, in seconds.
+#:
+#: **Deliberately not** :data:`BALANCE_MAX_SOURCE_AGE_SECONDS`, which is 300 and was
+#: calibrated for *diagnostics* -- comparing accumulated energy. Reused for
+#: actuation it would accept a five-minute-old photovoltaic reading as the basis for
+#: a live setpoint.
+#:
+#: Ninety seconds is one and a half physical ticks, and it is derived from measured
+#: behaviour rather than chosen: the installation reports source ages of five and
+#: twelve seconds and a worst skew of nineteen against an allowance of ninety. So
+#: this sits roughly seven times above the observed publish age and five times above
+#: the worst observed skew -- it cannot fire on ordinary jitter -- while being three
+#: times tighter than the diagnostics bound.
+CONTROL_MAX_SOURCE_AGE_SECONDS: Final = 90.0
+
+#: How many consecutive unusable physical ticks are tolerated before a provably
+#: owned run is stopped.
+#:
+#: **Counted in physical ticks, never in economic refreshes.** Two refreshes is
+#: about thirty minutes -- longer than the twenty-minute device dead-man it is
+#: supposed to sit inside, which would mean the device ended the run before the
+#: controller decided to. Three ticks is 180 seconds: fifteen percent of the
+#: dead-man and twenty percent of one economic quarter, and the smallest count that
+#: tolerates one dropped update plus a retry without ending a healthy run.
+CONTROL_COHERENCE_GRACE_TICKS: Final = 3
+
+#: Why the applied setpoint is not the calculated one. Typed, never a free string.
+DISPATCH_LIMIT_NONE: Final = "none"
+DISPATCH_LIMIT_INVERTER_POWER: Final = "inverter_power"
+DISPATCH_LIMIT_MIN_SOC: Final = "min_soc"
+DISPATCH_LIMIT_DYNAMIC_RESERVE: Final = "dynamic_reserve"
+DISPATCH_LIMIT_REMAINING_GRID_ENERGY: Final = "remaining_grid_energy"
+DISPATCH_LIMIT_HEADROOM: Final = "headroom"
+DISPATCH_LIMIT_EXPORT_SAFETY: Final = "export_safety"
+DISPATCH_LIMIT_GRID_LIMIT: Final = "grid_limit"
+DISPATCH_LIMIT_QUANTISATION: Final = "quantisation"
+DISPATCH_LIMIT_DIRECTION_GATE: Final = "direction_gate"
+DISPATCH_LIMIT_DEADBAND: Final = "deadband"
+DISPATCH_LIMIT_STALE_TARGET: Final = "stale_target"
+DISPATCH_LIMIT_OWNERSHIP: Final = "ownership"
+DISPATCH_LIMIT_SENSOR_COHERENCE: Final = "sensor_coherence"
+
+#: The clamp order, and the order is contractual.
+#:
+#: Clamp four is the **grid**-energy cap, not the battery remainder, and that
+#: correction is the whole reason this tuple is written down. ``battery_target_kwh``
+#: is ``expected_pv_to_battery_kwh + expected_grid_to_battery_kwh`` -- a forecast
+#: *composite* -- so clamping a grid-power controller with it stops absorption once
+#: production runs ahead of forecast and leaks free photovoltaic energy to the grid
+#: at an export price the optimizer had already judged worse than storing it. The
+#: economic authorisation is the grid share; the pack is bounded by clamps five and
+#: three.
+DISPATCH_CLAMP_ORDER: Final = (
+    DISPATCH_LIMIT_INVERTER_POWER,
+    DISPATCH_LIMIT_MIN_SOC,
+    DISPATCH_LIMIT_DYNAMIC_RESERVE,
+    DISPATCH_LIMIT_REMAINING_GRID_ENERGY,
+    DISPATCH_LIMIT_HEADROOM,
+    DISPATCH_LIMIT_EXPORT_SAFETY,
+    DISPATCH_LIMIT_GRID_LIMIT,
+    DISPATCH_LIMIT_QUANTISATION,
+)
+
+#: Control-grade coherence, as a state rather than a boolean.
+COHERENCE_OK: Final = "ok"
+COHERENCE_HOLDING: Final = "holding"
+COHERENCE_EXPIRED: Final = "expired"
+
+#: What the controller did about it.
+COHERENCE_ACTION_NONE: Final = "none"
+COHERENCE_ACTION_HOLD: Final = "hold_last_setpoint"
+COHERENCE_ACTION_STOP: Final = "stop_owned_run"
+COHERENCE_ACTION_REFUSE_REARM: Final = "refuse_deadman_rearm"
+
+#: Why a physical tick did nothing.
+TICK_SKIPPED_LOCK_HELD: Final = "lock_held"
+TICK_SKIPPED_NOT_LIVE: Final = "not_live"
+TICK_SKIPPED_NO_RUN: Final = "no_owned_run"
+TICK_SKIPPED_STALE_TARGET: Final = "stale_target"
+TICK_SKIPPED_INCOHERENT: Final = "sensor_coherence"
+TICK_SKIPPED_DEADBAND: Final = "within_deadband"
+TICK_APPLIED: Final = "power_written"
+
+#: Ownership, as four states. ``degraded`` is new in beta.25 and is **never** a
+#: synonym for owned: it means causation is still provable while the marker is not,
+#: which authorises exactly one write and nothing else.
+OWNERSHIP_DEGRADED: Final = "degraded"
+
+#: The one operation the emergency authority grants, named so a test can assert
+#: that it is the only one.
+EMERGENCY_STOP_OPERATION: Final = "dispatch_enable_off"
+
+#: How many times the narrowly authorised emergency stop is retried, one attempt
+#: per physical tick, before the device dead-man is left to finish the job.
+EMERGENCY_STOP_MAX_ATTEMPTS: Final = 3
+
+#: Stop reasons added by beta.25.
+EXECUTION_STOP_MARKER_LOST: Final = "ownership_marker_lost"
+EXECUTION_STOP_COHERENCE_LOST: Final = "sensor_coherence_lost"
+EXECUTION_STOP_CONFLICTING_FAMILY: Final = "conflicting_family_active"
+
+#: Refusals added by beta.25.
+CONTROL_REFUSE_DISPATCH_MODE: Final = "dispatch_mode_not_executable"
+CONTROL_REFUSE_DISPATCH_SIGN: Final = "dispatch_sign_not_executable"
+CONTROL_REFUSE_CONFLICTING_FAMILY: Final = "conflicting_family_active"
+
+#: The Live execution envelope for the raw Dispatch surface, as a pair rather than
+#: two loose facts. beta.25 may command mode 2 with a **negative** power and
+#: nothing else; the sign is part of the barrier, not a downstream check.
+CONTROL_EXECUTABLE_DISPATCH_MODES: Final = frozenset({2})
+CONTROL_EXECUTABLE_DISPATCH_SIGN: Final = -1
+
+#: The bounded ring of recent physical decisions, so a download taken later can
+#: reconstruct what happened earlier in the quarter -- diagnostics are rarely
+#: captured at the moment production moved.
+MAX_PHYSICAL_DECISIONS_REPORTED: Final = 16
+
 #: What a staged sequence checks between its two stages.
 #:
 #: **Both verify a write, not a device.** ``marker_on`` reads back the helper the

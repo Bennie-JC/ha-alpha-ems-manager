@@ -81,7 +81,7 @@ def captured_calls(hass: HomeAssistant) -> list[ServiceCall]:
     for domain, service in PERMITTED_SERVICES:
         hass.services.async_register(domain, service, record)
         seen.add(f"{domain}.{service}")
-    assert len(seen) == 3
+    assert len(seen) == 4
     return calls
 
 
