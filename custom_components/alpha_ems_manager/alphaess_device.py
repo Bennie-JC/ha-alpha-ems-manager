@@ -337,6 +337,12 @@ REQUIRED_ENTITIES: tuple[str, ...] = (
     AUTOMATION_DISPATCH_RESET_FULL,
     *DISCHARGE_FAMILY.entities,
     *CHARGE_FAMILY.entities,
+    # **The Dispatch surface, required from beta.25**, because it is now the one
+    # Live actuator family. The helper families stay required as well: they are
+    # still read for conflict detection, and an installation missing them is
+    # missing part of the package Alpha EMS reasons about.
+    *DISPATCH_ENTITIES,
+    DISPATCH_TIMER,
 )
 
 
@@ -927,7 +933,15 @@ def action_refusal(action: str, steps: tuple[CommandStep, ...]) -> str | None:
     if family is None:
         return CONTROL_REFUSE_DIRECTION_MISMATCH
 
-    permitted = set(family.entities) | {BOOLEAN_EXECUTION_OWNER}
+    # **The Dispatch surface is permitted here and constrained by value.**
+    # Direction on it is a signed number rather than a choice of entity, so this
+    # entity test cannot express charge-only for it at all -- that is
+    # :func:`dispatch_refusal`, which runs beside this one rather than instead of
+    # it. The owner marker is always permitted: it is not a direction, it is how a
+    # direction becomes attributable.
+    permitted = (
+        set(family.entities) | set(DISPATCH_ENTITIES) | {BOOLEAN_EXECUTION_OWNER}
+    )
     foreign_families = [
         other for other_action, other in FAMILIES.items() if other_action != action
     ]

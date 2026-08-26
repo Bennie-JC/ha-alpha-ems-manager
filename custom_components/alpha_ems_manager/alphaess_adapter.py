@@ -30,8 +30,17 @@ from .alphaess_device import (
     BOOLEAN_EXECUTION_OWNER,
     BOOLEAN_PEAK_SHAVING,
     CHARGE_FAMILY,
+    CONFLICTING_FAMILIES,
     DISCHARGE_FAMILY,
+    DISPATCH_CUTOFF_SOC,
+    DISPATCH_DURATION,
+    DISPATCH_ENABLE,
     DISPATCH_ENTITIES,
+    DISPATCH_MODE_LABELS,
+    DISPATCH_MODE_SELECT,
+    DISPATCH_POWER,
+    DISPATCH_PV_SWITCH,
+    DISPATCH_TIMER,
     FAMILIES,
     OWNERSHIP_PROVABLE,
     REQUIRED_ENTITIES,
@@ -221,6 +230,31 @@ class DeviceSnapshot:
     #: treated as "no evidence it advanced" rather than as agreement.
     charge_timer_active: bool | None = None
     charge_timer_finishes_at: datetime | None = None
+    # --- the Dispatch surface, read back -------------------------------------
+    #
+    # **Read since beta.25, and read because ownership now depends on it.** The
+    # signed power is the only place direction lives on this surface, so a
+    # readback that did not carry it could not tell an owned charge from somebody
+    # else's discharge.
+    #
+    #: Whether the Dispatch enable helper is on. ``None`` when it cannot be read,
+    #: which is no evidence rather than agreement.
+    dispatch_enabled: bool | None = None
+    #: The selected mode, matched against the labels this integration knows.
+    #: ``None`` for a label we have no name for -- which is a mode we cannot own.
+    dispatch_selected_mode: int | None = None
+    #: The commanded signed power, kW. Negative charges, positive discharges.
+    dispatch_setpoint_kw: float | None = None
+    dispatch_cutoff_percent: float | None = None
+    dispatch_duration_minutes: float | None = None
+    #: Whether photovoltaic production is enabled during the dispatch.
+    dispatch_pv_enabled: bool | None = None
+    #: The Dispatch dead-man, read rather than assumed.
+    dispatch_timer_active: bool | None = None
+    dispatch_timer_finishes_at: datetime | None = None
+    #: The conflicting families currently on, by name. Read for the pre-arm gate,
+    #: and never written -- standing down is the response, not switching them off.
+    conflicting_active: tuple[str, ...] = ()
     #: The marker as a typed state, for diagnosis rather than for attribution.
     #: Beside :attr:`owner_marker` rather than replacing it -- ownership is still
     #: computed from the boolean, and beta.24.1 does not change that arithmetic.
@@ -256,6 +290,25 @@ class DeviceSnapshot:
                 else self.charge_timer_finishes_at.isoformat()
             ),
             "charge_timer_entity": CHARGE_FAMILY.timer,
+            "dispatch_enabled": self.dispatch_enabled,
+            "dispatch_selected_mode": self.dispatch_selected_mode,
+            "dispatch_setpoint_kw": self.dispatch_setpoint_kw,
+            "dispatch_cutoff_percent": self.dispatch_cutoff_percent,
+            "dispatch_duration_minutes": self.dispatch_duration_minutes,
+            "dispatch_pv_enabled": self.dispatch_pv_enabled,
+            "dispatch_timer_active": self.dispatch_timer_active,
+            "dispatch_timer_finishes_at": (
+                None
+                if self.dispatch_timer_finishes_at is None
+                else self.dispatch_timer_finishes_at.isoformat()
+            ),
+            "dispatch_timer_entity": DISPATCH_TIMER,
+            "conflicting_active": list(self.conflicting_active),
+            "dispatch_sign_rule": (
+                "negative charges and positive discharges. the opposite "
+                "convention from the helper families, which take a positive "
+                "magnitude and carry direction in which family was written"
+            ),
             "charge_timer_rule": (
                 "the device dead-man, read rather than assumed. a sustaining "
                 "re-arm must move finishes_at forward; if it does not, the run "
@@ -282,6 +335,72 @@ def _state_of(hass: HomeAssistant, entity_id: str) -> str | None:
     """Return an entity's state string, or ``None`` when it does not exist."""
     state = hass.states.get(entity_id)
     return None if state is None else state.state
+
+
+@callback
+def _boolean_state(hass: HomeAssistant, entity_id: str) -> bool | None:
+    """Return whether a boolean helper is on, or ``None`` if unreadable."""
+    state = _state_of(hass, entity_id)
+    if state is None or state in _UNUSABLE_STATES:
+        return None
+    return state == STATE_ON
+
+
+@callback
+def conflicting_families_active(hass: HomeAssistant) -> tuple[str, ...]:
+    """Return the names of the conflicting families that are currently on.
+
+    **All six the vendor automation disables**, read so Alpha EMS can stand down
+    rather than let ``AlphaESS Dispatch`` silently switch off a feature the user
+    chose. Read only: nothing here is ever written.
+    """
+    return tuple(
+        name
+        for name, entity in CONFLICTING_FAMILIES
+        if _state_of(hass, entity) == STATE_ON
+    )
+
+
+@callback
+def dispatch_mode_of(label: str | None) -> int | None:
+    """Return the mode number a package label names, or ``None``.
+
+    Matched against the labels this integration knows rather than parsed out of
+    the string. A label we have no name for is a mode we cannot claim to own, and
+    pulling a number out of arbitrary text is how a readback comes to agree with
+    something it never understood.
+    """
+    if label is None:
+        return None
+    for mode, known in DISPATCH_MODE_LABELS.items():
+        if label == known:
+            return mode
+    return None
+
+
+@callback
+def dispatch_readback_compatible(
+    snapshot: DeviceSnapshot, *, expected_mode: int, expected_sign: int
+) -> bool:
+    """Return whether the running Dispatch matches what we believe we armed.
+
+    **Mode *and* sign, and the sign is the half a helper-family check could not
+    express.** On this surface direction is a signed number rather than a choice
+    of entity, so a readback agreeing on mode alone would call somebody else's
+    discharge our charge.
+
+    Fails closed on anything unreadable: no evidence is not agreement.
+    """
+    if snapshot.dispatch_selected_mode != expected_mode:
+        return False
+    setpoint = snapshot.dispatch_setpoint_kw
+    if setpoint is None:
+        return False
+    if setpoint == 0.0:
+        # Zero is a value we legitimately command -- the direction gate produces
+        # it -- and it is compatible with either sign because it asserts neither.
+        return True
+    return (setpoint < 0.0) == (expected_sign < 0)
 
 
 @callback
@@ -374,6 +493,15 @@ def read_snapshot(hass: HomeAssistant) -> DeviceSnapshot:
     # surface settles, and during that window the safe reading is the pessimistic
     # one.
     marker = _state_of(hass, BOOLEAN_EXECUTION_OWNER)
+    dispatch_timer = hass.states.get(DISPATCH_TIMER)
+    dispatch_running = (
+        None if dispatch_timer is None else dispatch_timer.state == "active"
+    )
+    dispatch_finishes = (
+        None
+        if dispatch_timer is None
+        else instant_of(dispatch_timer.attributes.get("finishes_at"))
+    )
     timer_state = hass.states.get(CHARGE_FAMILY.timer)
     timer_active = None if timer_state is None else timer_state.state == "active"
     finishes_at = None
@@ -394,6 +522,15 @@ def read_snapshot(hass: HomeAssistant) -> DeviceSnapshot:
         charge_timer_active=timer_active,
         charge_timer_finishes_at=finishes_at,
         owner_marker_state=marker_state(hass),
+        dispatch_enabled=_boolean_state(hass, DISPATCH_ENABLE),
+        dispatch_selected_mode=dispatch_mode_of(_state_of(hass, DISPATCH_MODE_SELECT)),
+        dispatch_setpoint_kw=_numeric_state(hass, DISPATCH_POWER),
+        dispatch_cutoff_percent=_numeric_state(hass, DISPATCH_CUTOFF_SOC),
+        dispatch_duration_minutes=_numeric_state(hass, DISPATCH_DURATION),
+        dispatch_pv_enabled=_boolean_state(hass, DISPATCH_PV_SWITCH),
+        dispatch_timer_active=dispatch_running,
+        dispatch_timer_finishes_at=dispatch_finishes,
+        conflicting_active=conflicting_families_active(hass),
     )
 
 

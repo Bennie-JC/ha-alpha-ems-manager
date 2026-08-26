@@ -220,9 +220,19 @@ def control_surface(hass: HomeAssistant) -> None:
         AUTOMATION_HOLD_MONITOR,
         BOOLEAN_EXCESS_EXPORT,
         BOOLEAN_EXECUTION_OWNER,
+        BOOLEAN_FORCE_EXPORT,
+        BOOLEAN_FORCE_IMPORT,
         BOOLEAN_PEAK_SHAVING,
         CHARGE_FAMILY,
         DISCHARGE_FAMILY,
+        DISPATCH_CUTOFF_SOC,
+        DISPATCH_DURATION,
+        DISPATCH_ENABLE,
+        DISPATCH_MODE_LABELS,
+        DISPATCH_MODE_SELECT,
+        DISPATCH_POWER,
+        DISPATCH_PV_SWITCH,
+        DISPATCH_TIMER,
     )
 
     for entity_id, value in CONTROL_SURFACE_AT_REST.items():
@@ -242,6 +252,22 @@ def control_surface(hass: HomeAssistant) -> None:
     # that does not exist means ownership cannot be established at all, which is
     # the correct fail-safe but is a different case from a marker reading off.
     hass.states.async_set(BOOLEAN_EXECUTION_OWNER, "off")
+
+    # **The Dispatch surface at rest, as the package ships it.** Required from
+    # beta.25, because it is the Live actuator family. Note the photovoltaic
+    # switch is **on**: that is both the package default and the fail-safe state,
+    # and a fixture that started it off would let a test pass while the real
+    # installation curtailed production.
+    hass.states.async_set(DISPATCH_ENABLE, "off")
+    hass.states.async_set(DISPATCH_MODE_SELECT, DISPATCH_MODE_LABELS[2])
+    hass.states.async_set(DISPATCH_POWER, "0.0")
+    hass.states.async_set(DISPATCH_CUTOFF_SOC, "4")
+    hass.states.async_set(DISPATCH_DURATION, "0")
+    hass.states.async_set(DISPATCH_PV_SWITCH, "on")
+    hass.states.async_set(DISPATCH_TIMER, "idle")
+    # The two conflicting families beta.25 added to the six, both off.
+    hass.states.async_set(BOOLEAN_FORCE_IMPORT, "off")
+    hass.states.async_set(BOOLEAN_FORCE_EXPORT, "off")
 
 
 @pytest.fixture

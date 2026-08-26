@@ -97,6 +97,7 @@ from .const import (
     EXECUTION_STOP_TIMER_NOT_REFRESHED,
     EXECUTION_STOP_WINDOW_ENDED,
     EXECUTION_TARGET_STALE_MINUTES,
+    OWNERSHIP_DEGRADED,
     OWNERSHIP_FOREIGN,
     OWNERSHIP_NONE,
     OWNERSHIP_OWNED,
@@ -238,6 +239,13 @@ class OwnershipEvidence:
     #: "contradictory" every fifteen minutes and lost ownership of a run nothing
     #: had replaced.
     run_id: str | None = None
+    #: Whether the device readback still matches the expected mode **and sign**.
+    #:
+    #: **New in beta.25, and it is what makes a degraded state distinguishable
+    #: from a foreign one.** On the raw Dispatch surface direction is a signed
+    #: number, so "is this ours" cannot be answered by which entity is on. A
+    #: caller with no readback passes ``False`` and gets the conservative answer.
+    readback_compatible: bool = False
 
     @property
     def record_present(self) -> bool:
@@ -338,6 +346,18 @@ def ownership_of(evidence: OwnershipEvidence) -> str:
     if not evidence.dispatch_active:
         return OWNERSHIP_NONE
     if not evidence.marker_on:
+        # **Marker gone, causation still provable: degraded, never owned.**
+        #
+        # The definition above is not weakened to make a stop reachable -- what
+        # this state grants is one write, through a separate authority in
+        # ``safety``. It is named ``degraded`` precisely so nothing downstream can
+        # mistake it for control.
+        #
+        # Its requirements are the same proof the foreign invariant demands, which
+        # is why this does not weaken that either: a dispatch whose Alpha-EMS
+        # causation cannot *still* be shown stays untouchable.
+        if evidence.record_matches and evidence.readback_compatible:
+            return OWNERSHIP_DEGRADED
         return OWNERSHIP_FOREIGN
     if not evidence.record_matches:
         return OWNERSHIP_UNPROVEN

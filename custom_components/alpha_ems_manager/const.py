@@ -2218,6 +2218,13 @@ MAX_PHYSICAL_DECISIONS_REPORTED: Final = 16
 #: ownership rule read; it is not what tells us our own write landed.
 EXECUTION_VERIFY_MARKER_ON: Final = "marker_on"
 EXECUTION_VERIFY_NO_FAMILY_ACTIVE: Final = "no_family_active"
+#: The Dispatch enable helper reads off. Checked instead of the device register
+#: for the same reason as above: the register lags a poll.
+EXECUTION_VERIFY_DISPATCH_INACTIVE: Final = "dispatch_inactive"
+#: A commanded Dispatch power reads back readable and signed as sent. The exact
+#: float is deliberately not compared -- the helper quantises, and demanding
+#: equality would fail on the device's own rounding rather than on a real fault.
+EXECUTION_VERIFY_DISPATCH_SETPOINT: Final = "dispatch_setpoint"
 
 #: Stage one of the arm was sent and the marker did not read back on, so stage two
 #: -- which carries the activation -- was never sent and nothing was armed.

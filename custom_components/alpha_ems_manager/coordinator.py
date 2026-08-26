@@ -11,9 +11,11 @@ registry, so this integration adds no API traffic of its own.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta, tzinfo
@@ -37,30 +39,38 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .alphaess_adapter import (
+    ControlActionNotPermitted,
     ControlExecutionUnavailable,
     async_execute,
     discover,
+    dispatch_readback_compatible,
     read_snapshot,
 )
 from .alphaess_device import (
     BOOLEAN_EXECUTION_OWNER,
-    CHARGE_FAMILY,
+    DISPATCH_ENABLE,
+    DISPATCH_MODE_SOC_CONTROL,
     FAMILIES,
     action_refusal,
     build_command,
     device_power_kw,
+    dispatch_refusal,
     limit_command,
     plan_arm_parameters,
+    plan_dispatch_arm,
+    plan_dispatch_cleanup,
+    plan_dispatch_cutoff,
+    plan_dispatch_power,
+    plan_dispatch_rearm,
+    plan_dispatch_stop,
     plan_marker_claim,
     plan_release_marker,
-    plan_reset_cleanup,
-    plan_reset_deactivate,
-    plan_sustain,
 )
 from .api import load_forecast_from
 from .battery import INTERVAL_HOURS, BatteryLimits, sanitize_soc_percent
 from .confidence import ConfidenceBreakdown, compute_confidence
 from .const import (
+    ACTION_CHARGE,
     ACTION_DISCHARGE,
     BALANCE_MAX_SOURCE_AGE_SECONDS,
     BATTERY_MAX_SOC_PERCENT,
@@ -91,6 +101,7 @@ from .const import (
     CONF_SELECTED_SOLCAST_SITE_IDS,
     CONF_SOLCAST_ENTRY_ID,
     CONF_USE_PV_FORECAST,
+    CONTROL_EXECUTABLE_DISPATCH_SIGN,
     CONTROL_EXECUTION_AVAILABLE,
     CONTROL_MIN_POWER_KW,
     CONTROL_MODE_ACTIVE,
@@ -115,11 +126,16 @@ from .const import (
     DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     DEFAULT_GRID_POWER_SIGN,
     DEFAULT_MINIMUM_TRADE_GAIN_EUR,
+    DISPATCH_POWER_DEADBAND_KW,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     EV_ABSENCE_GRACE_REFRESHES,
+    EXECUTION_STOP_COHERENCE_LOST,
+    EXECUTION_STOP_MARKER_LOST,
     EXECUTION_STOP_SAFETY,
     EXECUTION_STOP_SWITCHED_OFF,
     EXECUTION_TARGET_STALE_MINUTES,
+    EXECUTION_VERIFY_DISPATCH_INACTIVE,
+    EXECUTION_VERIFY_DISPATCH_SETPOINT,
     EXECUTION_VERIFY_MARKER_ON,
     EXECUTION_VERIFY_NO_FAMILY_ACTIVE,
     INHIBIT_NO_DECISION,
@@ -127,8 +143,10 @@ from .const import (
     INHIBIT_PLAN_UNAVAILABLE,
     LOG_THROTTLE_SECONDS,
     MAX_CONTROL_EVENTS_REPORTED,
+    MAX_PHYSICAL_DECISIONS_REPORTED,
     MAX_SAMPLE_GAP_SECONDS,
     MIN_QUARTER_COVERAGE,
+    OWNERSHIP_DEGRADED,
     OWNERSHIP_NONE,
     OWNERSHIP_OWNED,
     OWNERSHIP_PROVENANCE_SETTLING,
@@ -161,8 +179,19 @@ from .const import (
     REFUSE_MODE_NOT_ACTIVE,
     SAFETY_SAMPLE_SECONDS,
     SELECT_INVERTER_AC_LIMIT,
+    TICK_APPLIED,
+    TICK_SKIPPED_INCOHERENT,
+    TICK_SKIPPED_LOCK_HELD,
+    TICK_SKIPPED_NO_RUN,
+    TICK_SKIPPED_NOT_LIVE,
+    TICK_SKIPPED_STALE_TARGET,
 )
 from .control import translate
+from .dispatch import (
+    ChargeLimits,
+    deadman_minutes,
+)
+from .dispatch import decide as decide_setpoint
 from .economic import (
     EconomicOutcome,
     IntervalPrice,
@@ -180,12 +209,15 @@ from .energy_balance import (
     OUTCOME_SKIPPED_INCOHERENT,
     BalanceMonitor,
     BalanceSample,
+    ControlCoherence,
     SourceCoherence,
+    control_coherence,
     evaluate_balance,
     measure_coherence,
 )
 from .execution import (
     CarriedRun,
+    ForwardAuthorisation,
     OwnershipEvidence,
     action_for_intent,
     actionable_target,
@@ -195,6 +227,7 @@ from .execution import (
     decide,
     measure_progress,
     ownership_of,
+    remaining_authorised_kwh,
     stale_marker,
     target_as_published,
     withdrawal_basis,
@@ -268,9 +301,11 @@ from .safety import (
     ExecutionDecision,
     SafetyVerdict,
     absorbing_capacity_kw,
+    authorize_emergency_self_stop,
     authorize_marker_release,
     authorize_reset,
     authorize_start,
+    emergency_self_stop_authorized,
     evaluate,
     safe_discharge_power_kw,
 )
@@ -1061,6 +1096,31 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # until the claim reads back, and a stop may not disturb a running
         # dispatch's fields until the deactivation reads back. Their concatenation
         # is always exactly the list the report published.
+        # **One lock, over every actuator sequence.** Until beta.25 there was a
+        # single write path -- the quarter refresh -- so nothing needed
+        # serialising. The sixty-second physical controller is a second one, and a
+        # Home Assistant timer callback is not serialised against a coordinator
+        # refresh, so without this the two can interleave mid-sequence. The arm is
+        # the dangerous case: mode, power, cutoff and duration must all be settled
+        # before the enable, and a correction landing between them would arm a
+        # dispatch against half-written values.
+        self._execution_lock = asyncio.Lock()
+        #: The last setpoint actually written, for the deadband comparison. Never
+        #: the last *calculated* one: the deadband exists to compare against what
+        #: is on the wire.
+        self._applied_setpoint_kw: float | None = None
+        #: Control-grade coherence, carried across physical ticks.
+        self._coherence: ControlCoherence | None = None
+        #: The forward authorisation cap, replaced on every affirmation.
+        self._forward: ForwardAuthorisation | None = None
+        #: Narrow emergency-stop attempts made against the current dispatch.
+        self._emergency_attempts = 0
+        #: The bounded ring of recent physical decisions.
+        self._physical_decisions: deque[dict[str, Any]] = deque(
+            maxlen=MAX_PHYSICAL_DECISIONS_REPORTED
+        )
+        #: Why the most recent physical tick did nothing, when it did nothing.
+        self._last_tick_reason: str | None = None
         self._pending_stage_one: tuple[Any, ...] = ()
         self._pending_stage_two: tuple[Any, ...] = ()
         self._pending_verify: str | None = None
@@ -1373,9 +1433,353 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @callback
     def _handle_safety_sample(self, now: datetime) -> None:
-        """Advance integration even while the source is quiet."""
-        self._sample(dt_util.as_local(now))
+        """Advance integration even while the source is quiet, then correct.
+
+        **Two jobs on one cadence, and no new timer.** The sampling half is
+        unchanged. The second half is the beta.25 physical controller: it follows
+        the *frozen* Stage-A grid target for the current quarter using live
+        measurements, which is what a fifteen-minute setpoint could not do.
+
+        Scheduled rather than awaited, because this callback is synchronous and a
+        write is not.
+        """
+        moment = dt_util.as_local(now)
+        self._sample(moment)
         self._sample_balance()
+        self.hass.async_create_task(self._async_physical_tick(moment))
+
+    async def _async_physical_tick(self, now: datetime) -> None:
+        """Correct the commanded power against live measurements. Never plans.
+
+        **The narrowest write path in the integration.** It reads the frozen grid
+        target for the quarter it is in and moves the setpoint toward it. It does
+        not re-run prices, admit a run, re-rank a window, alter an economic target
+        or re-arm the dead-man -- the last of those matters most, because a re-arm
+        on a power cadence would extend a run the economics never extended.
+
+        Every refusal is recorded rather than silent: a controller that did
+        nothing and said nothing is indistinguishable from one that is not running.
+        """
+        if self.control_mode != CONTROL_MODE_ACTIVE:
+            self._note_tick(now, TICK_SKIPPED_NOT_LIVE)
+            return
+        if not self.config.control_execution_enabled:
+            self._note_tick(now, TICK_SKIPPED_NOT_LIVE)
+            return
+        # **Non-blocking, and a skip rather than a queue.** A correction computed
+        # while an arm was in progress describes a world that no longer exists by
+        # the time the lock frees, and the next tick is only sixty seconds away.
+        if self._execution_lock.locked():
+            self._note_tick(now, TICK_SKIPPED_LOCK_HELD)
+            return
+        try:
+            async with self._execution_lock:
+                await self._async_correct_setpoint(now)
+        except Exception:
+            # **A fault costs the correction, never the coordinator.** This runs
+            # as a detached task, so an escaping exception would surface only as
+            # an unretrieved-task error while the sampling half carried on and
+            # nobody knew the controller had stopped. The lock is released by the
+            # context manager either way, which is the property that matters most.
+            _LOGGER.exception(
+                "The physical controller failed this tick; the setpoint is "
+                "unchanged and the next tick will retry"
+            )
+            self._last_tick_reason = "controller_error"
+
+    async def _async_correct_setpoint(self, now: datetime) -> None:
+        """Run one correction, with the execution lock already held."""
+        run = self._carried
+        snapshot = read_snapshot(self.hass)
+        if run is None or not snapshot.dispatch_active:
+            self._note_tick(now, TICK_SKIPPED_NO_RUN)
+            return
+        if self._ownership_now(snapshot, now) != OWNERSHIP_OWNED:
+            self._note_tick(now, TICK_SKIPPED_NO_RUN)
+            return
+        if run.stale_at(now) or not run.actionable_at(now):
+            self._note_tick(now, TICK_SKIPPED_STALE_TARGET)
+            return
+
+        coherence = self._update_coherence(now)
+        if not coherence.usable:
+            # **Hold the last applied setpoint, and calculate nothing.** No
+            # fallback production, house or grid figure is invented: an unusable
+            # reading produces a hold, never a guess. The economic target is
+            # untouched.
+            self._note_tick(now, TICK_SKIPPED_INCOHERENT)
+            if coherence.expired:
+                await self._async_stop_owned_run(
+                    now, snapshot, EXECUTION_STOP_COHERENCE_LOST
+                )
+            return
+
+        decision = self._setpoint_for(run.target, now)
+        if decision is None:
+            self._note_tick(now, TICK_SKIPPED_STALE_TARGET)
+            return
+        self._record_physical_decision(now, decision, coherence)
+        if not decision.update_needed:
+            self._last_tick_reason = decision.update_reason
+            return
+        await self._async_send_locked(
+            plan_dispatch_power(decision.applied_kw),
+            now=now,
+            verify=EXECUTION_VERIFY_DISPATCH_SETPOINT,
+        )
+        self._applied_setpoint_kw = decision.applied_kw
+        self._last_tick_reason = TICK_APPLIED
+
+    @callback
+    def _blocking_conflicts(self, snapshot: Any) -> tuple[str, ...]:
+        """Return the conflicting families that must prevent an arm.
+
+        **All six the vendor automation would silently switch off**, minus the one
+        that is ours. ``AlphaESS Dispatch`` disables force charging, force
+        discharging, force import, force export, excess export and peak shaving
+        before arming and cancels their timers -- so arming over a feature the user
+        selected destroys it without asking.
+
+        The charge family is excluded while a dispatch of ours is running, because
+        then it is not somebody else's feature; the distinction is ownership, never
+        the entity.
+        """
+        if snapshot is None:
+            return ()
+        return tuple(snapshot.conflicting_active)
+
+    @callback
+    def _setpoint_for(self, target: Any, now: datetime) -> Any:
+        """Return the signed Dispatch setpoint for this instant, or ``None``.
+
+        **The one place the physical setpoint is decided**, shared by the quarter
+        refresh and the sixty-second tick so the two cannot disagree about what
+        the same world means.
+
+        ``desired_grid_kw`` is Stage A's, frozen for the quarter. Nothing here
+        reads a price, ranks a window or moves a target: the arithmetic lives in
+        :mod:`.dispatch` and this only assembles its inputs.
+        """
+        if target is None or target.desired_grid_kw is None:
+            return None
+        flows = self.read_flows()
+        if flows.house_kw is None:
+            return None
+        return decide_setpoint(
+            desired_grid_kw=target.desired_grid_kw,
+            house_load_kw=flows.house_kw,
+            pv_kw=flows.pv_kw or 0.0,
+            limits=self._charge_limits(target, now),
+            last_applied_kw=self._applied_setpoint_kw,
+            charge_only=True,
+        )
+
+    @callback
+    def _charge_limits(self, target: Any, now: datetime) -> ChargeLimits:
+        """Return the bounds on a charge, as typed components.
+
+        **Assembled from the typed parts, never from ``demand_for``'s composite
+        ``required_kw``.** That figure already has the headroom ceiling and the
+        grid cap folded into it, so feeding it in would apply both a second time.
+
+        Three of the eight slots are structurally non-binding for a charge and are
+        left ``None`` rather than filled with a number that means nothing: a charge
+        never approaches the minimum state of charge, never breaches the dynamic
+        reserve, and never exports. Saying ``None`` is saying "unconstrained",
+        which is true; inventing a bound would be a clamp nobody could interpret.
+        """
+        decision = self._stage_b_decision
+        demand = None if decision is None else decision.demand
+        plan = self.battery_plan
+
+        inverter_kw = None
+        if plan is not None and plan.state is not None:
+            inverter_kw = plan.state.limits.max_charge_kw
+
+        # **Clamp four: the grid authorisation, not the battery remainder.**
+        # ``battery_target_kwh`` is production plus grid, a forecast composite, so
+        # bounding a grid-power controller with it stops absorption the moment
+        # production runs ahead of forecast and pushes free energy out to the meter.
+        grid_kw = None
+        if demand is not None and demand.grid_cap_kwh is not None:
+            remaining_kwh = max(0.0, demand.grid_cap_kwh - demand.grid_charged_kwh)
+            # And bounded again by the downward revision, whichever binds harder.
+            revised, _cap = remaining_authorised_kwh(
+                now=now,
+                frozen_remaining_kwh=remaining_kwh,
+                forward=self._forward,
+            )
+            minutes = max(1.0, demand.remaining_minutes)
+            grid_kw = revised / (minutes / 60.0)
+
+        return ChargeLimits(
+            inverter_kw=inverter_kw,
+            remaining_grid_kw=grid_kw,
+            headroom_kw=None if demand is None else demand.ceiling_kw,
+        )
+
+    async def _async_send_locked(
+        self, steps: tuple[Any, ...], *, now: datetime, verify: str | None
+    ) -> bool:
+        """Send steps with the lock already held, and verify the readback.
+
+        Returns whether the write both landed and read back. **The verification
+        stays inside the locked section**: a check that ran after the lock was
+        released would be reading a world another sequence may already have moved.
+        """
+        if not steps:
+            return True
+        try:
+            await async_execute(self.hass, steps)
+        except (ControlExecutionUnavailable, ControlActionNotPermitted):
+            _LOGGER.warning("A Dispatch write was refused at the send site")
+            return False
+        except Exception:
+            _LOGGER.exception("A Dispatch write could not be sent")
+            return False
+        self._last_control_write = now
+        if verify is None:
+            return True
+        return self._staged_write_landed(verify)
+
+    async def _async_stop_owned_run(
+        self, now: datetime, snapshot: Any, reason: str
+    ) -> None:
+        """Stop a dispatch we own, in the approved order, with the lock held.
+
+        Enable **off first**, then verified inactive, and only then the resting
+        values and the marker. The cleanup is withheld on an unverified stop for a
+        concrete reason: writing the duration restarts the vendor timer, so tidying
+        up a dispatch that did not actually stop would extend the run being ended.
+        """
+        landed = await self._async_send_locked(
+            plan_dispatch_stop(), now=now, verify=EXECUTION_VERIFY_DISPATCH_INACTIVE
+        )
+        if not landed:
+            # Every piece of evidence is kept, so the next refresh reads the same
+            # state and tries again. Clearing it would drop to ``unproven``, and an
+            # unproven dispatch is never touched -- the run would latch on.
+            _LOGGER.warning(
+                "A Dispatch stop for %s could not be verified; ownership evidence "
+                "has been kept so the next refresh can retry",
+                reason,
+            )
+            return
+        await self._async_send_locked(plan_dispatch_cleanup(), now=now, verify=None)
+        self._clear_execution_record()
+        self._carried = None
+        self._applied_setpoint_kw = None
+        self._coherence = None
+        self._forward = None
+        self._emergency_attempts = 0
+        self._sustained_deadline = None
+        self._sustained_run_id = None
+        self._last_tick_reason = reason
+
+    async def _async_emergency_self_stop(self, now: datetime, snapshot: Any) -> None:
+        """Send the one write the emergency authority grants, and nothing else.
+
+        **Not ownership, and the state it belongs to is never called owned.** The
+        marker has gone, so ownership is ``degraded``; what survives is proof that
+        Alpha EMS caused this dispatch, and that proof authorises exactly
+        ``Dispatch enable -> OFF``.
+
+        Everything else stops immediately: no power, cutoff, duration, mode or
+        photovoltaic write, and no dead-man re-arm. Bounded to three attempts, one
+        per physical tick, after which the device dead-man finishes the job.
+        """
+        steps = plan_dispatch_stop()
+        decision = authorize_emergency_self_stop(
+            authorized=emergency_self_stop_authorized(
+                dispatch_active=bool(snapshot.dispatch_active),
+                marker_present_and_on=bool(snapshot.owner_marker),
+                record_matches_run=self._evidence_for(snapshot, now).record_matches,
+                readback_compatible=dispatch_readback_compatible(
+                    snapshot,
+                    expected_mode=DISPATCH_MODE_SOC_CONTROL,
+                    expected_sign=CONTROL_EXECUTABLE_DISPATCH_SIGN,
+                ),
+                contradicted=False,
+            ),
+            steps=tuple(step.entity_id for step in steps),
+            attempts_made=self._emergency_attempts,
+        )
+        if not decision.authorized:
+            return
+        self._emergency_attempts += 1
+        landed = await self._async_send_locked(
+            steps, now=now, verify=EXECUTION_VERIFY_DISPATCH_INACTIVE
+        )
+        if not landed:
+            return
+        self._clear_execution_record()
+        self._carried = None
+        self._applied_setpoint_kw = None
+        self._forward = None
+        self._sustained_deadline = None
+        self._sustained_run_id = None
+        self._last_tick_reason = EXECUTION_STOP_MARKER_LOST
+
+    @callback
+    def _note_tick(self, now: datetime, reason: str) -> None:
+        """Record a physical tick that wrote nothing, and why.
+
+        Deliberately **not** a clamp reason: nothing was calculated, so naming a
+        clamp would invent an explanation for a decision that was never made.
+        """
+        self._last_tick_reason = reason
+        self._physical_decisions.append(
+            {"controller_refresh_at": now.isoformat(), "update_reason": reason}
+        )
+
+    @callback
+    def _record_physical_decision(
+        self, now: datetime, decision: Any, coherence: ControlCoherence
+    ) -> None:
+        """Append one physical decision to the bounded ring."""
+        entry = {"controller_refresh_at": now.isoformat()}
+        entry.update(decision.as_dict())
+        entry["coherence_state"] = coherence.state
+        entry["dispatch_power_deadband_kw"] = DISPATCH_POWER_DEADBAND_KW
+        self._physical_decisions.append(entry)
+
+    @callback
+    def _update_coherence(self, now: datetime) -> ControlCoherence:
+        """Advance the control-grade coherence state by one physical tick."""
+        flows = self.read_flows()
+        available = flows.house_kw is not None and flows.grid_kw is not None
+        self._coherence = control_coherence(
+            previous=self._coherence,
+            now=now,
+            coherence=self._source_coherence(),
+            sources_available=available,
+        )
+        return self._coherence
+
+    @callback
+    def _ownership_now(self, snapshot: Any, now: datetime) -> str:
+        """Return the ownership state for a snapshot, on the Dispatch surface."""
+        return ownership_of(self._evidence_for(snapshot, now))
+
+    @callback
+    def _evidence_for(self, snapshot: Any, now: datetime) -> OwnershipEvidence:
+        """Return the ownership evidence, including the signed readback."""
+        return OwnershipEvidence(
+            dispatch_active=bool(snapshot is not None and snapshot.dispatch_active),
+            marker_on=bool(snapshot is not None and snapshot.owner_marker),
+            record=self.store.execution_record,
+            dispatch_start=_dispatch_start_instant(snapshot, now),
+            run_id=self._owned_run_id(),
+            now=now,
+            readback_compatible=bool(
+                snapshot is not None
+                and dispatch_readback_compatible(
+                    snapshot,
+                    expected_mode=DISPATCH_MODE_SOC_CONTROL,
+                    expected_sign=CONTROL_EXECUTABLE_DISPATCH_SIGN,
+                )
+            ),
+        )
 
     @callback
     def _handle_quarter_boundary(self, now: datetime) -> None:
@@ -2470,11 +2874,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         stage_two: tuple[Any, ...] = ()
         verify: str | None = None
 
-        if ownership == OWNERSHIP_OWNED:
-            if reset_action:
-                stage_one = plan_reset_deactivate(reset_action)
-                stage_two = plan_reset_cleanup(reset_action)
-                verify = EXECUTION_VERIFY_NO_FAMILY_ACTIVE if stage_one else None
+        if ownership in (OWNERSHIP_OWNED, OWNERSHIP_DEGRADED):
+            stage_one = plan_dispatch_stop()
+            # A degraded stop is the narrow one: the cleanup is withheld until a
+            # later refresh can verify the dispatch really stopped.
+            stage_two = (
+                () if ownership == OWNERSHIP_DEGRADED else plan_dispatch_cleanup()
+            )
+            verify = EXECUTION_VERIFY_DISPATCH_INACTIVE
             commands = stage_one + stage_two
             refusal = action_refusal(reset_action, commands) if commands else None
             if refusal is not None:
@@ -2658,7 +3065,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         previous = self._sustained_deadline
         if previous is None:
             return False
-        current = None if snapshot is None else snapshot.charge_timer_finishes_at
+        current = None if snapshot is None else snapshot.dispatch_timer_finishes_at
         if current is None:
             return False
         return current <= previous
@@ -4414,6 +4821,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return snapshot.owner_marker is True
         if verify == EXECUTION_VERIFY_NO_FAMILY_ACTIVE:
             return not snapshot.active_modes
+        if verify == EXECUTION_VERIFY_DISPATCH_INACTIVE:
+            # The **enable helper**, which is what we wrote, and not
+            # ``sensor.alphaess_dispatch_start``: that register lags a poll, so a
+            # cleanup gated on it would be withheld every time.
+            return snapshot.dispatch_enabled is False
+        if verify == EXECUTION_VERIFY_DISPATCH_SETPOINT:
+            # A commanded power is only verified as *readable and signed the way
+            # we sent it*. The exact float is not compared: the helper quantises,
+            # and demanding equality would fail on the device's own rounding.
+            setpoint = snapshot.dispatch_setpoint_kw
+            return setpoint is not None and setpoint <= 0.0
         return False  # pragma: no cover - an unknown check fails closed
 
     async def _async_dispatch(
@@ -4669,6 +5087,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         stage_b = self._stage_b_report(plan=plan, snapshot=snapshot, now=now, mode=mode)
         ownership_state = (stage_b.get("ownership") or {}).get("state")
         owned = ownership_state == OWNERSHIP_OWNED
+        # **Degraded is not owned**, and the name is the point: the marker has
+        # gone, so nothing may be adjusted -- but causation is still provable, so
+        # one narrow write is authorised to end the run deliberately rather than
+        # leaving it to the device dead-man.
+        degraded = ownership_state == OWNERSHIP_DEGRADED
         charge_intent = self._stage_b_intent(plan=plan, now=now)
 
         # **The command source, and the one place it is decided.**
@@ -4814,29 +5237,72 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Deriving ``commands`` from the two halves rather than beside them means
         # the report can never describe a sequence the send site would not send:
         # there is one construction, not two that have to agree.
+        # **The Live actuator family is Dispatch, and it is the only one.** The
+        # Force Charging helpers are still read -- they are one of the six
+        # conflicting families -- but nothing here commands them. A split runtime
+        # would be worse than either surface alone: an arm on one and a stop on
+        # the other cannot be reasoned about at all.
         stage_one: tuple[Any, ...] = ()
         stage_two: tuple[Any, ...] = ()
         verify: str | None = None
-        if resetting:
-            if reset_action:
-                stage_one = plan_reset_deactivate(reset_action)
-                stage_two = plan_reset_cleanup(reset_action)
-                verify = EXECUTION_VERIFY_NO_FAMILY_ACTIVE if stage_one else None
+        setpoint = self._setpoint_for(
+            None if self._carried is None else self._carried.target, now
+        )
+        conflicts = self._blocking_conflicts(snapshot)
+        if degraded:
+            # The emergency authority: one write, and the cleanup withheld until
+            # inactivity is verified on a later refresh.
+            stage_one = plan_dispatch_stop()
+            verify = EXECUTION_VERIFY_DISPATCH_INACTIVE
+        elif resetting:
+            stage_one = plan_dispatch_stop()
+            stage_two = plan_dispatch_cleanup()
+            verify = EXECUTION_VERIFY_DISPATCH_INACTIVE
         elif releasing:
             stage_two = plan_release_marker()
-        elif command is None:
+        elif command is None or conflicts:
+            # A conflicting family nobody can prove is ours means standing down,
+            # never switching it off: the vendor automation would do that
+            # silently, and destroying a feature the user chose is not a safe
+            # default.
             pass
         elif sustaining:
-            # Ownership is already proven by the time a sustain is reachable, so
-            # there is no claim to make and nothing to verify before re-arming.
-            stage_two = plan_sustain(command)
-        else:
+            # **The dead-man cadence, and only here.** A power correction never
+            # re-arms: that would extend a run on a cadence the economics never
+            # chose. The cutoff is re-asserted because it is an upper bound and
+            # the configured ceiling may have moved since the run was armed.
+            stage_two = plan_dispatch_rearm(
+                deadman_minutes(
+                    None if snapshot is None else snapshot.dispatch_duration_minutes
+                )
+            ) + plan_dispatch_cutoff(command.cutoff_soc_percent)
+        elif command.action != ACTION_CHARGE:
+            # **The advisory path, unchanged.** The Phase-3 reserve guard emits
+            # discharges, and no release executes one: the typed barrier refuses
+            # the action at authorisation and the send site refuses the entities.
+            # It still has to be *planned*, because shadow reporting is what a
+            # user reads to decide whether to trust the layer at all.
+            #
+            # This is not a second Live path. Live charge is Dispatch and only
+            # Dispatch; the helper families remain the advisory surface for
+            # actions that have no actuator, and remain refused at every
+            # boundary.
             stage_two = plan_arm_parameters(command)
+            stage_one = plan_marker_claim() if stage_two else ()
+            verify = EXECUTION_VERIFY_MARKER_ON if stage_one else None
+        elif setpoint is not None and setpoint.applied_kw < 0.0:
+            stage_two = plan_dispatch_arm(
+                mode=DISPATCH_MODE_SOC_CONTROL,
+                power_kw=setpoint.applied_kw,
+                cutoff_soc_percent=command.cutoff_soc_percent,
+                duration_minutes=deadman_minutes(None),
+                pv_enabled=True,
+            )
             # **No claim without something to arm.** A command that moves no
             # battery is not an arm, and a lone marker write would claim
             # ownership of nothing and then have to be cleaned up as stale.
-            stage_one = plan_marker_claim() if stage_two else ()
-            verify = EXECUTION_VERIFY_MARKER_ON if stage_one else None
+            stage_one = plan_marker_claim()
+            verify = EXECUTION_VERIFY_MARKER_ON
         commands = stage_one + stage_two
 
         # Layer 3 of the direction interlock, and it now guards the reset list too:
@@ -4854,6 +5320,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         refusal = None
         if commands and checked is not None:
             refusal = action_refusal(checked, commands)
+        # And the value check, which the entity test structurally cannot make.
+        if refusal is None and commands:
+            refusal = dispatch_refusal(commands)
         if refusal is not None:
             commands = ()
             stage_one = stage_two = ()
@@ -4985,12 +5454,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # the steps rather than from the intention, so "started" can only ever be
         # said about a list that actually carries an activation.
         self._pending_activates = any(
-            step.entity_id == CHARGE_FAMILY.activate for step in commands
+            step.entity_id == DISPATCH_ENABLE for step in commands
         )
         # What the dead-man read *before* this write. Compared against the reading
         # after it, next refresh.
         self._pending_deadline = (
-            None if snapshot is None else snapshot.charge_timer_finishes_at
+            None if snapshot is None else snapshot.dispatch_timer_finishes_at
         )
         self._pending_run_id = carried_run_id
 
