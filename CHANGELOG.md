@@ -9,12 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
-## [1.0.0-beta.24.1] - 2026-08-26
+## [1.0.0-beta.25] - 2026-08-26
 
-**A charge could be armed that Alpha EMS could provably never own, sustain or
-stop.** Ownership safety only; nothing else changed.
+**Two stages in one version.** The ownership hotfix planned as beta.24.1 and the
+first half of the Dispatch-surface rewrite. `beta.24.1` is not a shape this
+project's version pattern accepts, so both ship under one number; they are
+separate commits.
 
-### Fixed
+**The Live execution path is unchanged.** Everything beta.25 adds is built,
+gated and tested, and nothing drives an actuator yet: the Live charge still runs
+through the Force Charging helper family exactly as it did in beta.24. See
+*Known and outstanding* -- this is deliberately stated rather than implied.
+
+### Fixed -- ownership safety
 
 - **The owner marker was not a required entity.** `discover` walks
   `REQUIRED_ENTITIES` and nothing else, and the marker was absent from it, so an
@@ -26,49 +33,148 @@ stop.** Ownership safety only; nothing else changed.
   arm again at :30. A missing or unavailable marker now makes the capability
   unready and Live refuses before anything is planned, naming the entity.
 
-- **The arm is staged, and the activation is no longer in the same stage as the
+- **The arm is staged, so the activation is no longer in the same stage as the
   claim.** "Activation last" was already true and was not enough: last in a list
   that runs unconditionally is still reached when the first step did nothing. The
-  ownership claim is now sent alone and read back, and only a verified claim
-  reaches the parameters and the activation. A claim that cannot be read back
-  arms nothing, withdraws the causal record and reports `marker_not_verified`.
-
-  This is deliberately a second, independent guarantee: it holds even where the
-  capability check cannot help, because a service call that succeeds is not a
-  state that changed.
+  claim is now sent alone and read back, and only a verified claim reaches the
+  parameters and the activation. A claim that cannot be read back arms nothing,
+  withdraws the causal record and reports `marker_not_verified`. This is a second,
+  independent guarantee -- it holds where a capability snapshot cannot help,
+  because a service call that succeeds is not a state that changed.
 
 - **The stop is staged the same way.** The deactivation is sent alone and read
-  back before anything else is written. That ordering is not tidiness: writing
-  the duration helper restarts the vendor package timer, so a cleanup issued
-  against a dispatch that did not actually stop would extend the run it was
-  ending. A stop that cannot be confirmed withholds the cleanup, keeps the marker
-  and the causal record, reports `stop_not_verified`, and retries on a later
-  refresh -- it never publishes a clean or unowned state.
+  back before anything else is written. Writing the duration helper restarts the
+  vendor timer, so a cleanup issued against a dispatch that did not actually stop
+  would extend the run it was ending. A stop that cannot be confirmed withholds
+  the cleanup, keeps the marker and the record, reports `stop_not_verified`, and
+  retries later -- it never publishes a clean or unowned state.
 
 - **The marker is reported as four distinct facts** -- absent, unavailable, off,
-  on -- plus `unverified` for a write whose readback disagreed. `owner_marker`
-  was `None` for a missing helper and `False` for one that is off; both mean "not
-  ours", which is correct for attribution and useless for diagnosis.
+  on -- plus `unverified` for a write whose readback disagreed.
+
+### Added -- the Dispatch surface, built and gated
+
+- **The real writable Hillview Dispatch entities**, read from the published
+  package rather than guessed, with the register each one drives recorded because
+  the encoding is what constrains the design. Power is honoured in modes 1, 2, 3
+  and 5 only; outside those the package writes the register as a bare `32000`,
+  which is zero watts -- so **modes 6 and 7 are not controllable kW primitives at
+  all**. That corrects the assumption that mode 7 is a throttled consumption mode.
+
+- **`dispatch.py`, one canonical identity and every sign derived from it**:
+  `grid = house - pv - dispatch`, so
+  `required_dispatch_kw = house_load_kw - pv_kw - desired_grid_kw`. Deliberately
+  the opposite convention from the helper families, which take a positive
+  magnitude and carry direction in *which family* was written -- the two never
+  meet in one expression.
+
+- **A 0.2 kW deadband with zero-crossing hysteresis.** Quantise first, then
+  compare, so -2.00 to -2.04 writes nothing while -2.0 to -2.3 does. The deadband
+  alone would still permit chatter around zero, so reversing a sign has to clear
+  the band on the far side of it: noise cannot flip the sign, a real reversal can.
+
+- **The clamp hierarchy, with clamp four as the grid-energy authorisation** rather
+  than the remaining battery target. `battery_target_kwh` is
+  `expected_pv_to_battery_kwh + expected_grid_to_battery_kwh`, a forecast
+  composite, so bounding a grid-power controller with it stops absorption the
+  moment production runs ahead of forecast and pushes free photovoltaic energy out
+  to the meter at an export price the optimizer had already judged worse than
+  storing it. The pack stays bounded by headroom and the reserve, which are
+  different questions and are asked separately.
+
+- **A two-part interlock, because one part cannot express it.** Direction on this
+  surface is a signed *value*, not a choice of entity, so the entity subset test
+  that keeps a discharge off the helper families cannot see a wrong-way dispatch.
+  `dispatch_refusal` is the check that can: positive power refused, any mode
+  outside the executable set refused by exact label. Zero is permitted, and that
+  is not a loophole -- it is what the direction gate produces when the grid target
+  would require a discharge, and what the cleanup writes.
+
+- **All six conflicting Hillview families** are now declared, not four. The vendor
+  automation turns off force charging, force discharging, force import, force
+  export, excess export and peak shaving before arming, and a feature Alpha EMS
+  does not know about is one it would have silently destroyed.
+
+- `PERMITTED_SERVICES` grows by exactly one, `input_select.select_option`, because
+  the mode is an `input_select` whose label the package parses a number out of.
+  `input_button.press` is **not** added: turning the enable boolean off already
+  triggers the package's own reset.
+
+### Added -- the Stage-A to Stage-B contract
+
+- **`desired_grid_kw`**, signed, per quarter, read off the solved plan's own
+  per-interval grid energies. Positive is intended net import. Kept separate from
+  `grid_target_kwh`, which is an export *energy* published only for a net-export
+  intent -- merging them is precisely the confusion that field's own comment
+  guards against.
+
+- **`safety_buy_kwh` and `economic_buy_kwh`**, from the reserve-relaxed
+  counterfactual the plan already solves. The difference used to be computed,
+  compared against one bucket and discarded. The documented limitation travels
+  with the figures: quantities within this run window, not a globally exact
+  decomposition, because the relaxed solve may move economic charging elsewhere.
+
+### Added -- three safety layers
+
+- **Control-grade sensor coherence**, on its own threshold.
+  `BALANCE_MAX_SOURCE_AGE_SECONDS` is 300 and was calibrated for comparing
+  accumulated energy; reused as an actuator threshold it accepts a five-minute-old
+  reading as the basis for a live setpoint. 90 seconds is derived from measured
+  behaviour -- the installation reports source ages of five and twelve seconds
+  against a worst skew of nineteen -- so it cannot fire on ordinary jitter.
+
+  The grace period is counted in **physical ticks, never economic refreshes**. Two
+  refreshes is about thirty minutes, longer than the twenty-minute dead-man it is
+  supposed to sit inside. Three ticks is 180 seconds, and the dead-man is never
+  re-armed while incoherent.
+
+- **An emergency self-stop authority that is not ownership.** Marker off still
+  means not owned, and the degraded state is never called owned. What the
+  authority adds is one write -- Dispatch enable off -- granted only while
+  causation survives the marker, and it refuses any widening: each other write
+  touches a dispatch that may still be running, and one of them restarts the
+  vendor timer. Retries are bounded at three, then the device dead-man finishes.
+
+- **An admitted run can now be revised downward.** Its energy figures were
+  immutable, so a Safety Buy admitted conservatively while tomorrow's prices were
+  unknown kept delivering after cheaper prices arrived. Two caps on separate
+  domains, never one comparison across origins: a fresh publication reports
+  remaining energy from the *next boundary* while the frozen remainder is measured
+  from the *admitted window start*, and a single `min` across them trims a healthy
+  6.0 kWh run to about 4.5. Strictly subtractive -- carry-forward can reduce a run
+  or leave it alone, never grow one.
 
 ### Preserved
 
-The foreign-dispatch invariant, restart adoption, the claim window, the
-four-layer charge-only interlock, G.1/G.2 sustain, headroom, the grid budget,
-Activity, `authorize_reset` and `authorize_marker_release` are all unchanged.
-`plan_commands` and `plan_reset` return exactly what they returned in beta.24 --
-asserted, not assumed -- so the two staged halves sum to the sequence the report
-publishes.
+Stage-A economics are **unchanged**, and that is a finding rather than an
+omission: fifteen counterfactuals were written first and all fifteen pass. The
+Safety Buy waits for the cheapest feasible quarter and buys early only as far as
+feasibility forces, with the dearest quarter carrying the least. A kilowatt-hour
+is retained for a 0.40 avoided import over a 0.30 export, and exported when export
+really is worth more. The battery is not exhausted in the first sell window when a
+better one follows. No export price unlocks a reserve violation, and energy above
+the reserve stays discretionary. Negative prices are ordinary numbers in the same
+objective, and no module selects an actuator mode from a price sign.
 
-### Testing
-
-3343 passed, 1 skipped. beta.24.1: 21. beta.24: 83. beta.23: 47. Mutation
-suites: 238, 0 survivors.
+The foreign-dispatch invariant, restart adoption, the claim window, the four-layer
+charge-only interlock, G.1/G.2 sustain, headroom, the grid budget, Activity,
+`authorize_reset` and `authorize_marker_release` are all unchanged.
 
 ### Known and outstanding
 
-- Not hardware-proven. The first thing to confirm on the installation is that the
-  capability refuses while the helper is absent, and only then that a verified
-  claim precedes any parameter write.
+- **The beta.25 integration layer is not implemented.** The sixty-second physical
+  controller, the shared execution lock, the ownership `degraded` state machine,
+  the coherence and downward-revision wiring, and the flight-recorder ring are all
+  absent, and the Live charge path still uses the Force Charging helper family.
+  Every layer above is pure, gated and tested; none of it drives hardware.
+- **Not hardware-proven.** The ownership fix should be validated first, and the
+  first thing to confirm is that the capability refuses while the helper is
+  absent.
+- Modes 6 and 7, mode-2 positive power, export, and photovoltaic curtailment are
+  modelled and tested and remain gated at both boundaries.
+- **R2 remains open**: withdrawal is inferred from the absence of an affirming
+  publication.
+- beta.22's capped-charge observation is still outstanding.
 
 ## [1.0.0-beta.24] - 2026-08-25
 
