@@ -46,6 +46,10 @@ from .const import (
     CONTROL_EXECUTABLE_ACTIONS,
     CONTROL_EXECUTION_AVAILABLE,
     CONTROL_REFUSE_ACTION_NOT_EXECUTABLE,
+    MARKER_ABSENT,
+    MARKER_OFF,
+    MARKER_ON,
+    MARKER_UNAVAILABLE,
     MAX_CONTROL_EVENTS_REPORTED,
 )
 from .execution import instant_of
@@ -214,6 +218,10 @@ class DeviceSnapshot:
     #: treated as "no evidence it advanced" rather than as agreement.
     charge_timer_active: bool | None = None
     charge_timer_finishes_at: datetime | None = None
+    #: The marker as a typed state, for diagnosis rather than for attribution.
+    #: Beside :attr:`owner_marker` rather than replacing it -- ownership is still
+    #: computed from the boolean, and beta.24.1 does not change that arithmetic.
+    owner_marker_state: str = MARKER_ABSENT
 
     @property
     def marker_present(self) -> bool:
@@ -231,7 +239,13 @@ class DeviceSnapshot:
             "dispatch_time_s": self.dispatch_time_s,
             "active_modes": list(self.active_modes[:MAX_CONTROL_EVENTS_REPORTED]),
             "owner_marker": self.owner_marker,
+            "owner_marker_state": self.owner_marker_state,
             "owner_marker_entity": BOOLEAN_EXECUTION_OWNER,
+            "owner_marker_rule": (
+                "absent means the helper does not exist, which is not off: "
+                "without it ownership cannot be established at all, so the "
+                "capability reports it missing and no charge may be armed"
+            ),
             "charge_timer_active": self.charge_timer_active,
             "charge_timer_finishes_at": (
                 None
@@ -265,6 +279,39 @@ def _state_of(hass: HomeAssistant, entity_id: str) -> str | None:
     """Return an entity's state string, or ``None`` when it does not exist."""
     state = hass.states.get(entity_id)
     return None if state is None else state.state
+
+
+@callback
+def marker_state(hass: HomeAssistant) -> str:
+    """Return the owner marker's state as one of :data:`MARKER_STATES`.
+
+    **Four distinguishable facts, because beta.24 had one boolean and it hid the
+    fault.** ``owner_marker`` was ``None`` for a missing helper and ``False`` for
+    one that is off, and every reader that mattered treated both as "not ours" --
+    which is correct for attribution and useless for diagnosis. A user whose
+    charge never owned anything needs to be told the helper does not exist, not
+    that a marker is off.
+
+    Never ``unverified``: that state is a property of a *write*, not of a reading,
+    and only the staged arm can observe it.
+    """
+    state = hass.states.get(BOOLEAN_EXECUTION_OWNER)
+    if state is None:
+        return MARKER_ABSENT
+    if state.state in _UNUSABLE_STATES:
+        return MARKER_UNAVAILABLE
+    return MARKER_ON if state.state == STATE_ON else MARKER_OFF
+
+
+@callback
+def marker_verified_on(hass: HomeAssistant) -> bool:
+    """Return whether the marker can be *read back* as on, right now.
+
+    The verification stage-one of the arm is gated on. Deliberately a positive
+    test: anything other than a readable, present, on marker is a failure, so a
+    new failure mode cannot pass by not being listed.
+    """
+    return marker_state(hass) == MARKER_ON
 
 
 @callback
@@ -343,6 +390,7 @@ def read_snapshot(hass: HomeAssistant) -> DeviceSnapshot:
         owner_marker=None if marker is None else marker == STATE_ON,
         charge_timer_active=timer_active,
         charge_timer_finishes_at=finishes_at,
+        owner_marker_state=marker_state(hass),
     )
 
 

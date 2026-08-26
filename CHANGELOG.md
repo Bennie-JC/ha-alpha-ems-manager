@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.24.1] - 2026-08-26
+
+**A charge could be armed that Alpha EMS could provably never own, sustain or
+stop.** Ownership safety only; nothing else changed.
+
+### Fixed
+
+- **The owner marker was not a required entity.** `discover` walks
+  `REQUIRED_ENTITIES` and nothing else, and the marker was absent from it, so an
+  installation that had never created `input_boolean.alpha_ems_dispatch_owner`
+  reported a complete control surface. The arm wrote `turn_on` to a non-existent
+  entity, the write reported success, the causal record could never match, and
+  every later refresh read `foreign`. The fifteen-minute alternation in the event
+  log was the whole cycle: arm at :00, inhibited at :15, device dead-man at :20,
+  arm again at :30. A missing or unavailable marker now makes the capability
+  unready and Live refuses before anything is planned, naming the entity.
+
+- **The arm is staged, and the activation is no longer in the same stage as the
+  claim.** "Activation last" was already true and was not enough: last in a list
+  that runs unconditionally is still reached when the first step did nothing. The
+  ownership claim is now sent alone and read back, and only a verified claim
+  reaches the parameters and the activation. A claim that cannot be read back
+  arms nothing, withdraws the causal record and reports `marker_not_verified`.
+
+  This is deliberately a second, independent guarantee: it holds even where the
+  capability check cannot help, because a service call that succeeds is not a
+  state that changed.
+
+- **The stop is staged the same way.** The deactivation is sent alone and read
+  back before anything else is written. That ordering is not tidiness: writing
+  the duration helper restarts the vendor package timer, so a cleanup issued
+  against a dispatch that did not actually stop would extend the run it was
+  ending. A stop that cannot be confirmed withholds the cleanup, keeps the marker
+  and the causal record, reports `stop_not_verified`, and retries on a later
+  refresh -- it never publishes a clean or unowned state.
+
+- **The marker is reported as four distinct facts** -- absent, unavailable, off,
+  on -- plus `unverified` for a write whose readback disagreed. `owner_marker`
+  was `None` for a missing helper and `False` for one that is off; both mean "not
+  ours", which is correct for attribution and useless for diagnosis.
+
+### Preserved
+
+The foreign-dispatch invariant, restart adoption, the claim window, the
+four-layer charge-only interlock, G.1/G.2 sustain, headroom, the grid budget,
+Activity, `authorize_reset` and `authorize_marker_release` are all unchanged.
+`plan_commands` and `plan_reset` return exactly what they returned in beta.24 --
+asserted, not assumed -- so the two staged halves sum to the sequence the report
+publishes.
+
+### Testing
+
+3343 passed, 1 skipped. beta.24.1: 21. beta.24: 83. beta.23: 47. Mutation
+suites: 238, 0 survivors.
+
+### Known and outstanding
+
+- Not hardware-proven. The first thing to confirm on the installation is that the
+  capability refuses while the helper is absent, and only then that a verified
+  claim precedes any parameter write.
+
 ## [1.0.0-beta.24] - 2026-08-25
 
 **The first release that can charge your battery -- and stop.** Live execution is

@@ -2036,6 +2036,56 @@ CONTROL_REFUSE_SERVICE_NOT_PERMITTED: Final = "service_not_permitted"
 #: entity with one comparison and cannot be fooled by a mislabelled command.
 CONTROL_REFUSE_ACTION_NOT_EXECUTABLE: Final = "live_charge_only"
 
+#: The owner marker's state, as five distinct facts rather than a boolean.
+#:
+#: **"Off" and "absent" are different, and beta.24 could not tell them apart.**
+#: A missing helper means ownership is *structurally impossible* -- the arm writes
+#: to nothing, the write reports success, and the causal record can never match --
+#: while a marker that is merely off is the ordinary resting state. One of those
+#: must refuse to execute and the other must not, so they cannot share a name.
+MARKER_ABSENT: Final = "absent"
+MARKER_UNAVAILABLE: Final = "unavailable"
+MARKER_OFF: Final = "off"
+MARKER_ON: Final = "on"
+#: Written, and the readback did not agree. Distinct from ``off`` because the
+#: write was attempted: it says the control surface did not do what it was asked.
+MARKER_UNVERIFIED: Final = "unverified"
+
+MARKER_STATES: Final = (
+    MARKER_ABSENT,
+    MARKER_UNAVAILABLE,
+    MARKER_OFF,
+    MARKER_ON,
+    MARKER_UNVERIFIED,
+)
+
+#: The marker states in which no dispatch may be armed. ``off`` is absent from
+#: this set on purpose: it is the state every arm *starts* from.
+MARKER_STATES_UNUSABLE: Final = (MARKER_ABSENT, MARKER_UNAVAILABLE)
+
+#: What a staged sequence checks between its two stages.
+#:
+#: **Both verify a write, not a device.** ``marker_on`` reads back the helper the
+#: claim just wrote; ``no_family_active`` reads back the activation booleans the
+#: deactivation just cleared. Both are local ``input_boolean`` entities and settle
+#: within the service call, which is what makes a same-refresh check meaningful.
+#:
+#: Deliberately **not** ``sensor.alphaess_dispatch_start``. That register is the
+#: device's own readback and legitimately lags a poll behind, so gating the
+#: cleanup on it would withhold the resting values every single time and release
+#: the marker never -- a stop that can never finish is worse than the fault this
+#: staging exists to fix. The register remains what the dead-man and the
+#: ownership rule read; it is not what tells us our own write landed.
+EXECUTION_VERIFY_MARKER_ON: Final = "marker_on"
+EXECUTION_VERIFY_NO_FAMILY_ACTIVE: Final = "no_family_active"
+
+#: Stage one of the arm was sent and the marker did not read back on, so stage two
+#: -- which carries the activation -- was never sent and nothing was armed.
+CONTROL_REFUSE_MARKER_NOT_VERIFIED: Final = "marker_not_verified"
+#: Stage one of the stop was sent and the dispatch did not read back inactive, so
+#: the cleanup was withheld and the ownership evidence was kept for a retry.
+CONTROL_REFUSE_STOP_NOT_VERIFIED: Final = "stop_not_verified"
+
 CONTROL_WRITE_REFUSALS: Final = (
     CONTROL_REFUSE_DIRECTION_MISMATCH,
     CONTROL_REFUSE_FOREIGN_FAMILY,

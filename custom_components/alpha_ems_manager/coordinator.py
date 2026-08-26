@@ -50,9 +50,11 @@ from .alphaess_device import (
     build_command,
     device_power_kw,
     limit_command,
-    plan_commands,
+    plan_arm_parameters,
+    plan_marker_claim,
     plan_release_marker,
-    plan_reset,
+    plan_reset_cleanup,
+    plan_reset_deactivate,
     plan_sustain,
 )
 from .api import load_forecast_from
@@ -94,6 +96,8 @@ from .const import (
     CONTROL_MODE_ACTIVE,
     CONTROL_MODE_OFF,
     CONTROL_MODE_OPTIONS,
+    CONTROL_REFUSE_MARKER_NOT_VERIFIED,
+    CONTROL_REFUSE_STOP_NOT_VERIFIED,
     CONTROL_STATE_ELIGIBLE,
     CONTROL_STATE_EXECUTED,
     CONTROL_STATE_IDLE,
@@ -116,6 +120,8 @@ from .const import (
     EXECUTION_STOP_SAFETY,
     EXECUTION_STOP_SWITCHED_OFF,
     EXECUTION_TARGET_STALE_MINUTES,
+    EXECUTION_VERIFY_MARKER_ON,
+    EXECUTION_VERIFY_NO_FAMILY_ACTIVE,
     INHIBIT_NO_DECISION,
     INHIBIT_NO_PLAN,
     INHIBIT_PLAN_UNAVAILABLE,
@@ -1048,6 +1054,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: Whether the pending steps stop a run rather than start one. A reset must
         #: never write a claim of ownership.
         self._pending_is_reset: bool = False
+        # **The two stages of the pending sequence, and what is checked between
+        # them.** Held apart rather than as one list because the whole point of
+        # beta.24.1 is that stage two is *conditional*: an arm may not activate
+        # until the claim reads back, and a stop may not disturb a running
+        # dispatch's fields until the deactivation reads back. Their concatenation
+        # is always exactly the list the report published.
+        self._pending_stage_one: tuple[Any, ...] = ()
+        self._pending_stage_two: tuple[Any, ...] = ()
+        self._pending_verify: str | None = None
         #: Whether the pending step list ends in an activation, so a *confirmed*
         #: physical start can be distinguished from a computed one. Activity says
         #: "started" only when a write carrying this actually succeeded.
@@ -2450,11 +2465,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         decision = ExecutionDecision(False, REFUSE_MODE_NOT_ACTIVE)
         source = None
 
+        stage_one: tuple[Any, ...] = ()
+        stage_two: tuple[Any, ...] = ()
+        verify: str | None = None
+
         if ownership == OWNERSHIP_OWNED:
-            commands = plan_reset(reset_action) if reset_action else ()
+            if reset_action:
+                stage_one = plan_reset_deactivate(reset_action)
+                stage_two = plan_reset_cleanup(reset_action)
+                verify = EXECUTION_VERIFY_NO_FAMILY_ACTIVE if stage_one else None
+            commands = stage_one + stage_two
             refusal = action_refusal(reset_action, commands) if commands else None
             if refusal is not None:
                 commands = ()
+                stage_one = stage_two = ()
+                verify = None
             decision = authorize_reset(
                 ownership=ownership,
                 stopping_action=reset_action,
@@ -2467,6 +2492,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # and must not be blocked by the mode, or a marker left on by a crash
             # would latch there for as long as the user stays in Off.
             commands = plan_release_marker()
+            # Nothing is running, so there is nothing to verify and nothing to
+            # withhold: the release is the whole operation.
+            stage_two = commands
             decision = authorize_marker_release(
                 marker_is_stale=stale_marker(evidence),
                 steps_planned=len(commands),
@@ -2474,6 +2502,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             source = "off_marker_release"
 
         self._pending_commands = commands
+        self._pending_stage_one = stage_one
+        self._pending_stage_two = stage_two
+        self._pending_verify = verify
         self._pending_power_kw = None
         self._pending_command = None
         self._pending_snapshot = snapshot
@@ -2494,6 +2525,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "write_boundary": {
                 "action": reset_action if source == "off_reset" else None,
                 "source": source,
+                "stage_one": [step.as_dict() for step in stage_one],
+                "stage_two": [step.as_dict() for step in stage_two],
+                "stage_verification": verify,
                 "steps": [step.as_dict() for step in commands],
                 "stop_reason": (
                     EXECUTION_STOP_SWITCHED_OFF if source == "off_reset" else None
@@ -4347,6 +4381,27 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             window.append(end > sunrise and start < sunset)
         return tuple(window)
 
+    def _staged_write_landed(self, verify: str) -> bool:
+        """Return whether stage one's write can be *read back*.
+
+        **Positive tests only.** Anything that is not an observed success is a
+        failure, so a state nobody thought of does not pass by not being listed.
+
+        Both readings are of local ``input_boolean`` helpers, which settle inside
+        the blocking service call that wrote them. That is what makes checking in
+        the same refresh meaningful, and it is why neither reading is
+        ``sensor.alphaess_dispatch_start``: the device register lags a poll, so a
+        cleanup gated on it would be withheld every time and the marker released
+        never. The register is still what ownership and the dead-man read; it is
+        not what tells us our own write landed.
+        """
+        snapshot = read_snapshot(self.hass)
+        if verify == EXECUTION_VERIFY_MARKER_ON:
+            return snapshot.owner_marker is True
+        if verify == EXECUTION_VERIFY_NO_FAMILY_ACTIVE:
+            return not snapshot.active_modes
+        return False  # pragma: no cover - an unknown check fails closed
+
     async def _async_dispatch(
         self, report: dict[str, Any] | None, now: datetime
     ) -> None:
@@ -4396,8 +4451,20 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._write_execution_record(
                 run, self._pending_command, self._pending_snapshot, now
             )
+        # **Two stages, and stage two is conditional.** This is the whole of
+        # beta.24.1 at the send site: an activation may not be issued until the
+        # ownership claim has been read back, and a running dispatch's fields may
+        # not be disturbed until the deactivation has been read back.
+        stage_one = self._pending_stage_one
+        stage_two = self._pending_stage_two
+        verify = self._pending_verify
+        landed = True
         try:  # pragma: no cover - the barrier makes this unreachable
-            await async_execute(self.hass, commands)
+            if stage_one:
+                await async_execute(self.hass, stage_one)
+                landed = verify is None or self._staged_write_landed(verify)
+            if landed and stage_two:
+                await async_execute(self.hass, stage_two)
         except ControlExecutionUnavailable:
             # The expected outcome while the barrier stands, and recorded rather
             # than swallowed: a release that believes it sent something is worse
@@ -4432,6 +4499,33 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             _mark_execution_error(report, "write_failed")
         else:
+            if not landed:
+                # **Stage two was withheld, and which failure it was matters.**
+                #
+                # An unverified *claim* means nothing was armed -- the activation
+                # lives in stage two -- so the record is withdrawn and the marker,
+                # whatever it did or did not do, is left to the ordinary
+                # stale-marker path. The alternative is a dispatch running under a
+                # claim that was never real, which is the beta.24 fault itself.
+                #
+                # An unverified *stop* means the opposite: something may well
+                # still be running, so every piece of ownership evidence is kept
+                # so the next refresh reads ``owned`` and tries again. Clearing it
+                # here would drop to ``unproven``, and an unproven dispatch is
+                # never touched again -- the run would latch on for good.
+                if verify == EXECUTION_VERIFY_MARKER_ON:
+                    if claiming:
+                        self._clear_execution_record()
+                    _mark_execution_error(report, CONTROL_REFUSE_MARKER_NOT_VERIFIED)
+                else:
+                    _mark_execution_error(report, CONTROL_REFUSE_STOP_NOT_VERIFIED)
+                _LOGGER.warning(
+                    "A staged control sequence was stopped after its first stage "
+                    "because the write could not be read back (%s). Nothing "
+                    "further was sent",
+                    verify,
+                )
+                return
             report["state"] = CONTROL_STATE_EXECUTED
             # **From the power actually written**, not from Stage B's request.
             # beta.19 copied ``requested_kw`` here, so the report would have
@@ -4702,16 +4796,34 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # fails closed; it is never defaulted to a charge.
         reset_action = self._owned_run_action()
 
+        # **The stages are built first and the published list is their sum.**
+        # Deriving ``commands`` from the two halves rather than beside them means
+        # the report can never describe a sequence the send site would not send:
+        # there is one construction, not two that have to agree.
+        stage_one: tuple[Any, ...] = ()
+        stage_two: tuple[Any, ...] = ()
+        verify: str | None = None
         if resetting:
-            commands = plan_reset(reset_action) if reset_action else ()
+            if reset_action:
+                stage_one = plan_reset_deactivate(reset_action)
+                stage_two = plan_reset_cleanup(reset_action)
+                verify = EXECUTION_VERIFY_NO_FAMILY_ACTIVE if stage_one else None
         elif releasing:
-            commands = plan_release_marker()
+            stage_two = plan_release_marker()
         elif command is None:
-            commands = ()
+            pass
         elif sustaining:
-            commands = plan_sustain(command)
+            # Ownership is already proven by the time a sustain is reachable, so
+            # there is no claim to make and nothing to verify before re-arming.
+            stage_two = plan_sustain(command)
         else:
-            commands = plan_commands(command)
+            stage_two = plan_arm_parameters(command)
+            # **No claim without something to arm.** A command that moves no
+            # battery is not an arm, and a lone marker write would claim
+            # ownership of nothing and then have to be cleaned up as stale.
+            stage_one = plan_marker_claim() if stage_two else ()
+            verify = EXECUTION_VERIFY_MARKER_ON if stage_one else None
+        commands = stage_one + stage_two
 
         # Layer 3 of the direction interlock, and it now guards the reset list too:
         # checked against the entity list itself, not against the intention that
@@ -4730,8 +4842,25 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             refusal = action_refusal(checked, commands)
         if refusal is not None:
             commands = ()
+            stage_one = stage_two = ()
+            verify = None
         stage_b["write_boundary"] = {
             "refusal": refusal,
+            # **The two stages, published separately.** A reader has to be able
+            # to see that the activation is not in the same stage as the claim,
+            # because "activation last" and "activation only after the claim was
+            # read back" are different guarantees and beta.24 had only the first.
+            "stage_one": [step.as_dict() for step in stage_one],
+            "stage_two": [step.as_dict() for step in stage_two],
+            "stage_verification": verify,
+            "staging_rule": (
+                "stage two is conditional. an arm may not reach its activation "
+                "until the owner marker reads back on; a stop may not disturb a "
+                "running dispatch's fields until no activation boolean is on. "
+                "both checks read the helper the stage itself wrote, never the "
+                "device register, which lags a poll and would withhold every "
+                "cleanup for ever"
+            ),
             # The action of whatever is being sent. On a reset that is the action
             # the record says we armed, which is the whole point: a stopping refresh
             # has no command to take it from.
@@ -4829,6 +4958,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # diagnostics, and a second reader of the live tuple would be a second
         # path to the inverter.
         self._pending_commands = commands
+        self._pending_stage_one = stage_one
+        self._pending_stage_two = stage_two
+        self._pending_verify = verify
         self._pending_power_kw = None if command is None else command.power_kw
         self._pending_command = command
         self._pending_snapshot = snapshot

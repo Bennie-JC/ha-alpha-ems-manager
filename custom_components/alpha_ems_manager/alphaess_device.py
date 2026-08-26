@@ -195,6 +195,15 @@ FAMILIES: dict[str, HelperFamily] = {
 
 #: Everything the adapter must find before a command can be considered.
 REQUIRED_ENTITIES: tuple[str, ...] = (
+    # **The owner marker, and its absence here was the beta.24 ownership fault.**
+    # ``discover`` walks exactly this tuple, so an entity missing from it is an
+    # entity nothing refuses to execute without. On an installation that had never
+    # created the helper the arm wrote ``turn_on`` to a non-existent entity, the
+    # write reported success, the causal record could never match, and every later
+    # refresh read ``foreign`` -- a charge Alpha EMS could start and provably never
+    # own, sustain or stop. It is listed first because it is the first thing the
+    # arm writes and the first thing that must exist.
+    BOOLEAN_EXECUTION_OWNER,
     SENSOR_DISPATCH_START,
     SENSOR_DISPATCH_MODE,
     SENSOR_DISPATCH_ACTIVE_POWER,
@@ -606,9 +615,36 @@ def plan_commands(command: DeviceCommand) -> tuple[CommandStep, ...]:
         # must not quietly become one.
         return ()
 
+    return plan_marker_claim() + plan_arm_parameters(command)
+
+
+def plan_marker_claim() -> tuple[CommandStep, ...]:
+    """Return stage one of the arm: claim ownership, and nothing else.
+
+    **Separated since beta.24.1 so the claim can be verified before anything is
+    armed.** A marker write that silently did nothing -- the entity absent, or
+    unavailable -- used to be indistinguishable from one that worked, because the
+    next step in the same list carried on regardless and the activation at the end
+    of it started a dispatch nothing could prove was ours.
+
+    Alone, this step is inert: no parameter is set and no activation is issued, so
+    a sequence that stops here has claimed ownership of nothing and is cleared by
+    the ordinary stale-marker path.
+    """
+    return (CommandStep(*SERVICE_TURN_ON, BOOLEAN_EXECUTION_OWNER),)
+
+
+def plan_arm_parameters(command: DeviceCommand) -> tuple[CommandStep, ...]:
+    """Return stage two of the arm: the parameters, then activation.
+
+    Reachable only once :func:`plan_marker_claim` has been verified by readback.
+    **Activation is still last**, for the reason it always was: it is what triggers
+    the device write, so it must observe settled values.
+    """
+    if not command.moves_battery:
+        return ()
     family = FAMILIES[command.action]
     return (
-        CommandStep(*SERVICE_TURN_ON, BOOLEAN_EXECUTION_OWNER),
         CommandStep(*SERVICE_SET_VALUE, family.power, command.power_kw),
         CommandStep(
             *SERVICE_SET_VALUE,
@@ -772,15 +808,43 @@ def plan_reset(action: str) -> tuple[CommandStep, ...]:
     evidence -- but a reset issued without it would be exactly the "touch a
     dispatch it did not start" this project promises never to do.
     """
+    return plan_reset_deactivate(action) + plan_reset_cleanup(action)
+
+
+def plan_reset_deactivate(action: str | None) -> tuple[CommandStep, ...]:
+    """Return stage one of the stop: switch the dispatch off, and nothing else.
+
+    **Separated since beta.24.1 so inactivity is verified before anything else is
+    written.** The rest of the reset disturbs fields a *running* dispatch depends
+    on, and one of them makes it worse rather than better: writing the duration
+    helper restarts the vendor package's timer, so a cleanup issued against a
+    dispatch that did not actually stop would extend the very run it was trying to
+    end.
+
+    Empty when there is no direction to reset -- there is nothing to switch off,
+    and the marker release in :func:`plan_reset_cleanup` is the whole operation.
+    """
+    family = FAMILIES.get(action)
+    if family is None:
+        return ()
+    return (CommandStep(*SERVICE_TURN_OFF, family.activate),)
+
+
+def plan_reset_cleanup(action: str | None) -> tuple[CommandStep, ...]:
+    """Return stage two of the stop: resting values, then the marker.
+
+    Reachable only once the dispatch has been *observed* inactive. **The marker
+    goes last**: until it is off the dispatch is still owned, and releasing
+    ownership before finishing the cleanup would leave Alpha EMS unable to finish
+    its own.
+    """
     family = FAMILIES.get(action)
     if family is None:
         # No direction to reset. The marker is still released, because a marker
         # with nothing behind it is the stale case and clearing it is safe.
         return (CommandStep(*SERVICE_TURN_OFF, BOOLEAN_EXECUTION_OWNER),)
     return (
-        # 1. Stop the dispatch.
-        CommandStep(*SERVICE_TURN_OFF, family.activate),
-        # 2. Leave nothing a later run could inherit. Power to zero, and the
+        # Leave nothing a later run could inherit. Power to zero, and the
         #    dead-man to its own minimum rather than to zero -- the helper refuses
         #    values below its range, and a refused write is not a cleared field.
         CommandStep(*SERVICE_SET_VALUE, family.power, 0.0),
@@ -795,7 +859,7 @@ def plan_reset(action: str) -> tuple[CommandStep, ...]:
             float(CONTROL_CUTOFF_MIN_PERCENT),
         ),
         CommandStep(*SERVICE_TURN_OFF, family.hold),
-        # 3. Release ownership, having finished with it.
+        # Release ownership, having finished with it.
         CommandStep(*SERVICE_TURN_OFF, BOOLEAN_EXECUTION_OWNER),
     )
 
