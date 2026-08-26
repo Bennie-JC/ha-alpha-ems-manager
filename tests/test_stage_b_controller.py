@@ -93,6 +93,11 @@ def raw_target(**overrides) -> dict:
         "stale_after": (ISSUED + timedelta(hours=8)).isoformat(),
         "battery_target_kwh": 11.94,
         "grid_target_kwh": None,
+        # **The beta.25 contract field**: the signed meter target for the quarter,
+        # positive for import. Distinct from ``grid_target_kwh`` above, which is an
+        # export *energy* and stays ``None`` for a charge -- the two are never
+        # defaulted from each other.
+        "desired_grid_kw": 2.1,
         "average_power_kw": 2.08,
         "first_power_kw": 2.1,
         "reserve_floor_kwh": 4.25,

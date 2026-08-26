@@ -48,8 +48,10 @@ from .alphaess_adapter import (
 )
 from .alphaess_device import (
     BOOLEAN_EXECUTION_OWNER,
+    DISPATCH_DURATION,
     DISPATCH_ENABLE,
     DISPATCH_MODE_SOC_CONTROL,
+    DISPATCH_POWER,
     FAMILIES,
     action_refusal,
     build_command,
@@ -4909,7 +4911,23 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # somebody else started. And never for a reset, which ends a run rather
         # than beginning one.
         run = self._carried
-        claiming = run is not None and not self._pending_is_reset
+        # **The claim is written once, by the sequence that actually arms.**
+        #
+        # Until beta.25 every non-stopping refresh rewrote it, which cleared the
+        # ``dispatch_start`` stamp each time -- and that was survivable only
+        # because the old sustain re-issued the activation boolean, so the device
+        # restamped its own start instant to match the new write. beta.25's sustain
+        # deliberately does not toggle the enable: writing the duration re-arms the
+        # vendor timer on its own, and not toggling it is what keeps the dispatch
+        # continuously live.
+        #
+        # So without this the settle window could never match again after the first
+        # refresh, ownership fell back to ``unproven`` on the second, and a charge
+        # became unstoppable while still running. The claim is about the *arming*;
+        # once stamped it is completed rather than replaced.
+        claiming = (
+            run is not None and not self._pending_is_reset and self._pending_activates
+        )
         if claiming:
             self._write_execution_record(
                 run, self._pending_command, self._pending_snapshot, now
@@ -4990,6 +5008,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 return
             report["state"] = CONTROL_STATE_EXECUTED
+            # **One record of what is on the wire, whichever path wrote it.** The
+            # quarter refresh and the sixty-second tick both command power, so a
+            # deadband comparing against only one of them would compare against a
+            # stale figure and either chatter or go deaf.
+            for step in commands:
+                if step.entity_id == DISPATCH_POWER and step.value is not None:
+                    self._applied_setpoint_kw = step.value
             # **From the power actually written**, not from Stage B's request.
             # beta.19 copied ``requested_kw`` here, so the report would have
             # asserted one figure while a different one was on the wire -- and it
@@ -5004,9 +5029,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # nothing -- which is the one claim a release that writes must not get
             # wrong.
             self._activation_confirmed = self._pending_activates
-            if self._pending_activates:
-                # Remember what the dead-man read before this activation, so the
-                # next refresh can check that it moved.
+            if any(step.entity_id == DISPATCH_DURATION for step in commands):
+                # **Recorded on the re-arm, not on the activation.**
+                #
+                # Until beta.25 the two were the same event, because a sustain
+                # re-issued the activation boolean. They are not the same now: the
+                # duration write is what re-arms the vendor timer, and the enable
+                # is left alone so the dispatch stays continuously live. Keying
+                # this on activation meant the observation was taken once, at the
+                # arm, and never again -- so a dead-man that stopped advancing
+                # halfway through a run was compared against a deadline from the
+                # start of it and looked fine.
                 self._sustained_deadline = self._pending_deadline
                 self._sustained_run_id = self._pending_run_id
             # **The claim is released only once the stop has actually landed.**
@@ -5227,7 +5260,6 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             and bool(snapshot is not None and snapshot.dispatch_active)
             and recorded_run_id is not None
             and recorded_run_id == carried_run_id
-            and not self._power_moved_materially(command)
         )
         # **Which operation this refresh performs, decided before anything is
         # built.** Until the amendment the order was inverted: a start was
@@ -5298,15 +5330,30 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # default.
             pass
         elif sustaining:
-            # **The dead-man cadence, and only here.** A power correction never
-            # re-arms: that would extend a run on a cadence the economics never
-            # chose. The cutoff is re-asserted because it is an upper bound and
-            # the configured ceiling may have moved since the run was armed.
-            stage_two = plan_dispatch_rearm(
+            # **A running run is always sustained.** Whether the commanded power
+            # moved is a different question from whether the run continues, and
+            # conflating them is the beta.24 fault: a charge holding steady at
+            # 3.0 kW re-armed nothing and expired mid-run while the controller
+            # believed it was still going. Constant power is the *common* case.
+            #
+            # Order is the approved one: power, cutoff, then the dead-man. The
+            # power step appears only when the setpoint materially moved, which is
+            # the same deadband decision the sixty-second tick makes, from the
+            # same pure function -- so the two writers cannot disagree about what
+            # "moved" means.
+            stage_two = ()
+            if setpoint is not None and setpoint.update_needed:
+                stage_two += plan_dispatch_power(setpoint.applied_kw)
+            stage_two += plan_dispatch_cutoff(command.cutoff_soc_percent)
+            # **The dead-man cadence, and only here.** A sixty-second correction
+            # never re-arms: that would extend a run on a cadence the economics
+            # never chose. The alternation is what makes the vendor automation
+            # fire at all -- it triggers on the helper changing state.
+            stage_two += plan_dispatch_rearm(
                 deadman_minutes(
                     None if snapshot is None else snapshot.dispatch_duration_minutes
                 )
-            ) + plan_dispatch_cutoff(command.cutoff_soc_percent)
+            )
         elif command.action != ACTION_CHARGE:
             # **The advisory path, unchanged.** The Phase-3 reserve guard emits
             # discharges, and no release executes one: the typed barrier refuses

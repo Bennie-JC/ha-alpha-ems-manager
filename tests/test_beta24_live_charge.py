@@ -43,6 +43,13 @@ from custom_components.alpha_ems_manager.alphaess_device import (
     BOOLEAN_EXECUTION_OWNER,
     CHARGE_FAMILY,
     DISCHARGE_FAMILY,
+    DISPATCH_CUTOFF_SOC,
+    DISPATCH_DURATION,
+    DISPATCH_ENABLE,
+    DISPATCH_ENTITIES,
+    DISPATCH_POWER,
+    DISPATCH_PV_SWITCH,
+    DISPATCH_TIMER,
     PERMITTED_SERVICES,
     SENSOR_DISPATCH_ACTIVE_POWER,
     SENSOR_DISPATCH_MODE,
@@ -513,7 +520,7 @@ def test_the_staleness_test_needs_a_previous_sustain_of_this_run(
     coordinator = setup_integration.runtime_data
 
     class Snapshot:
-        charge_timer_finishes_at = None
+        dispatch_timer_finishes_at = None
 
     assert coordinator._deadman_is_stale(Snapshot(), "run-1") is False
     coordinator._sustained_run_id = "run-1"
@@ -522,10 +529,10 @@ def test_the_staleness_test_needs_a_previous_sustain_of_this_run(
     assert coordinator._deadman_is_stale(Snapshot(), "run-1") is False
 
     class Advanced:
-        charge_timer_finishes_at = NOW + timedelta(minutes=20)
+        dispatch_timer_finishes_at = NOW + timedelta(minutes=20)
 
     class Stuck:
-        charge_timer_finishes_at = NOW
+        dispatch_timer_finishes_at = NOW
 
     assert coordinator._deadman_is_stale(Advanced(), "run-1") is False
     assert coordinator._deadman_is_stale(Stuck(), "run-1") is True
@@ -962,9 +969,15 @@ class LiveSurface:
         async def set_value(call) -> None:
             self._apply(call, str(call.data["value"]))
 
+        async def select_option(call) -> None:
+            # The mode is a *label*, which the vendor package parses a number out
+            # of -- so the harness stores the label rather than a number.
+            self._apply(call, call.data["option"])
+
         hass.services.async_register("input_boolean", "turn_on", turn_on)
         hass.services.async_register("input_boolean", "turn_off", turn_off)
         hass.services.async_register("input_number", "set_value", set_value)
+        hass.services.async_register("input_select", "select_option", select_option)
 
     def at(self, moment: datetime) -> None:
         """Set this surface's clock to the instant the coordinator is about to use.
@@ -982,28 +995,39 @@ class LiveSurface:
         self.calls.append(call)
         entity_id = call.data["entity_id"]
         self.hass.states.async_set(entity_id, value)
-        if entity_id != CHARGE_FAMILY.activate:
+        if entity_id == DISPATCH_DURATION and self.dispatch_seconds:
+            # **Writing the duration while the dispatch is on re-arms the
+            # dead-man**, which is the vendor behaviour the alternation exists to
+            # trigger: the automation fires on the helper changing state and then
+            # cancels and restarts the timer. Same value, no state change, no
+            # re-arm -- which is exactly what the alternation prevents.
+            self._rearm(float(value))
+            return
+        if entity_id != DISPATCH_ENABLE:
             return
         if value == "on":
-            # Activation starts a dispatch and re-arms the dead-man. Both are
-            # readbacks the ownership rule depends on.
+            # Enabling starts a dispatch and arms the dead-man. Both are readbacks
+            # the ownership rule depends on.
             # The same reconstruction the ownership layer performs, from the same
             # instant: seconds since the refresh day's midnight.
             midnight = self._now.replace(hour=0, minute=0, second=0, microsecond=0)
             self.dispatch_seconds = (self._now - midnight).total_seconds()
-            duration = float(self.hass.states.get(CHARGE_FAMILY.duration).state)
-            self.timer_finishes_at = self._now + timedelta(minutes=duration)
-            self.deadlines.append(self.timer_finishes_at)
-            self.hass.states.async_set(
-                CHARGE_FAMILY.timer,
-                "active",
-                {"finishes_at": self.timer_finishes_at.isoformat()},
-            )
+            self._rearm(float(self.hass.states.get(DISPATCH_DURATION).state))
         else:
             self.dispatch_seconds = 0.0
             self.timer_finishes_at = None
-            self.hass.states.async_set(CHARGE_FAMILY.timer, "idle", {})
+            self.hass.states.async_set(DISPATCH_TIMER, "idle", {})
         self.hass.states.async_set(SENSOR_DISPATCH_START, str(self.dispatch_seconds))
+
+    def _rearm(self, minutes: float) -> None:
+        """Set the Dispatch dead-man, as writing the duration helper does."""
+        self.timer_finishes_at = self._now + timedelta(minutes=minutes)
+        self.deadlines.append(self.timer_finishes_at)
+        self.hass.states.async_set(
+            DISPATCH_TIMER,
+            "active",
+            {"finishes_at": self.timer_finishes_at.isoformat()},
+        )
 
     def steps_of(self, entity_id: str) -> list:
         """Return every write made to one entity, in order."""
@@ -1131,13 +1155,14 @@ async def test_a_live_charge_arms_once_and_is_sustained_thereafter(
 
     # **The dead-man was rewritten on every executing refresh**, which is the
     # guarantee, and it holds whichever sequence ran -- arming writes the duration
-    # too. On this synthetic day the rolling power moves every quarter, because
-    # nothing feeds measured progress back, so most refreshes legitimately re-arm.
-    # The sustain *wiring* is asserted on its own below, where the power is held
-    # still deliberately rather than by accident.
-    assert len(live_surface.steps_of(CHARGE_FAMILY.duration)) == len(executing)
-    # One activation per moving refresh, plus one deactivation per reset.
-    assert len(live_surface.steps_of(CHARGE_FAMILY.activate)) == len(executing)
+    # too, and a sustain writes nothing else that matters.
+    assert len(live_surface.steps_of(DISPATCH_DURATION)) == len(executing)
+    # **The enable is written once, not once per refresh**, and that is a beta.25
+    # improvement rather than a weaker assertion. Writing the duration re-arms the
+    # vendor timer on its own, so a sustain needs no enable toggle -- and not
+    # toggling it is what keeps the dispatch continuously live instead of
+    # momentarily off fifteen times an hour.
+    assert len(live_surface.steps_of(DISPATCH_ENABLE)) == 1
     # The dead-man moved forward every time it was re-armed, and it is still live:
     # the run is under way throughout this window, so a cleared timer here would
     # mean the charge had silently stopped.
@@ -1146,7 +1171,7 @@ async def test_a_live_charge_arms_once_and_is_sustained_thereafter(
     assert live_surface.timer_finishes_at is not None
 
     # No redundant power write: every one carried a value different from the last.
-    values = [call.data["value"] for call in live_surface.steps_of(CHARGE_FAMILY.power)]
+    values = [call.data["value"] for call in live_surface.steps_of(DISPATCH_POWER)]
     assert values
     assert all(a != b for a, b in pairwise(values)), values
 
@@ -1212,12 +1237,18 @@ async def test_a_live_charge_never_writes_a_discharge_helper(
     """Across a whole Live campaign, not one write leaves the charge family."""
     await drive_live_charge(hass, config_data, frank, live_surface, quarters=8)
 
-    permitted = set(CHARGE_FAMILY.entities) | {BOOLEAN_EXECUTION_OWNER}
+    # **The Live surface is Dispatch and the marker, and nothing else.** The
+    # invariant is unchanged from beta.24 -- no discharge helper is ever written --
+    # but the family it is asserted against is the one that now executes.
+    permitted = set(DISPATCH_ENTITIES) | {BOOLEAN_EXECUTION_OWNER}
     touched = {call.data["entity_id"] for call in live_surface.calls}
 
     assert touched
     assert touched <= permitted, touched - permitted
     assert not touched & set(DISCHARGE_FAMILY.entities)
+    # And the Force Charging family is not commanded either: it is read for
+    # conflict detection and nothing more.
+    assert not touched & set(CHARGE_FAMILY.entities)
 
 
 async def test_a_run_whose_power_holds_still_is_sustained_not_re_armed(
@@ -1250,11 +1281,14 @@ async def test_a_run_whose_power_holds_still_is_sustained_not_re_armed(
 
     from .forecast_helpers import NORMAL, local, refresh_at
 
-    monkeypatch.setattr(
-        type(coordinator), "_power_moved_materially", lambda self, command: False
-    )
-    before = len(live_surface.steps_of(CHARGE_FAMILY.power))
-    duration_before = len(live_surface.steps_of(CHARGE_FAMILY.duration))
+    # **No patch is needed to hold the power still any more, and that is the
+    # point.** beta.24 gated the sustain on ``_power_moved_materially``, so the
+    # test had to force that predicate. beta.25 decides materiality with the
+    # deadband in ``dispatch.decide``, from live measurements that do not move in
+    # this harness -- so a steady setpoint is the natural outcome rather than a
+    # forced one, and the assertion below is about real behaviour.
+    before = len(live_surface.steps_of(DISPATCH_POWER))
+    duration_before = len(live_surface.steps_of(DISPATCH_DURATION))
     deadline_before = live_surface.timer_finishes_at
 
     for quarter in (2, 3):
@@ -1268,12 +1302,21 @@ async def test_a_run_whose_power_holds_still_is_sustained_not_re_armed(
 
     assert boundary.get("sequence") == "sustain"
     # The dead-man was rewritten on both sustaining refreshes, and the timer moved.
-    assert len(live_surface.steps_of(CHARGE_FAMILY.duration)) == duration_before + 2
+    assert len(live_surface.steps_of(DISPATCH_DURATION)) == duration_before + 2
     assert live_surface.timer_finishes_at is not None
     assert deadline_before is not None
     assert live_surface.timer_finishes_at > deadline_before
-    # And the power helper was left exactly as it was.
-    assert len(live_surface.steps_of(CHARGE_FAMILY.power)) == before
+    # **At most one power write per refresh, and only a material one.**
+    #
+    # The old assertion here was "the power helper was left exactly as it was",
+    # which is no longer the right claim: Stage A publishes a fresh
+    # ``desired_grid_kw`` on every quarter boundary, so a correction at a boundary
+    # is the controller doing its job rather than churn. What must hold is that no
+    # write is redundant and none is duplicated -- the deadband decision, asserted
+    # here on the real path and exhaustively in the dispatch arithmetic tests.
+    written = [call.data["value"] for call in live_surface.steps_of(DISPATCH_POWER)]
+    assert len(written) - before <= 2, written
+    assert all(a != b for a, b in pairwise(written)), written
     # One run throughout: a sustain is a continuation, not a new campaign.
     run_id = ((report.get("execution") or {}).get("carried") or {}).get("run") or {}
     assert run_id.get("run_id") == armed[-1]["run_id"]
@@ -1476,12 +1519,17 @@ def test_the_planned_line_is_also_keyed_on_the_run_rather_than_the_intent() -> N
 # asserts the physical consequence, rather than depending on where a synthetic day
 # happens to end a run.
 
+#: **The Dispatch stop, in order.** Enable off first, so an interrupted stop
+#: leaves the dispatch off rather than half-cleaned; the resting values next,
+#: because a dispatch left armed at zero still holds a duration and a cutoff a
+#: later run would inherit; the photovoltaic switch back to its fail-safe on; and
+#: the marker last, because until it is off the dispatch is still owned.
 RESET_ORDER = (
-    CHARGE_FAMILY.activate,
-    CHARGE_FAMILY.power,
-    CHARGE_FAMILY.duration,
-    CHARGE_FAMILY.cutoff_soc,
-    CHARGE_FAMILY.hold,
+    DISPATCH_ENABLE,
+    DISPATCH_POWER,
+    DISPATCH_DURATION,
+    DISPATCH_CUTOFF_SOC,
+    DISPATCH_PV_SWITCH,
     BOOLEAN_EXECUTION_OWNER,
 )
 
@@ -1492,7 +1540,7 @@ async def owned_live_charge(hass, config_data, frank, live_surface, *, quarters=
         hass, config_data, frank, live_surface, quarters=quarters
     )
     assert any(row["ownership"] == OWNERSHIP_OWNED for row in trace), trace
-    assert hass.states.get(CHARGE_FAMILY.activate).state == "on"
+    assert hass.states.get(DISPATCH_ENABLE).state == "on"
     assert coordinator.store.execution_record is not None
     live_surface.calls.clear()
     return coordinator
@@ -1537,9 +1585,9 @@ def assert_full_charge_reset(hass, live_surface, report, *, reason: str) -> None
     assert sent == list(RESET_ORDER), sent
     # Deactivation first so an interrupted reset leaves the dispatch off, and the
     # marker last so ownership outlives the cleanup that needs it.
-    assert sent[0] == CHARGE_FAMILY.activate
+    assert sent[0] == DISPATCH_ENABLE
     assert sent[-1] == BOOLEAN_EXECUTION_OWNER
-    assert hass.states.get(CHARGE_FAMILY.activate).state == "off"
+    assert hass.states.get(DISPATCH_ENABLE).state == "off"
     assert hass.states.get(BOOLEAN_EXECUTION_OWNER).state == "off"
 
 
@@ -1721,12 +1769,12 @@ async def test_a_deadman_that_did_not_advance_stops_the_charge(
         hass, live_surface, report, reason=EXECUTION_STOP_TIMER_NOT_REFRESHED
     )
     # No deactivate-and-reactivate anywhere: the run ends, it is not cycled.
-    activations = [
+    enables = [
         call
         for call in live_surface.calls
-        if call.data["entity_id"] == CHARGE_FAMILY.activate
+        if call.data["entity_id"] == DISPATCH_ENABLE
     ]
-    assert [call.service for call in activations] == ["turn_off"]
+    assert [call.service for call in enables] == ["turn_off"]
 
 
 async def test_a_failed_reset_keeps_its_evidence_and_retries(
