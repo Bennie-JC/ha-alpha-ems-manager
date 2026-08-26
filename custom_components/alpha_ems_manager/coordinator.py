@@ -1111,7 +1111,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pending_is_reset: bool = False
         # **The two stages of the pending sequence, and what is checked between
         # them.** Held apart rather than as one list because the whole point of
-        # beta.24.1 is that stage two is *conditional*: an arm may not activate
+        # beta.25 is that stage two is *conditional*: an arm may not activate
         # until the claim reads back, and a stop may not disturb a running
         # dispatch's fields until the deactivation reads back. Their concatenation
         # is always exactly the list the report published.
@@ -5053,7 +5053,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 run, self._pending_command, self._pending_snapshot, now
             )
         # **Two stages, and stage two is conditional.** This is the whole of
-        # beta.24.1 at the send site: an activation may not be issued until the
+        # beta.25 at the send site: an activation may not be issued until the
         # ownership claim has been read back, and a running dispatch's fields may
         # not be disturbed until the deactivation has been read back.
         stage_one = self._pending_stage_one

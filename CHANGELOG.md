@@ -9,13 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
-## [1.0.0-beta.25] - 2026-08-26
+## [1.0.0-beta.26] - 2026-08-26
 
-**Two stages in one version.** The ownership hotfix planned as beta.24.1 and the
-complete Dispatch-surface rewrite. `beta.24.1` is not a shape this project's
-version pattern accepts, so both ship under one number -- and the hotfix is a
-distinct commit (`e1b4d18`) so it can be reviewed, tested and if necessary
-released on its own.
+**The Dispatch runtime.** Everything in `beta.25` plus the complete migration of
+Live charging onto the real Hillview Dispatch surface. The ownership hotfix ships
+separately as `beta.25` so it can be installed and validated on hardware without
+also taking this migration.
 
 **The Live actuator family has changed, and the cutover is atomic.** A Live
 charge now executes on the real Hillview Dispatch surface in mode 2 with a
@@ -28,37 +27,6 @@ of the six conflicting families the vendor automation would silently switch off 
 and the reserve-guard discharge is still *planned* for shadow reporting. Neither
 is a Live path: no release executes a discharge, and it stays refused at both
 boundaries.
-
-### Fixed -- ownership safety
-
-- **The owner marker was not a required entity.** `discover` walks
-  `REQUIRED_ENTITIES` and nothing else, and the marker was absent from it, so an
-  installation that had never created `input_boolean.alpha_ems_dispatch_owner`
-  reported a complete control surface. The arm wrote `turn_on` to a non-existent
-  entity, the write reported success, the causal record could never match, and
-  every later refresh read `foreign`. The fifteen-minute alternation in the event
-  log was the whole cycle: arm at :00, inhibited at :15, device dead-man at :20,
-  arm again at :30. A missing or unavailable marker now makes the capability
-  unready and Live refuses before anything is planned, naming the entity.
-
-- **The arm is staged, so the activation is no longer in the same stage as the
-  claim.** "Activation last" was already true and was not enough: last in a list
-  that runs unconditionally is still reached when the first step did nothing. The
-  claim is now sent alone and read back, and only a verified claim reaches the
-  parameters and the activation. A claim that cannot be read back arms nothing,
-  withdraws the causal record and reports `marker_not_verified`. This is a second,
-  independent guarantee -- it holds where a capability snapshot cannot help,
-  because a service call that succeeds is not a state that changed.
-
-- **The stop is staged the same way.** The deactivation is sent alone and read
-  back before anything else is written. Writing the duration helper restarts the
-  vendor timer, so a cleanup issued against a dispatch that did not actually stop
-  would extend the run it was ending. A stop that cannot be confirmed withholds
-  the cleanup, keeps the marker and the record, reports `stop_not_verified`, and
-  retries later -- it never publishes a clean or unowned state.
-
-- **The marker is reported as four distinct facts** -- absent, unavailable, off,
-  on -- plus `unverified` for a write whose readback disagreed.
 
 ### Added -- the Dispatch surface, built and gated
 
@@ -188,8 +156,8 @@ boundaries.
 
 ### Testing
 
-3533 passed, 1 skipped. beta.25: 184. beta.24.1: 21. beta.24: 83. beta.23: 47.
-Stage-B gate family: 200. Mutation suites: 238, 0 survivors.
+3534 passed, 1 skipped. Dispatch runtime: 185. Ownership hotfix: 21. beta.24: 83.
+beta.23: 47. Stage-B gate family: 200. Mutation suites: 238, 0 survivors.
 
 None of it is hardware evidence. See *Known and outstanding*.
 
@@ -223,6 +191,61 @@ charge-only interlock, G.1/G.2 sustain, headroom, the grid budget, Activity,
 - **R2 remains open**: withdrawal is inferred from the absence of an affirming
   publication.
 - beta.22's capped-charge observation is still outstanding.
+
+## [1.0.0-beta.25] - 2026-08-26
+
+**A charge could be armed that Alpha EMS could provably never own, sustain or
+stop.** Ownership safety only; nothing else changed -- the previous execution
+architecture is deliberately untouched, so this release can be installed and
+validated on hardware on its own.
+
+Planned as `beta.24.1`. A four-part version is not a shape this project's version
+pattern accepts, and the pattern was not going to be widened to accommodate a
+name.
+
+### Fixed -- ownership safety
+
+- **The owner marker was not a required entity.** `discover` walks
+  `REQUIRED_ENTITIES` and nothing else, and the marker was absent from it, so an
+  installation that had never created `input_boolean.alpha_ems_dispatch_owner`
+  reported a complete control surface. The arm wrote `turn_on` to a non-existent
+  entity, the write reported success, the causal record could never match, and
+  every later refresh read `foreign`. The fifteen-minute alternation in the event
+  log was the whole cycle: arm at :00, inhibited at :15, device dead-man at :20,
+  arm again at :30. A missing or unavailable marker now makes the capability
+  unready and Live refuses before anything is planned, naming the entity.
+
+- **The arm is staged, so the activation is no longer in the same stage as the
+  claim.** "Activation last" was already true and was not enough: last in a list
+  that runs unconditionally is still reached when the first step did nothing. The
+  claim is now sent alone and read back, and only a verified claim reaches the
+  parameters and the activation. A claim that cannot be read back arms nothing,
+  withdraws the causal record and reports `marker_not_verified`. This is a second,
+  independent guarantee -- it holds where a capability snapshot cannot help,
+  because a service call that succeeds is not a state that changed.
+
+- **The stop is staged the same way.** The deactivation is sent alone and read
+  back before anything else is written. Writing the duration helper restarts the
+  vendor timer, so a cleanup issued against a dispatch that did not actually stop
+  would extend the run it was ending. A stop that cannot be confirmed withholds
+  the cleanup, keeps the marker and the record, reports `stop_not_verified`, and
+  retries later -- it never publishes a clean or unowned state.
+
+- **The marker is reported as four distinct facts** -- absent, unavailable, off,
+  on -- plus `unverified` for a write whose readback disagreed.
+
+### Testing
+
+3343 passed, 1 skipped. Ownership hotfix: 21. beta.24: 83. beta.23: 47.
+Mutation suites: 238, 0 survivors.
+
+None of it is hardware evidence.
+
+### Known and outstanding
+
+- **Not hardware-proven.** The first thing to confirm on the installation is that
+  the capability refuses while `input_boolean.alpha_ems_dispatch_owner` is absent,
+  and only then that a verified claim precedes any parameter write.
 
 ## [1.0.0-beta.24] - 2026-08-25
 

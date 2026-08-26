@@ -257,7 +257,7 @@ class DeviceSnapshot:
     conflicting_active: tuple[str, ...] = ()
     #: The marker as a typed state, for diagnosis rather than for attribution.
     #: Beside :attr:`owner_marker` rather than replacing it -- ownership is still
-    #: computed from the boolean, and beta.24.1 does not change that arithmetic.
+    #: computed from the boolean, and beta.25 does not change that arithmetic.
     owner_marker_state: str = MARKER_ABSENT
 
     @property

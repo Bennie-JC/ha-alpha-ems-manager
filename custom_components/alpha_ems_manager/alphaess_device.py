@@ -764,7 +764,7 @@ def plan_commands(command: DeviceCommand) -> tuple[CommandStep, ...]:
 def plan_marker_claim() -> tuple[CommandStep, ...]:
     """Return stage one of the arm: claim ownership, and nothing else.
 
-    **Separated since beta.24.1 so the claim can be verified before anything is
+    **Separated since beta.25 so the claim can be verified before anything is
     armed.** A marker write that silently did nothing -- the entity absent, or
     unavailable -- used to be indistinguishable from one that worked, because the
     next step in the same list carried on regardless and the activation at the end
@@ -1002,7 +1002,7 @@ def plan_reset(action: str) -> tuple[CommandStep, ...]:
 def plan_reset_deactivate(action: str | None) -> tuple[CommandStep, ...]:
     """Return stage one of the stop: switch the dispatch off, and nothing else.
 
-    **Separated since beta.24.1 so inactivity is verified before anything else is
+    **Separated since beta.25 so inactivity is verified before anything else is
     written.** The rest of the reset disturbs fields a *running* dispatch depends
     on, and one of them makes it worse rather than better: writing the duration
     helper restarts the vendor package's timer, so a cleanup issued against a
