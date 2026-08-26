@@ -66,6 +66,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
+from .alphaess_device import DISPATCH_ENABLE
 from .const import (
     ACTION_DISCHARGE,
     CONTROL_COOLDOWN_SECONDS,
@@ -76,6 +77,7 @@ from .const import (
     CONTROL_MAX_POWER_KW,
     CONTROL_MIN_POWER_KW,
     CONTROL_MODE_ACTIVE,
+    EMERGENCY_STOP_MAX_ATTEMPTS,
     INHIBIT_AT_OR_BELOW_FLOOR,
     INHIBIT_BATTERY_NOT_CONFIGURED,
     INHIBIT_BATTERY_POWER_STALE,
@@ -105,6 +107,9 @@ from .const import (
     MIN_CONTROL_HORIZON_MINUTES,
     OWNERSHIP_OWNED,
     REFUSE_COOLDOWN,
+    REFUSE_EMERGENCY_ATTEMPTS_SPENT,
+    REFUSE_EMERGENCY_NOT_AUTHORIZED,
+    REFUSE_EMERGENCY_NOT_THE_STOP,
     REFUSE_EXECUTION_NOT_ENABLED,
     REFUSE_EXECUTION_UNAVAILABLE,
     REFUSE_LIVE_ACTION_NOT_PERMITTED,
@@ -588,6 +593,83 @@ def authorize_reset(
         return ExecutionDecision(False, REFUSE_RESET_WITHOUT_REASON)
     if steps_planned <= 0:
         return ExecutionDecision(False, REFUSE_NO_COMMANDS)
+    return ExecutionDecision(True, None)
+
+
+def emergency_self_stop_authorized(
+    *,
+    dispatch_active: bool,
+    marker_present_and_on: bool,
+    record_matches_run: bool,
+    readback_compatible: bool,
+    contradicted: bool,
+) -> bool:
+    """Return whether the one emergency actuator operation is authorised.
+
+    **This is not ownership, and the state it belongs to is never called owned.**
+    Ownership requires the marker; when the marker has gone, ownership is
+    ``degraded`` and that definition is not weakened to make a stop reachable.
+
+    But letting a dispatch we can still *prove we caused* run until the device
+    dead-man expires is less safe than stopping it deliberately -- up to twenty
+    minutes of uncommanded charging against one write. So the stop gets its own
+    authority, granted only when causation survives the marker:
+
+    * the dispatch is still running -- there is nothing to stop otherwise;
+    * the marker is **gone**, which is what makes this the emergency case rather
+      than an ordinary stop;
+    * the causal record is present and matches the admitted run;
+    * the device readback still matches the expected mode **and sign**;
+    * nothing contradicts any of it.
+
+    Those last three are exactly the proof the foreign-dispatch invariant demands,
+    which is why granting this does not weaken it: a dispatch whose Alpha-EMS
+    causation cannot *still* be proven is never touched, stopped or overwritten.
+
+    Strictly subtractive. It grants one operation and forbids everything else --
+    no power, cutoff, duration, timer re-arm, mode, photovoltaic switch, run
+    adoption, or clearing evidence before verified inactivity. What may be *sent*
+    under it is enforced separately by :func:`authorize_emergency_self_stop`, so
+    the grant and the envelope cannot drift apart.
+    """
+    if not dispatch_active:
+        return False
+    if marker_present_and_on:
+        # Not the emergency case: ownership is intact, so the ordinary stop path
+        # applies and this authority must not shadow it.
+        return False
+    if contradicted:
+        return False
+    return record_matches_run and readback_compatible
+
+
+def authorize_emergency_self_stop(
+    *,
+    authorized: bool,
+    steps: tuple[str, ...],
+    attempts_made: int,
+) -> ExecutionDecision:
+    """Return whether *this exact* step list may be sent under the emergency grant.
+
+    **The envelope, checked against the steps rather than against the intention.**
+    The grant is one operation -- ``Dispatch enable -> OFF`` -- so anything else in
+    the list is refused whole. That is what stops the authority quietly widening
+    into "a stop, and while we are here, the resting values": those writes touch a
+    dispatch that may still be running, and one of them restarts the vendor timer.
+
+    Bounded retries, one per physical tick. After
+    :data:`EMERGENCY_STOP_MAX_ATTEMPTS` the device dead-man is left to finish the
+    job, because a write that has failed three times is not going to be persuaded
+    by a fourth and the backstop already exists.
+    """
+    if not CONTROL_EXECUTION_AVAILABLE:
+        return ExecutionDecision(False, REFUSE_EXECUTION_UNAVAILABLE)
+    if not authorized:
+        return ExecutionDecision(False, REFUSE_EMERGENCY_NOT_AUTHORIZED)
+    if attempts_made >= EMERGENCY_STOP_MAX_ATTEMPTS:
+        return ExecutionDecision(False, REFUSE_EMERGENCY_ATTEMPTS_SPENT)
+    if tuple(steps) != (DISPATCH_ENABLE,):
+        return ExecutionDecision(False, REFUSE_EMERGENCY_NOT_THE_STOP)
     return ExecutionDecision(True, None)
 
 

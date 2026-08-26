@@ -64,6 +64,15 @@ from .const import (
     BALANCE_METERING_TOLERANCE,
     BALANCE_MODE_ACTIVE_W,
     BALANCE_SUSTAINED_FAILURES,
+    COHERENCE_ACTION_HOLD,
+    COHERENCE_ACTION_NONE,
+    COHERENCE_ACTION_STOP,
+    COHERENCE_EXPIRED,
+    COHERENCE_HOLDING,
+    COHERENCE_OK,
+    CONTROL_COHERENCE_GRACE_TICKS,
+    CONTROL_MAX_SOURCE_AGE_SECONDS,
+    SAFETY_SAMPLE_SECONDS,
 )
 from .normalization import PowerFlows
 
@@ -268,6 +277,179 @@ def infer_balance_mode(flows: PowerFlows) -> str:
     if not active_sources and not active_sinks:
         return MODE_IDLE
     return f"{'+'.join(active_sources) or 'none'}->{'+'.join(active_sinks) or 'none'}"
+
+
+@dataclass(frozen=True, slots=True)
+class ControlCoherence:
+    """Whether live measurements are fit to **actuate** on, and for how long not.
+
+    **A second, tighter question than :attr:`SourceCoherence.coherent`, and it
+    needs to be.** ``BALANCE_MAX_SOURCE_AGE_SECONDS`` is 300 and was calibrated
+    for *diagnostics* -- comparing accumulated energy over a quarter. Reused as an
+    actuator threshold it would accept a five-minute-old photovoltaic reading as
+    the basis for a live setpoint, which is not a bound at all on a controller
+    that corrects every sixty seconds.
+
+    **Counted in physical ticks, never in economic refreshes.** Two economic
+    refreshes is about thirty minutes -- longer than the twenty-minute device
+    dead-man it is supposed to sit inside, so the device would end the run before
+    the controller decided to. Three sixty-second ticks is 180 seconds: fifteen
+    percent of the dead-man and twenty percent of one quarter, so the economic
+    cadence is not in the loop at all.
+    """
+
+    state: str
+    #: When the current run of unusable samples began. ``None`` while healthy.
+    bad_since: datetime | None
+    #: How many consecutive physical ticks have been unusable.
+    bad_ticks: int
+    #: The bound, in seconds, so a reader never has to multiply it out.
+    grace_seconds: float
+    #: What the controller did about it this tick.
+    action: str
+    #: The last tick whose measurements were fit to actuate on.
+    last_coherent_tick: datetime | None
+    #: Which condition failed, for diagnosis. ``None`` while healthy.
+    reason: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        """Return whether a new setpoint may be calculated this tick."""
+        return self.state == COHERENCE_OK
+
+    @property
+    def expired(self) -> bool:
+        """Return whether the grace period is spent and the run must stop."""
+        return self.state == COHERENCE_EXPIRED
+
+    @property
+    def may_rearm_deadman(self) -> bool:
+        """Return whether the device dead-man may be re-armed.
+
+        **Only while coherent, and this is deterministic rather than a judgement
+        call.** Re-arming on measurements the controller does not trust is exactly
+        "keep the run alive indefinitely while blind", which is the thing the
+        grace period exists to prevent. So a scheduled re-arm falling due during a
+        hold is refused and the run is stopped on that tick, without waiting out
+        the remaining grace.
+
+        The two timers cannot race: at 180 seconds against about twenty minutes
+        the deliberate stop always comes first, and this covers the case where a
+        re-arm happens to land inside the window.
+        """
+        return self.state == COHERENCE_OK
+
+    def as_dict(self) -> dict[str, object]:
+        """Return the bounded diagnostics form."""
+        return {
+            "coherence_state": self.state,
+            "coherence_bad_since": (
+                None if self.bad_since is None else self.bad_since.isoformat()
+            ),
+            "coherence_bad_ticks": self.bad_ticks,
+            "coherence_grace_seconds": self.grace_seconds,
+            "coherence_action": self.action,
+            "last_coherent_physical_tick": (
+                None
+                if self.last_coherent_tick is None
+                else self.last_coherent_tick.isoformat()
+            ),
+            "coherence_reason": self.reason,
+            "coherence_rule": (
+                "counted in sixty-second physical ticks, not economic refreshes: "
+                "the bound must be materially shorter than the device dead-man, "
+                "and the economic cadence must not decide how long an unreliable "
+                "measurement is tolerated"
+            ),
+        }
+
+
+#: The resting value, for a controller that has not yet ticked.
+COHERENCE_UNKNOWN = ControlCoherence(
+    state=COHERENCE_OK,
+    bad_since=None,
+    bad_ticks=0,
+    grace_seconds=CONTROL_COHERENCE_GRACE_TICKS * SAFETY_SAMPLE_SECONDS,
+    action=COHERENCE_ACTION_NONE,
+    last_coherent_tick=None,
+)
+
+
+def control_coherence(
+    *,
+    previous: ControlCoherence | None,
+    now: datetime,
+    coherence: SourceCoherence | None,
+    sources_available: bool,
+    identity_ok: bool = True,
+) -> ControlCoherence:
+    """Return the control-grade coherence state for this physical tick.
+
+    Pure and total. Given the previous state and this tick's readings it decides
+    hold, resume or stop -- and nothing else. In particular it **never invents a
+    fallback** photovoltaic, house or grid figure: an unusable reading produces a
+    hold, not a guess.
+
+    Four ways a tick can be unusable, and a gross identity contradiction takes the
+    **same** path as a stale one: hold, then stop if it persists. It is tempting to
+    treat a provably wrong reading more harshly than a merely late one, but the
+    energy identity has its own tolerance and a single blip is not evidence that
+    control has been lost -- and the grace period is already only 180 seconds.
+    """
+    grace = CONTROL_COHERENCE_GRACE_TICKS * SAFETY_SAMPLE_SECONDS
+    last_ok = None if previous is None else previous.last_coherent_tick
+
+    reason: str | None = None
+    if not sources_available:
+        reason = "source_unavailable"
+    elif not identity_ok:
+        reason = "energy_identity"
+    elif coherence is None:
+        reason = "no_reading"
+    elif coherence.oldest_age_seconds > CONTROL_MAX_SOURCE_AGE_SECONDS:
+        reason = "stale_beyond_control_age"
+    elif (
+        coherence.source_count >= 2
+        and coherence.skew_seconds > BALANCE_MAX_SOURCE_SKEW_SECONDS
+    ):
+        reason = "skew"
+
+    if reason is None:
+        return ControlCoherence(
+            state=COHERENCE_OK,
+            bad_since=None,
+            bad_ticks=0,
+            grace_seconds=grace,
+            action=COHERENCE_ACTION_NONE,
+            last_coherent_tick=now,
+        )
+
+    bad_ticks = 1 if previous is None else previous.bad_ticks + 1
+    bad_since = (
+        now if previous is None or previous.bad_since is None else previous.bad_since
+    )
+    # **At the third bad tick, not after it.** Three ticks of untrusted control is
+    # the bound; spending a fourth would be tolerating 240 seconds while claiming
+    # 180. The stricter reading is the one a safety bound should take.
+    if bad_ticks >= CONTROL_COHERENCE_GRACE_TICKS:
+        return ControlCoherence(
+            state=COHERENCE_EXPIRED,
+            bad_since=bad_since,
+            bad_ticks=bad_ticks,
+            grace_seconds=grace,
+            action=COHERENCE_ACTION_STOP,
+            last_coherent_tick=last_ok,
+            reason=reason,
+        )
+    return ControlCoherence(
+        state=COHERENCE_HOLDING,
+        bad_since=bad_since,
+        bad_ticks=bad_ticks,
+        grace_seconds=grace,
+        action=COHERENCE_ACTION_HOLD,
+        last_coherent_tick=last_ok,
+        reason=reason,
+    )
 
 
 @dataclass(frozen=True, slots=True)

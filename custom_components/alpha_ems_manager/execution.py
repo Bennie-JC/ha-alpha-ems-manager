@@ -58,6 +58,8 @@ from typing import Any
 from .battery import INTERVAL_HOURS
 from .const import (
     ACTION_CHARGE,
+    CAP_FORWARD,
+    CAP_FROZEN,
     ECONOMIC_BUCKET_KWH,
     ECONOMIC_FINGERPRINT_CHARS,
     EXECUTION_BASIS_ACCUMULATED,
@@ -746,6 +748,96 @@ class CarriedRun:
             "max_end_energy_kwh": self.target.max_end_energy_kwh,
             "reserve_floor_kwh": self.target.reserve_floor_kwh,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardAuthorisation:
+    """The second authorisation cap: energy allowed from a boundary onward.
+
+    **Why a second cap rather than a smaller first one.** A fresh publication
+    reports remaining energy from the *next interval boundary*, while the frozen
+    remainder is measured from the *admitted window start*. Both are "remaining",
+    from origins up to fifteen minutes apart -- so taking one ``min`` across them
+    ratchets a healthy run down by an interval every refresh. A steady 6.0 kWh run
+    over 10:00-11:00 reads ``min(6.0, 4.5)`` then ``min(4.5, 3.0)`` and delivers
+    about 4.5 of the 6.0 the plan actually wanted.
+
+    So each cap is enforced over **its own domain with its own accumulator**, and
+    no origin is ever reconciled arithmetically. No in-flight estimate is needed
+    either, which is the other thing that would have had to be guessed.
+    """
+
+    #: What the latest affirming publication says is still wanted, from
+    #: :attr:`forward_from` onward.
+    authorised_kwh: float
+    #: The boundary the allowance starts at -- the fresh publication window start.
+    forward_from: datetime
+    #: Measured delivery since that boundary.
+    delivered_since_kwh: float = 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the bounded diagnostics form."""
+        return {
+            "forward_authorised_kwh": round(self.authorised_kwh, 3),
+            "forward_from": self.forward_from.isoformat(),
+            "delivered_since_forward_kwh": round(self.delivered_since_kwh, 3),
+        }
+
+
+def forward_authorisation(published: Target) -> ForwardAuthorisation:
+    """Return the forward cap an affirming publication sets.
+
+    Read straight off the fresh publication, with no comparison to the frozen
+    figure and no reconciliation: the cap is "this much, from there", which is
+    exactly what the publication says.
+
+    **The accumulator resets, and that is what stops the ratchet.** Every
+    affirmation replaces the cap with a new allowance and a new boundary, so
+    delivery is measured from *that* boundary rather than accumulated across
+    boundaries. A healthy run is therefore never trimmed: while its boundary is
+    still in the future the cap is inactive, and by the time it passes a fresh
+    affirmation has moved it on again.
+
+    The cap bites in exactly the case it exists for -- a publication that wants
+    materially **less** than the frozen figure -- and in the case where refreshes
+    have stopped arriving and the boundary has gone by unrenewed.
+    """
+    return ForwardAuthorisation(
+        authorised_kwh=max(0.0, published.battery_target_kwh),
+        forward_from=published.window_start,
+    )
+
+
+def remaining_authorised_kwh(
+    *,
+    now: datetime,
+    frozen_remaining_kwh: float,
+    forward: ForwardAuthorisation | None,
+) -> tuple[float, str]:
+    """Return how much energy may still be delivered, and which cap binds.
+
+    **Strictly subtractive, and that is the invariant.** The result is never
+    greater than ``frozen_remaining_kwh``, so a fresh publication can reduce an
+    admitted run or leave it alone and can **never** expand it. Stage A wanting
+    *more* energy has to go through normal fresh admission; carry-forward is not a
+    path for growth.
+
+    Before :attr:`ForwardAuthorisation.forward_from` only the frozen cap applies,
+    and that is deliberate rather than a gap. The interval in flight is the one
+    Stage A authorised *for now*, under the economics that held when it began --
+    obsolescence starts at the boundary, which is exactly where the forward cap
+    starts. Cutting the elapsing interval too would mean Stage B overriding an
+    authorisation Stage A issued for an interval it had already solved.
+    """
+    frozen = max(0.0, frozen_remaining_kwh)
+    if forward is None or now < forward.forward_from:
+        return frozen, CAP_FROZEN
+    # Past the boundary both figures are "remaining from now", so comparing them
+    # is like with like and no origin is being mixed.
+    forward_left = max(0.0, forward.authorised_kwh - forward.delivered_since_kwh)
+    if forward_left < frozen:
+        return forward_left, CAP_FORWARD
+    return frozen, CAP_FROZEN
 
 
 def affirms(carried: CarriedRun, published: Target) -> bool:

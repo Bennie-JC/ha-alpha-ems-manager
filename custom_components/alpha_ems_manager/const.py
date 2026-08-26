@@ -2165,6 +2165,10 @@ TICK_APPLIED: Final = "power_written"
 #: which authorises exactly one write and nothing else.
 OWNERSHIP_DEGRADED: Final = "degraded"
 
+REFUSE_EMERGENCY_NOT_AUTHORIZED: Final = "emergency_self_stop_not_authorized"
+REFUSE_EMERGENCY_NOT_THE_STOP: Final = "emergency_self_stop_permits_only_dispatch_off"
+REFUSE_EMERGENCY_ATTEMPTS_SPENT: Final = "emergency_self_stop_attempts_spent"
+
 #: The one operation the emergency authority grants, named so a test can assert
 #: that it is the only one.
 EMERGENCY_STOP_OPERATION: Final = "dispatch_enable_off"
@@ -2172,6 +2176,11 @@ EMERGENCY_STOP_OPERATION: Final = "dispatch_enable_off"
 #: How many times the narrowly authorised emergency stop is retried, one attempt
 #: per physical tick, before the device dead-man is left to finish the job.
 EMERGENCY_STOP_MAX_ATTEMPTS: Final = 3
+
+#: Which of the two authorisation caps produced the effective remainder.
+CAP_FROZEN: Final = "frozen"
+CAP_FORWARD: Final = "forward"
+CAP_NONE: Final = "none"
 
 #: Stop reasons added by beta.25.
 EXECUTION_STOP_MARKER_LOST: Final = "ownership_marker_lost"
