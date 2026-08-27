@@ -43,17 +43,23 @@ switched off.
 >
 > In *off* and *shadow* it never writes to your inverter and cannot change how your
 > system behaves; the worst case is an inaccurate forecast. In *Live* it can buy
-> energy on a schedule it believes is cheap, and — from `beta.27` — it can **sell
+> energy on a schedule it believes is cheap, and — from `beta.28` — it can **sell
 > energy back to the grid** when the plan says that is worth more. It can stop doing
 > either at any time: by reaching the target, by running out of room, by the plan
 > being withdrawn, by a safety condition, or because you switched the mode back.
 >
 > It can never discharge to serve your house, and never curtails production.
 >
-> **Export is new in `beta.27` and has not yet been validated on real hardware.**
-> Charging was validated on the live installation in `beta.26`; exporting has been
-> proven only in tests. If you enable *Live* on this release, watch your grid meter
-> during the first planned export quarter.
+> **Export has not yet been validated on real hardware.** Charging was validated on
+> the live installation in `beta.26`; exporting has been proven only in tests. If
+> you enable *Live* on this release, watch your grid meter during the first planned
+> export quarter.
+>
+> `beta.27` announced export but could not actually perform it: two wiring defects
+> found on real hardware meant no quarter was ever admitted and every export was
+> refused. `beta.28` fixes both. **If you are running `beta.27`, upgrade** — its
+> quarter envelope never opens, so it also cannot execute a charge the way it
+> describes.
 >
 > **This integration is not in the HACS default repository.** Install it as a
 > HACS *custom repository* — see [Installation](#installation). A submission for
