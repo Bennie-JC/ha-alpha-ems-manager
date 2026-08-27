@@ -1705,6 +1705,14 @@ async def test_stage_a_withdrawal_stops_the_charge(
 
     This is the beta.22 incident's own shape, and the case that shows why a reset
     cannot be authorised through the start path: there is nothing to start.
+
+    **"Anywhere" includes the quarter, since beta.29.** An open ``CarriedQuarter``
+    is itself an intent source -- deliberately, because a parent run ending must not
+    stop a quarter that has already opened -- so the scenario this test is about
+    needs the quarter closed as well as the publications withdrawn. That
+    continuation is a different property and has its own test in
+    ``test_beta29_quarter_authority_lifecycle``; conflating the two here would leave
+    neither pinned.
     """
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
 
@@ -1712,6 +1720,9 @@ async def test_stage_a_withdrawal_stops_the_charge(
     monkeypatch.setattr(
         type(coordinator), "_execution_targets", lambda self, **kwargs: ()
     )
+    # And no quarter is open, so there is genuinely no intent anywhere.
+    coordinator._quarter = None
+    coordinator._reset_quarter_progress(None)
     report = await step_once(hass, coordinator, live_surface)
 
     assert (report.get("intent")) is None

@@ -110,6 +110,11 @@ def authorised(**overrides) -> ExportRequest:
         "intent": EXECUTION_INTENT_NET_EXPORT,
         "quarter_admitted": True,
         "quarter_open": True,
+        # **A sustain, not a start.** The default describes a dispatch of ours that
+        # is already running, so the ownership and causation clauses below are the
+        # hard requirements they have always been. The start case -- nothing
+        # running, nothing yet ownable -- is ``startable()`` beside this.
+        "dispatch_active": True,
         "owned": True,
         "causation_proven": True,
         "foreign_dispatch": False,
@@ -129,6 +134,19 @@ def authorised(**overrides) -> ExportRequest:
     }
     fields.update(overrides)
     return ExportRequest(**fields)
+
+
+def startable(**overrides) -> ExportRequest:
+    """Return a request describing a **start**: nothing running, nothing owned yet.
+
+    Before the first write there is no dispatch to own and no causal record to
+    match, so neither is required -- see ``authorize_export``'s ownership block.
+    What protects the site in this state is the foreign-dispatch check, which is
+    unreachable here precisely because nothing is active.
+    """
+    fields = {"dispatch_active": False, "owned": False, "causation_proven": False}
+    fields.update(overrides)
+    return authorised(**fields)
 
 
 # == 1. the meter is the target, not the battery ============================
@@ -451,9 +469,13 @@ def test_the_published_order_matches_the_order_actually_checked() -> None:
         ({"failsafe_available": False}, EXPORT_REFUSE_NO_FAILSAFE),
         ({"conflicting_feature": True}, EXPORT_REFUSE_CONFLICTING_FEATURE),
         ({"foreign_dispatch": True}, EXPORT_REFUSE_DISPATCH_FOREIGN),
-        # -- is it ours, provably? --
-        ({"owned": False}, EXPORT_REFUSE_NOT_OWNED),
-        ({"causation_proven": False}, EXPORT_REFUSE_RECORD_MISMATCH),
+        # -- is it ours, provably? Asked only of a *running* dispatch; the start
+        #    case is ``test_a_start_with_nothing_running_is_authorised``. --
+        ({"dispatch_active": True, "owned": False}, EXPORT_REFUSE_NOT_OWNED),
+        (
+            {"dispatch_active": True, "causation_proven": False},
+            EXPORT_REFUSE_RECORD_MISMATCH,
+        ),
         ({"coherent": False}, EXPORT_REFUSE_INCOHERENT),
         # -- has the battery anything to give, above both floors? --
         ({"soc_percent": None}, EXPORT_REFUSE_SOC_UNUSABLE),
@@ -643,15 +665,15 @@ def test_the_discharge_family_is_still_refused_at_the_boundary() -> None:
 def test_an_export_command_is_unreachable_without_an_admitted_quarter() -> None:
     """No quarter, no export -- by construction, not by a caller remembering.
 
-    ``export_intent_for`` takes a ``CarriedQuarter`` as its first positional
-    argument, so there is no signature through which an export command could be
-    built without one.
+    ``quarter_intent_for`` takes a ``CarriedQuarter`` as its first positional
+    argument, so there is no signature through which a command could be built
+    without one -- for either intent, since beta.29.
     """
     import inspect
 
-    from custom_components.alpha_ems_manager.execution import export_intent_for
+    from custom_components.alpha_ems_manager.execution import quarter_intent_for
 
-    signature = inspect.signature(export_intent_for)
+    signature = inspect.signature(quarter_intent_for)
     first = next(iter(signature.parameters.values()))
 
     assert first.name == "quarter"

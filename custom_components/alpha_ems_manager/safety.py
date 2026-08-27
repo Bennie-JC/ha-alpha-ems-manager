@@ -597,6 +597,16 @@ class ExportRequest:
     #: from the vendor surface is parameter matching, which is worse than nothing
     #: here. ``False`` is the safe default and refuses the export.
     causation_proven: bool
+    #: Whether **any** dispatch is running, whoever owns it.
+    #:
+    #: **The field that makes a START expressible.** Before beta.29 this checklist
+    #: required provable ownership unconditionally -- and before the first write
+    #: there is no dispatch to own, so an export could never start at all. The rule
+    #: below is the one :func:`evaluate` has used since Phase 4: *inactive, or
+    #: owned*. ``False`` is the safe default only because it is paired with
+    #: ``foreign_dispatch``; on its own it would say "nothing is running", which is
+    #: exactly the claim a caller must not be able to make by omission.
+    dispatch_active: bool
     #: Whether a dispatch is running that is *not* ours.
     foreign_dispatch: bool
     #: Whether the control-grade coherence bound is currently usable.
@@ -650,6 +660,10 @@ def authorize_export(request: ExportRequest) -> SafetyVerdict:
     Fails closed on every condition. The checks are ordered cheapest and most
     fundamental first, so the single reported reason is the most useful one, and
     every one of them is reached in :data:`EXPORT_AUTHORISATION_ORDER`.
+
+    **One condition is asked differently on a start than on a sustain**, and only
+    one: ownership. See the ownership block below -- before the first write there is
+    nothing to own, so requiring it made every export unstartable.
     """
     checks: list[tuple[str, bool]] = []
 
@@ -684,10 +698,38 @@ def authorize_export(request: ExportRequest) -> SafetyVerdict:
         return refuse(EXPORT_REFUSE_DISPATCH_FOREIGN)
 
     # -- is it ours, and provably? ------------------------------------------
-    if not check(EXPORT_REFUSE_NOT_OWNED, request.owned):
-        return refuse(EXPORT_REFUSE_NOT_OWNED)
-    if not check(EXPORT_REFUSE_RECORD_MISMATCH, request.causation_proven):
-        return refuse(EXPORT_REFUSE_RECORD_MISMATCH)
+    #
+    # **Inactive, or owned -- the rule :func:`evaluate` has used since Phase 4.**
+    # There is exactly one question here and two situations in which it is asked:
+    #
+    # * **starting**, with nothing running. There is no dispatch to own and no
+    #   causal record to match, because neither exists until the write lands. So
+    #   ownership and causation are *not* required, and what protects the site is
+    #   the foreign-dispatch check above: if anything at all is running that we
+    #   cannot prove is ours, this never gets here.
+    # * **continuing**, with a dispatch running. Ownership and causation are hard
+    #   requirements again, unchanged and unrelaxed.
+    #
+    # beta.27 demanded ownership in both, which made the first unreachable: an
+    # export could compute the right power, build the right Mode 2 sequence, and be
+    # refused ``ownership_not_provable`` on every refresh forever. Measured on the
+    # real installation at the 19:45 quarter.
+    #
+    # The relaxation is confined to ``dispatch_active is False``. It is not a
+    # weakening of the ownership model: a *running* export is gated exactly as
+    # strictly as before, and a running dispatch that is not ours was already
+    # refused as foreign before this block is reached.
+    if request.dispatch_active:
+        if not check(EXPORT_REFUSE_NOT_OWNED, request.owned):
+            return refuse(EXPORT_REFUSE_NOT_OWNED)
+        if not check(EXPORT_REFUSE_RECORD_MISMATCH, request.causation_proven):
+            return refuse(EXPORT_REFUSE_RECORD_MISMATCH)
+    else:
+        # Recorded as reached and passing, so the published checklist is still a
+        # complete account of what was evaluated rather than a shorter list on a
+        # start than on a sustain.
+        check(EXPORT_REFUSE_NOT_OWNED, True)
+        check(EXPORT_REFUSE_RECORD_MISMATCH, True)
     if not check(EXPORT_REFUSE_INCOHERENT, request.coherent):
         return refuse(EXPORT_REFUSE_INCOHERENT)
 

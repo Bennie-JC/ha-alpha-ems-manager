@@ -257,11 +257,11 @@ from .execution import (
     carry_quarter,
     control_intent_for,
     decide,
-    export_intent_for,
     forward_authorisation,
     measure_progress,
     ownership_of,
     parse_target,
+    quarter_intent_for,
     remaining_authorised_kwh,
     stale_marker,
     target_as_published,
@@ -2016,6 +2016,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 intent=None if quarter is None else quarter.intent,
                 quarter_admitted=quarter is not None,
                 quarter_open=quarter is not None and quarter.open_at(now),
+                dispatch_active=bool(context.dispatch_active),
                 owned=bool(context.dispatch_owned),
                 # The causal record must name the run the quarter was admitted
                 # under. ``_execution_identity`` resolves that quarter-first, which
@@ -2024,7 +2025,30 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 foreign_dispatch=bool(
                     context.dispatch_active and not context.dispatch_owned
                 ),
-                coherent=bool(self._coherence is not None and self._coherence.usable),
+                # **Absence of a coherence verdict is not evidence of
+                # incoherence.** The control-grade coherence state is produced by
+                # the sixty-second tick and set to ``None`` by every stop -- and the
+                # tick cannot run before a START, because it requires an active
+                # dispatch. So requiring the verdict to *exist* made an export
+                # unstartable on the first refresh after any stop, including the
+                # previous quarter's own expiry: refused ``sensor_incoherence``,
+                # with the next opportunity a full quarter away.
+                #
+                # When no verdict exists yet, the honest question is the one
+                # ``control_coherence`` seeds itself from -- ``sources_available``,
+                # which is exactly ``_live_kw() is not None``. A verdict that does
+                # exist and says unusable still refuses, unchanged.
+                #
+                # Deliberately **not** fixed by advancing the coherence state on the
+                # refresh cadence as well: its grace is counted in ticks
+                # (``bad_ticks >= CONTROL_COHERENCE_GRACE_TICKS``), so a second
+                # cadence feeding it would shorten a documented 180-second safety
+                # bound. The machine is untouched here.
+                coherent=(
+                    self._coherence.usable
+                    if self._coherence is not None
+                    else self._live_kw() is not None
+                ),
                 conflicting_feature=bool(
                     context.excess_export_active or context.peak_shaving_active
                 ),
@@ -3738,10 +3762,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _stage_b_intent(self, *, plan: Any, now: datetime) -> Any:
         """Return the ``ControlIntent`` Stage B wants, or ``None``.
 
-        ``None`` for everything that is not an executable grid charge inside its
-        window, which is what leaves the reserve-guard path untouched. The last
-        Stage-B decision is reused rather than recomputed, so the intent and the
-        published diagnostics describe the same refresh.
+        **An open quarter is asked first, and is authoritative for both executable
+        intents since beta.29.** Below that, ``None`` for everything that is not an
+        executable grid charge inside its window, which is what leaves the
+        reserve-guard path untouched. The last Stage-B decision is reused rather than
+        recomputed, so the intent and the published diagnostics describe the same
+        refresh.
         """
         decision = self._stage_b_decision
         if decision is None or plan is None or plan.state is None:
@@ -3750,18 +3776,37 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         index = getattr(plan, "start_index", None)
         if day is None or index is None:
             return None
-        # **An admitted export quarter builds its own command.** Asked first, and
-        # only ever satisfied by a quarter whose intent is exactly ``net_export`` --
-        # ``control_intent_for`` below keeps its charge-only guarantee intact and is
-        # reached for everything else, including every path that existed before
-        # beta.27.
+        # **An open quarter builds its own command, whichever intent it is.**
+        #
+        # beta.27 made the quarter the execution envelope and then asked it only for
+        # ``net_export``; a charge still went through ``control_intent_for``, which
+        # needs ``decision.wants_command`` and therefore a carried run with an
+        # actionable window. So an open *charge* quarter whose parent run had ended
+        # produced no command at all -- the beta.26 skipped-quarter fault, still
+        # live, and masked only because charge runs usually span several quarters
+        # and get affirmed by the next publication.
+        #
+        # A run ending is not consulted here. That is the whole point: the quarter
+        # carries its own frozen intent, targets and provenance, so ``CarriedRun``
+        # may end, roll or be ``None`` without stopping a quarter already open.
+        #
+        # ``control_intent_for`` below is unchanged and keeps its charge-only
+        # guarantee. It is still the path for a publication carrying no quarter
+        # schedule -- anything written before beta.27 -- and for the prepared and
+        # no-quarter cases.
         quarter = self._quarter
-        if quarter is not None and quarter.intent == EXECUTION_INTENT_NET_EXPORT:
+        if quarter is not None and quarter.open_at(now):
             setpoint = self._dispatch_setpoint(now)
-            return export_intent_for(
+            return quarter_intent_for(
                 quarter,
-                battery_power_kw=0.0 if setpoint is None else setpoint.applied_kw,
+                # An unsigned magnitude: the sign lives in the action, and the
+                # signed value is rebuilt at the Dispatch boundary.
+                battery_power_kw=0.0 if setpoint is None else abs(setpoint.applied_kw),
                 floor_soc_percent=plan.reserve.configured_min_soc_percent,
+                # **The pack's own maximum, and the only ceiling there is.** Passed
+                # for a charge and ignored for an export, because a charge cutoff is
+                # an upper state of charge and a discharge cutoff is a lower one.
+                ceiling_soc_percent=plan.state.limits.max_soc_percent,
                 horizon_minutes=self.config.control_horizon_minutes,
                 target_day=day,
                 start_index=index,
@@ -6530,21 +6575,6 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         stage_b["controller"] = self._controller_block(setpoint, now)
         stage_b["quarter"] = self._quarter_block(now)
         stage_b["physical_decisions"] = list(self._physical_decisions)
-        # **The refresh's own outcome, on its own cadence.** Recorded here, at the
-        # end of the refresh, for the same reason the tick records at the end of the
-        # tick: a reason captured earlier could survive beside a write that happened
-        # afterwards, which is precisely the beta.26 diagnostics fault.
-        self._refresh_outcome = TickOutcome(
-            cadence=CADENCE_QUARTER_REFRESH,
-            reason=(
-                refusal
-                if refusal is not None
-                else (stop_reason or ("commands_planned" if commands else "no_command"))
-            ),
-            wrote=bool(commands),
-            at=now,
-            phase="write_boundary",
-        )
         stage_b["write_boundary"] = {
             "refusal": refusal,
             # **The two stages, published separately.** A reader has to be able
@@ -6688,6 +6718,43 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif verdict.safe:
             state = CONTROL_STATE_ELIGIBLE if commands else CONTROL_STATE_IDLE
 
+        # **The refresh's own outcome, recorded here because here is the first
+        # point at which it is knowable.**
+        #
+        # It used to be built at the write boundary, *before* authorization ran --
+        # so it could not see the authorization decision at all and fell back to
+        # Stage B's run-level ``stop_reason``. On the real installation that
+        # published ``target_reached`` for a refresh which had planned a correct
+        # START and been refused ``ownership_not_provable``: the one fact a reader
+        # needed was absent, and a fact about a different question was in its place.
+        #
+        # Precedence, most-specific first, so the reason names what actually decided
+        # the refresh:
+        #
+        # 1. the write-boundary refusal -- the step list was malformed, so nothing
+        #    downstream got a say;
+        # 2. the authorization refusal, carrying ``unsafe_reason`` when the gate is
+        #    what refused, because "unsafe" alone does not say which condition;
+        # 3. ``stop_reason`` **only while actually stopping**. A stop reason on a
+        #    refresh that was starting describes a different question, which is the
+        #    defect above;
+        # 4. otherwise whether a command was planned at all.
+        outcome_reason = refusal
+        if outcome_reason is None and decision is not None and not decision.authorized:
+            outcome_reason = decision.unsafe_reason or decision.refusal
+        if outcome_reason is None and (resetting or releasing):
+            outcome_reason = stop_reason
+        if outcome_reason is None:
+            outcome_reason = "commands_planned" if commands else "no_command"
+        self._refresh_outcome = TickOutcome(
+            cadence=CADENCE_QUARTER_REFRESH,
+            reason=outcome_reason,
+            # **Planned and permitted are different**, and conflating them is how a
+            # refused START read as a write that had happened.
+            wrote=bool(commands) and bool(decision is not None and decision.authorized),
+            at=now,
+            phase="write_boundary",
+        )
         self._record_control_event(now, state, verdict, decision)
         # Held for the one async method that would send them. Not published and
         # not read anywhere else: the report already carries the step list for

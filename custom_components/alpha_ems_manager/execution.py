@@ -2248,48 +2248,65 @@ def control_intent_for(
     )
 
 
-def export_intent_for(
+def quarter_intent_for(
     quarter: CarriedQuarter,
     *,
     battery_power_kw: float,
     floor_soc_percent: float,
+    ceiling_soc_percent: float | None,
     horizon_minutes: int,
     target_day: date,
     start_index: int,
     built_at: datetime,
 ) -> ControlIntent | None:
-    """Return the command a Live ``net_export`` quarter wants, or ``None``.
+    """Return the command an **open quarter** wants, or ``None``.
 
-    **Deliberately not a branch inside :func:`control_intent_for`.** That function
-    guarantees, in its own docstring, that ``ACTION_CHARGE`` is the only action it
-    can return and that no parameter could select another. That guarantee is what
-    makes the direction interlock structural rather than careful, and beta.27 keeps
-    it by building the export elsewhere instead of widening it.
+    **The quarter is the execution object, and since beta.29 that is true of both
+    intents.** beta.27 said so and implemented it for ``net_export`` only: a charge
+    still went through :func:`control_intent_for`, which needs
+    :attr:`Decision.wants_command` and therefore a carried run with an actionable
+    window. So an open *charge* quarter whose parent run had ended produced no
+    command at all -- the beta.26 skipped-quarter fault, still live, merely masked
+    because charge runs usually span several quarters and get affirmed.
 
-    Two properties mirror it here:
+    A run ending is not an event this function knows about. That is the point: the
+    quarter carries its own frozen intent, its own targets and its own provenance,
+    so ``CarriedRun`` may end, roll or be ``None`` without stopping the quarter that
+    is already open.
 
-    * the only action this function can return is ``ACTION_DISCHARGE``, and it
-      returns ``None`` rather than the opposite one for anything else;
-    * it requires an admitted ``CarriedQuarter`` whose intent is exactly
-      ``net_export``. There is no path to an export command without one, which is
-      what makes "no quarter, no export" true by construction rather than by a
-      caller remembering to check.
+    Three properties, and they are what keep the direction interlock structural:
+
+    * the action is chosen from the quarter's **frozen** intent and nothing else --
+      ``net_export`` discharges, ``grid_charge`` charges, and every other intent
+      returns ``None`` rather than a guess. An intent carries a surface; an action
+      carries only a direction, which is the distinction the beta.27 routing trap
+      turned on;
+    * it takes a :class:`CarriedQuarter` as its first positional argument, so
+      "no quarter, no command" is true by construction rather than by a caller
+      remembering to check;
+    * :func:`control_intent_for` is **untouched** and still cannot return anything
+      but ``ACTION_CHARGE``. It remains the path for a publication with no quarter
+      schedule -- anything written before beta.27 -- and for the prepared and
+      no-quarter cases.
 
     ``battery_power_kw`` arrives **already clamped** by :mod:`.dispatch`, in the
-    documented order. Nothing is recomputed here: this assembles a command, and a
-    second copy of the clamp arithmetic is a second thing to keep in step.
+    documented order, as an unsigned magnitude. Nothing is recomputed here: this
+    assembles a command, and a second copy of the clamp arithmetic is a second thing
+    to keep in step.
 
-    The cutoff is the **discharge** floor, so the device stops before the
-    configured minimum rather than at it -- the register truncates, which is why
-    :func:`alphaess_device.device_cutoff_percent` adds the percent it does.
+    The two cutoffs are not interchangeable and are passed separately for that
+    reason. Measured on the real installation: a **charge** cutoff is an *upper*
+    state of charge, and a **discharge** cutoff is a *lower* one. Handing a charge
+    the discharge floor would write "stop at 21 %" to a pack already at 61 %.
     """
-    if quarter.intent != EXECUTION_INTENT_NET_EXPORT:
+    action = EXECUTION_INTENT_ACTIONS.get(quarter.intent)
+    if action not in (ACTION_CHARGE, ACTION_DISCHARGE):
         return None
     power_kw = max(0.0, battery_power_kw)
     if power_kw <= 0.0:
         return None
     return ControlIntent(
-        action=ACTION_DISCHARGE,
+        action=action,
         energy_ac_kwh=power_kw * INTERVAL_HOURS,
         average_power_kw=power_kw,
         interval_hours=INTERVAL_HOURS,
@@ -2299,13 +2316,15 @@ def export_intent_for(
         target_day=target_day,
         start_index=start_index,
         built_at=built_at,
-        reason=EXECUTION_INTENT_NET_EXPORT,
-        policy="stage_b_export",
+        reason=quarter.intent,
+        policy="stage_b_quarter",
         policy_version=1,
-        # **No charge ceiling, and that is correct rather than missing.** A
-        # discharge's device backstop is the floor, which is carried above; a
-        # ceiling would be the wrong bound in the wrong direction.
-        ceiling_soc_percent=None,
+        # **Only a charge has a ceiling, and only a charge may.** A discharge's
+        # device backstop is the floor above; a ceiling there would be the wrong
+        # bound in the wrong direction. ``None`` for a charge is not a licence to
+        # substitute anything either -- the device layer refuses a charge whose
+        # ceiling cannot be established.
+        ceiling_soc_percent=(ceiling_soc_percent if action == ACTION_CHARGE else None),
     )
 
 

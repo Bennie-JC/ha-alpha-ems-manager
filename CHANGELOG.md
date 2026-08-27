@@ -9,6 +9,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.29] - 2026-08-27
+
+**The open quarter becomes the execution authority, for both intents.** `beta.28`
+got further on real hardware and stopped again: at the **19:45–20:00 export
+quarter** the controller computed the correct physics, built the correct Mode 2
+START sequence, and the device stayed inactive.
+
+Tracing that one symptom found **five** defects. Four share a root — `beta.27`
+declared `CarriedQuarter` the execution envelope and left several gates still asking
+run-era questions. Stage A's economics are untouched, and so is every safety
+function.
+
+Anyone on `beta.27` or `beta.28` should upgrade.
+
+### Fixed: an export could never start
+
+`authorize_export` required provable ownership unconditionally. Before the first
+write there is no dispatch to own and no causal record to match, so the export path
+refused **every** START, deterministically, forever — computing the right power,
+building the right sequence, and reporting `ownership_not_provable`.
+
+The rule is now the one `evaluate` has used since Phase 4: **inactive, or owned.**
+
+* **starting**, nothing running — ownership and causation are not required, because
+  neither exists yet. What protects the site is the foreign-dispatch check, which is
+  reachable only when something *is* active;
+* **continuing**, a dispatch running — ownership and causation are hard requirements
+  again, unchanged and unrelaxed.
+
+The relaxation is confined to `dispatch_active is False`. A running export is gated
+exactly as strictly as before.
+
+### Fixed: an open charge quarter whose run had ended produced no command
+
+`beta.27` made the quarter the execution envelope and then asked it only for
+`net_export`. A charge still went through the run-level path, which needs a carried
+run with an actionable window — so an open **charge** quarter whose parent run had
+ended commanded nothing at all. That is the `beta.26` skipped-quarter fault, still
+live in every release since, and masked only because charge runs usually span
+several quarters and get affirmed by the next publication.
+
+`export_intent_for` is generalised into `quarter_intent_for`, keyed on the quarter's
+frozen intent: `net_export` discharges, `grid_charge` charges, everything else
+returns nothing. `control_intent_for` keeps its charge-only guarantee untouched and
+remains the path for a publication with no quarter schedule.
+
+**A parent run ending, rolling or being absent no longer prevents an already-open
+quarter from executing** — for either intent. The exposure stays bounded exactly as
+before: one quarter, fifteen minutes, and the energy admitted before it opened.
+
+### Fixed: an export could not start on the first refresh after any stop
+
+Found while implementing the above, and release-blocking on its own. The
+control-grade coherence verdict is produced only by the sixty-second tick and set to
+`None` by every stop — and the tick cannot run before a START, because it requires
+an active dispatch. So an export was refused `sensor_incoherence` on the first
+refresh after any stop, **including the previous quarter's own expiry**, with the
+next opportunity a full quarter away.
+
+Absence of a verdict is not evidence of incoherence. With no verdict yet, the
+question asked is the one `control_coherence` seeds itself from: are the sources
+readable at all. A verdict that exists and says unusable still refuses.
+
+Deliberately **not** fixed by advancing the coherence state on the refresh cadence
+too: its grace is counted in *ticks*, so a second cadence feeding it would have
+shortened a documented 180-second safety bound to something nobody chose.
+
+### Fixed: `refresh_decision` reported the wrong question
+
+It was recorded at the write boundary, *before* authorization ran, so it could not
+see the decision even in principle and fell back to Stage B's run-level
+`stop_reason`. On the hardware that published `target_reached` for a refresh which
+had planned a correct START and been refused — while the quarter diagnostics beside
+it correctly showed the target *not* reached. The one fact a reader needed was
+absent and a fact about a different question was in its place.
+
+It is now recorded after authorization, in precedence order: the write-boundary
+refusal, then the authorization refusal including which condition, then
+`stop_reason` **only while actually stopping**, then whether a command was planned.
+`wrote` now means permitted rather than merely planned.
+
+### Not changed, and asserted so
+
+The run-level `TARGET_TOLERANCE_KWH` is still `0.25`. It *was* implicated: the
+19:45 run's battery target was 0.25 kWh with zero progress, so `demand_for`
+declared the target met on the first refresh, which is where the phantom
+`target_reached` came from. Under quarter authority the command no longer comes from
+that path, so it cannot block execution — and a named regression proves exactly that
+at the boundary value, for both intents, rather than assuming it.
+
+Also unchanged, verified byte-for-byte against the published `beta.28`: `evaluate`,
+`absorbing_capacity_kw`, `safe_discharge_power_kw`, `limit_command`, `demand_for`,
+`carry_forward`, `carry_quarter` and `control_intent_for`. A reserve-guard discharge
+still cannot export, `INHIBIT_WOULD_EXPORT` still fires, `serve_load` stays blocked,
+and the Force Charging and Force Discharging helpers remain unwritten for Live.
+
+`carry_forward` and `carry_quarter` were deliberately left alone. The 19:45 run
+ending is **expected**: Stage A's horizon head is `elapsed_intervals + 1`, so a
+19:45 refresh publishes from 20:00 and the 19:45 run cannot affirm itself. That is
+the fact `CarriedQuarter` exists for, and fighting it would have been the wrong fix.
+
+### One semantic expectation changed
+
+`test_stage_a_withdrawal_stops_the_charge` — Sequence D, "a reset with no current
+charge intent anywhere" — now closes the open quarter as well as withdrawing the
+publications. "Anywhere" includes the quarter, because an open quarter is itself an
+intent source; that is the point of the fix, and the continuation behaviour has its
+own test rather than being conflated with the reset-path test.
+
+### Upgrading
+
+Nothing to do, and no migration: `STORAGE_MINOR_VERSION` is unchanged.
+
 ## [1.0.0-beta.28] - 2026-08-27
 
 **The beta.27 hardware hotfix.** `beta.27` was installed on the live installation
@@ -3960,7 +4073,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.28...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.29...HEAD
+[1.0.0-beta.29]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.28...v1.0.0-beta.29
 [1.0.0-beta.28]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.27...v1.0.0-beta.28
 [1.0.0-beta.27]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.26...v1.0.0-beta.27
 [1.0.0-beta.11]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.10...v1.0.0-beta.11
