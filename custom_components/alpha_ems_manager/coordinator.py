@@ -1724,9 +1724,41 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if completion == QUARTER_END_EXPIRED
                 else EXECUTION_STOP_QUARTER_TARGET_REACHED
             )
+        # Held across the stop, which clears the slot: the physical write must come
+        # first, and the record must still know what it is recording afterwards.
+        # **Held across the stop, which resets the accumulators.** The physical write
+        # must come first -- a record written before a stop that then failed would
+        # claim a finished quarter while the inverter was still moving energy -- so
+        # everything the record needs is captured before the stop and restored after
+        # it, for exactly as long as it takes to write the row.
+        finished = self._quarter
+        measured = (
+            self._quarter_battery_kwh,
+            self._quarter_grid_import_kwh,
+            self._quarter_grid_export_kwh,
+            self._quarter_peak_kw,
+            self._quarter_power_sum,
+            self._quarter_power_samples,
+            self._quarter_pv_helped,
+            self._quarter_target_reached_at,
+            set(self._quarter_clamps),
+        )
         self._note_quarter_clamp(shortfall)
+        clamps = set(self._quarter_clamps)
         await self._async_stop_owned_run(now, snapshot, stop_reason)
-        self._record_completed_quarter(completion)
+        (
+            self._quarter_battery_kwh,
+            self._quarter_grid_import_kwh,
+            self._quarter_grid_export_kwh,
+            self._quarter_peak_kw,
+            self._quarter_power_sum,
+            self._quarter_power_samples,
+            self._quarter_pv_helped,
+            self._quarter_target_reached_at,
+            _clamps,
+        ) = measured
+        self._quarter_clamps = clamps
+        self._record_completed_quarter(finished, completion)
         self._quarter = None
         self._reset_quarter_progress(None)
 
@@ -2162,6 +2194,62 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     @callback
+    def _quarter_ring_fields(self, now: datetime) -> dict[str, Any]:
+        """Return the quarter context every flight-recorder entry carries.
+
+        **Enough to reconstruct the quarter, not just the instant.** Diagnostics are
+        almost never captured at the moment production moved, so a download taken an
+        hour later has to be able to answer "what was this tick aiming at, under
+        whose authority, and how much was left" without the reader having to
+        correlate three other blocks by timestamp.
+
+        Shared by the decision entry and the refusal entry, so the two cannot drift
+        into carrying different context for the same tick.
+        """
+        quarter = self._quarter
+        progress = self._quarter_progress(now)
+        export = quarter is not None and quarter.intent == EXECUTION_INTENT_NET_EXPORT
+        return {
+            "plan_id": None if quarter is None else quarter.plan_id,
+            "run_id": self._execution_identity(),
+            "intent": None if quarter is None else quarter.intent,
+            "quarter_start": (
+                None if quarter is None else quarter.quarter_start.isoformat()
+            ),
+            "quarter_end": None if quarter is None else quarter.quarter_end.isoformat(),
+            "battery_target_kwh": (
+                None if quarter is None else round(quarter.battery_allowance_kwh(), 3)
+            ),
+            "battery_realized_kwh": round(self._quarter_battery_kwh, 3),
+            "battery_remaining_kwh": (
+                None if progress is None else round(progress.battery_remaining_kwh, 3)
+            ),
+            "grid_target_kwh": (
+                None
+                if quarter is None
+                else round(
+                    quarter.grid_export_target_kwh
+                    if export
+                    else quarter.grid_authorised_kwh,
+                    3,
+                )
+            ),
+            "grid_realized_kwh": round(
+                self._quarter_grid_export_kwh
+                if export
+                else self._quarter_grid_import_kwh,
+                3,
+            ),
+            "grid_remaining_kwh": (
+                None if progress is None else round(progress.grid_remaining_kwh, 3)
+            ),
+            "seconds_remaining": (
+                None if progress is None else round(progress.seconds_remaining, 1)
+            ),
+            "stop_reason": None,
+        }
+
+    @callback
     def _quarter_target_reached(self, progress: QuarterProgress) -> bool:
         """Return whether the open quarter's own objective has been met.
 
@@ -2187,14 +2275,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._quarter_clamps.add(clamp)
 
     @callback
-    def _record_completed_quarter(self, reason: str) -> None:
-        """Append the finished quarter to the bounded history.
+    def _record_completed_quarter(
+        self, quarter: CarriedQuarter | None, reason: str
+    ) -> None:
+        """Append ``quarter`` to the bounded history, with its measured progress.
 
         Recorded whatever the outcome, because the quarter that fell short is the
         one a reader most needs -- and the shortfall is **stated**, not left to be
         derived by subtracting two other published figures.
+
+        **The subject is a parameter, not ``self._quarter``.** Both callers reach
+        this after the slot has already moved on: the stop path clears it before the
+        bookkeeping runs, and the carry path has replaced it with the *next* quarter.
+        Reading the field would have recorded nothing in the first case and the new
+        quarter's targets against the old one's measured progress in the second.
         """
-        quarter = self._quarter
         if quarter is None:
             return
         planned_battery = quarter.battery_allowance_kwh()
@@ -2563,9 +2658,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._tick_outcome = TickOutcome(
             cadence=CADENCE_PHYSICAL_TICK, reason=reason, wrote=wrote, at=now
         )
-        self._physical_decisions.append(
-            {"controller_refresh_at": now.isoformat(), "update_reason": reason}
-        )
+        # **The refusal goes in the ring with its quarter context.** It is the entry
+        # a reader most needs explained -- "nothing was written" is only useful
+        # beside what was being aimed at and how much of it was left.
+        entry = {"controller_refresh_at": now.isoformat(), "update_reason": reason}
+        entry.update(self._quarter_ring_fields(now))
+        self._physical_decisions.append(entry)
 
     @callback
     def _record_physical_decision(
@@ -2583,46 +2681,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # taken an hour later has to be able to answer "what was this tick aiming
         # at, under whose authority, and how much was left" without the reader
         # having to correlate three other blocks by timestamp.
-        quarter = self._quarter
-        progress = self._quarter_progress(now)
-        export = quarter is not None and quarter.intent == EXECUTION_INTENT_NET_EXPORT
-        entry["plan_id"] = None if quarter is None else quarter.plan_id
-        entry["run_id"] = self._execution_identity()
-        entry["intent"] = None if quarter is None else quarter.intent
-        entry["quarter_start"] = (
-            None if quarter is None else quarter.quarter_start.isoformat()
-        )
-        entry["quarter_end"] = (
-            None if quarter is None else quarter.quarter_end.isoformat()
-        )
-        entry["battery_target_kwh"] = (
-            None if quarter is None else round(quarter.battery_allowance_kwh(), 3)
-        )
-        entry["battery_realized_kwh"] = round(self._quarter_battery_kwh, 3)
-        entry["battery_remaining_kwh"] = (
-            None if progress is None else round(progress.battery_remaining_kwh, 3)
-        )
-        entry["grid_target_kwh"] = (
-            None
-            if quarter is None
-            else round(
-                quarter.grid_export_target_kwh
-                if export
-                else quarter.grid_authorised_kwh,
-                3,
-            )
-        )
-        entry["grid_realized_kwh"] = round(
-            self._quarter_grid_export_kwh if export else self._quarter_grid_import_kwh,
-            3,
-        )
-        entry["grid_remaining_kwh"] = (
-            None if progress is None else round(progress.grid_remaining_kwh, 3)
-        )
-        entry["seconds_remaining"] = (
-            None if progress is None else round(progress.seconds_remaining, 1)
-        )
-        entry["stop_reason"] = None
+        entry.update(self._quarter_ring_fields(now))
         self._physical_decisions.append(entry)
 
     @callback
@@ -4297,9 +4356,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # It ended between ticks rather than on one -- record it before the
             # accumulators are rebased, or the history loses the quarter entirely.
             self._record_completed_quarter(
+                previous_quarter,
                 QUARTER_END_TARGET_REACHED
                 if self._quarter_target_reached_at is not None
-                else QUARTER_END_EXPIRED
+                else QUARTER_END_EXPIRED,
             )
             self._reset_quarter_progress(self._quarter)
         carried = outcome.carried
@@ -6005,6 +6065,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # against a deadline from a run that no longer exists.
                 self._sustained_deadline = None
                 self._sustained_run_id = None
+                # And the quarter goes with it: its authority came from a dispatch
+                # that is no longer running. The restart flag is cleared here too --
+                # left set, it would stop the next admitted quarter the moment it
+                # armed, on evidence about a process that has already been dealt
+                # with.
+                self._quarter = None
+                self._reset_quarter_progress(None)
+                self._quarter_progress_unknown = False
 
     def _build_control_report_safely(
         self,
