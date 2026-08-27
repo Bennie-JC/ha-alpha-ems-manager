@@ -43,7 +43,7 @@ switched off.
 >
 > In *off* and *shadow* it never writes to your inverter and cannot change how your
 > system behaves; the worst case is an inaccurate forecast. In *Live* it can buy
-> energy on a schedule it believes is cheap, and — from `beta.28` — it can **sell
+> energy on a schedule it believes is cheap, and — from `beta.29` — it can **sell
 > energy back to the grid** when the plan says that is worth more. It can stop doing
 > either at any time: by reaching the target, by running out of room, by the plan
 > being withdrawn, by a safety condition, or because you switched the mode back.
