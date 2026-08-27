@@ -19,14 +19,16 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.26` — a public beta.**
+> **Current release: `1.0.0-beta.27` — a public beta.**
 >
 > Stage A is feature-complete. Stage B — the physical execution controller — is
-> wired end to end and, from beta.24, **can charge your battery**. Covered by 3322
-> automated tests.
+> wired end to end and, from beta.24, **can charge your battery**. From beta.27 it
+> executes each 15-minute plan interval as an explicit energy target, and can also
+> **export to the grid** when the plan says so. Covered by 3714 automated tests.
 >
-> **One action is executable: buying energy into the battery.** Discharging,
-> exporting and curtailing are calculated, published and explained, and are refused
+> **Two actions are executable: buying energy into the battery, and selling it back
+> out.** Serving the house from the battery, and curtailing production, are
+> calculated, published and explained, and are refused
 > at three independent boundaries before anything reaches the inverter. That is a
 > property of the source, not a setting you could clear by accident.
 >
@@ -77,7 +79,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.26` is not offered.
+     dialog if `1.0.0-beta.27` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 

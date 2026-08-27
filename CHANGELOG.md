@@ -9,6 +9,208 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.27] - 2026-08-27
+
+**Quarter-accurate execution, and Live net export.** Everything in `beta.26` plus
+two changes: every 15-minute Stage-A interval becomes an explicit execution
+envelope with its own energy target, and selling energy back to the grid becomes
+executable on the same validated Dispatch surface.
+
+`beta.26` was validated on the real installation: production moved, the controller
+recomputed `-3.17 kW` and moved the applied setpoint from `-2.7` to `-3.1`. Two
+things did not work, and both are fixed here from the code rather than from a
+guess.
+
+### The skipped quarter, and the repeated "no owned run"
+
+A planned 15:00–15:15 charge never physically executed, and every sixty-second
+tick through it reported `no_owned_run`. One shared cause, and it is structural
+rather than a race.
+
+`carry_forward` has **one** carried slot, and the only way to fill an empty one is
+a target whose window *contains* the current instant. But Stage A's horizon head is
+`elapsed_intervals + 1`, so **every fresh publication opens at the next boundary**.
+At any boundary where the carried run ends, the fresh publication therefore cannot
+be admitted until the *following* boundary — and a whole quarter has no carrier at
+all. Nothing is armed, because arming needs a command, which needs an intent, which
+needed a carried run.
+
+So **any quarter in which a run ends was skippable**, on every installation.
+
+`CarriedQuarter` fixes it by being carried in its own right, admitted one refresh
+ahead exactly as runs are, and by being authority enough for the tick on its own.
+The 15:00 quarter now survives the 15:00 refresh.
+
+### The progress objective is asymmetric, and the contract already said so
+
+A quarter's target is realised by measuring progress inside it and correcting every
+sixty seconds. **Which figure is the objective depends on the intent**, and the
+publication contract has always distinguished the two: `battery_target_kwh` is
+*"Battery side. Authoritative for a charge"*, and `grid_target_kwh` is *"Meter side.
+Present only when the meter is what the plan is aiming at"* — `None` for a charge.
+
+| intent | objective | ceiling |
+|---|---|---|
+| `grid_charge` | the **battery** figure | the marginal grid import authorised |
+| `net_export` | the **actual meter export** | the battery discharge authorised |
+
+A single formula for both would treat a charge's grid authorisation as an amount to
+**consume**. On a quarter with a 2.0 kWh battery target, 1.2 kWh of authorisation
+and production outperforming its forecast at 8 kW, the asymmetric design meets the
+target from production alone and buys **nothing**; the single formula would have
+imported 4.8 kW throughout and bought about **1.2 kWh that was not needed**. That
+counterexample is now a test timeline rather than an argument.
+
+Four consequences, each one a requirement:
+
+- **production substitutes for planned grid energy** — more sun, same battery
+  target, less buying;
+- **missing production cannot unlock extra buying** — the ceiling comes from the
+  authorisation, never from the battery deficit;
+- **falling behind still speeds up**, bounded by production plus the authorisation;
+- **free production is still absorbed once the grid budget is spent** — a spent
+  *ceiling* is not a reached *objective*.
+
+### A multi-quarter run no longer follows its first quarter's rate
+
+`desired_grid_kw` was published as a run's **first interval** rate while its window
+spanned every interval it covered, so quarters two onward of a multi-quarter run
+were executed against quarter one's target. Stage A now publishes the per-quarter
+schedule it had already solved — no new solve, and **no economics changed**.
+
+### Live net export
+
+`net_export` executes on the same Dispatch surface, in mode 2, with a **positive**
+power. The meter is the target: house consumption is supplied *in addition* to the
+export and production reduces the discharge required, through the canonical
+identity `dispatch = house − pv + export`. Commanding the planned export magnitude
+as battery power would under-export by exactly the house load.
+
+The export objective is the **actual** meter export, not the marginal figure. On a
+site whose production is already exporting, following the marginal figure would
+under-export by precisely the amount the sun was sending anyway.
+
+**No existing safety gate was widened to make this work.** `INHIBIT_WOULD_EXPORT`
+refuses any discharge above the measured absorbing capacity, and
+`absorbing_capacity_kw` returns zero for a site that is already exporting — both
+correct for the reserve-guard discharge they were written for, where energy reaching
+the meter is an accident. Rather than thread a condition through them, beta.27 adds a
+**separate** authorisation function with its own twenty-one-condition checklist,
+reachable only for an admitted `net_export` quarter. `evaluate`,
+`safe_discharge_power_kw`, `absorbing_capacity_kw` and `limit_command` are unchanged,
+and tests assert they never learned the words *quarter*, *net_export* or *intent*.
+
+An authorised export then continues through the same machinery a Live charge uses:
+ownership, the execution lock, the Dispatch Mode 2 builders, the write boundary,
+readback verification, the dead-man and the stop sequence. **The Force Charging and
+Force Discharging helpers are never written for it.**
+
+`serve_load` stays blocked. It has no published meter target, so there is no
+quantity a quarter could measure it against. So do modes 6 and 7, production
+curtailment, and every unverified direction — all of them by having no entry in the
+intent-to-sign map rather than by being enumerated anywhere.
+
+### Stopping, and what is never carried forward
+
+**Reaching the target stops the dispatch immediately.** The 20/25-minute device
+duration is a dead-man *lease*, never an execution entitlement: a dispatch left
+armed because a countdown has not expired is how a target gets exceeded.
+
+**A quarter that expires short records the shortfall and carries nothing.** Stage A
+decides each quarter independently; letting Stage B accumulate a deficit would be it
+claiming an entitlement no economic layer authorised.
+
+Before every write the requested power is additionally bounded by what one control
+interval could deliver against the energy actually left, on a **90-second** horizon —
+longer than the 60-second tick it guards, because the tick is approximate, a readback
+lands after the write, and a tick can be skipped for lock contention. Near a quarter
+boundary that can finish a few watt-hours short. **That is the intended direction of
+error**: overshooting spends energy the plan never authorised, and falling marginally
+short does not. The shortfall is recorded with the binding clamp named.
+
+### An open quarter is economically immutable
+
+Once a quarter starts, its economic authority is frozen for at most fifteen minutes.
+Exactly three things end it: the objective is reached, `quarter_end` arrives, or a
+safety condition invalidates execution. A parent run ending or rolling forward has
+**no effect** on it.
+
+**Withdrawal is never inferred**, and the reason is structural rather than cautious:
+Stage A's horizon head is `elapsed_intervals + 1`, so no publication issued after a
+quarter starts can ever contain it. Reading its absence as a cancellation would treat
+a certainty as evidence — and would cancel every quarter, always. There is no
+explicit cancellation signal in the contract today; adding one is a deliberate
+non-goal for this release, and a future phase that needs it needs a real contract
+field, not a sharper inference.
+
+Stage B keeps full freedom to throttle or stop for physical safety throughout, so
+"immutable" bounds the *authorisation* and never the safety response. The exposure is
+bounded by construction: one quarter, fifteen minutes, and the energy admitted before
+it opened.
+
+### A restart over a running dispatch stops it
+
+The quarter envelope is deliberately **not persisted**, and its measured progress
+lives only in memory — so after a restart the energy already delivered inside the
+open quarter is unknown. Continuing would risk delivering the quarter twice, and
+leaving the inverter running while sending nothing means relying on the vendor
+dead-man. So a provably owned active dispatch is **stopped**, reported as
+`quarter_progress_unknown`, and the next admitted quarter is awaited. At most the
+remainder of one quarter is lost, and Stage A re-plans at the next boundary.
+
+A dispatch whose provenance **cannot** be established still gets **zero writes**.
+That rule is unchanged.
+
+### Diagnostics
+
+`_last_tick_reason` was a single mutable string written by the sixty-second tick and
+then published beside figures computed during the *quarter refresh* — so a stale
+refusal sat next to a freshly successful write with nothing saying the two described
+different events. It is replaced by a typed record that carries its own cadence and
+is written once, at the end of the evaluation. `controller.last_tick` and
+`controller.refresh_decision` are now separate.
+
+`no_owned_run` covered three different situations — *nothing admitted*, *nothing
+armed*, and *we cannot prove this is ours* — needing three different responses. It is
+now three reasons.
+
+New with every tick: the open quarter's bounds, elapsed and remaining time, and
+planned against realised against remaining energy in both domains. New per finished
+quarter, bounded to the last twelve: planned and realised figures, the shortfall in
+kWh and per cent, how it ended, peak and mean power, whether production helped, which
+clamps bound it, and when the target was reached if it was early.
+
+### Upgrading
+
+Nothing to do, and no migration: `STORAGE_MINOR_VERSION` is unchanged.
+
+A publication or persisted record written before beta.27 carries no quarter schedule,
+admits no quarter, and the sixty-second tick **degrades to the run** — executing the
+same arithmetic that was proven on the hardware. Refusing to correct a run for want
+of a quarter would have taken the working charge path away on upgrade.
+
+### Fixed
+
+- `net_export` mapping to `ACTION_DISCHARGE` — needed so a stop can name what it
+  stops — would have made an export command fall into the advisory branch and be
+  armed on the **Force Discharging helper family**, silently making a helper family
+  the physical actuator for the new capability. The branch now keys on whether the
+  intent is a validated Live Dispatch intent. An intent carries a surface; an action
+  carries only a direction, and two intents can share one.
+- With an export quarter's meter target already met, the canonical identity gives
+  `house − pv`, which is the power that holds the meter at zero by supplying the
+  house from the battery. That is `serve_load`, which this release does not execute.
+  The sixty-second tick would have discharged the battery every time an export
+  finished early in its quarter.
+- The completed-quarter record read the live quarter field, which both callers reach
+  after it has already moved on — recording nothing on the stop path, and the *next*
+  quarter's targets against the previous one's measured progress on the refresh path.
+- A refusal's flight-recorder entry carried only a timestamp and a reason, which is
+  the entry a reader most needs explained.
+- The restart flag was cleared on two stop paths but not on the one a restart
+  actually takes, so it would have stopped the next admitted quarter the moment it
+  armed.
+
 ## [1.0.0-beta.26] - 2026-08-26
 
 **The Dispatch runtime.** Everything in `beta.25` plus the complete migration of
@@ -3671,7 +3873,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.11...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.27...HEAD
+[1.0.0-beta.27]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.26...v1.0.0-beta.27
 [1.0.0-beta.11]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.10...v1.0.0-beta.11
 [1.0.0-beta.10]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.9...v1.0.0-beta.10
 [1.0.0-beta.9]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.8...v1.0.0-beta.9
