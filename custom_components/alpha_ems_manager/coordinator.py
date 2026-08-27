@@ -217,6 +217,7 @@ from .dispatch import (
     decide_for_intent,
     permitted_sign,
     sign_matches_intent,
+    tick_energy_cap_kw,
 )
 from .dispatch import decide as decide_setpoint
 from .economic import (
@@ -256,6 +257,7 @@ from .execution import (
     carry_quarter,
     control_intent_for,
     decide,
+    export_intent_for,
     forward_authorisation,
     measure_progress,
     ownership_of,
@@ -332,9 +334,11 @@ from .reserve import (
 from .safety import (
     ControlContext,
     ExecutionDecision,
+    ExportRequest,
     SafetyVerdict,
     absorbing_capacity_kw,
     authorize_emergency_self_stop,
+    authorize_export,
     authorize_marker_release,
     authorize_reset,
     authorize_start,
@@ -1933,6 +1937,87 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
         }
         return block
+
+    @callback
+    def _export_quarter_open(self, now: datetime) -> bool:
+        """Return whether an admitted ``net_export`` quarter is open right now."""
+        quarter = self._quarter
+        return (
+            quarter is not None
+            and quarter.intent == EXECUTION_INTENT_NET_EXPORT
+            and quarter.open_at(now)
+        )
+
+    @callback
+    def _export_verdict(self, intent: Any, context: Any, now: datetime) -> Any:
+        """Return the dedicated Live export authorisation for this refresh.
+
+        **Built from the ``ControlContext`` that already exists at the call site**,
+        not from a second reading of the same entities. The capability, the readings
+        and the conflicting-feature flags are assembled once per refresh precisely so
+        the gate cannot see a different world halfway through evaluating itself, and
+        a parallel assembly here would be a second world to keep in step.
+
+        What this adds beyond the context is the part the context has no field for:
+        the admitted quarter, its two remaining authorisations, and the reserve
+        headroom the export must stay above.
+        """
+        quarter = self._quarter
+        progress = None if quarter is None else self._quarter_progress(now)
+        plan = self.battery_plan
+        headroom_kwh = None
+        max_discharge_kw = None
+        min_soc = None
+        if plan is not None and plan.state is not None:
+            max_discharge_kw = plan.state.limits.max_discharge_kw
+            min_soc = plan.reserve.configured_min_soc_percent
+            headroom_kwh = max(
+                0.0,
+                plan.state.energy_kwh - plan.state.limits.energy_for_soc(min_soc),
+            )
+        return authorize_export(
+            ExportRequest(
+                intent=None if quarter is None else quarter.intent,
+                quarter_admitted=quarter is not None,
+                quarter_open=quarter is not None and quarter.open_at(now),
+                owned=bool(context.dispatch_owned),
+                # The causal record must name the run the quarter was admitted
+                # under. ``_execution_identity`` resolves that quarter-first, which
+                # is what lets a quarter stay provable while the run slot is empty.
+                causation_proven=self._execution_identity() is not None,
+                foreign_dispatch=bool(
+                    context.dispatch_active and not context.dispatch_owned
+                ),
+                coherent=bool(self._coherence is not None and self._coherence.usable),
+                conflicting_feature=bool(
+                    context.excess_export_active or context.peak_shaving_active
+                ),
+                missing_entities=tuple(context.missing_entities)
+                + tuple(context.unavailable_entities),
+                failsafe_available=bool(context.failsafe_available),
+                soc_percent=context.soc_percent,
+                configured_min_soc_percent=min_soc,
+                reserve_headroom_kwh=headroom_kwh,
+                battery_remaining_kwh=(
+                    0.0 if progress is None else progress.battery_remaining_kwh
+                ),
+                grid_export_remaining_kwh=(
+                    0.0 if progress is None else progress.grid_remaining_kwh
+                ),
+                requested_kw=(
+                    0.0 if intent is None else max(0.0, float(intent.average_power_kw))
+                ),
+                inverter_max_discharge_kw=max_discharge_kw,
+                # No configured site export limit exists in this integration, so
+                # this bound is genuinely unconstrained rather than defaulted.
+                site_export_limit_kw=None,
+                tick_cap_kw=(
+                    None
+                    if progress is None
+                    else tick_energy_cap_kw(progress.battery_remaining_kwh)
+                ),
+            )
+        )
 
     @callback
     def _executing_intent(self) -> str | None:
@@ -3602,6 +3687,23 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         index = getattr(plan, "start_index", None)
         if day is None or index is None:
             return None
+        # **An admitted export quarter builds its own command.** Asked first, and
+        # only ever satisfied by a quarter whose intent is exactly ``net_export`` --
+        # ``control_intent_for`` below keeps its charge-only guarantee intact and is
+        # reached for everything else, including every path that existed before
+        # beta.27.
+        quarter = self._quarter
+        if quarter is not None and quarter.intent == EXECUTION_INTENT_NET_EXPORT:
+            setpoint = self._dispatch_setpoint(now)
+            return export_intent_for(
+                quarter,
+                battery_power_kw=0.0 if setpoint is None else setpoint.applied_kw,
+                floor_soc_percent=plan.reserve.configured_min_soc_percent,
+                horizon_minutes=self.config.control_horizon_minutes,
+                target_day=day,
+                start_index=index,
+                built_at=now,
+            )
         return control_intent_for(
             decision,
             floor_soc_percent=plan.reserve.configured_min_soc_percent,
@@ -6084,8 +6186,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ("only a discharge can export"); the clamp did not, which is the same
         # direction-blindness the cooldown gate had. Discharge behaviour is
         # unchanged, byte for byte.
+        # **``limit_command`` is untouched and still clamps the reserve-guard
+        # discharge.** It is simply not applied to an authorised export, because the
+        # bound it applies is "do not reach the meter" and an export's whole purpose
+        # is to reach it. Applying it would silently reduce every authorised export
+        # to whatever the house happened to be drawing.
+        #
+        # The export is not unbounded as a result: :mod:`.dispatch` has already
+        # clamped it in the documented order, and ``authorize_export`` re-checks
+        # every one of those bounds before the command is authorised at all.
         command = requested
-        if requested is not None and requested.action == ACTION_DISCHARGE:
+        if (
+            requested is not None
+            and requested.action == ACTION_DISCHARGE
+            and not self._export_quarter_open(now)
+        ):
             command = limit_command(requested, safe_power_kw)
         if command is not None and command is not requested:
             context = replace(context, device_power_kw=command.power_kw)
@@ -6123,7 +6238,23 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # A safety verdict that has turned unsafe under a dispatch of ours is
         # itself a stop condition. "Do not start this" and "do not stop what is
         # already running" look alike and are opposites; the second is never right.
+        # **Two authorisation paths, and the export one is separate on purpose.**
+        # ``evaluate`` refuses any discharge above the measured absorbing capacity,
+        # which is right for the Phase-3 reserve guard -- there, energy reaching the
+        # meter is an accident. For an admitted ``net_export`` the meter *is* the
+        # objective, so the same question has the opposite answer.
+        #
+        # Nothing about ``evaluate`` changed. It still governs every charge, every
+        # hold and every reserve-guard discharge, ``INHIBIT_WOULD_EXPORT`` still
+        # fires on them, and the absorbing-capacity clamp still binds them. This is
+        # a path that did not exist before, not a gate that was widened.
         verdict = evaluate(intent, context)
+        if (
+            intent is not None
+            and self._quarter is not None
+            and self._quarter.intent == EXECUTION_INTENT_NET_EXPORT
+        ):
+            verdict = self._export_verdict(intent, context, now)
         dispatch_active = bool(snapshot is not None and snapshot.dispatch_active)
         result = stage_b.get("result") or {}
         stop_reason = result.get("stop_reason")

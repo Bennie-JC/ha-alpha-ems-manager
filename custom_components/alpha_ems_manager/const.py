@@ -2219,6 +2219,60 @@ CONTROL_TICK_ENERGY_HORIZON_SECONDS: Final = 90.0
 #: from done.
 QUARTER_TARGET_TOLERANCE_KWH: Final = 0.01
 
+#: Why a Live ``net_export`` was not authorised. **A separate vocabulary from the
+#: ``INHIBIT_*`` reasons on purpose**: those describe the reserve-guard discharge
+#: gate, which beta.27 does not touch, and reusing them would make a reader think
+#: that gate had been widened. It has not.
+EXPORT_REFUSE_NOT_EXPORT_INTENT: Final = "not_an_export_intent"
+EXPORT_REFUSE_NO_QUARTER: Final = "no_admitted_quarter"
+EXPORT_REFUSE_QUARTER_NOT_OPEN: Final = "quarter_not_open"
+EXPORT_REFUSE_NOT_OWNED: Final = "ownership_not_provable"
+EXPORT_REFUSE_RECORD_MISMATCH: Final = "causal_record_mismatch"
+EXPORT_REFUSE_DISPATCH_FOREIGN: Final = "dispatch_not_ours"
+EXPORT_REFUSE_INCOHERENT: Final = "sensor_incoherence"
+EXPORT_REFUSE_CONFLICTING_FEATURE: Final = "conflicting_feature_active"
+EXPORT_REFUSE_MISSING_ENTITY: Final = "missing_control_entity"
+EXPORT_REFUSE_NO_FAILSAFE: Final = "no_failsafe_automation"
+EXPORT_REFUSE_SOC_UNUSABLE: Final = "soc_unusable"
+EXPORT_REFUSE_RESERVE_FLOOR: Final = "reserve_floor"
+EXPORT_REFUSE_MIN_SOC: Final = "configured_min_soc"
+EXPORT_REFUSE_NO_BATTERY_ALLOWANCE: Final = "no_battery_discharge_authorised"
+EXPORT_REFUSE_NO_EXPORT_TARGET: Final = "no_meter_export_target"
+EXPORT_REFUSE_INVERTER_LIMIT: Final = "inverter_discharge_limit"
+EXPORT_REFUSE_SITE_EXPORT_LIMIT: Final = "site_export_limit"
+EXPORT_REFUSE_TICK_HORIZON: Final = "tick_energy_horizon"
+EXPORT_REFUSE_SIGN: Final = "dispatch_sign"
+EXPORT_REFUSE_BELOW_DEVICE_MINIMUM: Final = "power_below_device_minimum"
+EXPORT_REFUSE_ABOVE_DEVICE_MAXIMUM: Final = "power_above_device_maximum"
+EXPORT_AUTHORISED: Final = "authorised"
+
+#: Every condition a Live export must satisfy, in the order they are checked.
+#: Published so the checklist is auditable from the diagnostics rather than only
+#: from the source.
+EXPORT_AUTHORISATION_ORDER: Final = (
+    EXPORT_REFUSE_NOT_EXPORT_INTENT,
+    EXPORT_REFUSE_NO_QUARTER,
+    EXPORT_REFUSE_QUARTER_NOT_OPEN,
+    EXPORT_REFUSE_MISSING_ENTITY,
+    EXPORT_REFUSE_NO_FAILSAFE,
+    EXPORT_REFUSE_CONFLICTING_FEATURE,
+    EXPORT_REFUSE_DISPATCH_FOREIGN,
+    EXPORT_REFUSE_NOT_OWNED,
+    EXPORT_REFUSE_RECORD_MISMATCH,
+    EXPORT_REFUSE_INCOHERENT,
+    EXPORT_REFUSE_SOC_UNUSABLE,
+    EXPORT_REFUSE_MIN_SOC,
+    EXPORT_REFUSE_RESERVE_FLOOR,
+    EXPORT_REFUSE_NO_BATTERY_ALLOWANCE,
+    EXPORT_REFUSE_NO_EXPORT_TARGET,
+    EXPORT_REFUSE_INVERTER_LIMIT,
+    EXPORT_REFUSE_SITE_EXPORT_LIMIT,
+    EXPORT_REFUSE_TICK_HORIZON,
+    EXPORT_REFUSE_BELOW_DEVICE_MINIMUM,
+    EXPORT_REFUSE_ABOVE_DEVICE_MAXIMUM,
+    EXPORT_REFUSE_SIGN,
+)
+
 #: Why an admitted quarter stopped.
 QUARTER_END_TARGET_REACHED: Final = "quarter_target_reached"
 QUARTER_END_EXPIRED: Final = "quarter_expired"

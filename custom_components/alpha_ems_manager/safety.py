@@ -78,6 +78,28 @@ from .const import (
     CONTROL_MIN_POWER_KW,
     CONTROL_MODE_ACTIVE,
     EMERGENCY_STOP_MAX_ATTEMPTS,
+    EXECUTION_INTENT_NET_EXPORT,
+    EXPORT_REFUSE_ABOVE_DEVICE_MAXIMUM,
+    EXPORT_REFUSE_BELOW_DEVICE_MINIMUM,
+    EXPORT_REFUSE_CONFLICTING_FEATURE,
+    EXPORT_REFUSE_DISPATCH_FOREIGN,
+    EXPORT_REFUSE_INCOHERENT,
+    EXPORT_REFUSE_INVERTER_LIMIT,
+    EXPORT_REFUSE_MIN_SOC,
+    EXPORT_REFUSE_MISSING_ENTITY,
+    EXPORT_REFUSE_NO_BATTERY_ALLOWANCE,
+    EXPORT_REFUSE_NO_EXPORT_TARGET,
+    EXPORT_REFUSE_NO_FAILSAFE,
+    EXPORT_REFUSE_NO_QUARTER,
+    EXPORT_REFUSE_NOT_EXPORT_INTENT,
+    EXPORT_REFUSE_NOT_OWNED,
+    EXPORT_REFUSE_QUARTER_NOT_OPEN,
+    EXPORT_REFUSE_RECORD_MISMATCH,
+    EXPORT_REFUSE_RESERVE_FLOOR,
+    EXPORT_REFUSE_SIGN,
+    EXPORT_REFUSE_SITE_EXPORT_LIMIT,
+    EXPORT_REFUSE_SOC_UNUSABLE,
+    EXPORT_REFUSE_TICK_HORIZON,
     INHIBIT_AT_OR_BELOW_FLOOR,
     INHIBIT_BATTERY_NOT_CONFIGURED,
     INHIBIT_BATTERY_POWER_STALE,
@@ -540,6 +562,192 @@ def evaluate(intent: ControlIntent | None, context: ControlContext) -> SafetyVer
         export_ok = context.device_power_kw <= safe_discharge_power_kw(context)
     if not check(INHIBIT_WOULD_EXPORT, export_ok):
         return SafetyVerdict(False, INHIBIT_WOULD_EXPORT, tuple(checks))
+
+    return SafetyVerdict(True, None, tuple(checks))
+
+
+@dataclass(frozen=True, slots=True)
+class ExportRequest:
+    """Every fact the Live export authorisation needs, as plain values.
+
+    **Explicit rather than derived.** Each field is a question the caller has
+    already answered elsewhere -- ownership, coherence, the quarter -- and passing
+    the answers in is what makes the whole checklist visible in one function
+    instead of spread across the refresh. This module still derives no ownership
+    and reads no entity.
+    """
+
+    #: The admitted quarter's intent. Anything but ``net_export`` is refused.
+    intent: str | None
+    #: Whether a ``CarriedQuarter`` has been admitted at all.
+    quarter_admitted: bool
+    #: Whether ``now`` falls inside that quarter's own bounds. Separate from
+    #: ``quarter_admitted`` because the two failures mean different things: one is
+    #: "Stage A authorised nothing", the other is "the envelope has closed".
+    quarter_open: bool
+    #: The controller's ownership verdict, supplied not derived.
+    owned: bool
+    #: Whether the caller has **proven** that the running dispatch was caused by
+    #: the run this quarter was admitted under.
+    #:
+    #: A supplied verdict, exactly like ``dispatch_owned``, and named so it cannot
+    #: be mistaken for one of ``OwnershipEvidence``'s own fields. This module
+    #: derives no ownership and must never learn how: the only derivation available
+    #: from the vendor surface is parameter matching, which is worse than nothing
+    #: here. ``False`` is the safe default and refuses the export.
+    causation_proven: bool
+    #: Whether a dispatch is running that is *not* ours.
+    foreign_dispatch: bool
+    #: Whether the control-grade coherence bound is currently usable.
+    coherent: bool
+    #: Another feature of the vendor surface driving the battery.
+    conflicting_feature: bool
+    missing_entities: tuple[str, ...] = ()
+    failsafe_available: bool = False
+    #: State of charge now, and the two floors it must stay above. Both are
+    #: checked, because they are different promises: one is the user's
+    #: configuration and one is the planner's dynamic reserve.
+    soc_percent: float | None = None
+    configured_min_soc_percent: float | None = None
+    reserve_headroom_kwh: float | None = None
+    #: What remains authorised this quarter, in the two domains.
+    battery_remaining_kwh: float = 0.0
+    grid_export_remaining_kwh: float = 0.0
+    #: The power the caller intends to command, positive kW at the battery.
+    requested_kw: float = 0.0
+    #: Bounds it must respect. ``None`` means genuinely unconstrained.
+    inverter_max_discharge_kw: float | None = None
+    site_export_limit_kw: float | None = None
+    tick_cap_kw: float | None = None
+
+
+def authorize_export(request: ExportRequest) -> SafetyVerdict:
+    """Return whether a Live ``net_export`` may be commanded, and why not if not.
+
+    **A separate path, and deliberately not a relaxation of :func:`evaluate`.**
+    That gate refuses any discharge above :func:`safe_discharge_power_kw`, and it
+    is right to: it was written for the Phase-3 reserve guard, where energy
+    reaching the meter is an accident. An authorised net export is the opposite --
+    the meter is the *objective* -- so the same question has the opposite answer,
+    and the honest way to express that is a second function rather than a
+    condition threaded through the first.
+
+    So :func:`evaluate`, :func:`safe_discharge_power_kw`,
+    :func:`absorbing_capacity_kw` and ``limit_command`` are untouched by beta.27.
+    The reserve-guard discharge still cannot export, ``INHIBIT_WOULD_EXPORT``
+    still fires on it, and the absorbing-capacity clamp still binds it. Nothing
+    that path did has been widened; this path simply did not exist before.
+
+    **This authorises an economic intent. It is not an actuator path.** Nothing
+    here writes, plans a step or names an entity. An authorised export continues
+    through the same ownership, execution lock, Dispatch Mode 2 builders, write
+    boundary, readback verification, dead-man and stop machinery a Live charge
+    uses -- because there is one physical actuator and it is the validated
+    Dispatch surface with positive signed power. The helper families are never
+    written for an export, and ``serve_load`` is not admitted at all.
+
+    Fails closed on every condition. The checks are ordered cheapest and most
+    fundamental first, so the single reported reason is the most useful one, and
+    every one of them is reached in :data:`EXPORT_AUTHORISATION_ORDER`.
+    """
+    checks: list[tuple[str, bool]] = []
+
+    def check(name: str, passed: bool) -> bool:
+        checks.append((name, passed))
+        return passed
+
+    def refuse(name: str) -> SafetyVerdict:
+        return SafetyVerdict(False, name, tuple(checks))
+
+    # -- is this even an export? --------------------------------------------
+    if not check(
+        EXPORT_REFUSE_NOT_EXPORT_INTENT, request.intent == EXECUTION_INTENT_NET_EXPORT
+    ):
+        return refuse(EXPORT_REFUSE_NOT_EXPORT_INTENT)
+    # ``serve_load`` lands on the check above: it has no published meter target, so
+    # there is no quantity a quarter could measure it against. Blocked by having no
+    # entry in the executable intents rather than by being named.
+    if not check(EXPORT_REFUSE_NO_QUARTER, request.quarter_admitted):
+        return refuse(EXPORT_REFUSE_NO_QUARTER)
+    if not check(EXPORT_REFUSE_QUARTER_NOT_OPEN, request.quarter_open):
+        return refuse(EXPORT_REFUSE_QUARTER_NOT_OPEN)
+
+    # -- can anything be commanded at all? ----------------------------------
+    if not check(EXPORT_REFUSE_MISSING_ENTITY, not request.missing_entities):
+        return refuse(EXPORT_REFUSE_MISSING_ENTITY)
+    if not check(EXPORT_REFUSE_NO_FAILSAFE, request.failsafe_available):
+        return refuse(EXPORT_REFUSE_NO_FAILSAFE)
+    if not check(EXPORT_REFUSE_CONFLICTING_FEATURE, not request.conflicting_feature):
+        return refuse(EXPORT_REFUSE_CONFLICTING_FEATURE)
+    if not check(EXPORT_REFUSE_DISPATCH_FOREIGN, not request.foreign_dispatch):
+        return refuse(EXPORT_REFUSE_DISPATCH_FOREIGN)
+
+    # -- is it ours, and provably? ------------------------------------------
+    if not check(EXPORT_REFUSE_NOT_OWNED, request.owned):
+        return refuse(EXPORT_REFUSE_NOT_OWNED)
+    if not check(EXPORT_REFUSE_RECORD_MISMATCH, request.causation_proven):
+        return refuse(EXPORT_REFUSE_RECORD_MISMATCH)
+    if not check(EXPORT_REFUSE_INCOHERENT, request.coherent):
+        return refuse(EXPORT_REFUSE_INCOHERENT)
+
+    # -- has the battery anything to give, above both floors? ---------------
+    if not check(EXPORT_REFUSE_SOC_UNUSABLE, request.soc_percent is not None):
+        return refuse(EXPORT_REFUSE_SOC_UNUSABLE)
+    floor = request.configured_min_soc_percent
+    if not check(EXPORT_REFUSE_MIN_SOC, floor is None or request.soc_percent > floor):
+        return refuse(EXPORT_REFUSE_MIN_SOC)
+    # **Absolute: no export price unlocks a reserve violation.** The reserve is a
+    # promise about tonight, and a profitable quarter is not a reason to break it.
+    if not check(
+        EXPORT_REFUSE_RESERVE_FLOOR,
+        request.reserve_headroom_kwh is None or request.reserve_headroom_kwh > 0.0,
+    ):
+        return refuse(EXPORT_REFUSE_RESERVE_FLOOR)
+
+    # -- is there anything left authorised, in **both** domains? ------------
+    if not check(
+        EXPORT_REFUSE_NO_BATTERY_ALLOWANCE, request.battery_remaining_kwh > 0.0
+    ):
+        return refuse(EXPORT_REFUSE_NO_BATTERY_ALLOWANCE)
+    if not check(
+        EXPORT_REFUSE_NO_EXPORT_TARGET, request.grid_export_remaining_kwh > 0.0
+    ):
+        return refuse(EXPORT_REFUSE_NO_EXPORT_TARGET)
+
+    # -- does the requested power respect every bound? ----------------------
+    # Compared, never clamped: this function authorises or refuses, and the
+    # clamping belongs to :mod:`.dispatch`, which has already applied the same
+    # bounds in the documented order. Checking them again here is the barrier
+    # against a caller that computed the setpoint some other way.
+    power = request.requested_kw
+    if not check(
+        EXPORT_REFUSE_INVERTER_LIMIT,
+        request.inverter_max_discharge_kw is None
+        or power <= request.inverter_max_discharge_kw + 1e-9,
+    ):
+        return refuse(EXPORT_REFUSE_INVERTER_LIMIT)
+    if not check(
+        EXPORT_REFUSE_SITE_EXPORT_LIMIT,
+        request.site_export_limit_kw is None
+        or power <= request.site_export_limit_kw + 1e-9,
+    ):
+        return refuse(EXPORT_REFUSE_SITE_EXPORT_LIMIT)
+    if not check(
+        EXPORT_REFUSE_TICK_HORIZON,
+        request.tick_cap_kw is None or power <= request.tick_cap_kw + 1e-9,
+    ):
+        return refuse(EXPORT_REFUSE_TICK_HORIZON)
+    if not check(EXPORT_REFUSE_BELOW_DEVICE_MINIMUM, power >= CONTROL_MIN_POWER_KW):
+        return refuse(EXPORT_REFUSE_BELOW_DEVICE_MINIMUM)
+    if not check(EXPORT_REFUSE_ABOVE_DEVICE_MAXIMUM, power <= CONTROL_MAX_POWER_KW):
+        return refuse(EXPORT_REFUSE_ABOVE_DEVICE_MAXIMUM)
+
+    # -- and the direction, last, because it is the one that cannot be wrong -
+    # Positive at the battery, which becomes positive signed Dispatch power. The
+    # send site refuses the value independently; this is the same statement made
+    # where the authorisation is decided.
+    if not check(EXPORT_REFUSE_SIGN, power > 0.0):
+        return refuse(EXPORT_REFUSE_SIGN)
 
     return SafetyVerdict(True, None, tuple(checks))
 

@@ -58,6 +58,7 @@ from typing import Any
 from .battery import INTERVAL_HOURS
 from .const import (
     ACTION_CHARGE,
+    ACTION_DISCHARGE,
     CAP_FORWARD,
     CAP_FROZEN,
     ECONOMIC_BUCKET_KWH,
@@ -2244,6 +2245,67 @@ def control_intent_for(
         policy="stage_b",
         policy_version=1,
         ceiling_soc_percent=ceiling_soc_percent,
+    )
+
+
+def export_intent_for(
+    quarter: CarriedQuarter,
+    *,
+    battery_power_kw: float,
+    floor_soc_percent: float,
+    horizon_minutes: int,
+    target_day: date,
+    start_index: int,
+    built_at: datetime,
+) -> ControlIntent | None:
+    """Return the command a Live ``net_export`` quarter wants, or ``None``.
+
+    **Deliberately not a branch inside :func:`control_intent_for`.** That function
+    guarantees, in its own docstring, that ``ACTION_CHARGE`` is the only action it
+    can return and that no parameter could select another. That guarantee is what
+    makes the direction interlock structural rather than careful, and beta.27 keeps
+    it by building the export elsewhere instead of widening it.
+
+    Two properties mirror it here:
+
+    * the only action this function can return is ``ACTION_DISCHARGE``, and it
+      returns ``None`` rather than the opposite one for anything else;
+    * it requires an admitted ``CarriedQuarter`` whose intent is exactly
+      ``net_export``. There is no path to an export command without one, which is
+      what makes "no quarter, no export" true by construction rather than by a
+      caller remembering to check.
+
+    ``battery_power_kw`` arrives **already clamped** by :mod:`.dispatch`, in the
+    documented order. Nothing is recomputed here: this assembles a command, and a
+    second copy of the clamp arithmetic is a second thing to keep in step.
+
+    The cutoff is the **discharge** floor, so the device stops before the
+    configured minimum rather than at it -- the register truncates, which is why
+    :func:`alphaess_device.device_cutoff_percent` adds the percent it does.
+    """
+    if quarter.intent != EXECUTION_INTENT_NET_EXPORT:
+        return None
+    power_kw = max(0.0, battery_power_kw)
+    if power_kw <= 0.0:
+        return None
+    return ControlIntent(
+        action=ACTION_DISCHARGE,
+        energy_ac_kwh=power_kw * INTERVAL_HOURS,
+        average_power_kw=power_kw,
+        interval_hours=INTERVAL_HOURS,
+        floor_soc_percent=floor_soc_percent,
+        energy_limit_bound=False,
+        horizon_minutes=horizon_minutes,
+        target_day=target_day,
+        start_index=start_index,
+        built_at=built_at,
+        reason=EXECUTION_INTENT_NET_EXPORT,
+        policy="stage_b_export",
+        policy_version=1,
+        # **No charge ceiling, and that is correct rather than missing.** A
+        # discharge's device backstop is the floor, which is carried above; a
+        # ceiling would be the wrong bound in the wrong direction.
+        ceiling_soc_percent=None,
     )
 
 
