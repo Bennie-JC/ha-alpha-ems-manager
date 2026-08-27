@@ -43,10 +43,17 @@ switched off.
 >
 > In *off* and *shadow* it never writes to your inverter and cannot change how your
 > system behaves; the worst case is an inaccurate forecast. In *Live* it can buy
-> energy on a schedule it believes is cheap, and it can stop doing so — by reaching
-> the target, by running out of room, by the plan being withdrawn, by a safety
-> condition, or because you switched the mode back. It can never discharge or
-> export.
+> energy on a schedule it believes is cheap, and — from `beta.27` — it can **sell
+> energy back to the grid** when the plan says that is worth more. It can stop doing
+> either at any time: by reaching the target, by running out of room, by the plan
+> being withdrawn, by a safety condition, or because you switched the mode back.
+>
+> It can never discharge to serve your house, and never curtails production.
+>
+> **Export is new in `beta.27` and has not yet been validated on real hardware.**
+> Charging was validated on the live installation in `beta.26`; exporting has been
+> proven only in tests. If you enable *Live* on this release, watch your grid meter
+> during the first planned export quarter.
 >
 > **This integration is not in the HACS default repository.** Install it as a
 > HACS *custom repository* — see [Installation](#installation). A submission for
@@ -493,11 +500,15 @@ payload is priced on grid energy and a reader has to be able to check that.
 **A note on upgrading to beta.24: it can charge your battery now, if you ask
 it to twice.**
 
-This is the first release in which Alpha EMS can send a command to your inverter.
-It can do exactly one thing: **buy energy into the battery** when the plan says the
-price is worth it. It cannot discharge, cannot export and cannot curtail -- those
-are still calculated and explained, and refused before anything reaches the
-hardware.
+This was the first release in which Alpha EMS could send a command to your
+inverter, and it could do exactly one thing: **buy energy into the battery** when
+the plan said the price was worth it. Discharging, exporting and curtailing were all
+calculated and explained, and refused before anything reached the hardware.
+
+> **Superseded by `beta.27`**, which also executes authorised **net export**. The
+> paragraphs below describe `beta.24` as it shipped and are kept for anyone
+> upgrading across several releases; see [Project status](#project-status) for what
+> the current release does.
 
 **Upgrading changes nothing on its own.** Two switches have to be on: the Control
 Mode select has to say *Live*, and command sending has to be enabled in the options.
