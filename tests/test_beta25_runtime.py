@@ -41,9 +41,11 @@ from custom_components.alpha_ems_manager.const import (
     EXECUTION_STOP_TIMER_NOT_REFRESHED,
     OWNERSHIP_DEGRADED,
     OWNERSHIP_OWNED,
+    TICK_SKIPPED_DISPATCH_INACTIVE,
     TICK_SKIPPED_LOCK_HELD,
-    TICK_SKIPPED_NO_RUN,
+    TICK_SKIPPED_NO_QUARTER,
     TICK_SKIPPED_NOT_LIVE,
+    TICK_SKIPPED_OWNERSHIP,
 )
 
 from .forecast_helpers import NORMAL, local
@@ -237,10 +239,12 @@ async def test_the_quarter_sequence_holds_the_lock_against_a_tick(
     seen: list[bool] = []
     original = module.async_execute
 
-    async def watched(hass_arg, steps):
-        # Sampled at the moment of every send, in every sequence.
+    async def watched(hass_arg, steps, *, intent=None):
+        # Sampled at the moment of every send, in every sequence. ``intent`` is
+        # accepted and forwarded because the send site carries it from beta.27 on --
+        # a double that swallowed it would make the sign gate untestable here.
         seen.append(coordinator._execution_lock.locked())
-        return await original(hass_arg, steps)
+        return await original(hass_arg, steps, intent=intent)
 
     monkeypatch.setattr(module, "async_execute", watched)
     await step_once(hass, coordinator, live_surface, hour=10, minute=46)
@@ -309,8 +313,15 @@ async def test_the_tick_writes_nothing_without_an_owned_run(
     await coordinator._async_physical_tick(local(NORMAL, 10, 1))
 
     assert live_surface.calls == []
+    # **The three reasons beta.27 split out of ``no_owned_run``.** That one string
+    # covered "nothing is admitted", "nothing is armed" and "we cannot prove this
+    # is ours" -- and reporting them as one is what made the live beta.26
+    # observation unreadable. Any of them is a correct answer here; what matters is
+    # that nothing was written.
     assert coordinator._last_tick_reason in (
-        TICK_SKIPPED_NO_RUN,
+        TICK_SKIPPED_NO_QUARTER,
+        TICK_SKIPPED_DISPATCH_INACTIVE,
+        TICK_SKIPPED_OWNERSHIP,
         TICK_SKIPPED_NOT_LIVE,
     )
 

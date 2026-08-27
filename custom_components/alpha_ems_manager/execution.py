@@ -501,6 +501,286 @@ def measure_progress(
 
 
 @dataclass(frozen=True, slots=True)
+class QuarterRow:
+    """One solved quarter of a run, as Stage A published it.
+
+    Read straight off ``EconomicInterval``; no figure here is computed by Stage B.
+    The two grid fields are **different quantities** and are named so they cannot be
+    confused:
+
+    * :attr:`grid_authorised_kwh` is the *marginal* import the charge causes -- a
+      **ceiling** on how much of the battery target may be bought.
+    * :attr:`grid_export_target_kwh` is the **actual** meter export the plan aims
+      at, which is the *objective* for an export. It reproduces the run-level
+      ``grid_target_kwh``, which is built as the sum of the interval actuals; the
+      marginal figure is summed separately and is attribution only.
+    """
+
+    start: datetime
+    end: datetime
+    battery_kwh: float
+    grid_authorised_kwh: float
+    grid_export_target_kwh: float
+    grid_export_caused_kwh: float
+    desired_grid_kw: float
+
+    def covers(self, moment: datetime) -> bool:
+        """Return whether ``moment`` falls inside this quarter. End exclusive."""
+        return self.start <= moment < self.end
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the publishable form, instants as ISO-8601 strings."""
+        return {
+            "start": self.start.isoformat(),
+            "end": self.end.isoformat(),
+            "battery_kwh": round(self.battery_kwh, 3),
+            "grid_authorised_kwh": round(self.grid_authorised_kwh, 3),
+            "grid_export_target_kwh": round(self.grid_export_target_kwh, 3),
+            "grid_export_caused_kwh": round(self.grid_export_caused_kwh, 3),
+            "desired_grid_kw": round(self.desired_grid_kw, 3),
+        }
+
+
+def _quarter_rows(raw: Any) -> tuple[QuarterRow, ...]:
+    """Return the schedule a publication carries, skipping anything unreadable.
+
+    Total: an unparseable row is dropped rather than raised on, and a missing
+    schedule is an empty tuple. A publication Stage B cannot fully read must still
+    be usable for everything it *can* read.
+    """
+    if not isinstance(raw, list):
+        return ()
+    rows: list[QuarterRow] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        start = instant_of(entry.get("start"))
+        end = instant_of(entry.get("end"))
+        if start is None or end is None or end <= start:
+            continue
+        rows.append(
+            QuarterRow(
+                start=start,
+                end=end,
+                battery_kwh=max(0.0, _finite(entry.get("battery_kwh")) or 0.0),
+                grid_authorised_kwh=max(
+                    0.0, _finite(entry.get("grid_authorised_kwh")) or 0.0
+                ),
+                grid_export_target_kwh=max(
+                    0.0, _finite(entry.get("grid_export_target_kwh")) or 0.0
+                ),
+                grid_export_caused_kwh=max(
+                    0.0, _finite(entry.get("grid_export_caused_kwh")) or 0.0
+                ),
+                desired_grid_kw=_finite(entry.get("desired_grid_kw")) or 0.0,
+            )
+        )
+    # **Not sorted, and deliberately.** ``quarter_schedule_for`` emits one row
+    # per solved interval in interval order, so the published schedule is already
+    # chronological; re-sorting would be redundant. It would also be the only
+    # ordering operation in this module, and this module is asserted to contain
+    # none -- the structural way of saying Stage B never ranks windows. Row
+    # selection is a minimum over a *time* instead; see ``next_quarter_row``.
+    return tuple(rows)
+
+
+@dataclass(frozen=True, slots=True)
+class CarriedQuarter:
+    """One quarter of execution authority, frozen before it opens.
+
+    **Why this exists at all.** ``carry_forward`` holds a single run, and an empty
+    slot can only be filled from a target whose window *contains now*. Stage A's
+    horizon head is the next boundary, so a run ending at a boundary cannot be
+    replaced until the following one -- and the quarter in between had no carrier,
+    nothing armed, and every tick reporting "no owned run" through an economically
+    active period. That was the measured beta.26 fault.
+
+    So the quarter is carried in its own right. It is **subordinate to the run for
+    authority** -- its allowance is snapshotted from the run-level caps at admission
+    -- and **independent of it for continuation**, which is the entire fix: a parent
+    run ending or rolling has no effect on a quarter already open.
+
+    **Economically immutable once open.** After :attr:`quarter_start` the allowance
+    is never re-evaluated from a later publication, because no later publication can
+    describe this quarter: the horizon starts after it. Any rule claiming to detect
+    a mid-quarter withdrawal would be inferring from evidence that structurally
+    cannot exist. The contract has no cancellation signal -- ``affirms`` says so of
+    runs already: *"This is an inference, not a cancellation signal, and the
+    contract cannot do better."* Exactly four things end a quarter: its target is
+    reached, its end arrives, safety invalidates it, or a future explicit
+    quarter-addressed signal that does not exist in beta.27.
+
+    Stage B keeps full freedom to throttle or stop for physical safety throughout,
+    so "immutable" bounds the *authorisation* and never the safety response. The
+    exposure is bounded by construction: one quarter, fifteen minutes, and the
+    energy admitted before it opened.
+    """
+
+    quarter_start: datetime
+    quarter_end: datetime
+    intent: str
+    #: Battery-side AC energy. **Objective** for a charge, **ceiling** for an export.
+    battery_target_kwh: float
+    #: Marginal grid import. **Ceiling** for a charge; unused for an export.
+    grid_authorised_kwh: float
+    #: Actual meter export. **Objective** for an export; unused for a charge.
+    grid_export_target_kwh: float
+    #: What Stage A published as the opening rate. Diagnostics only -- the live rate
+    #: is derived from the remaining energy and the remaining time.
+    initial_desired_grid_kw: float
+    # --- provenance, frozen at admission ---------------------------------------
+    #: The run this quarter was admitted under. It is the **execution identity**
+    #: while the run slot is empty, so the causal record still matches.
+    run_id: str
+    plan_id: str
+    revision: int
+    admitted_at: datetime
+    #: The run-level frozen remainder at the instant of admission. Captured rather
+    #: than consulted live, so a run that later vanishes can neither enlarge this
+    #: quarter nor reach back into it.
+    frozen_remaining_at_admission_kwh: float | None = None
+
+    def covers(self, moment: datetime) -> bool:
+        """Return whether this quarter is the one in progress at ``moment``."""
+        return self.quarter_start <= moment < self.quarter_end
+
+    def open_at(self, moment: datetime) -> bool:
+        """Return whether the quarter has started and not yet finished."""
+        return self.covers(moment)
+
+    def seconds_remaining(self, moment: datetime) -> float:
+        """Return the seconds left in this quarter, never negative."""
+        return max(0.0, (self.quarter_end - moment).total_seconds())
+
+    def battery_allowance_kwh(self) -> float:
+        """Return the battery energy this quarter may move.
+
+        Bounded by the run-level frozen remainder as it stood at admission, which is
+        how a run-level reduction reaches a quarter that has not yet opened without
+        being able to reach one that has.
+        """
+        allowance = max(0.0, self.battery_target_kwh)
+        if self.frozen_remaining_at_admission_kwh is not None:
+            allowance = min(allowance, max(0.0, self.frozen_remaining_at_admission_kwh))
+        return allowance
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the bounded diagnostics form."""
+        return {
+            "quarter_start": self.quarter_start.isoformat(),
+            "quarter_end": self.quarter_end.isoformat(),
+            "intent": self.intent,
+            "battery_target_kwh": round(self.battery_target_kwh, 3),
+            "grid_authorised_kwh": round(self.grid_authorised_kwh, 3),
+            "grid_export_target_kwh": round(self.grid_export_target_kwh, 3),
+            "initial_desired_grid_kw": round(self.initial_desired_grid_kw, 3),
+            "run_id": self.run_id,
+            "plan_id": self.plan_id,
+            "revision": self.revision,
+            "admitted_at": self.admitted_at.isoformat(),
+            "frozen_remaining_at_admission_kwh": self.frozen_remaining_at_admission_kwh,
+            "authority_rule": (
+                "frozen before the quarter opens and economically immutable once "
+                "it has. a parent run ending or rolling does not cancel it; only "
+                "target reached, quarter end or a safety condition does. "
+                "withdrawal is never inferred from a horizon that structurally "
+                "cannot describe this quarter"
+            ),
+        }
+
+
+def admit_quarter(
+    row: QuarterRow,
+    *,
+    intent: str,
+    run_id: str,
+    plan_id: str,
+    revision: int,
+    now: datetime,
+    frozen_remaining_kwh: float | None,
+) -> CarriedQuarter:
+    """Return the envelope for one published quarter row."""
+    return CarriedQuarter(
+        quarter_start=row.start,
+        quarter_end=row.end,
+        intent=intent,
+        battery_target_kwh=row.battery_kwh,
+        grid_authorised_kwh=row.grid_authorised_kwh,
+        grid_export_target_kwh=row.grid_export_target_kwh,
+        initial_desired_grid_kw=row.desired_grid_kw,
+        run_id=run_id,
+        plan_id=plan_id,
+        revision=revision,
+        admitted_at=now,
+        frozen_remaining_at_admission_kwh=frozen_remaining_kwh,
+    )
+
+
+def next_quarter_row(target: Target, now: datetime) -> QuarterRow | None:
+    """Return the row for the quarter that opens **next**, or ``None``.
+
+    Admission happens one refresh ahead, exactly as runs are admitted and for the
+    same reason: a quarter can only be executed from its first instant if it was
+    accepted before that instant arrived. Looking for a row that *contains* now
+    would reproduce the beta.26 fault, because Stage A's horizon never contains the
+    current quarter.
+    """
+    # **A minimum over a time, not a sort.** Taking ``[0]`` would trust the
+    # order the publication arrived in; taking the minimum does not, and it keeps
+    # this module free of any ordering operation -- which is the structural way
+    # this project says Stage B never ranks windows by worth.
+    upcoming = [row for row in target.quarter_schedule if row.start > now]
+    if not upcoming:
+        return None
+    return min(upcoming, key=lambda row: row.start)
+
+
+def carry_quarter(
+    current: CarriedQuarter | None,
+    targets: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    now: datetime,
+    *,
+    run: CarriedRun | None,
+    frozen_remaining_kwh: float | None = None,
+    executable_intents: frozenset[str] = frozenset({EXECUTION_INTENT_GRID_CHARGE}),
+) -> CarriedQuarter | None:
+    """Return the admitted quarter after this refresh. Pure, and priority-ordered.
+
+    **An open quarter is returned unchanged.** Not re-derived, not re-priced, not
+    compared against the horizon -- because the horizon cannot describe it. That is
+    the whole of the beta.27 authority rule, and it is one branch.
+
+    A finished quarter is dropped; the caller records its shortfall. A new quarter
+    is admitted only from a publication that describes the quarter opening next, and
+    only for an intent this release executes.
+    """
+    if current is not None and current.open_at(now):
+        return current
+
+    for raw in targets:
+        target = parse_target(raw)
+        if target is None or target.intent not in executable_intents:
+            continue
+        row = next_quarter_row(target, now)
+        if row is None:
+            continue
+        if row.battery_kwh <= 0.0 and row.grid_export_target_kwh <= 0.0:
+            # Nothing to execute in that quarter; admitting it would arm a
+            # dispatch with no target and immediately stop it.
+            continue
+        return admit_quarter(
+            row,
+            intent=target.intent,
+            run_id=run.run_id if run is not None else target.plan_id,
+            plan_id=target.plan_id,
+            revision=target.revision,
+            now=now,
+            frozen_remaining_kwh=frozen_remaining_kwh,
+        )
+    return None
+
+
+@dataclass(frozen=True, slots=True)
 class Target:
     """One Stage-A execution target, parsed and nothing more.
 
@@ -544,6 +824,12 @@ class Target:
     required_headroom_kwh: float | None = None
     max_end_energy_kwh: float | None = None
     headroom_until: datetime | None = None
+    #: The per-quarter execution rows Stage A already solved, in order.
+    #:
+    #: **Empty is a valid answer** and must degrade to run-level behaviour rather
+    #: than fail: a record persisted before beta.27 carries no schedule, and a
+    #: publication that could not be parsed must not take the control layer down.
+    quarter_schedule: tuple[QuarterRow, ...] = ()
 
     @property
     def constrained(self) -> bool:
@@ -631,6 +917,7 @@ def parse_target(raw: dict[str, Any]) -> Target | None:
         stale_after=instant_of(raw.get("stale_after")),
         battery_target_kwh=max(0.0, battery),
         grid_target_kwh=_finite(raw.get("grid_target_kwh")),
+        quarter_schedule=_quarter_rows(raw.get("quarter_schedule")),
         desired_grid_kw=_finite(raw.get("desired_grid_kw")),
         average_power_kw=mean_kw,
         # Falls back to the mean rather than to zero: a controller with no first
@@ -959,6 +1246,7 @@ def target_as_published(target: Target) -> dict[str, Any]:
         "stale_after": moment(target.stale_after),
         "battery_target_kwh": target.battery_target_kwh,
         "grid_target_kwh": target.grid_target_kwh,
+        "quarter_schedule": [row.as_dict() for row in target.quarter_schedule],
         "desired_grid_kw": target.desired_grid_kw,
         "average_power_kw": target.average_power_kw,
         "first_power_kw": target.first_power_kw,

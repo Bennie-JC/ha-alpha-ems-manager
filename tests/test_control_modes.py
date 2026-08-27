@@ -46,6 +46,7 @@ from custom_components.alpha_ems_manager.const import (
     CONTROL_STATE_INHIBITED,
     CONTROL_STATE_OFF,
     DOMAIN,
+    EXECUTION_INTENT_GRID_CHARGE,
     INHIBIT_DISPATCH_ACTIVE,
     INHIBIT_EXCESS_EXPORT_ACTIVE,
     INHIBIT_MISSING_CONTROL_ENTITY,
@@ -586,7 +587,7 @@ async def test_the_executor_refuses_even_when_called_directly(
     assert len(steps) == 6
 
     with pytest.raises(ControlActionNotPermitted, match="live_charge_only"):
-        await async_execute(hass, steps)
+        await async_execute(hass, steps, intent=EXECUTION_INTENT_GRID_CHARGE)
 
 
 async def test_the_executor_sends_nothing_before_it_refuses(
@@ -611,7 +612,7 @@ async def test_the_executor_sends_nothing_before_it_refuses(
     steps = plan_commands(build_command(make_intent(energy_ac_kwh=0.5)))
 
     with pytest.raises(ControlActionNotPermitted, match="live_charge_only"):
-        await async_execute(hass, steps)
+        await async_execute(hass, steps, intent=EXECUTION_INTENT_GRID_CHARGE)
 
     assert captured_calls == []
 

@@ -42,6 +42,7 @@ from custom_components.alpha_ems_manager.const import (
     CONTROL_MAX_POWER_KW,
     CONTROL_MIN_POWER_KW,
     CONTROL_MODE_ACTIVE,
+    EXECUTION_INTENT_GRID_CHARGE,
     OWNERSHIP_OWNED,
 )
 
@@ -180,7 +181,7 @@ async def test_the_completed_charge_command_reaches_the_wire_in_order(
     assert len(commands) == 7
     assert commands[-1].entity_id == DISPATCH_ENABLE
 
-    sent = await async_execute(hass, commands)
+    sent = await async_execute(hass, commands, intent=EXECUTION_INTENT_GRID_CHARGE)
 
     assert sent == 7
     assert [call.data["entity_id"] for call in writes] == [
@@ -229,7 +230,7 @@ async def test_the_same_step_list_for_a_discharge_is_refused_as_one_unit(
     assert len(steps) == 6
 
     with pytest.raises(ControlActionNotPermitted) as raised:
-        await async_execute(hass, steps)
+        await async_execute(hass, steps, intent=EXECUTION_INTENT_GRID_CHARGE)
 
     assert raised.value.reason == "live_charge_only"
     assert set(raised.value.entity_ids) == set(DISCHARGE_FAMILY.entities) - {

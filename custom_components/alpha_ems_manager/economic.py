@@ -2193,6 +2193,66 @@ def _safety_buy_runs(
     )
 
 
+def quarter_schedule_for(
+    intervals: tuple[EconomicInterval, ...],
+    *,
+    start_index: int,
+    end_index: int,
+    intent: str,
+    moment: Any,
+) -> list[dict[str, Any]]:
+    """Return the per-quarter execution rows for one run. **No new solve.**
+
+    Every figure is read off a row the optimizer already produced. This exists
+    because the run-level publication is too coarse to execute against: a run's
+    ``desired_grid_kw`` is its *first* interval's rate, and a multi-quarter run
+    executed against that rate follows the wrong target from its second quarter on.
+
+    Three grid quantities, and they are not interchangeable:
+
+    * ``grid_authorised_kwh`` -- :attr:`marginal_grid_import_kwh`, the import the
+      charge *causes*. A **ceiling** on how much of the battery target may be
+      bought, never an amount to consume.
+    * ``grid_export_target_kwh`` -- :attr:`grid_export_kwh`, the **actual** meter
+      export. The **objective** for an export, and the same quantity the run-level
+      ``grid_target_kwh`` is summed from, so the quarter rows and the run agree.
+    * ``grid_export_caused_kwh`` -- :attr:`marginal_grid_export_kwh`, attribution
+      and diagnostics only. Using it as the objective would under-export by exactly
+      the production the site was exporting anyway.
+    """
+    rows: list[dict[str, Any]] = []
+    for entry in intervals:
+        if entry.index < start_index or entry.index > end_index:
+            continue
+        start = moment(entry.index)
+        end = moment(entry.index + 1)
+        if start is None or end is None:
+            continue
+        battery_kwh = (
+            entry.battery_discharge_ac_kwh
+            if intent == EXECUTION_INTENT_NET_EXPORT
+            else entry.battery_charge_ac_kwh
+        )
+        rows.append(
+            {
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "battery_kwh": _round_kwh(battery_kwh),
+                "grid_authorised_kwh": _round_kwh(
+                    max(0.0, entry.marginal_grid_import_kwh)
+                ),
+                "grid_export_target_kwh": _round_kwh(entry.grid_export_kwh),
+                "grid_export_caused_kwh": _round_kwh(
+                    max(0.0, entry.marginal_grid_export_kwh)
+                ),
+                "desired_grid_kw": _round_kw(
+                    (entry.grid_import_kwh - entry.grid_export_kwh) / INTERVAL_HOURS
+                ),
+            }
+        )
+    return rows
+
+
 def desired_grid_kw_at(
     intervals: tuple[EconomicInterval, ...], index: int
 ) -> float | None:
@@ -2494,6 +2554,7 @@ def execution_target(
     desired_grid_kw: float | None = None,
     safety_buy_kwh: float | None = None,
     economic_buy_kwh: float | None = None,
+    quarter_schedule: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return the machine-readable target a future Stage B would consume.
 
@@ -2575,6 +2636,19 @@ def execution_target(
         # is stated rather than glossed.
         "safety_buy_kwh": _round_kwh(safety_buy_kwh),
         "economic_buy_kwh": _round_kwh(economic_buy_kwh),
+        # **The per-quarter execution rows, since beta.27.** The run aggregates
+        # above are unchanged and still published, so nothing that read the
+        # contract before has to change; this is what Stage B executes against,
+        # because a run-level rate cannot describe a run's later quarters.
+        "quarter_schedule": quarter_schedule or [],
+        "quarter_schedule_rule": (
+            "one row per solved interval of this run. battery_kwh is the "
+            "objective for a charge and the ceiling for an export; "
+            "grid_authorised_kwh is the marginal import ceiling for a charge; "
+            "grid_export_target_kwh is the ACTUAL meter export objective for an "
+            "export and is what the run-level grid_target_kwh is summed from. "
+            "grid_export_caused_kwh is attribution only"
+        ),
         "buy_attribution_rule": (
             "reserve-attributable and economic energy within this run window, "
             "from the reserve-relaxed counterfactual the plan already solves. "

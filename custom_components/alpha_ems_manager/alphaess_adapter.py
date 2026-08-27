@@ -560,7 +560,9 @@ def steps_outside_capability(steps: tuple[CommandStep, ...]) -> tuple[str, ...]:
     return tuple(step.entity_id for step in steps if step.entity_id not in permitted)
 
 
-async def async_execute(hass: HomeAssistant, steps: tuple[CommandStep, ...]) -> int:
+async def async_execute(
+    hass: HomeAssistant, steps: tuple[CommandStep, ...], *, intent: str | None = None
+) -> int:
     """Send a planned command, and return how many steps were sent.
 
     **Never reached in this release.** The pipeline refuses first, and this
@@ -590,7 +592,7 @@ async def async_execute(hass: HomeAssistant, steps: tuple[CommandStep, ...]) -> 
         raise ControlActionNotPermitted(CONTROL_REFUSE_ACTION_NOT_EXECUTABLE, outside)
     # The value half of the same boundary: a positive dispatch power or a mode
     # outside the executable set, refused here whatever built the list.
-    refusal = dispatch_refusal(steps)
+    refusal = dispatch_refusal(intent, steps)
     if refusal is not None:
         raise ControlActionNotPermitted(
             refusal, tuple(step.entity_id for step in steps)

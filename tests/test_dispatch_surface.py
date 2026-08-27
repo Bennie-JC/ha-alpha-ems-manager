@@ -50,9 +50,11 @@ from custom_components.alpha_ems_manager.alphaess_device import (
 )
 from custom_components.alpha_ems_manager.const import (
     CONTROL_EXECUTABLE_DISPATCH_MODES,
-    CONTROL_EXECUTABLE_DISPATCH_SIGN,
+    CONTROL_EXECUTABLE_DISPATCH_SIGNS,
     CONTROL_REFUSE_DISPATCH_MODE,
     CONTROL_REFUSE_DISPATCH_SIGN,
+    EXECUTION_INTENT_GRID_CHARGE,
+    EXECUTION_INTENT_NET_EXPORT,
 )
 
 
@@ -242,7 +244,7 @@ def test_a_healthy_mode_two_charge_is_permitted_at_both_boundaries() -> None:
     steps = arm()
 
     assert steps_outside_capability(steps) == ()
-    assert dispatch_refusal(steps) is None
+    assert dispatch_refusal(EXECUTION_INTENT_GRID_CHARGE, steps) is None
 
 
 @pytest.mark.parametrize("power_kw", [0.1, 1.0, 2.3, 20.0])
@@ -255,7 +257,10 @@ def test_a_positive_dispatch_power_is_refused(power_kw: float) -> None:
     steps = plan_dispatch_power(power_kw)
 
     assert steps_outside_capability(steps) == (), "the entity itself is permitted"
-    assert dispatch_refusal(steps) == CONTROL_REFUSE_DISPATCH_SIGN
+    assert (
+        dispatch_refusal(EXECUTION_INTENT_GRID_CHARGE, steps)
+        == CONTROL_REFUSE_DISPATCH_SIGN
+    )
 
 
 @pytest.mark.parametrize("power_kw", [0.0, -0.1, -2.3, -10.0])
@@ -267,7 +272,10 @@ def test_zero_and_negative_powers_are_permitted(power_kw: float) -> None:
     physical meaning of "do not discharge"; refusing to write it would leave the
     previous charge running into the reversal it was told to stop.
     """
-    assert dispatch_refusal(plan_dispatch_power(power_kw)) is None
+    assert (
+        dispatch_refusal(EXECUTION_INTENT_GRID_CHARGE, plan_dispatch_power(power_kw))
+        is None
+    )
 
 
 @pytest.mark.parametrize("mode", [6, 7])
@@ -280,12 +288,18 @@ def test_a_gated_mode_is_refused_even_though_it_is_modelled(mode: int) -> None:
     """
     assert mode in DISPATCH_MODE_LABELS
     assert mode not in CONTROL_EXECUTABLE_DISPATCH_MODES
-    assert dispatch_refusal((dispatch_mode_step(mode),)) == CONTROL_REFUSE_DISPATCH_MODE
+    assert (
+        dispatch_refusal(EXECUTION_INTENT_GRID_CHARGE, (dispatch_mode_step(mode),))
+        == CONTROL_REFUSE_DISPATCH_MODE
+    )
 
 
 def test_an_arm_in_a_gated_mode_is_refused_whole() -> None:
     """The refusal is on the list, so there are no partial writes."""
-    assert dispatch_refusal(arm(mode=7)) == CONTROL_REFUSE_DISPATCH_MODE
+    assert (
+        dispatch_refusal(EXECUTION_INTENT_GRID_CHARGE, arm(mode=7))
+        == CONTROL_REFUSE_DISPATCH_MODE
+    )
 
 
 def test_an_unlabelled_mode_string_is_refused() -> None:
@@ -294,13 +308,25 @@ def test_an_unlabelled_mode_string_is_refused() -> None:
         *SERVICE_SELECT_OPTION, DISPATCH_MODE_SELECT, option="State of Charge Control"
     )
 
-    assert dispatch_refusal((step,)) == CONTROL_REFUSE_DISPATCH_MODE
+    assert (
+        dispatch_refusal(EXECUTION_INTENT_GRID_CHARGE, (step,))
+        == CONTROL_REFUSE_DISPATCH_MODE
+    )
 
 
-def test_the_executable_envelope_is_charge_only_by_construction() -> None:
-    """The barrier itself says mode 2 and a negative sign, in one place."""
+def test_the_executable_envelope_is_stated_in_one_place() -> None:
+    """The barrier itself says mode 2 and which sign each intent may command.
+
+    beta.27 executes two directions, so a single scalar can no longer express the
+    envelope. The map is the stronger statement: it pins both permitted signs
+    *and*, by omission, refuses every other intent -- which is how ``serve_load``
+    and the negative-price modes stay blocked without being enumerated.
+    """
     assert frozenset({2}) == CONTROL_EXECUTABLE_DISPATCH_MODES
-    assert CONTROL_EXECUTABLE_DISPATCH_SIGN == -1
+    assert CONTROL_EXECUTABLE_DISPATCH_SIGNS == {
+        EXECUTION_INTENT_GRID_CHARGE: -1,
+        EXECUTION_INTENT_NET_EXPORT: +1,
+    }
 
 
 def test_the_discharge_family_is_still_refused_on_the_other_surface() -> None:
@@ -322,7 +348,9 @@ def test_the_charge_family_and_the_dispatch_surface_are_disjoint() -> None:
 async def test_the_send_site_refuses_a_positive_power(hass: HomeAssistant) -> None:
     """Asserted at the wire, because that is the interlock that has to hold."""
     with pytest.raises(ControlActionNotPermitted) as caught:
-        await async_execute(hass, plan_dispatch_power(2.3))
+        await async_execute(
+            hass, plan_dispatch_power(2.3), intent=EXECUTION_INTENT_GRID_CHARGE
+        )
 
     assert CONTROL_REFUSE_DISPATCH_SIGN in str(caught.value)
 
@@ -330,7 +358,9 @@ async def test_the_send_site_refuses_a_positive_power(hass: HomeAssistant) -> No
 async def test_the_send_site_refuses_a_gated_mode(hass: HomeAssistant) -> None:
     """Same boundary, other half of the value check."""
     with pytest.raises(ControlActionNotPermitted) as caught:
-        await async_execute(hass, (dispatch_mode_step(7),))
+        await async_execute(
+            hass, (dispatch_mode_step(7),), intent=EXECUTION_INTENT_GRID_CHARGE
+        )
 
     assert CONTROL_REFUSE_DISPATCH_MODE in str(caught.value)
 
@@ -346,6 +376,6 @@ async def test_a_refused_list_reaches_no_service(hass: HomeAssistant) -> None:
         hass.services.async_register(domain, service, record)
 
     with pytest.raises(ControlActionNotPermitted):
-        await async_execute(hass, arm(mode=7))
+        await async_execute(hass, arm(mode=7), intent=EXECUTION_INTENT_GRID_CHARGE)
 
     assert calls == []

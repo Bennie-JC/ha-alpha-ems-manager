@@ -72,10 +72,11 @@ from .api import load_forecast_from
 from .battery import INTERVAL_HOURS, BatteryLimits, sanitize_soc_percent
 from .confidence import ConfidenceBreakdown, compute_confidence
 from .const import (
-    ACTION_CHARGE,
     ACTION_DISCHARGE,
     BALANCE_MAX_SOURCE_AGE_SECONDS,
     BATTERY_MAX_SOC_PERCENT,
+    CADENCE_PHYSICAL_TICK,
+    CADENCE_QUARTER_REFRESH,
     CAP_NONE,
     CONF_ALLOW_BATTERY_EXPORT,
     CONF_ALLOW_GRID_CHARGING,
@@ -104,8 +105,8 @@ from .const import (
     CONF_SELECTED_SOLCAST_SITE_IDS,
     CONF_SOLCAST_ENTRY_ID,
     CONF_USE_PV_FORECAST,
-    CONTROL_EXECUTABLE_DISPATCH_SIGN,
     CONTROL_EXECUTION_AVAILABLE,
+    CONTROL_LIVE_DISPATCH_INTENTS,
     CONTROL_MIN_POWER_KW,
     CONTROL_MODE_ACTIVE,
     CONTROL_MODE_OFF,
@@ -133,8 +134,12 @@ from .const import (
     DISPATCH_POWER_DEADBAND_KW,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     EV_ABSENCE_GRACE_REFRESHES,
+    EXECUTION_INTENT_NET_EXPORT,
     EXECUTION_STOP_COHERENCE_LOST,
     EXECUTION_STOP_MARKER_LOST,
+    EXECUTION_STOP_QUARTER_EXPIRED,
+    EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
+    EXECUTION_STOP_QUARTER_TARGET_REACHED,
     EXECUTION_STOP_SAFETY,
     EXECUTION_STOP_SWITCHED_OFF,
     EXECUTION_TARGET_STALE_MINUTES,
@@ -146,6 +151,7 @@ from .const import (
     INHIBIT_NO_PLAN,
     INHIBIT_PLAN_UNAVAILABLE,
     LOG_THROTTLE_SECONDS,
+    MAX_COMPLETED_QUARTERS_REPORTED,
     MAX_CONTROL_EVENTS_REPORTED,
     MAX_PHYSICAL_DECISIONS_REPORTED,
     MAX_SAMPLE_GAP_SECONDS,
@@ -179,21 +185,38 @@ from .const import (
     PV_UNAVAILABLE_NOT_CONFIGURED,
     PV_UNAVAILABLE_SERVICE_FAILED,
     PV_UNAVAILABLE_SERVICE_MISSING,
+    QUARTER_END_EXPIRED,
+    QUARTER_END_SAFETY,
+    QUARTER_END_TARGET_REACHED,
     QUARTER_MINUTES,
+    QUARTER_TARGET_TOLERANCE_KWH,
     REFUSE_MODE_NOT_ACTIVE,
     SAFETY_SAMPLE_SECONDS,
     SELECT_INVERTER_AC_LIMIT,
+    SHORTFALL_NONE,
+    SHORTFALL_QUARTER_EXPIRED,
+    SHORTFALL_SENSOR_INCOHERENCE,
+    SHORTFALL_TARGET_REACHED,
     TICK_APPLIED,
+    TICK_ERROR,
+    TICK_SKIPPED_DISPATCH_INACTIVE,
     TICK_SKIPPED_INCOHERENT,
     TICK_SKIPPED_LOCK_HELD,
-    TICK_SKIPPED_NO_RUN,
+    TICK_SKIPPED_NO_QUARTER,
     TICK_SKIPPED_NOT_LIVE,
+    TICK_SKIPPED_OWNERSHIP,
     TICK_SKIPPED_STALE_TARGET,
+    TICK_STOPPED_QUARTER_EXPIRED,
+    TICK_STOPPED_TARGET_REACHED,
 )
 from .control import translate
 from .dispatch import (
     ChargeLimits,
+    QuarterProgress,
     deadman_minutes,
+    decide_for_intent,
+    permitted_sign,
+    sign_matches_intent,
 )
 from .dispatch import decide as decide_setpoint
 from .economic import (
@@ -221,6 +244,7 @@ from .energy_balance import (
     measure_coherence,
 )
 from .execution import (
+    CarriedQuarter,
     CarriedRun,
     ForwardAuthorisation,
     OwnershipEvidence,
@@ -229,6 +253,7 @@ from .execution import (
     affirms,
     carried_from_record,
     carry_forward,
+    carry_quarter,
     control_intent_for,
     decide,
     forward_authorisation,
@@ -414,6 +439,38 @@ _UNSET_RUN = "<unset>"
 def carried_run_id_of(carried: Any) -> str | None:
     """Return the carried run's id, or ``None`` when nothing is carried."""
     return None if carried is None else carried.run_id
+
+
+@dataclass(frozen=True, slots=True)
+class TickOutcome:
+    """What one control evaluation actually did, recorded once at its end.
+
+    **The beta.26 diagnostics fault, fixed by shape rather than by wording.** A
+    single mutable reason string was written by the sixty-second tick and then
+    published beside figures computed during the quarter refresh, so a stale
+    "no owned run" sat next to a freshly successful write with nothing saying the
+    two described different events. A record that carries its own cadence cannot do
+    that, and recording it once at the end means an early reason can no longer
+    survive a later write.
+    """
+
+    cadence: str
+    reason: str
+    wrote: bool
+    at: datetime
+    #: Which stage of the evaluation produced the reason, for a reader who needs to
+    #: know whether the controller got as far as calculating anything.
+    phase: str = "evaluate"
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the bounded diagnostics form."""
+        return {
+            "cadence": self.cadence,
+            "phase": self.phase,
+            "reason": self.reason,
+            "wrote": self.wrote,
+            "at": self.at.isoformat(),
+        }
 
 
 _EXECUTION_SCOPE = (
@@ -1124,6 +1181,37 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # before the enable, and a correction landing between them would arm a
         # dispatch against half-written values.
         self._execution_lock = asyncio.Lock()
+        # --- beta.27: the per-quarter execution envelope ---------------------
+        #: The quarter currently authorised for execution. Carried in its own
+        #: right, because a run that ends at a boundary used to leave the quarter
+        #: after it with no carrier at all -- which is the whole of R1.
+        self._quarter: CarriedQuarter | None = None
+        #: Measured progress inside the current quarter, keyed on its start so a
+        #: new quarter can never inherit the last one's accumulators.
+        self._quarter_key: datetime | None = None
+        self._quarter_battery_kwh: float = 0.0
+        self._quarter_grid_import_kwh: float = 0.0
+        self._quarter_grid_export_kwh: float = 0.0
+        self._quarter_sampled_at: datetime | None = None
+        self._quarter_peak_kw: float = 0.0
+        self._quarter_power_sum: float = 0.0
+        self._quarter_power_samples: int = 0
+        self._quarter_pv_helped: bool = False
+        self._quarter_target_reached_at: datetime | None = None
+        self._quarter_clamps: set[str] = set()
+        #: The bounded history of finished execution quarters.
+        self._completed_quarters: deque[dict[str, Any]] = deque(
+            maxlen=MAX_COMPLETED_QUARTERS_REPORTED
+        )
+        #: What each cadence last did, kept apart so a tick reason can never be
+        #: published beside quarter-refresh figures as though they were one event.
+        self._tick_outcome: TickOutcome | None = None
+        self._refresh_outcome: TickOutcome | None = None
+        #: Set when a run is adopted from the persisted record after a restart.
+        #: ``CarriedQuarter`` is not persisted and quarter progress cannot be
+        #: reconstructed without guessing, so an adopted dispatch is **stopped**
+        #: rather than continued -- see :meth:`_adopt_persisted_run`.
+        self._quarter_progress_unknown: bool = False
         #: The last setpoint actually written, for the deadband comparison. Never
         #: the last *calculated* one: the deadband exists to compare against what
         #: is on the wire.
@@ -1504,19 +1592,56 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "The physical controller failed this tick; the setpoint is "
                 "unchanged and the next tick will retry"
             )
-            self._last_tick_reason = "controller_error"
+            self._note_tick(now, TICK_ERROR)
 
     async def _async_correct_setpoint(self, now: datetime) -> None:
-        """Run one correction, with the execution lock already held."""
+        """Run one correction, with the execution lock already held.
+
+        **Progress is measured before authority is questioned.** What the plant did
+        in the last sixty seconds is a physical fact and stays true whether or not
+        this tick is entitled to write; accruing it only on the paths that write
+        would lose energy from the quarter's totals on exactly the ticks a reader
+        most wants explained.
+        """
+        self._accrue_quarter_progress(now)
+        quarter = self._quarter
         run = self._carried
         snapshot = read_snapshot(self.hass)
-        if run is None or not snapshot.dispatch_active:
-            self._note_tick(now, TICK_SKIPPED_NO_RUN)
+
+        # **Three reasons where beta.26 published one.** ``no_owned_run`` covered
+        # "nothing is admitted", "nothing is armed" and "we cannot prove this is
+        # ours" -- three different situations needing three different responses,
+        # reported as one string that told a reader none of them apart.
+        #
+        # **Either carrier is authority enough.** A quarter is the beta.27 envelope
+        # and is preferred, but a publication written before beta.27 carries no
+        # ``quarter_schedule`` and admits no quarter -- and refusing to correct a
+        # run for that reason would take the hardware-proven beta.26 charge path
+        # away. So the tick degrades to the run rather than to nothing.
+        if quarter is None and run is None:
+            self._note_tick(now, TICK_SKIPPED_NO_QUARTER)
+            return
+        if not snapshot.dispatch_active:
+            self._note_tick(now, TICK_SKIPPED_DISPATCH_INACTIVE)
             return
         if self._ownership_now(snapshot, now) != OWNERSHIP_OWNED:
-            self._note_tick(now, TICK_SKIPPED_NO_RUN)
+            self._note_tick(now, TICK_SKIPPED_OWNERSHIP)
             return
-        if run.stale_at(now) or not run.actionable_at(now):
+
+        # **The open quarter's own bounds are the authority, not the run's.** This
+        # is the R1 fix at the tick: a run that ended at the boundary leaves
+        # ``self._carried`` empty while the quarter it opened is still executing,
+        # and asking the run whether the tick may proceed is what made a whole
+        # quarter unexecutable.
+        if quarter is not None:
+            if now >= quarter.quarter_end:
+                await self._async_end_quarter(
+                    now, snapshot, QUARTER_END_EXPIRED, SHORTFALL_QUARTER_EXPIRED
+                )
+                self._note_tick(now, TICK_STOPPED_QUARTER_EXPIRED, wrote=True)
+                return
+        elif run.stale_at(now) or not run.actionable_at(now):
+            # The beta.26 window test, reached only on the run-only fallback.
             self._note_tick(now, TICK_SKIPPED_STALE_TARGET)
             return
 
@@ -1528,18 +1653,39 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # untouched.
             self._note_tick(now, TICK_SKIPPED_INCOHERENT)
             if coherence.expired:
-                await self._async_stop_owned_run(
-                    now, snapshot, EXECUTION_STOP_COHERENCE_LOST
+                await self._async_end_quarter(
+                    now,
+                    snapshot,
+                    QUARTER_END_SAFETY,
+                    SHORTFALL_SENSOR_INCOHERENCE,
+                    stop_reason=EXECUTION_STOP_COHERENCE_LOST,
                 )
             return
 
-        decision = self._setpoint_for(run.target, now)
+        # **Target reached ends the quarter now, whatever the lease says.** The
+        # 20/25-minute duration is a dead-man, not an entitlement: a dispatch left
+        # armed because a countdown has not expired is how a target is exceeded.
+        progress = self._quarter_progress(now)
+        if progress is not None and self._quarter_target_reached(progress):
+            if self._quarter_target_reached_at is None:
+                self._quarter_target_reached_at = now
+            await self._async_end_quarter(
+                now,
+                snapshot,
+                QUARTER_END_TARGET_REACHED,
+                SHORTFALL_TARGET_REACHED,
+                stop_reason=EXECUTION_STOP_QUARTER_TARGET_REACHED,
+            )
+            self._note_tick(now, TICK_STOPPED_TARGET_REACHED, wrote=True)
+            return
+
+        decision = self._dispatch_setpoint(now)
         if decision is None:
             self._note_tick(now, TICK_SKIPPED_STALE_TARGET)
             return
         self._record_physical_decision(now, decision, coherence)
         if not decision.update_needed:
-            self._last_tick_reason = decision.update_reason
+            self._note_tick(now, decision.update_reason)
             return
         await self._async_send_locked(
             plan_dispatch_power(decision.applied_kw),
@@ -1547,7 +1693,38 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             verify=EXECUTION_VERIFY_DISPATCH_SETPOINT,
         )
         self._applied_setpoint_kw = decision.applied_kw
-        self._last_tick_reason = TICK_APPLIED
+        self._note_tick(now, TICK_APPLIED, wrote=True)
+
+    async def _async_end_quarter(
+        self,
+        now: datetime,
+        snapshot: Any,
+        completion: str,
+        shortfall: str,
+        *,
+        stop_reason: str | None = None,
+    ) -> None:
+        """End the open quarter: stop the dispatch, then record what happened.
+
+        **The physical stop comes first and the bookkeeping second.** If the record
+        were written first and the stop then failed, the history would claim a
+        finished quarter while the inverter was still moving energy.
+
+        **No deficit is carried.** The shortfall is recorded against this quarter
+        and Stage A decides the next one independently -- carrying a deficit forward
+        would let Stage B accumulate an entitlement no economic layer authorised.
+        """
+        if stop_reason is None:
+            stop_reason = (
+                EXECUTION_STOP_QUARTER_EXPIRED
+                if completion == QUARTER_END_EXPIRED
+                else EXECUTION_STOP_QUARTER_TARGET_REACHED
+            )
+        self._note_quarter_clamp(shortfall)
+        await self._async_stop_owned_run(now, snapshot, stop_reason)
+        self._record_completed_quarter(completion)
+        self._quarter = None
+        self._reset_quarter_progress(None)
 
     @callback
     def _controller_block(self, setpoint: Any, now: datetime) -> dict[str, Any]:
@@ -1566,6 +1743,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "pv_kw": None if live is None else round(live[1], 3),
             "actual_grid_kw": None if live is None else round(live[2], 3),
             "dispatch_power_deadband_kw": DISPATCH_POWER_DEADBAND_KW,
+            # **Two cadences, two records, and they are never merged.** The tick
+            # reason describes the sixty-second correction; ``refresh_decision``
+            # describes the quarter refresh whose figures surround it here. beta.26
+            # published one mutable string beside the other cadence's figures, so a
+            # stale refusal read as an explanation of a fresh write.
+            "last_tick": (
+                None if self._tick_outcome is None else self._tick_outcome.as_dict()
+            ),
+            "refresh_decision": (
+                None
+                if self._refresh_outcome is None
+                else self._refresh_outcome.as_dict()
+            ),
+            # Kept for one release so an existing dashboard does not break. The
+            # typed records above are what a reader should use.
             "last_tick_reason": self._last_tick_reason,
             "applied_setpoint_kw": self._applied_setpoint_kw,
             "lock_held": self._execution_lock.locked(),
@@ -1620,6 +1812,32 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return block
 
     @callback
+    def _frozen_remaining_kwh(self, now: datetime) -> float | None:
+        """Return the grid energy this run may still buy, or ``None`` if uncapped.
+
+        The same two-cap composition the authorisation block publishes -- the
+        frozen remainder from the admitted window start, reduced by the forward
+        allowance from the latest publication's own boundary -- read here so a
+        quarter can snapshot it **at admission**.
+
+        Snapshotted, because once a quarter is open the run-level caps must not
+        reach backwards into it. That is consistent with the forward cap rather than
+        an exception to it: ``remaining_authorised_kwh`` returns the frozen cap
+        whenever ``now < forward.forward_from``, and ``forward_from`` is by
+        construction the *next* boundary -- so the forward cap has always been a
+        "next quarter onward" instrument.
+        """
+        decision = self._stage_b_decision
+        demand = None if decision is None else decision.demand
+        if demand is None or demand.grid_cap_kwh is None:
+            return None
+        remaining = max(0.0, demand.grid_cap_kwh - demand.grid_charged_kwh)
+        revised, _cap = remaining_authorised_kwh(
+            now=now, frozen_remaining_kwh=remaining, forward=self._forward
+        )
+        return revised
+
+    @callback
     def _affirming_target(self, carried: Any) -> Any:
         """Return the freshest published target for the carried run, or ``None``.
 
@@ -1637,6 +1855,310 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if affirms(carried, target):
                 return target
         return None
+
+    @callback
+    def _quarter_block(self, now: datetime) -> dict[str, Any]:
+        """Return the open quarter's state and the finished ones behind it.
+
+        Published every tick, because the question a reader has during a quarter is
+        "is it on course?", and that cannot be answered from a target and a setpoint
+        alone -- it needs elapsed time, delivered energy and the remainder together.
+        """
+        quarter = self._quarter
+        progress = self._quarter_progress(now)
+        export = quarter is not None and quarter.intent == EXECUTION_INTENT_NET_EXPORT
+        block: dict[str, Any] = {
+            "quarter_start": (
+                None if quarter is None else quarter.quarter_start.isoformat()
+            ),
+            "quarter_end": None if quarter is None else quarter.quarter_end.isoformat(),
+            "intent": None if quarter is None else quarter.intent,
+            "quarter_seconds_elapsed": (
+                None
+                if quarter is None
+                else round((now - quarter.quarter_start).total_seconds(), 1)
+            ),
+            "quarter_seconds_remaining": (
+                None if progress is None else round(progress.seconds_remaining, 1)
+            ),
+            "battery_target_this_quarter_kwh": (
+                None if quarter is None else round(quarter.battery_allowance_kwh(), 3)
+            ),
+            "battery_realized_this_quarter_kwh": round(self._quarter_battery_kwh, 3),
+            "battery_remaining_this_quarter_kwh": (
+                None if progress is None else round(progress.battery_remaining_kwh, 3)
+            ),
+            "grid_target_this_quarter_kwh": (
+                None
+                if quarter is None
+                else round(
+                    quarter.grid_export_target_kwh
+                    if export
+                    else quarter.grid_authorised_kwh,
+                    3,
+                )
+            ),
+            "grid_realized_this_quarter_kwh": round(
+                self._quarter_grid_export_kwh
+                if export
+                else self._quarter_grid_import_kwh,
+                3,
+            ),
+            "grid_remaining_this_quarter_kwh": (
+                None if progress is None else round(progress.grid_remaining_kwh, 3)
+            ),
+            "required_average_battery_kw": (
+                None if progress is None else round(progress.battery_rate_kw, 3)
+            ),
+            "required_grid_correction_kw": (
+                None if progress is None else round(progress.grid_rate_kw, 3)
+            ),
+            "binding_clamps": sorted(self._quarter_clamps),
+            "target_reached_at": (
+                None
+                if self._quarter_target_reached_at is None
+                else self._quarter_target_reached_at.isoformat()
+            ),
+            "completed_quarters": list(self._completed_quarters),
+            "objective_rule": (
+                "the objective is the battery figure for a grid charge and the "
+                "actual meter export for a net export; the other figure is a "
+                "ceiling. a ceiling is never a completion test, so unspent grid "
+                "authorisation on a charge is production having paid for it, not "
+                "a deficit"
+            ),
+            "carry_over_rule": (
+                "a shortfall is recorded against the quarter it happened in and "
+                "never carried forward. stage a decides each quarter independently"
+            ),
+        }
+        return block
+
+    @callback
+    def _executing_intent(self) -> str | None:
+        """Return the intent currently being executed, or ``None``.
+
+        **The quarter first**, because it is the narrower and more current
+        authority and it freezes its intent at admission; the carried run only as a
+        fallback, so a stop remains provable after the quarter has gone.
+
+        ``None`` is a real answer and fails closed everywhere it is consumed: the
+        sign gate refuses an unknown intent rather than guessing a direction.
+        """
+        if self._quarter is not None:
+            return self._quarter.intent
+        if self._carried is not None:
+            return self._carried.intent
+        return None
+
+    @callback
+    def _execution_identity(self) -> str | None:
+        """Return the run id ownership must be matched against.
+
+        **The fallback that keeps a quarter executable while the run slot is
+        empty**, which is beta.27's authority split:
+
+            open quarter's run_id  ->  else carried run's run_id  ->  else None
+
+        The causal record names a run, and a quarter admitted under run X still
+        names run X -- so ``record_matches`` keeps working with nothing relaxed. The
+        quarter is consulted *first* precisely so a newly admitted future run
+        cannot take over the execution identity mid-quarter and rebase the
+        run-keyed progress reset underneath it.
+        """
+        if self._quarter is not None:
+            return self._quarter.run_id
+        if self._carried is not None:
+            return self._carried.run_id
+        return None
+
+    @callback
+    def _reset_quarter_progress(self, quarter: CarriedQuarter | None) -> None:
+        """Begin measuring ``quarter``, discarding any previous one's totals."""
+        self._quarter_key = None if quarter is None else quarter.quarter_start
+        self._quarter_battery_kwh = 0.0
+        self._quarter_grid_import_kwh = 0.0
+        self._quarter_grid_export_kwh = 0.0
+        self._quarter_sampled_at = None
+        self._quarter_peak_kw = 0.0
+        self._quarter_power_sum = 0.0
+        self._quarter_power_samples = 0
+        self._quarter_pv_helped = False
+        self._quarter_target_reached_at = None
+        self._quarter_clamps = set()
+
+    @callback
+    def _accrue_quarter_progress(self, now: datetime) -> None:
+        """Integrate measured flows into the open quarter's totals.
+
+        **Measured, never ``setpoint x elapsed``.** The setpoint is what the
+        inverter was *asked* for; a clamp, a limit, a cloud or a full pack each make
+        the delivered figure a different number.
+
+        The two grid quantities follow the domains they will be compared against,
+        and they are not symmetric because the plant is not:
+
+        * **import** is attributed exactly as :meth:`_accrue_grid_attribution`
+          does it -- production surplus first, grid second, incoherent readings
+          attributed wholly to the grid -- because no metered grid-to-battery
+          channel exists and the ceiling was published in those terms;
+        * **export** is taken **straight off the meter**, because unlike the import
+          share this genuinely is a metered channel, and it is the quantity Stage
+          A's export objective is expressed in.
+
+        Same defensive properties as the run-scoped accumulator: monotonic, a gap
+        longer than :data:`MAX_SAMPLE_GAP_SECONDS` accrues nothing rather than
+        extrapolating across a silence, and reset keyed on ``quarter_start`` alone.
+        """
+        quarter = self._quarter
+        if quarter is None:
+            self._quarter_sampled_at = None
+            return
+        if self._quarter_key != quarter.quarter_start:
+            self._reset_quarter_progress(quarter)
+
+        previous = self._quarter_sampled_at
+        self._quarter_sampled_at = now
+        if previous is None:
+            return
+        seconds = (now - previous).total_seconds()
+        if seconds <= 0.0 or seconds > MAX_SAMPLE_GAP_SECONDS:
+            # Out of order, or a silence too long to integrate across.
+            return
+        hours = seconds / 3600.0
+
+        flows = self.read_flows()
+        if quarter.intent == EXECUTION_INTENT_NET_EXPORT:
+            discharge_kw = max(0.0, (flows.battery_discharge_w or 0.0) / 1000.0)
+            self._quarter_battery_kwh += discharge_kw * hours
+            if flows.grid_export_w is not None:
+                self._quarter_grid_export_kwh += (
+                    max(0.0, flows.grid_export_w) / 1000.0 * hours
+                )
+            power_kw = discharge_kw
+        else:
+            charge_kw = max(0.0, (flows.battery_charge_w or 0.0) / 1000.0)
+            self._quarter_battery_kwh += charge_kw * hours
+            pv_w = self._read_pv_power_w()
+            load_w = self._read_house_load_w()
+            if pv_w is None or load_w is None:
+                # Conservative: attribute the whole charge to the grid, so the
+                # ceiling binds earlier. A budget exists to bound buying.
+                surplus_kw = 0.0
+            else:
+                surplus_kw = max(0.0, (pv_w - load_w) / 1000.0)
+            self._quarter_grid_import_kwh += max(0.0, charge_kw - surplus_kw) * hours
+            if surplus_kw > 0.0:
+                self._quarter_pv_helped = True
+            power_kw = charge_kw
+
+        self._quarter_peak_kw = max(self._quarter_peak_kw, power_kw)
+        self._quarter_power_sum += power_kw
+        self._quarter_power_samples += 1
+
+    @callback
+    def _quarter_progress(self, now: datetime) -> QuarterProgress | None:
+        """Return what remains of the open quarter, in both energy domains."""
+        quarter = self._quarter
+        if quarter is None:
+            return None
+        if quarter.intent == EXECUTION_INTENT_NET_EXPORT:
+            grid_remaining = quarter.grid_export_target_kwh - (
+                self._quarter_grid_export_kwh
+            )
+        else:
+            grid_remaining = quarter.grid_authorised_kwh - self._quarter_grid_import_kwh
+        return QuarterProgress(
+            seconds_remaining=quarter.seconds_remaining(now),
+            battery_remaining_kwh=max(
+                0.0, quarter.battery_allowance_kwh() - self._quarter_battery_kwh
+            ),
+            grid_remaining_kwh=max(0.0, grid_remaining),
+        )
+
+    @callback
+    def _quarter_target_reached(self, progress: QuarterProgress) -> bool:
+        """Return whether the open quarter's own objective has been met.
+
+        **The objective decides, and which figure is the objective depends on the
+        intent** -- the asymmetry the publication contract already states: a charge
+        aims at the battery figure, an export at the meter figure.
+
+        So a charge whose grid ceiling is spent has *not* finished: free production
+        may still fill the pack, which is beta.26's F2. A ceiling is never a
+        completion test.
+        """
+        quarter = self._quarter
+        if quarter is None:
+            return False
+        if quarter.intent == EXECUTION_INTENT_NET_EXPORT:
+            return progress.grid_remaining_kwh <= QUARTER_TARGET_TOLERANCE_KWH
+        return progress.battery_remaining_kwh <= QUARTER_TARGET_TOLERANCE_KWH
+
+    @callback
+    def _note_quarter_clamp(self, clamp: str | None) -> None:
+        """Remember a clamp that bound this quarter, for the completion record."""
+        if clamp and clamp != SHORTFALL_NONE:
+            self._quarter_clamps.add(clamp)
+
+    @callback
+    def _record_completed_quarter(self, reason: str) -> None:
+        """Append the finished quarter to the bounded history.
+
+        Recorded whatever the outcome, because the quarter that fell short is the
+        one a reader most needs -- and the shortfall is **stated**, not left to be
+        derived by subtracting two other published figures.
+        """
+        quarter = self._quarter
+        if quarter is None:
+            return
+        planned_battery = quarter.battery_allowance_kwh()
+        export = quarter.intent == EXECUTION_INTENT_NET_EXPORT
+        planned_grid = (
+            quarter.grid_export_target_kwh if export else quarter.grid_authorised_kwh
+        )
+        realised_grid = (
+            self._quarter_grid_export_kwh if export else self._quarter_grid_import_kwh
+        )
+        # Against the objective, never the ceiling: unspent grid authorisation on a
+        # charge is not a shortfall, it is production having paid for the charge.
+        planned = planned_grid if export else planned_battery
+        realised = realised_grid if export else self._quarter_battery_kwh
+        shortfall = max(0.0, planned - realised)
+        mean_kw = (
+            0.0
+            if not self._quarter_power_samples
+            else self._quarter_power_sum / self._quarter_power_samples
+        )
+        self._completed_quarters.append(
+            {
+                "quarter_start": quarter.quarter_start.isoformat(),
+                "quarter_end": quarter.quarter_end.isoformat(),
+                "intent": quarter.intent,
+                "planned_battery_kwh": round(planned_battery, 3),
+                "realized_battery_kwh": round(self._quarter_battery_kwh, 3),
+                "planned_grid_kwh": round(planned_grid, 3),
+                "realized_grid_kwh": round(realised_grid, 3),
+                "shortfall_kwh": round(shortfall, 3),
+                "shortfall_percent": (
+                    None if planned <= 0.0 else round(100.0 * shortfall / planned, 1)
+                ),
+                "completion_reason": reason,
+                "max_dispatch_kw": round(self._quarter_peak_kw, 3),
+                "mean_dispatch_kw": round(mean_kw, 3),
+                "pv_helped": self._quarter_pv_helped,
+                "binding_clamps": sorted(self._quarter_clamps),
+                "target_reached_at": (
+                    None
+                    if self._quarter_target_reached_at is None
+                    else self._quarter_target_reached_at.isoformat()
+                ),
+                "carry_over_rule": (
+                    "a shortfall is recorded and never carried into another "
+                    "quarter. Stage A decides each quarter independently"
+                ),
+            }
+        )
 
     @callback
     def _live_kw(self) -> tuple[float, float, float] | None:
@@ -1684,6 +2206,81 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if snapshot is None:
             return ()
         return tuple(snapshot.conflicting_active)
+
+    @callback
+    def _dispatch_setpoint(self, now: datetime) -> Any:
+        """Return this instant's signed Dispatch setpoint, or ``None``.
+
+        **The quarter is the execution envelope, and it is asked first.** This is
+        R3: a run publishes ``desired_grid_kw`` as its *first* interval's rate while
+        its window spans every interval it covers, so a multi-quarter run executed
+        against the run-level figure follows quarter one's target for the whole run.
+        The quarter rows carry each interval's own figures, so asking the quarter
+        removes the defect rather than compensating for it.
+
+        The run-level path is kept as the fallback and is **unchanged**, which is
+        what makes this safe to ship: a publication or a persisted record written
+        before beta.27 carries no ``quarter_schedule``, admits no quarter, and
+        executes exactly the beta.26 arithmetic that was proven on the hardware.
+        """
+        quarter = self._quarter
+        if quarter is not None:
+            progress = self._quarter_progress(now)
+            live = self._live_kw()
+            if progress is not None and live is not None:
+                house_kw, pv_kw, _grid_kw = live
+                decision = decide_for_intent(
+                    intent=quarter.intent,
+                    progress=progress,
+                    house_load_kw=house_kw,
+                    pv_kw=pv_kw,
+                    limits=self._charge_limits(
+                        None if self._carried is None else self._carried.target, now
+                    ),
+                    last_applied_kw=self._applied_setpoint_kw,
+                    **self._export_limits(quarter, now),
+                )
+                if decision is not None:
+                    self._note_quarter_clamp(getattr(decision, "reason", None))
+                    return decision
+        return self._setpoint_for(
+            None if self._carried is None else self._carried.target, now
+        )
+
+    @callback
+    def _export_limits(self, quarter: CarriedQuarter, now: datetime) -> dict[str, Any]:
+        """Return the export-only bounds, empty for a charge.
+
+        Separate from :meth:`_charge_limits` because the two directions are bounded
+        by different physical quantities, and folding them into one structure would
+        mean every slot was ``None`` for one of them. Three of the four are
+        structurally absent for a charge: a charge never approaches the floor, never
+        breaches the reserve and never exports.
+        """
+        if quarter.intent != EXECUTION_INTENT_NET_EXPORT:
+            return {}
+        plan = self.battery_plan
+        max_discharge_kw = None
+        reserve_headroom_kwh = None
+        if plan is not None and plan.state is not None:
+            max_discharge_kw = plan.state.limits.max_discharge_kw
+            # **The reserve is absolute: no export price unlocks a violation.** The
+            # bound is the energy above the configured floor, expressed as energy so
+            # the conversion to a rate happens once, in :mod:`.dispatch`, against
+            # the quarter's own remaining time.
+            floor_kwh = plan.state.limits.energy_for_soc(
+                plan.reserve.configured_min_soc_percent
+            )
+            reserve_headroom_kwh = max(0.0, plan.state.energy_kwh - floor_kwh)
+        return {
+            "max_discharge_kw": max_discharge_kw,
+            "reserve_headroom_kwh": reserve_headroom_kwh,
+            # **No configured site export limit exists in this integration**, so
+            # this clamp is genuinely unconstrained rather than defaulted to a
+            # number nobody chose. Stated here so a reader does not assume the
+            # slot is enforcing something.
+            "grid_export_limit_kw": None,
+        }
 
     @callback
     def _setpoint_for(self, target: Any, now: datetime) -> Any:
@@ -1768,7 +2365,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not steps:
             return True
         try:
-            await async_execute(self.hass, steps)
+            await async_execute(self.hass, steps, intent=self._executing_intent())
         except (ControlExecutionUnavailable, ControlActionNotPermitted):
             _LOGGER.warning("A Dispatch write was refused at the send site")
             return False
@@ -1806,6 +2403,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._async_send_locked(plan_dispatch_cleanup(), now=now, verify=None)
         self._clear_execution_record()
         self._carried = None
+        self._quarter = None
+        self._reset_quarter_progress(None)
+        self._quarter_progress_unknown = False
         self._applied_setpoint_kw = None
         self._coherence = None
         self._forward = None
@@ -1832,11 +2432,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 dispatch_active=bool(snapshot.dispatch_active),
                 marker_present_and_on=bool(snapshot.owner_marker),
                 record_matches_run=self._evidence_for(snapshot, now).record_matches,
-                readback_compatible=dispatch_readback_compatible(
-                    snapshot,
-                    expected_mode=DISPATCH_MODE_SOC_CONTROL,
-                    expected_sign=CONTROL_EXECUTABLE_DISPATCH_SIGN,
-                ),
+                readback_compatible=self._evidence_for(
+                    snapshot, now
+                ).readback_compatible,
                 contradicted=False,
             ),
             steps=tuple(step.entity_id for step in steps),
@@ -1852,6 +2450,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         self._clear_execution_record()
         self._carried = None
+        self._quarter = None
+        self._reset_quarter_progress(None)
+        self._quarter_progress_unknown = False
         self._applied_setpoint_kw = None
         self._forward = None
         self._sustained_deadline = None
@@ -1859,13 +2460,24 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_tick_reason = EXECUTION_STOP_MARKER_LOST
 
     @callback
-    def _note_tick(self, now: datetime, reason: str) -> None:
-        """Record a physical tick that wrote nothing, and why.
+    def _note_tick(self, now: datetime, reason: str, *, wrote: bool = False) -> None:
+        """Record what this physical tick did, and why. **Once, at its end.**
 
-        Deliberately **not** a clamp reason: nothing was calculated, so naming a
-        clamp would invent an explanation for a decision that was never made.
+        The reason is usually a refusal, and then deliberately **not** a clamp
+        reason: nothing was calculated, so naming a clamp would invent an
+        explanation for a decision that was never made.
+
+        The typed outcome carries its own cadence, which is the beta.26 diagnostics
+        fault fixed by shape. A bare mutable string written here was published
+        beside figures computed during the *quarter refresh*, so a stale
+        ``no_owned_run`` sat next to a freshly successful write with nothing saying
+        the two described different events. A record that names its own cadence
+        cannot do that.
         """
         self._last_tick_reason = reason
+        self._tick_outcome = TickOutcome(
+            cadence=CADENCE_PHYSICAL_TICK, reason=reason, wrote=wrote, at=now
+        )
         self._physical_decisions.append(
             {"controller_refresh_at": now.isoformat(), "update_reason": reason}
         )
@@ -1881,6 +2493,51 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         entry["actual_grid_kw"] = None if live is None else round(live[2], 3)
         entry["coherence_state"] = coherence.state
         entry["dispatch_power_deadband_kw"] = DISPATCH_POWER_DEADBAND_KW
+        # **Enough to reconstruct the quarter, not just the instant.** Diagnostics
+        # are almost never captured at the moment production moved, so a download
+        # taken an hour later has to be able to answer "what was this tick aiming
+        # at, under whose authority, and how much was left" without the reader
+        # having to correlate three other blocks by timestamp.
+        quarter = self._quarter
+        progress = self._quarter_progress(now)
+        export = quarter is not None and quarter.intent == EXECUTION_INTENT_NET_EXPORT
+        entry["plan_id"] = None if quarter is None else quarter.plan_id
+        entry["run_id"] = self._execution_identity()
+        entry["intent"] = None if quarter is None else quarter.intent
+        entry["quarter_start"] = (
+            None if quarter is None else quarter.quarter_start.isoformat()
+        )
+        entry["quarter_end"] = (
+            None if quarter is None else quarter.quarter_end.isoformat()
+        )
+        entry["battery_target_kwh"] = (
+            None if quarter is None else round(quarter.battery_allowance_kwh(), 3)
+        )
+        entry["battery_realized_kwh"] = round(self._quarter_battery_kwh, 3)
+        entry["battery_remaining_kwh"] = (
+            None if progress is None else round(progress.battery_remaining_kwh, 3)
+        )
+        entry["grid_target_kwh"] = (
+            None
+            if quarter is None
+            else round(
+                quarter.grid_export_target_kwh
+                if export
+                else quarter.grid_authorised_kwh,
+                3,
+            )
+        )
+        entry["grid_realized_kwh"] = round(
+            self._quarter_grid_export_kwh if export else self._quarter_grid_import_kwh,
+            3,
+        )
+        entry["grid_remaining_kwh"] = (
+            None if progress is None else round(progress.grid_remaining_kwh, 3)
+        )
+        entry["seconds_remaining"] = (
+            None if progress is None else round(progress.seconds_remaining, 1)
+        )
+        entry["stop_reason"] = None
         self._physical_decisions.append(entry)
 
     @callback
@@ -1915,6 +2572,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Off path agree; the Stage-B path passes the *carried* run, because there a
         record naming a different run is contradictory rather than merely old.
         """
+        # **The expected sign comes from the executing intent**, because beta.27
+        # executes two directions: a readback check with a hardcoded sign would call
+        # an owned export somebody else's discharge. An unknown intent yields
+        # ``None`` and the readback is treated as incompatible, which is the
+        # conservative direction.
+        expected_sign = permitted_sign(self._executing_intent())
         return OwnershipEvidence(
             dispatch_active=bool(snapshot is not None and snapshot.dispatch_active),
             marker_on=bool(snapshot is not None and snapshot.owner_marker),
@@ -1924,10 +2587,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             now=now,
             readback_compatible=bool(
                 snapshot is not None
+                and expected_sign is not None
                 and dispatch_readback_compatible(
                     snapshot,
                     expected_mode=DISPATCH_MODE_SOC_CONTROL,
-                    expected_sign=CONTROL_EXECUTABLE_DISPATCH_SIGN,
+                    expected_sign=expected_sign,
                 )
             ),
         )
@@ -3276,6 +3940,25 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         adopted = carried_from_record(self.store.execution_record)
         if adopted is not None:
             self._carried = adopted
+            # **An adopted dispatch is stopped, not continued.** beta.26 adopted the
+            # run and carried on, which was sound while execution was measured
+            # against a whole run: the run-level progress is reconstructible from
+            # the record. A *quarter* is not -- ``CarriedQuarter`` is deliberately
+            # not persisted, and its measured totals live only in memory.
+            #
+            # So after a restart the delivered energy inside the open quarter is
+            # unknown, and the three options are: continue against unknown progress
+            # and risk delivering the quarter twice; leave the device running while
+            # sending nothing and rely on the vendor dead-man; or stop and wait for
+            # the next admitted quarter. Only the third is both safe and honest, and
+            # the cost is bounded -- at most the remainder of one quarter, which
+            # Stage A will re-plan at the next boundary.
+            #
+            # This is *not* a relaxation of the foreign/unproven rule. It fires only
+            # where ownership is provable, which is what the marker-and-record
+            # guards above already established; an unprovable dispatch still gets
+            # zero writes.
+            self._quarter_progress_unknown = True
 
     @callback
     def _stamp_dispatch_start(self, evidence: Any, now: datetime) -> bool:
@@ -3488,6 +4171,35 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._adopt_persisted_run(snapshot)
         outcome = carry_forward(self._carried, self.execution_targets, now)
         self._carried = outcome.carried
+        # **The quarter is carried in its own right, and after the run.** After,
+        # because a quarter admitted this refresh should be able to name the run
+        # that authorised it; in its own right, because a run ending at a boundary
+        # used to leave the quarter after it with no carrier at all -- which is R1,
+        # and is why this cannot be a field on ``CarriedRun``.
+        #
+        # An **open** quarter is returned unchanged by ``carry_quarter`` and is not
+        # re-derived here either: Stage A's horizon head is ``elapsed + 1``, so no
+        # publication issued after ``quarter_start`` can contain the open quarter,
+        # and any rule claiming to re-describe it would be inferring from evidence
+        # that structurally cannot exist.
+        previous_quarter = self._quarter
+        self._quarter = carry_quarter(
+            previous_quarter,
+            self.execution_targets,
+            now,
+            run=self._carried,
+            frozen_remaining_kwh=self._frozen_remaining_kwh(now),
+            executable_intents=CONTROL_LIVE_DISPATCH_INTENTS,
+        )
+        if previous_quarter is not None and self._quarter is not previous_quarter:
+            # It ended between ticks rather than on one -- record it before the
+            # accumulators are rebased, or the history loses the quarter entirely.
+            self._record_completed_quarter(
+                QUARTER_END_TARGET_REACHED
+                if self._quarter_target_reached_at is not None
+                else QUARTER_END_EXPIRED
+            )
+            self._reset_quarter_progress(self._quarter)
         carried = outcome.carried
         if outcome.ended is not None and outcome.ended_run is not None:
             self._remember_ended_run(outcome.ended, outcome.ended_run, plan, now)
@@ -5076,11 +5788,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # ``_async_send_locked`` inside their held section rather than
             # re-acquiring it here.
             async with self._execution_lock:
+                intent = self._executing_intent()
                 if stage_one:
-                    await async_execute(self.hass, stage_one)
+                    await async_execute(self.hass, stage_one, intent=intent)
                     landed = verify is None or self._staged_write_landed(verify)
                 if landed and stage_two:
-                    await async_execute(self.hass, stage_two)
+                    await async_execute(self.hass, stage_two, intent=intent)
         except ControlExecutionUnavailable:
             # The expected outcome while the barrier stands, and recorded rather
             # than swallowed: a release that believes it sent something is worse
@@ -5417,7 +6130,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         unsafe_while_owned = owned and dispatch_active and not verdict.safe
         if unsafe_while_owned and not stop_reason:
             stop_reason = EXECUTION_STOP_SAFETY
-        resetting = owned and bool(result.get("reset_required") or unsafe_while_owned)
+        # **A restart over our own live dispatch is itself a stop condition**, for
+        # the reason set out in ``_adopt_persisted_run``: the quarter's progress did
+        # not survive the process and cannot be reconstructed.
+        progress_unknown = owned and self._quarter_progress_unknown
+        if progress_unknown and not stop_reason:
+            stop_reason = EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN
+        resetting = owned and bool(
+            result.get("reset_required") or unsafe_while_owned or progress_unknown
+        )
         if degraded and not stop_reason:
             stop_reason = EXECUTION_STOP_MARKER_LOST
         # The ownership layer's own verdict, read rather than recomputed. There is
@@ -5449,9 +6170,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         stage_one: tuple[Any, ...] = ()
         stage_two: tuple[Any, ...] = ()
         verify: str | None = None
-        setpoint = self._setpoint_for(
-            None if self._carried is None else self._carried.target, now
-        )
+        # **Which actuator surface this refresh may use, decided once.** Read from
+        # the executing intent rather than from the command, because the intent is
+        # what names a surface -- see the advisory branch below, which is where
+        # getting this wrong would have cost a helper-family write.
+        live_intent = self._executing_intent()
+        setpoint = self._dispatch_setpoint(now)
         conflicts = self._blocking_conflicts(snapshot)
         if degraded:
             # The emergency authority: one write, and the cleanup withheld until
@@ -5495,21 +6219,40 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     None if snapshot is None else snapshot.dispatch_duration_minutes
                 )
             )
-        elif command.action != ACTION_CHARGE:
-            # **The advisory path, unchanged.** The Phase-3 reserve guard emits
-            # discharges, and no release executes one: the typed barrier refuses
-            # the action at authorisation and the send site refuses the entities.
-            # It still has to be *planned*, because shadow reporting is what a
-            # user reads to decide whether to trust the layer at all.
+        elif live_intent not in CONTROL_LIVE_DISPATCH_INTENTS:
+            # **The advisory path, and the branch that must not be keyed on the
+            # action.** It used to read ``command.action != ACTION_CHARGE``, which
+            # was sound only while ``ACTION_CHARGE`` was the one action an intent
+            # could map to. beta.27 maps ``net_export -> ACTION_DISCHARGE`` so the
+            # stop path can name what it stops -- and under the old condition an
+            # export command would have fallen in here and been armed on the
+            # **Force Discharging helper family**, silently reintroducing a helper
+            # family as the physical actuator for a new capability.
             #
-            # This is not a second Live path. Live charge is Dispatch and only
-            # Dispatch; the helper families remain the advisory surface for
-            # actions that have no actuator, and remain refused at every
-            # boundary.
+            # So the question asked is the correct one: *is this intent one of the
+            # validated Live Dispatch intents?* An intent is what carries the
+            # actuator surface; an action only carries a battery direction, and
+            # two intents can share one.
+            #
+            # Everything else about this path is unchanged. The Phase-3 reserve
+            # guard emits discharges and no release executes one: the typed barrier
+            # refuses the action at authorisation and the send site refuses the
+            # entities. It still has to be *planned*, because shadow reporting is
+            # what a user reads to decide whether to trust the layer at all.
             stage_two = plan_arm_parameters(command)
             stage_one = plan_marker_claim() if stage_two else ()
             verify = EXECUTION_VERIFY_MARKER_ON if stage_one else None
-        elif setpoint is not None and setpoint.applied_kw < 0.0:
+        elif (
+            setpoint is not None
+            and setpoint.applied_kw != 0.0
+            and sign_matches_intent(live_intent, setpoint.applied_kw)
+        ):
+            # **The sign is checked against the intent**, not asserted to be
+            # negative. Two directions are executable in beta.27 and a hardcoded
+            # comparison would either block the new one or admit the wrong one.
+            # Zero is excluded here for the reason stated below -- it is not an arm
+            # -- and a sign that does not match the admitted intent falls through
+            # to no writes at all rather than being corrected into one.
             stage_two = plan_dispatch_arm(
                 mode=DISPATCH_MODE_SOC_CONTROL,
                 power_kw=setpoint.applied_kw,
@@ -5540,8 +6283,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if commands and checked is not None:
             refusal = action_refusal(checked, commands)
         # And the value check, which the entity test structurally cannot make.
+        # **Keyed on the intent since beta.27**: which sign is permitted is only
+        # answerable once you know what is being executed, and an unknown intent
+        # fails closed rather than defaulting to a direction.
         if refusal is None and commands:
-            refusal = dispatch_refusal(commands)
+            refusal = dispatch_refusal(live_intent, commands)
         if refusal is not None:
             commands = ()
             stage_one = stage_two = ()
@@ -5553,7 +6299,23 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # download taken later has to be able to reconstruct the quarter rather
         # than only describe the instant it was taken.
         stage_b["controller"] = self._controller_block(setpoint, now)
+        stage_b["quarter"] = self._quarter_block(now)
         stage_b["physical_decisions"] = list(self._physical_decisions)
+        # **The refresh's own outcome, on its own cadence.** Recorded here, at the
+        # end of the refresh, for the same reason the tick records at the end of the
+        # tick: a reason captured earlier could survive beside a write that happened
+        # afterwards, which is precisely the beta.26 diagnostics fault.
+        self._refresh_outcome = TickOutcome(
+            cadence=CADENCE_QUARTER_REFRESH,
+            reason=(
+                refusal
+                if refusal is not None
+                else (stop_reason or ("commands_planned" if commands else "no_command"))
+            ),
+            wrote=bool(commands),
+            at=now,
+            phase="write_boundary",
+        )
         stage_b["write_boundary"] = {
             "refusal": refusal,
             # **The two stages, published separately.** A reader has to be able

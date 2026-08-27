@@ -1927,7 +1927,18 @@ EXECUTION_INTENT_HOLD: Final = "hold"
 #: rather than guess. ``serve_load`` and ``net_export`` are deliberately absent:
 #: the first keeps the Phase-3 reserve-guard behaviour and the second has no
 #: primitive at all, so neither is something Alpha EMS can own or stop.
-EXECUTION_INTENT_ACTIONS: Final = {EXECUTION_INTENT_GRID_CHARGE: ACTION_CHARGE}
+#: What a *stop* is stopping, per intent. Read at arm time and persisted, so the
+#: stop path reads a record of what was armed rather than reconstructing it.
+#:
+#: **This maps an intent to a battery direction, and nothing else.** It must never
+#: be used to choose an actuator *surface*: doing so is what would have routed
+#: ``net_export`` onto the Force Discharging family, because that family is where
+#: ``ACTION_DISCHARGE`` used to lead. The surface is chosen from
+#: :data:`CONTROL_LIVE_DISPATCH_INTENTS`, which is keyed on the intent.
+EXECUTION_INTENT_ACTIONS: Final = {
+    EXECUTION_INTENT_GRID_CHARGE: ACTION_CHARGE,
+    EXECUTION_INTENT_NET_EXPORT: ACTION_DISCHARGE,
+}
 
 EXECUTION_INTENTS: Final = (
     EXECUTION_INTENT_GRID_CHARGE,
@@ -2177,6 +2188,104 @@ EMERGENCY_STOP_OPERATION: Final = "dispatch_enable_off"
 #: per physical tick, before the device dead-man is left to finish the job.
 EMERGENCY_STOP_MAX_ATTEMPTS: Final = 3
 
+# --- beta.27: the per-quarter execution envelope -----------------------------
+
+#: How long one physical control interval is *assumed* to last when capping the
+#: energy a single write may deliver, in seconds.
+#:
+#: **Deliberately longer than the sixty-second cadence it guards.** The tick is
+#: "approximately" every sixty seconds, a readback lands after the write rather
+#: than with it, and a tick can be skipped for lock contention -- so a cap built on
+#: an assumed exact sixty seconds would be optimistic in exactly the situations
+#: that matter.
+#:
+#: The direction of error is chosen: this can leave a target a few watt-hours short
+#: near the end of a quarter, and that is preferred to an overshoot. Spending
+#: energy Stage A did not authorise is a real cost; finishing marginally short is
+#: recorded and forgotten.
+CONTROL_TICK_ENERGY_HORIZON_SECONDS: Final = 90.0
+
+#: How close to an admitted quarter's objective counts as having reached it.
+#:
+#: **Deliberately not** :data:`execution.TARGET_TOLERANCE_KWH`, which is ``0.25``
+#: kWh. That figure is calibrated against a whole run's target and would call a
+#: half-kilowatt-hour quarter finished when half of it had been delivered. A
+#: quarter needs a quarter-scale figure.
+#:
+#: Ten watt-hours is below what one control tick can command at the 0.1 kW
+#: quantisation step -- 0.1 kW for :data:`CONTROL_TICK_ENERGY_HORIZON_SECONDS`
+#: delivers 2.5 Wh -- so the residue this forgives is smaller than the smallest
+#: correction that could chase it, and no quarter can sit forever a few watt-hours
+#: from done.
+QUARTER_TARGET_TOLERANCE_KWH: Final = 0.01
+
+#: Why an admitted quarter stopped.
+QUARTER_END_TARGET_REACHED: Final = "quarter_target_reached"
+QUARTER_END_EXPIRED: Final = "quarter_expired"
+QUARTER_END_SAFETY: Final = "quarter_safety_stop"
+
+#: What bound the delivered energy short of the plan, when something did.
+SHORTFALL_INVERTER_LIMIT: Final = "inverter_limit"
+SHORTFALL_GRID_LIMIT: Final = "grid_limit"
+SHORTFALL_RESERVE_LIMIT: Final = "reserve_limit"
+SHORTFALL_HEADROOM_LIMIT: Final = "headroom_limit"
+SHORTFALL_OWNERSHIP_LOSS: Final = "ownership_loss"
+SHORTFALL_SENSOR_INCOHERENCE: Final = "sensor_incoherence"
+SHORTFALL_TARGET_REACHED: Final = "target_reached"
+SHORTFALL_QUARTER_EXPIRED: Final = "quarter_expired"
+SHORTFALL_WRITE_FAILURE: Final = "hardware_write_failure"
+SHORTFALL_DEADMAN_FAILURE: Final = "deadman_failure"
+SHORTFALL_DIRECTION_GATE: Final = "direction_gate"
+SHORTFALL_TICK_HORIZON: Final = "tick_energy_horizon"
+SHORTFALL_NONE: Final = "none"
+
+#: Stop reasons beta.27 adds. The quarter is the entitlement; the dead-man lease is
+#: not, and these exist so a stop can say which of the two ended the run.
+EXECUTION_STOP_QUARTER_TARGET_REACHED: Final = "quarter_target_reached"
+EXECUTION_STOP_QUARTER_EXPIRED: Final = "quarter_expired"
+EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN: Final = "quarter_progress_unknown"
+
+#: The clamp that bound an export setpoint, in the documented order.
+DISPATCH_LIMIT_MAX_DISCHARGE: Final = "inverter_discharge"
+DISPATCH_LIMIT_REMAINING_DISCHARGE: Final = "remaining_discharge_energy"
+DISPATCH_LIMIT_REMAINING_EXPORT: Final = "remaining_export_energy"
+DISPATCH_LIMIT_TICK_HORIZON: Final = "tick_energy_horizon"
+
+#: The deterministic export clamp order, written once so the code and the
+#: documentation cannot drift. Battery-side and meter-side entries are converted
+#: through the canonical identity, never compared directly.
+DISPATCH_EXPORT_CLAMP_ORDER: Final = (
+    DISPATCH_LIMIT_MAX_DISCHARGE,
+    DISPATCH_LIMIT_MIN_SOC,
+    DISPATCH_LIMIT_DYNAMIC_RESERVE,
+    DISPATCH_LIMIT_REMAINING_DISCHARGE,
+    DISPATCH_LIMIT_REMAINING_EXPORT,
+    DISPATCH_LIMIT_TICK_HORIZON,
+    DISPATCH_LIMIT_GRID_LIMIT,
+    DISPATCH_LIMIT_EXPORT_SAFETY,
+    DISPATCH_LIMIT_QUANTISATION,
+    DISPATCH_LIMIT_DIRECTION_GATE,
+)
+
+#: Why a physical tick did what it did. ``no_owned_run`` is gone: it covered three
+#: distinct conditions, so a reader could not tell "no authority" from "authority
+#: but nothing armed".
+TICK_SKIPPED_NO_QUARTER: Final = "no_admitted_quarter"
+TICK_SKIPPED_DISPATCH_INACTIVE: Final = "dispatch_not_active"
+TICK_SKIPPED_OWNERSHIP: Final = "ownership_not_owned"
+TICK_STOPPED_TARGET_REACHED: Final = "stopped_target_reached"
+TICK_STOPPED_QUARTER_EXPIRED: Final = "stopped_quarter_expired"
+TICK_ERROR: Final = "controller_error"
+
+#: Which cadence produced a diagnostics record. Published so a sixty-second tick
+#: reason can never again sit beside quarter-refresh figures as though the two
+#: described one event.
+CADENCE_PHYSICAL_TICK: Final = "physical_tick"
+CADENCE_QUARTER_REFRESH: Final = "quarter_refresh"
+
+#: The bounded history of completed execution quarters.
+MAX_COMPLETED_QUARTERS_REPORTED: Final = 12
+
 #: Which of the two authorisation caps produced the effective remainder.
 CAP_FROZEN: Final = "frozen"
 CAP_FORWARD: Final = "forward"
@@ -2196,7 +2305,28 @@ CONTROL_REFUSE_CONFLICTING_FAMILY: Final = "conflicting_family_active"
 #: two loose facts. beta.25 may command mode 2 with a **negative** power and
 #: nothing else; the sign is part of the barrier, not a downstream check.
 CONTROL_EXECUTABLE_DISPATCH_MODES: Final = frozenset({2})
-CONTROL_EXECUTABLE_DISPATCH_SIGN: Final = -1
+
+#: The permitted signed direction **per admitted intent**, and the gate is keyed on
+#: the intent rather than on a single scalar for one reason: beta.27 executes two
+#: directions, so "which sign may be sent" is only answerable once you know what is
+#: being executed. A scalar could only ever describe one of them.
+#:
+#: An intent absent from this mapping is refused. That is what keeps
+#: ``serve_load``, the negative-price modes and every unverified direction blocked
+#: without needing a list of them.
+CONTROL_EXECUTABLE_DISPATCH_SIGNS: Final = {
+    EXECUTION_INTENT_GRID_CHARGE: -1,
+    EXECUTION_INTENT_NET_EXPORT: +1,
+}
+
+#: The intents beta.27 may physically execute, and the set the *actuator surface*
+#: is chosen from. Deliberately not derived from ``EXECUTION_INTENT_ACTIONS``: that
+#: maps an intent to a battery *direction* for the stop path, and using a direction
+#: to choose a surface is precisely the defect that would have routed export onto
+#: the Force Discharging family.
+CONTROL_LIVE_DISPATCH_INTENTS: Final = frozenset(
+    {EXECUTION_INTENT_GRID_CHARGE, EXECUTION_INTENT_NET_EXPORT}
+)
 
 #: The bounded ring of recent physical decisions, so a download taken later can
 #: reconstruct what happened earlier in the quarter -- diagnostics are rarely

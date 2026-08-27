@@ -45,7 +45,8 @@ from .alphaess_device import (
 from .const import (
     ACTION_CHARGE,
     CONTROL_EXECUTABLE_DISPATCH_MODES,
-    CONTROL_EXECUTABLE_DISPATCH_SIGN,
+    CONTROL_EXECUTABLE_DISPATCH_SIGNS,
+    CONTROL_TICK_ENERGY_HORIZON_SECONDS,
     DISPATCH_LIMIT_DEADBAND,
     DISPATCH_LIMIT_DIRECTION_GATE,
     DISPATCH_LIMIT_DYNAMIC_RESERVE,
@@ -53,12 +54,18 @@ from .const import (
     DISPATCH_LIMIT_GRID_LIMIT,
     DISPATCH_LIMIT_HEADROOM,
     DISPATCH_LIMIT_INVERTER_POWER,
+    DISPATCH_LIMIT_MAX_DISCHARGE,
     DISPATCH_LIMIT_MIN_SOC,
     DISPATCH_LIMIT_NONE,
     DISPATCH_LIMIT_QUANTISATION,
+    DISPATCH_LIMIT_REMAINING_DISCHARGE,
+    DISPATCH_LIMIT_REMAINING_EXPORT,
     DISPATCH_LIMIT_REMAINING_GRID_ENERGY,
+    DISPATCH_LIMIT_TICK_HORIZON,
     DISPATCH_POWER_DEADBAND_KW,
     DISPATCH_POWER_STEP_KW,
+    EXECUTION_INTENT_GRID_CHARGE,
+    EXECUTION_INTENT_NET_EXPORT,
     TICK_APPLIED,
     TICK_SKIPPED_DEADBAND,
 )
@@ -370,7 +377,7 @@ def mode_for(action: str | None, *, signed_power_kw: float) -> ModeChoice:
         DISPATCH_MODE_SOC_CONTROL,
         "state_of_charge_control_negative_power",
         DISPATCH_MODE_SOC_CONTROL in CONTROL_EXECUTABLE_DISPATCH_MODES
-        and CONTROL_EXECUTABLE_DISPATCH_SIGN < 0,
+        and permitted_sign(EXECUTION_INTENT_GRID_CHARGE) == -1,
     )
 
 
@@ -393,3 +400,393 @@ def deadman_minutes(previous: float | None) -> int:
     if previous is not None and abs(previous - float(low)) < 0.5:
         return high
     return low
+
+
+# ===========================================================================
+# beta.27: the intent-keyed direction gate
+# ===========================================================================
+
+
+def permitted_sign(intent: str | None) -> int | None:
+    """Return the signed direction ``intent`` may command, or ``None``.
+
+    **Keyed on the intent, because beta.27 executes two directions.** A single
+    scalar could only ever describe one of them, and an intent this release has not
+    validated has no entry -- so ``serve_load``, the negative-price modes and every
+    unverified direction stay blocked without needing to be listed.
+
+    ``None`` for an unknown or missing intent, which every caller must treat as a
+    refusal rather than as "no constraint".
+    """
+    if intent is None:
+        return None
+    return CONTROL_EXECUTABLE_DISPATCH_SIGNS.get(intent)
+
+
+def sign_matches_intent(intent: str | None, power_kw: float) -> bool:
+    """Return whether a signed power is the direction ``intent`` is allowed.
+
+    Zero always matches: it is what the direction gate produces when the target
+    would require a direction this release cannot command, and it is what the
+    cleanup writes. Commanding nothing is never the wrong direction.
+    """
+    sign = permitted_sign(intent)
+    if sign is None:
+        return False
+    if power_kw == 0.0:
+        return True
+    return (power_kw < 0.0) == (sign < 0)
+
+
+# ===========================================================================
+# beta.27: quarter progress, and the asymmetric objectives
+# ===========================================================================
+
+
+def hours_remaining(seconds_remaining: float) -> float:
+    """Return the remaining fraction of an hour, floored at one tick horizon.
+
+    **Floored rather than allowed to reach zero**, and not only to avoid dividing by
+    it: as a quarter closes, ``remaining / remaining_time`` diverges, and a rate
+    computed from three remaining seconds describes a physical impossibility. The
+    floor makes the requested rate converge on what one control interval could
+    actually deliver, which is the same figure :func:`tick_energy_cap_kw` enforces.
+    """
+    floor = CONTROL_TICK_ENERGY_HORIZON_SECONDS / 3600.0
+    return max(floor, max(0.0, seconds_remaining) / 3600.0)
+
+
+def tick_energy_cap_kw(remaining_kwh: float) -> float:
+    """Return the most power one control interval may be asked to deliver.
+
+    **The overshoot guard, and it is deliberately conservative.** Target-reached is
+    detected *after* measurements arrive, which is one tick too late to prevent an
+    overshoot -- so the request is bounded in advance by what a single interval
+    could deliver against the energy that is actually left.
+
+    The horizon is longer than the cadence it guards, because the tick is
+    "approximately" sixty seconds, a readback lands after the write, and a tick can
+    be skipped for lock contention. The cost is that a target may finish a few
+    watt-hours short near a quarter boundary; the alternative is spending energy
+    Stage A never authorised. The shortfall is recorded and never carried forward.
+    """
+    if remaining_kwh <= 0.0:
+        return 0.0
+    return remaining_kwh / (CONTROL_TICK_ENERGY_HORIZON_SECONDS / 3600.0)
+
+
+def export_rate_to_battery_kw(
+    *, house_load_kw: float, pv_kw: float, export_kw: float
+) -> float:
+    """Return the battery discharge that produces ``export_kw`` at the meter.
+
+    **The one conversion point between the two domains.** A meter-side export
+    energy and a battery-side discharge energy are different quantities and are
+    never compared; they are converted, here, through the canonical identity:
+
+        grid = house - pv - dispatch,  so  dispatch = house - pv + export
+
+    House consumption is supplied *in addition* to the export, and production
+    reduces the discharge required. Commanding the export magnitude directly as
+    battery power -- the likeliest error in this release -- would under-export by
+    exactly the house load.
+    """
+    return house_load_kw - pv_kw + max(0.0, export_kw)
+
+
+def battery_rate_to_export_kw(
+    *, house_load_kw: float, pv_kw: float, battery_kw: float
+) -> float:
+    """Return the meter export a battery discharge of ``battery_kw`` produces.
+
+    The inverse of :func:`export_rate_to_battery_kw`, through the same identity, so
+    a battery-side ceiling can be expressed as the export it permits.
+    """
+    return max(0.0, battery_kw) - house_load_kw + pv_kw
+
+
+@dataclass(frozen=True, slots=True)
+class QuarterProgress:
+    """What remains of one admitted quarter, in both domains, with time left.
+
+    Both domains are carried because neither answers the other's question, and the
+    asymmetry between them is the whole of the beta.27 contract: for a charge the
+    battery figure is the objective and the grid figure a ceiling, and for an export
+    it is the other way round.
+    """
+
+    seconds_remaining: float
+    #: Battery-side AC energy still to deliver. Objective for a charge, ceiling for
+    #: an export.
+    battery_remaining_kwh: float
+    #: Grid-side energy still authorised. Ceiling for a charge (import it may
+    #: cause), objective for an export (meter export it must realise).
+    grid_remaining_kwh: float
+
+    @property
+    def hours(self) -> float:
+        """Return the remaining time as hours, floored at one tick horizon."""
+        return hours_remaining(self.seconds_remaining)
+
+    @property
+    def battery_rate_kw(self) -> float:
+        """Return the average battery power that would finish on time."""
+        return max(0.0, self.battery_remaining_kwh) / self.hours
+
+    @property
+    def grid_rate_kw(self) -> float:
+        """Return the average grid rate the remaining authorisation permits."""
+        return max(0.0, self.grid_remaining_kwh) / self.hours
+
+
+def decide_charge(
+    *,
+    progress: QuarterProgress,
+    house_load_kw: float,
+    pv_kw: float,
+    limits: ChargeLimits,
+    last_applied_kw: float | None,
+    deadband_kw: float = DISPATCH_POWER_DEADBAND_KW,
+) -> DispatchDecision:
+    """Return the charge setpoint for this tick. **Battery objective, grid ceiling.**
+
+    The contract this implements is the one already written into the publication:
+    ``battery_target_kwh`` is *"Battery side. Authoritative for a charge"*, and
+    ``grid_target_kwh`` is *"Present only when the meter is what the plan is aiming
+    at"* -- and it is ``None`` for a charge. So the battery figure is what Stage B
+    tries to realise, and the grid figure is only a ceiling on how much of it may be
+    bought.
+
+    Four consequences, each a requirement rather than a side effect:
+
+    * **Production substitutes for planned grid energy.** A larger photovoltaic
+      surplus meets the same battery objective with less grid, so unspent
+      authorisation is never a deficit to consume. Treating it as a target buys
+      energy the plan did not need -- measured at roughly a kilowatt-hour on a
+      quarter where production outperformed.
+    * **Missing production cannot unlock extra buying.** The ceiling comes from the
+      authorisation, never from the battery deficit.
+    * **Behind schedule still speeds up**, up to ``pv_surplus + grid_rate_cap``.
+    * **Free production is still absorbed once the grid budget is spent**: the cap
+      falls to the surplus alone, and the charge continues under the battery,
+      headroom and reserve limits rather than pushing production to the meter.
+    """
+    pv_surplus_kw = max(0.0, pv_kw - house_load_kw)
+    required_battery_kw = progress.battery_rate_kw
+    grid_rate_cap_kw = progress.grid_rate_kw
+
+    applied_kw = required_battery_kw
+    reason = DISPATCH_LIMIT_NONE
+
+    # The grid authorisation, as a power ceiling on the battery.
+    battery_cap_kw = pv_surplus_kw + grid_rate_cap_kw
+    if battery_cap_kw < applied_kw - 1e-9:
+        applied_kw = battery_cap_kw
+        reason = DISPATCH_LIMIT_REMAINING_GRID_ENERGY
+
+    # The physical clamps, unchanged in meaning and order.
+    clamped_kw, clamp_reason = clamp_charge_kw(applied_kw, limits)
+    if clamp_reason != DISPATCH_LIMIT_NONE:
+        applied_kw, reason = clamped_kw, clamp_reason
+    else:
+        applied_kw = clamped_kw
+
+    # The overshoot guard, against the battery objective.
+    tick_cap_kw = tick_energy_cap_kw(progress.battery_remaining_kwh)
+    if tick_cap_kw < applied_kw - 1e-9:
+        applied_kw, reason = tick_cap_kw, DISPATCH_LIMIT_TICK_HORIZON
+
+    return _finish(
+        desired_grid_kw=house_load_kw - pv_kw + applied_kw,
+        house_load_kw=house_load_kw,
+        pv_kw=pv_kw,
+        required_kw=-required_battery_kw,
+        calculated_kw=-required_battery_kw,
+        signed_kw=-applied_kw,
+        reason=reason,
+        last_applied_kw=last_applied_kw,
+        deadband_kw=deadband_kw,
+    )
+
+
+def decide_export(
+    *,
+    progress: QuarterProgress,
+    house_load_kw: float,
+    pv_kw: float,
+    max_discharge_kw: float | None = None,
+    reserve_headroom_kwh: float | None = None,
+    grid_export_limit_kw: float | None = None,
+    last_applied_kw: float | None,
+    deadband_kw: float = DISPATCH_POWER_DEADBAND_KW,
+) -> DispatchDecision:
+    """Return the export setpoint for this tick. **Meter objective, battery ceiling.**
+
+    The mirror image of :func:`decide_charge`, and the asymmetry is the contract's:
+    ``grid_target_kwh`` is *"Meter side. Present only when the meter is what the
+    plan is aiming at"*, which for an export it is -- that is where the money is
+    measured. So the meter figure is the objective and the battery discharge
+    authorisation is the ceiling.
+
+    Clamps are applied in :data:`DISPATCH_EXPORT_CLAMP_ORDER`. Battery-side and
+    meter-side bounds are **converted** through :func:`export_rate_to_battery_kw`,
+    never compared.
+    """
+    export_rate_kw = progress.grid_rate_kw
+    required_dispatch_kw = export_rate_to_battery_kw(
+        house_load_kw=house_load_kw, pv_kw=pv_kw, export_kw=export_rate_kw
+    )
+    applied_kw = max(0.0, required_dispatch_kw)
+    reason = DISPATCH_LIMIT_NONE
+
+    def bind(cap_kw: float | None, why: str) -> None:
+        nonlocal applied_kw, reason
+        if cap_kw is None:
+            return
+        cap_kw = max(0.0, cap_kw)
+        if cap_kw < applied_kw - 1e-9:
+            applied_kw, reason = cap_kw, why
+
+    # 1. inverter discharge limit.
+    bind(max_discharge_kw, DISPATCH_LIMIT_MAX_DISCHARGE)
+    # 2-3. the reserve, expressed as the discharge the remaining headroom permits.
+    #      A profitable export never unlocks a reserve violation.
+    if reserve_headroom_kwh is not None:
+        bind(
+            max(0.0, reserve_headroom_kwh) / progress.hours,
+            DISPATCH_LIMIT_DYNAMIC_RESERVE,
+        )
+    # 4. the authorised battery discharge for this quarter.
+    bind(progress.battery_rate_kw, DISPATCH_LIMIT_REMAINING_DISCHARGE)
+    # 5. the authorised meter export **is the objective on this path**, so there is
+    #    no separate clamp for it: ``required_dispatch_kw`` was derived from
+    #    ``progress.grid_rate_kw``, which is exactly the remaining authorised export
+    #    over the remaining time. A ``bind`` against the same figure could never
+    #    fire, and a clamp that cannot fire is worse than none -- it reads as
+    #    enforcement. :data:`DISPATCH_LIMIT_REMAINING_EXPORT` still names the
+    #    quantity, and clamp 6 below is what actually bounds the meter domain.
+    # 6. the overshoot guard, against whichever domain binds sooner.
+    bind(
+        tick_energy_cap_kw(progress.battery_remaining_kwh),
+        DISPATCH_LIMIT_TICK_HORIZON,
+    )
+    bind(
+        export_rate_to_battery_kw(
+            house_load_kw=house_load_kw,
+            pv_kw=pv_kw,
+            export_kw=tick_energy_cap_kw(progress.grid_remaining_kwh),
+        ),
+        DISPATCH_LIMIT_REMAINING_EXPORT,
+    )
+    # 7. a known site or grid export limit, converted the same way.
+    if grid_export_limit_kw is not None:
+        bind(
+            export_rate_to_battery_kw(
+                house_load_kw=house_load_kw, pv_kw=pv_kw, export_kw=grid_export_limit_kw
+            ),
+            DISPATCH_LIMIT_GRID_LIMIT,
+        )
+
+    return _finish(
+        desired_grid_kw=-export_rate_kw,
+        house_load_kw=house_load_kw,
+        pv_kw=pv_kw,
+        required_kw=required_dispatch_kw,
+        calculated_kw=required_dispatch_kw,
+        signed_kw=applied_kw,
+        reason=reason,
+        last_applied_kw=last_applied_kw,
+        deadband_kw=deadband_kw,
+    )
+
+
+def _finish(
+    *,
+    desired_grid_kw: float,
+    house_load_kw: float,
+    pv_kw: float,
+    required_kw: float,
+    calculated_kw: float,
+    signed_kw: float,
+    reason: str,
+    last_applied_kw: float | None,
+    deadband_kw: float,
+) -> DispatchDecision:
+    """Quantise, apply the deadband and hysteresis, and assemble the decision.
+
+    Shared by both directions so the write decision cannot differ between them --
+    the deadband, the zero-crossing rule and the reported reason are one
+    implementation, exercised twice.
+    """
+    applied = quantise_kw(signed_kw)
+    if reason == DISPATCH_LIMIT_NONE and abs(applied - signed_kw) > 1e-9:
+        reason = DISPATCH_LIMIT_QUANTISATION
+
+    held = quantise_kw(last_applied_kw) if last_applied_kw is not None else None
+    if held is None:
+        update_needed, update_reason = True, TICK_APPLIED
+    elif not crosses_zero(last_applied_kw or 0.0, applied, deadband_kw):
+        update_needed, update_reason = False, TICK_SKIPPED_DEADBAND
+        applied, reason = held, DISPATCH_LIMIT_DEADBAND
+    elif abs(applied - held) >= deadband_kw:
+        update_needed, update_reason = True, TICK_APPLIED
+    else:
+        update_needed, update_reason = False, TICK_SKIPPED_DEADBAND
+        applied, reason = held, DISPATCH_LIMIT_DEADBAND
+
+    return DispatchDecision(
+        desired_grid_kw=desired_grid_kw,
+        house_load_kw=house_load_kw,
+        pv_kw=pv_kw,
+        required_kw=required_kw,
+        calculated_kw=calculated_kw,
+        applied_kw=applied,
+        achievable_grid_kw=achievable_grid_kw(
+            house_load_kw=house_load_kw, pv_kw=pv_kw, applied_kw=applied
+        ),
+        limited_by=reason,
+        update_needed=update_needed,
+        update_reason=update_reason,
+    )
+
+
+def decide_for_intent(
+    *,
+    intent: str,
+    progress: QuarterProgress,
+    house_load_kw: float,
+    pv_kw: float,
+    limits: ChargeLimits,
+    last_applied_kw: float | None,
+    max_discharge_kw: float | None = None,
+    reserve_headroom_kwh: float | None = None,
+    grid_export_limit_kw: float | None = None,
+    deadband_kw: float = DISPATCH_POWER_DEADBAND_KW,
+) -> DispatchDecision | None:
+    """Return the setpoint for an admitted intent, or ``None`` if it has none.
+
+    The one place the two objectives are selected between, so no caller has to know
+    which domain an intent's target lives in. ``None`` for anything this release
+    does not execute -- a refusal, never a zero setpoint that looks like a decision.
+    """
+    if intent == EXECUTION_INTENT_GRID_CHARGE:
+        return decide_charge(
+            progress=progress,
+            house_load_kw=house_load_kw,
+            pv_kw=pv_kw,
+            limits=limits,
+            last_applied_kw=last_applied_kw,
+            deadband_kw=deadband_kw,
+        )
+    if intent == EXECUTION_INTENT_NET_EXPORT:
+        return decide_export(
+            progress=progress,
+            house_load_kw=house_load_kw,
+            pv_kw=pv_kw,
+            max_discharge_kw=max_discharge_kw,
+            reserve_headroom_kwh=reserve_headroom_kwh,
+            grid_export_limit_kw=grid_export_limit_kw,
+            last_applied_kw=last_applied_kw,
+            deadband_kw=deadband_kw,
+        )
+    return None

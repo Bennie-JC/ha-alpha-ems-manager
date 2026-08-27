@@ -45,6 +45,7 @@ from .const import (
     CONTROL_CUTOFF_MIN_PERCENT,
     CONTROL_DURATION_STEP_MINUTES,
     CONTROL_EXECUTABLE_DISPATCH_MODES,
+    CONTROL_EXECUTABLE_DISPATCH_SIGNS,
     CONTROL_MAX_DURATION_MINUTES,
     CONTROL_MAX_POWER_KW,
     CONTROL_MIN_DURATION_MINUTES,
@@ -863,7 +864,7 @@ def write_refusal(command: DeviceCommand, steps: tuple[CommandStep, ...]) -> str
     return action_refusal(command.action, steps)
 
 
-def dispatch_refusal(steps: tuple[CommandStep, ...]) -> str | None:
+def dispatch_refusal(intent: str | None, steps: tuple[CommandStep, ...]) -> str | None:
     """Return why a Dispatch step list must not be sent, or ``None`` if it may be.
 
     **The sign is part of the barrier, not a downstream check.** On the raw
@@ -871,30 +872,41 @@ def dispatch_refusal(steps: tuple[CommandStep, ...]) -> str | None:
     test that keeps a discharge off the helper families cannot see a wrong-way
     dispatch at all. This is the check that can.
 
-    Two refusals:
+    **Keyed on the intent since beta.27**, because two directions are now
+    executable and "which sign is permitted" is only answerable once you know what
+    is being executed. An intent with no entry in
+    :data:`CONTROL_EXECUTABLE_DISPATCH_SIGNS` is refused outright -- which is how
+    ``serve_load``, the negative-price modes and every unverified direction stay
+    blocked without being enumerated. A **missing** intent fails closed for the
+    same reason.
 
-    * a **positive** power. Negative charges and positive discharges, so a
-      positive figure is the one thing beta.25 must never command. Zero is
-      permitted and has to be: it is what the direction gate produces when the
-      grid target would require a discharge, and it is what the cleanup writes.
-      Holding the battery still is the physical meaning of "do not discharge".
+    Three refusals:
+
+    * a power whose **sign** is not the one this intent may command. Zero is
+      permitted for either: it is what the direction gate produces when the target
+      would need a direction this release cannot send, and what the cleanup writes.
+      Commanding nothing is never the wrong direction.
     * a **mode** outside the executable set, compared by the exact package label.
-      The package parses the number out of the label, so a near-miss string
-      selects a different mode or none at all -- and modes 6 and 7 are not
-      controllable kW primitives in any case, because the package writes the power
-      register as a bare 32000 for anything outside modes 1, 2, 3 and 5.
+      The package parses the number out of the label, so a near-miss string selects
+      a different mode or none at all -- and modes 6 and 7 are not controllable kW
+      primitives in any case, because the package writes the power register as a
+      bare 32000 for anything outside modes 1, 2, 3 and 5.
+    * an **unknown intent**, refused before either of the above is considered.
 
-    Reads no action field and trusts no caller, for the same reason
-    :func:`action_refusal` does: "impossible" is a property of today code.
+    Trusts no caller, for the same reason :func:`action_refusal` does:
+    "impossible" is a property of today's code.
     """
+    sign = CONTROL_EXECUTABLE_DISPATCH_SIGNS.get(intent) if intent else None
     executable = {
         DISPATCH_MODE_LABELS[mode]
         for mode in CONTROL_EXECUTABLE_DISPATCH_MODES
         if mode in DISPATCH_MODE_LABELS
     }
     for step in steps:
-        if step.entity_id == DISPATCH_POWER and (step.value or 0.0) > 0.0:
-            return CONTROL_REFUSE_DISPATCH_SIGN
+        if step.entity_id == DISPATCH_POWER:
+            value = step.value or 0.0
+            if value != 0.0 and (sign is None or (value < 0.0) != (sign < 0)):
+                return CONTROL_REFUSE_DISPATCH_SIGN
         if step.entity_id == DISPATCH_MODE_SELECT and step.option not in executable:
             return CONTROL_REFUSE_DISPATCH_MODE
     return None

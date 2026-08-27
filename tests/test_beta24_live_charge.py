@@ -166,14 +166,20 @@ async def test_a_charge_reaches_the_wire_and_a_discharge_does_not(
     """Both halves on the same boundary, which is the only honest comparison."""
     charge = plan_commands(charge_command())
 
-    assert await async_execute(hass, charge) == len(charge)
+    assert await async_execute(
+        hass, charge, intent=EXECUTION_INTENT_GRID_CHARGE
+    ) == len(charge)
     assert [call.data["entity_id"] for call in writes] == [
         step.entity_id for step in charge
     ]
 
     writes.clear()
     with pytest.raises(ControlActionNotPermitted, match="live_charge_only"):
-        await async_execute(hass, plan_commands(build_command(make_intent())))
+        await async_execute(
+            hass,
+            plan_commands(build_command(make_intent())),
+            intent=EXECUTION_INTENT_GRID_CHARGE,
+        )
     assert writes == []
 
 
@@ -1953,7 +1959,16 @@ def test_a_record_without_an_action_falls_back_to_its_intent() -> None:
     """
     assert action_for_intent(EXECUTION_INTENT_GRID_CHARGE) == ACTION_CHARGE
     assert action_for_intent("serve_load") is None
-    assert action_for_intent("net_export") is None
+    # **Changed deliberately in beta.27**, and the reason is the stop path:
+    # ``net_export`` is executable from beta.27 on, so a stop has to be able to name
+    # the direction it is stopping.
+    #
+    # This maps an intent to a battery *direction* and nothing else. It must never
+    # be used to pick an actuator surface -- doing so is what would have routed an
+    # export onto the Force Discharging helper family, because that family is where
+    # ``ACTION_DISCHARGE`` used to lead. The surface is chosen from
+    # ``CONTROL_LIVE_DISPATCH_INTENTS``, keyed on the intent.
+    assert action_for_intent("net_export") == ACTION_DISCHARGE
     assert action_for_intent(None) is None
 
 
