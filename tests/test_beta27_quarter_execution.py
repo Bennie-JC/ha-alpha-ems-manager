@@ -73,9 +73,16 @@ def quarter_at(
 
 
 def install(coordinator, quarter: CarriedQuarter) -> None:
-    """Put an admitted quarter in place, with its progress reset to zero."""
+    """Put an admitted quarter in place, with its progress reset to zero.
+
+    **The completed history is cleared too**, because since beta.27.1 the fixture
+    admits real quarters of its own and its refreshes finish them -- so a test that
+    counted rows would be counting the fixture's history as well as its own. This
+    helper defines the whole starting state, not just the current quarter.
+    """
     coordinator._quarter = quarter
     coordinator._reset_quarter_progress(quarter)
+    coordinator._completed_quarters.clear()
 
 
 # == 1. the tick executes against the quarter ==============================
@@ -405,9 +412,14 @@ async def test_the_completed_quarter_history_is_bounded(
     )
 
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
+    # ``install`` clears the history by design, so it is called once to establish
+    # the starting state and never inside the loop -- it would reset the very ring
+    # this is filling.
+    install(coordinator, quarter_at(10, 45))
     for step in range(MAX_COMPLETED_QUARTERS_REPORTED + 6):
-        install(coordinator, quarter_at(10, 45) if step % 2 else quarter_at(11, 0))
-        coordinator._record_completed_quarter(coordinator._quarter, QUARTER_END_EXPIRED)
+        coordinator._record_completed_quarter(
+            quarter_at(10, 45) if step % 2 else quarter_at(11, 0), QUARTER_END_EXPIRED
+        )
 
     assert len(coordinator._completed_quarters) == MAX_COMPLETED_QUARTERS_REPORTED
 

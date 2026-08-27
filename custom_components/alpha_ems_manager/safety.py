@@ -73,6 +73,7 @@ from .const import (
     CONTROL_CUTOFF_MAX_PERCENT,
     CONTROL_CUTOFF_MIN_PERCENT,
     CONTROL_EXECUTABLE_ACTIONS,
+    CONTROL_EXECUTABLE_ACTIONS_BY_INTENT,
     CONTROL_EXECUTION_AVAILABLE,
     CONTROL_MAX_POWER_KW,
     CONTROL_MIN_POWER_KW,
@@ -752,12 +753,38 @@ def authorize_export(request: ExportRequest) -> SafetyVerdict:
     return SafetyVerdict(True, None, tuple(checks))
 
 
+def direction_permitted(action: str | None, intent: str | None) -> bool:
+    """Return whether this release may command ``action`` under ``intent``.
+
+    **The single answer to "may this direction execute", and it is intent-aware.**
+    ``CONTROL_EXECUTABLE_ACTIONS`` is the unconditional set and stays charge-only;
+    :data:`CONTROL_EXECUTABLE_ACTIONS_BY_INTENT` is consulted second and unlocks a
+    direction only for the intent that was validated for it.
+
+    That split is the whole point. Widening the unconditional set to admit
+    ``ACTION_DISCHARGE`` would have authorised the Phase-3 reserve guard's
+    discharge as well -- and for that path energy reaching the meter is an
+    accident, which is why ``INHIBIT_WOULD_EXPORT`` exists and is untouched here.
+
+    ``None`` for either argument is refused: an authorisation that cannot name what
+    it is authorising, or under whose authority, is not one.
+    """
+    if action is None:
+        return False
+    if action in CONTROL_EXECUTABLE_ACTIONS:
+        return True
+    if intent is None:
+        return False
+    return action in CONTROL_EXECUTABLE_ACTIONS_BY_INTENT.get(intent, frozenset())
+
+
 def authorize_reset(
     *,
     ownership: str,
     stopping_action: str | None,
     stop_reason: str | None,
     steps_planned: int,
+    intent: str | None = None,
 ) -> ExecutionDecision:
     """Return whether an owned dispatch may be returned to rest.
 
@@ -795,7 +822,11 @@ def authorize_reset(
         # Fails closed. A missing action is never defaulted to a charge: guessing
         # what to stop is how a stop becomes a start in the other direction.
         return ExecutionDecision(False, REFUSE_RESET_ACTION_UNKNOWN)
-    if stopping_action not in CONTROL_EXECUTABLE_ACTIONS:
+    if not direction_permitted(stopping_action, intent):
+        # **A stop is gated the same way a start is, and this is load-bearing.**
+        # Left charge-only, an admitted export could be started and then never
+        # stopped -- the worst failure this path has, because it strands a running
+        # dispatch on the device dead-man instead of a controlled stop.
         return ExecutionDecision(False, REFUSE_LIVE_ACTION_NOT_PERMITTED)
     if not stop_reason:
         return ExecutionDecision(False, REFUSE_RESET_WITHOUT_REASON)
@@ -923,6 +954,7 @@ def authorize_start(
     commands_planned: int,
     starts_or_increases: bool,
     action: str | None = None,
+    intent: str | None = None,
 ) -> ExecutionDecision:
     """Return whether a safe command may actually be sent.
 
@@ -962,7 +994,7 @@ def authorize_start(
         return ExecutionDecision(False, REFUSE_EXECUTION_UNAVAILABLE)
     if commands_planned <= 0:
         return ExecutionDecision(False, REFUSE_NO_COMMANDS)
-    if action not in CONTROL_EXECUTABLE_ACTIONS:
+    if not direction_permitted(action, intent):
         return ExecutionDecision(False, REFUSE_LIVE_ACTION_NOT_PERMITTED)
     # A command that reduces battery movement is exempt: reducing can only
     # reduce risk, and delaying a reduction is the one thing a rate limit must

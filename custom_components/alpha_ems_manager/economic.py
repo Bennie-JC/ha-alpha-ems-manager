@@ -2554,7 +2554,8 @@ def execution_target(
     desired_grid_kw: float | None = None,
     safety_buy_kwh: float | None = None,
     economic_buy_kwh: float | None = None,
-    quarter_schedule: list[dict[str, Any]] | None = None,
+    intervals: tuple[EconomicInterval, ...] = (),
+    moment: Any = None,
 ) -> dict[str, Any]:
     """Return the machine-readable target a future Stage B would consume.
 
@@ -2602,6 +2603,19 @@ def execution_target(
     which would forbid the pack from filling at all.
     """
     intent = EXECUTION_INTENT_GRID_CHARGE if safety_buy else execution_intent(run)
+    # One row per solved interval of this run, off the rows the optimizer already
+    # produced. No new solve, and no economics touched.
+    quarter_rows = (
+        quarter_schedule_for(
+            intervals,
+            start_index=run.start_index,
+            end_index=run.end_index,
+            intent=intent,
+            moment=moment,
+        )
+        if intervals and moment is not None
+        else []
+    )
     battery = run.battery_charge_ac_kwh + run.battery_discharge_ac_kwh
     return {
         "plan_id": _execution_plan_id(intent, window_start),
@@ -2640,7 +2654,24 @@ def execution_target(
         # above are unchanged and still published, so nothing that read the
         # contract before has to change; this is what Stage B executes against,
         # because a run-level rate cannot describe a run's later quarters.
-        "quarter_schedule": quarter_schedule or [],
+        #
+        # **Built here rather than handed in**, which is the beta.27.1 fix. The
+        # rows depend on ``intent``, and ``intent`` is derived *inside* this
+        # function -- so a caller assembling the schedule itself would need a
+        # second copy of that derivation. It had a worse failure than drift: the
+        # parameter was optional, the production call site never passed it, and
+        # every run published an empty list beside a rule describing what the list
+        # would have contained. Taking the rows instead of the result means the
+        # only way to get an empty schedule is to have no rows.
+        "quarter_schedule": quarter_rows,
+        # **Why the list is the length it is.** An empty schedule is a real answer
+        # when a run has no solved rows to publish, and was a *silent bug* when the
+        # call site forgot to pass them. Saying which of the two happened is what
+        # makes the difference visible in a hardware download rather than only in
+        # the source.
+        "quarter_schedule_source": (
+            "solved_intervals" if intervals else "no_intervals_supplied"
+        ),
         "quarter_schedule_rule": (
             "one row per solved interval of this run. battery_kwh is the "
             "objective for a charge and the ceiling for an export; "

@@ -1067,7 +1067,7 @@ REFUSE_NO_COMMANDS: Final = "no_commands"
 #: Not a hazard and not a mode problem: the command is well-formed and may be
 #: perfectly safe, and this release simply does not execute that direction. Named
 #: for what a reader needs to know rather than for the constant that decided it.
-REFUSE_LIVE_ACTION_NOT_PERMITTED: Final = "live_charge_only"
+REFUSE_LIVE_ACTION_NOT_PERMITTED: Final = "live_direction_not_permitted"
 #: A reset was asked for a dispatch Alpha EMS cannot prove it owns.
 #:
 #: The whole entitlement of the stop path, and the reason it can afford to ignore
@@ -1755,9 +1755,15 @@ ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL: Final = "no_primitive_curtail"
 #: The recommendation is a direction this release does not execute.
 #:
 #: Distinct from ``no_primitive_*``, which means no actuator exists at all. A
-#: discharge has a perfectly good actuator; beta.24 simply does not use it yet, and
-#: telling a reader "no primitive" would send them looking for missing hardware.
-ECONOMIC_BLOCKED_LIVE_CHARGE_ONLY: Final = "live_charge_only"
+#: discharge to serve the house has a perfectly good actuator; this release simply
+#: does not use it, and telling a reader "no primitive" would send them looking for
+#: missing hardware.
+#:
+#: **Renamed in beta.27.1**, because the value said ``live_charge_only`` on a
+#: release that also exports -- so a reader watching an export blocked here could
+#: not tell a defect from the documented design. The constant keeps its name for
+#: compatibility with anything importing it; only the published text changed.
+ECONOMIC_BLOCKED_LIVE_CHARGE_ONLY: Final = "live_direction_not_executable"
 
 #: Why the capability plan differs from the desired one. Diagnostics only: the
 #: entity shows the two actions and lets them speak for themselves.
@@ -1935,6 +1941,23 @@ EXECUTION_INTENT_HOLD: Final = "hold"
 #: ``net_export`` onto the Force Discharging family, because that family is where
 #: ``ACTION_DISCHARGE`` used to lead. The surface is chosen from
 #: :data:`CONTROL_LIVE_DISPATCH_INTENTS`, which is keyed on the intent.
+#: Actions an **intent** unlocks beyond the unconditional
+#: :data:`CONTROL_EXECUTABLE_ACTIONS`.
+#:
+#: **Keyed on the intent, and deliberately not merged into that set.** Adding
+#: ``ACTION_DISCHARGE`` there would authorise *every* discharge, the Phase-3
+#: reserve guard's included -- and the reserve guard discharges into the house,
+#: where energy reaching the meter is an accident. What beta.27 authorises is an
+#: **admitted economic export**, a different thing that happens to share a battery
+#: direction.
+#:
+#: So the unconditional set stays charge-only and this is consulted second. An
+#: intent with no entry here unlocks nothing, which is how ``serve_load`` and every
+#: unverified direction stay refused without being enumerated anywhere.
+CONTROL_EXECUTABLE_ACTIONS_BY_INTENT: Final = {
+    EXECUTION_INTENT_NET_EXPORT: frozenset({ACTION_DISCHARGE}),
+}
+
 EXECUTION_INTENT_ACTIONS: Final = {
     EXECUTION_INTENT_GRID_CHARGE: ACTION_CHARGE,
     EXECUTION_INTENT_NET_EXPORT: ACTION_DISCHARGE,
@@ -2043,9 +2066,15 @@ CONTROL_REFUSE_SERVICE_NOT_PERMITTED: Final = "service_not_permitted"
 #:
 #: The last interlock, checked against the step list itself at the send site. It
 #: names no action and reads no intent -- a subset test on entity ids, which is
-#: why it catches a discharge, an export, a raw-dispatch write and an unknown
-#: entity with one comparison and cannot be fooled by a mislabelled command.
-CONTROL_REFUSE_ACTION_NOT_EXECUTABLE: Final = "live_charge_only"
+#: why it catches a helper-family write, a write to an unknown entity and any
+#: entity outside the permitted set with one comparison, and cannot be fooled by a
+#: mislabelled command. Direction on the Dispatch surface is a *value*, so it is
+#: :data:`CONTROL_REFUSE_DISPATCH_SIGN` that catches a wrong-way dispatch.
+#:
+#: **Renamed in beta.27.1**: the value said ``live_charge_only``, which was the
+#: wrong thing to tell a reader on a release that executes two directions. The
+#: constant keeps its name; only the published text changed.
+CONTROL_REFUSE_ACTION_NOT_EXECUTABLE: Final = "entity_not_executable"
 
 #: The owner marker's state, as five distinct facts rather than a boolean.
 #:

@@ -478,10 +478,14 @@ class TickOutcome:
 
 
 _EXECUTION_SCOPE = (
-    "the control pipeline is fully evaluated and only a stage-b grid charge may "
-    "execute: every other direction -- discharge, export, curtailment and the "
-    "phase-3 reserve guard -- is refused at the authorization stage and again at "
-    "the send site, and executes nothing"
+    "the control pipeline is fully evaluated and two stage-b intents may execute: "
+    "grid_charge, and net_export inside an admitted quarter. both use the dispatch "
+    "mode 2 surface only -- negative power charges, positive exports -- and the "
+    "force charging and force discharging helper families are never written for "
+    "either. everything else is refused at the authorization stage and again at "
+    "the send site, and executes nothing: serve_load, the phase-3 reserve guard's "
+    "discharge (which still cannot export, and is still refused by would_export), "
+    "pv curtailment, panel shutdown and dispatch modes 6 and 7"
 )
 
 
@@ -3866,6 +3870,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 stopping_action=reset_action,
                 stop_reason=EXECUTION_STOP_SWITCHED_OFF,
                 steps_planned=len(commands),
+                intent=self._executing_intent(),
             )
             source = "off_reset"
         elif stale_marker(evidence):
@@ -4330,7 +4335,23 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Only while a dispatch is actually running: a record left behind by a
         # completed run must not resurrect it.
         self._adopt_persisted_run(snapshot)
-        outcome = carry_forward(self._carried, self.execution_targets, now)
+        # **Both executable intents, not just the charge.** ``carry_forward``
+        # defaults to charge-only, and beta.27 left the default in place -- so a
+        # ``net_export`` run was never carried at all. Two consequences on real
+        # hardware, and the second was the visible one:
+        #
+        # * no ``CarriedRun``, so no export could ever be admitted; and
+        # * ``stage_b_holds_the_run`` stayed false, which un-suppressed the Phase-3
+        #   reserve-guard fallback -- and that layer only ever discharges, so it
+        #   produced a discharge into the house that ``evaluate`` correctly refused
+        #   with ``would_export``. The reported inhibition was real and correct; it
+        #   was describing a command Stage B never wanted.
+        outcome = carry_forward(
+            self._carried,
+            self.execution_targets,
+            now,
+            executable_intents=CONTROL_LIVE_DISPATCH_INTENTS,
+        )
         self._carried = outcome.carried
         # **The quarter is carried in its own right, and after the run.** After,
         # because a quarter admitted this refresh should be able to name the run
@@ -4692,6 +4713,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ),
                 safety_buy_kwh=attribution.get(run.start_index, (None, None))[0],
                 economic_buy_kwh=attribution.get(run.start_index, (None, None))[1],
+                # **The solved rows, so the per-quarter schedule can be built.**
+                # Omitting these is what published an empty ``quarter_schedule``
+                # for every run in beta.27: the parameter was an optional prebuilt
+                # list, this call site never passed it, and Stage B consequently
+                # admitted no quarter on real hardware while the contract's own
+                # rule string sat beside the empty list describing what should
+                # have been in it.
+                intervals=outcome.desired.intervals,
+                moment=moment,
             )
             target["revision"] = execution_revision(
                 previous.get(target["plan_id"]), target
@@ -6612,6 +6642,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 stopping_action=reset_action,
                 stop_reason=stop_reason,
                 steps_planned=len(commands),
+                # Without this an admitted export could be started and never
+                # stopped, which strands a running dispatch on the device dead-man.
+                intent=self._executing_intent(),
             )
         elif releasing:
             decision = authorize_marker_release(
@@ -6638,6 +6671,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 commands_planned=len(commands),
                 starts_or_increases=starts_or_increases,
                 action=None if command is None else command.action,
+                # **The authority the direction is permitted under.** The
+                # unconditional action set stays charge-only, so the reserve
+                # guard's discharge is refused exactly as before; an admitted
+                # ``net_export`` unlocks the discharge direction and nothing else
+                # does.
+                intent=self._executing_intent(),
             )
 
         state = CONTROL_STATE_INHIBITED

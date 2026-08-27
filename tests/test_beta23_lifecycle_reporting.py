@@ -798,10 +798,19 @@ async def test_the_reason_survives_the_refreshes_after_the_one_that_ended_it(
     assert ending["ended_reason"] == EXECUTION_STOP_STAGE_A_HOLD
 
     # The two refreshes after it -- the ones a real download is taken on.
+    #
+    # **A carried run is no longer proof that the charge did not end.** Since
+    # beta.27.1 ``carry_forward`` admits ``net_export`` as well, so these refreshes
+    # legitimately carry the *export* run that follows -- which is the whole point
+    # of that fix. What this test is about is that the ended reason survives the
+    # refreshes after the one that ended it, so it asserts that, and asserts that no
+    # **charge** was re-admitted.
     for report in reports[9:]:
         carried = report["carried"]
         assert carried["ended_reason"] is None
-        assert carried["run"] is None
+        run = carried["run"]
+        if run is not None:
+            assert run["intent"] == EXECUTION_INTENT_NET_EXPORT, run["intent"]
         assert carried["last_ended"] is not None
         assert carried["last_ended"]["reason"] == EXECUTION_STOP_STAGE_A_HOLD
 

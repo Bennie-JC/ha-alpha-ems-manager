@@ -9,6 +9,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.28] - 2026-08-27
+
+**The beta.27 hardware hotfix.** `beta.27` was installed on the live installation
+and neither of its two headline features worked. Both causes were the same shape: a
+new mechanism was added correctly, and the older gate that *selects* it was left
+answering the older question. Four omissions, no redesign, and Stage A's economics
+untouched.
+
+Anyone running `beta.27` should upgrade. It cannot execute a `net_export` run at
+all, and its quarter envelope never opens.
+
+### Fixed: `quarter_schedule` was empty on every run
+
+The hardware reported `"quarter_schedule": []` for every published run, even after a
+full quarter refresh — so Stage B admitted no quarter, reported
+`quarter_start = null` and `intent = null`, and every sixty-second tick recorded
+`no_admitted_quarter`.
+
+`execution_target` took the schedule as an **optional prebuilt list**, and the
+production call site never passed it. The rule string describing the list was
+published unconditionally beside it, which is exactly why the diagnostics looked
+almost right: the schema was there and only the rows were missing.
+
+The rows are now the **input** rather than the result. `execution_target` takes the
+solved interval rows and builds the schedule itself, where the intent it depends on
+has already been derived — so a caller can no longer assemble it wrongly, or forget
+it. A new `quarter_schedule_source` field says whether rows were supplied at all, so
+an empty schedule and an unwired call site are never again the same observation in a
+download.
+
+### Fixed: `would_export` blocked every intentional export
+
+The hardware reported `inhibit_reason = would_export` and `authorized = false` on a
+planned export. **The inhibition itself was correct** — `evaluate` was refusing a
+genuine Phase-3 reserve-guard discharge into the house. What was wrong is that the
+reserve guard was asked for a command at all on a refresh where Stage A wanted to
+export.
+
+Three causes, in a chain:
+
+- `carry_forward` kept its **charge-only default**, so a `net_export` run was never
+  carried. It now receives both executable intents.
+- With nothing carried, the guard that suppresses the reserve-guard fallback while
+  Stage B holds a run was false — so the fallback took the wheel, and it only ever
+  discharges. Fixing the first cause fixes this one.
+- Both authorisation gates tested the action against an **unconditionally
+  charge-only** set, so an export would have been refused `live_charge_only` even
+  once it reached them. Worse, `authorize_reset` used the same test — so an export
+  could have been started and then never stopped, stranding a running dispatch on
+  the device dead-man.
+
+The action gates are now **intent-aware**, through one new function.
+`CONTROL_EXECUTABLE_ACTIONS` stays charge-only and unconditional; a second
+intent-keyed map unlocks the discharge direction for `net_export` and for nothing
+else. That split is the point: widening the unconditional set would have authorised
+every discharge, the reserve guard's included.
+
+**No existing safety function changed.** `evaluate`, `absorbing_capacity_kw`,
+`safe_discharge_power_kw` and `limit_command` are untouched, `INHIBIT_WOULD_EXPORT`
+still refuses a reserve-guard discharge above the measured absorbing capacity, and
+`serve_load` is still blocked — now asserted from both directions in tests.
+
+### Diagnostic strings that had gone stale
+
+Four published strings still told a reader that only a grid charge could execute, on
+a release that also exports — which made a hardware download ambiguous about whether
+a refused export was a defect or the documented design. The scope strings now name
+both executable intents and, explicitly, what remains blocked: `serve_load`, the
+reserve guard's discharge (which still cannot export), PV curtailment, panel
+shutdown and Dispatch modes 6 and 7. Two refusal reasons were renamed from
+`live_charge_only` to say what they actually refuse.
+
+### One semantic expectation changed, deliberately
+
+A `beta.25` test asserted that the battery setpoint eases back when production
+collapses. Under the quarter objective it does not: a charge aims at the **battery**
+figure, and production changes what the charge *costs* rather than what it *is*. That
+assertion described the `beta.26` meter-targeting behaviour the asymmetric design
+replaced on purpose — and it had continued to pass in `beta.27` only because the
+quarter was never admitted. It has been re-aimed at what the release guarantees, and
+the grid-consequence direction it used to cover is now asserted separately.
+
+Two other tests were adjusted for the same reason: with the schedule actually
+published, the shared fixture's quarter is planned at the full inverter limit, so
+its setpoint saturates and could not discriminate. The quarter is given explicit
+headroom rather than the assertions being loosened.
+
 ## [1.0.0-beta.27] - 2026-08-27
 
 **Quarter-accurate execution, and Live net export.** Everything in `beta.26` plus
@@ -3873,7 +3960,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.27...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.28...HEAD
+[1.0.0-beta.28]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.27...v1.0.0-beta.28
 [1.0.0-beta.27]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.26...v1.0.0-beta.27
 [1.0.0-beta.11]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.10...v1.0.0-beta.11
 [1.0.0-beta.10]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.9...v1.0.0-beta.10

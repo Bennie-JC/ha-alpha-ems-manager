@@ -65,6 +65,29 @@ def live_surface(hass: HomeAssistant, control_surface: None) -> LiveSurface:
     return LiveSurface(hass)
 
 
+def _give_the_quarter_headroom(coordinator) -> None:
+    """Lower the admitted quarter's target so the setpoint is not saturated.
+
+    This fixture's quarter is planned at the full 5.0 kW inverter limit, so every
+    correction inside it clamps and the applied setpoint cannot move. Halving the
+    target leaves the same arithmetic room to respond, which is what the tests
+    below are actually about.
+
+    Only the target moves. The window, the intent, the provenance and the frozen
+    admission cap are untouched, so the authority rules still govern it exactly as
+    they would in production.
+    """
+    from dataclasses import replace
+
+    quarter = coordinator._quarter
+    assert quarter is not None, "the fixture should admit a quarter since beta.27.1"
+    coordinator._quarter = replace(
+        quarter,
+        battery_target_kwh=quarter.battery_target_kwh / 2.0,
+        grid_authorised_kwh=quarter.grid_authorised_kwh / 2.0,
+    )
+
+
 def touched(surface: LiveSurface) -> set[str]:
     """Return every entity the surface was asked to write."""
     return {call.data["entity_id"] for call in surface.calls}
@@ -344,13 +367,26 @@ async def test_the_tick_corrects_the_setpoint_when_production_moves(
     instead of the difference leaving or entering through it. A fifteen-minute
     setpoint could do neither, which is what caused the incident.
 
-    Started from a **deliberately unclamped** state: with production at three
-    kilowatts the required charge already exceeds the inverter limit, so raising
-    it further would change nothing and the test would prove nothing.
+    Started from a **deliberately unclamped** state: at the inverter's configured
+    5.0 kW the quarter's own required rate already saturates it, so the setpoint
+    would read -5.0 whatever production did and the test would prove nothing.
+
+    **The admitted quarter is given headroom for this test**, and that is the point
+    of it. Since beta.27.1 the quarter schedule is actually published, so this tick
+    runs on the quarter arithmetic -- and this fixture's quarter asks for 1.25 kWh
+    in fifteen minutes, which is exactly the configured 5.0 kW inverter limit. A
+    quarter Stage A planned at full power is saturated by construction, so raising
+    the inverter limit cannot help: Stage A simply plans to use it. Lowering the
+    quarter's own target is what leaves the setpoint room to move.
+
+    While the schedule was never wired this fixture ran the beta.26 run-level path
+    and sat below the limit, which is to say this test was passing for the wrong
+    reason.
     """
     from .conftest import PV_POWER, set_sensor
 
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
+    _give_the_quarter_headroom(coordinator)
 
     async def tick(minute: int, production: int) -> float | None:
         set_sensor(hass, PV_POWER, production, "W", "power")
@@ -363,24 +399,77 @@ async def test_the_tick_corrects_the_setpoint_when_production_moves(
     dark = await tick(46, 0)
     assert dark is not None and dark < 0.0
 
-    # Production rises: the battery absorbs it, so the charge deepens.
+    # Production rises. With the grid ceiling binding -- which is the case here,
+    # because production is the only other thing that may fund the charge -- more
+    # production raises the permitted rate, so the charge deepens.
     risen = await tick(47, 1500)
     assert risen is not None
     assert risen < dark, (risen, dark)
 
-    # And collapses: the charge eases back rather than the house importing more.
+    # **And now the part that changed in beta.27, deliberately.** Under the quarter
+    # objective the battery setpoint tracks the *objective*, not production: the
+    # battery figure is what a charge aims at, and the grid authorisation is only a
+    # ceiling on how much of it may be bought. So when production collapses the
+    # setpoint does **not** ease back on its own account -- it eases back only if
+    # the ceiling it was resting on has fallen below the objective.
+    #
+    # That is the whole point of the asymmetric design: production changes what the
+    # charge *costs*, not what the charge *is*. beta.26 targeted the meter directly
+    # and so tracked production in both directions; treating an unspent grid
+    # authorisation as an amount to consume is exactly the fault that replaced.
+    # ``test_beta27_progress_objective`` holds the counterexample.
     collapsed = await tick(48, 0)
     assert collapsed is not None
-    assert collapsed > risen, (collapsed, risen)
+    assert collapsed >= risen, (collapsed, risen)
+    # It never deepened on collapsing production, which would be the real fault.
+    assert collapsed <= 0.0
     # **Stage B never bought more than Stage A authorised.** The target is
     # untouched throughout -- only the physical setpoint moved.
     assert coordinator._carried is not None
     assert coordinator._carried.target.desired_grid_kw == pytest.approx(2.1, abs=5.0)
 
-    # Every write was material, and there was at most one per tick.
+    # **Every write was material, and there was at most one per tick.** The count
+    # is no longer asserted at two or more: under the quarter objective the setpoint
+    # holds still whenever the objective and the ceiling both hold still, and a
+    # write that changed nothing is the thing this asserts against. What matters is
+    # that something moved and that nothing was written twice with the same value.
     powers = [call.data["value"] for call in live_surface.steps_of(DISPATCH_POWER)]
-    assert len(powers) >= 2, powers
+    assert powers, powers
     assert all(a != b for a, b in pairwise(powers)), powers
+    assert len(powers) <= 3, powers
+
+
+async def test_production_changes_what_the_charge_costs_not_what_it_is(
+    hass: HomeAssistant,
+    config_data: dict,
+    source_entities: None,
+    frank,
+    live_surface: LiveSurface,
+) -> None:
+    """The beta.27 replacement for the direction the test above no longer asserts.
+
+    The grid *consequence* is what production moves. With the objective unchanged,
+    a larger production surplus means the same battery rate is met with less import
+    -- and the setpoint's implied grid figure is what shows it.
+    """
+    from .conftest import PV_POWER, set_sensor
+
+    coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
+    _give_the_quarter_headroom(coordinator)
+
+    def grid_of(production: int) -> float:
+        set_sensor(hass, PV_POWER, production, "W", "power")
+        decision = coordinator._dispatch_setpoint(local(NORMAL, 10, 46))
+        assert decision is not None
+        return decision.desired_grid_kw
+
+    poor = grid_of(0)
+    await hass.async_block_till_done()
+    rich = grid_of(6000)
+    await hass.async_block_till_done()
+
+    # More production, strictly less grid asked of the meter for the same charge.
+    assert rich < poor, (rich, poor)
 
 
 async def test_the_tick_writes_nothing_for_a_sub_deadband_wobble(
@@ -394,6 +483,9 @@ async def test_the_tick_writes_nothing_for_a_sub_deadband_wobble(
     from .conftest import PV_POWER, set_sensor
 
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
+    # The same headroom as the test above, and for the same reason: a saturated
+    # setpoint cannot move, so a deadband test on it would prove nothing.
+    _give_the_quarter_headroom(coordinator)
     live_surface.calls.clear()
 
     # Well inside the 0.2 kW band, and expressed from it so the two cannot drift.

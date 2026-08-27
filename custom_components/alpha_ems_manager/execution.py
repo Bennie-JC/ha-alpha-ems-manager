@@ -2530,10 +2530,12 @@ def as_dict(decision: Decision, *, mode: str, executed: bool) -> dict[str, Any]:
         },
         "notes": list(decision.notes),
         "execution_scope": (
-            "since beta.24 this is the one path that can execute, and only for a "
-            "grid charge. in shadow it computes the command a live run would send "
-            "and sends none, so applied_kw is zero; in live a charge may be sent "
-            "and every other direction is refused twice over. the field was called "
-            "controls_nothing while that was true of every release"
+            "since beta.24 this is the one path that can execute. beta.27 executes "
+            "two intents: grid_charge, and net_export inside an admitted quarter. "
+            "in shadow it computes the command a live run would send and sends "
+            "none, so applied_kw is zero. in live either of those two may be sent "
+            "on the dispatch mode 2 surface; serve_load, the reserve guard's "
+            "discharge, curtailment and modes 6/7 are refused twice over. the "
+            "field was called controls_nothing while that was true of every release"
         ),
     }

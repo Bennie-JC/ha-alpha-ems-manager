@@ -174,7 +174,7 @@ async def test_a_charge_reaches_the_wire_and_a_discharge_does_not(
     ]
 
     writes.clear()
-    with pytest.raises(ControlActionNotPermitted, match="live_charge_only"):
+    with pytest.raises(ControlActionNotPermitted, match="entity_not_executable"):
         await async_execute(
             hass,
             plan_commands(build_command(make_intent())),

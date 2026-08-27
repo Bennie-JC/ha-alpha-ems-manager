@@ -586,7 +586,7 @@ async def test_the_executor_refuses_even_when_called_directly(
     # dispatch running without it is somebody else's by construction.
     assert len(steps) == 6
 
-    with pytest.raises(ControlActionNotPermitted, match="live_charge_only"):
+    with pytest.raises(ControlActionNotPermitted, match="entity_not_executable"):
         await async_execute(hass, steps, intent=EXECUTION_INTENT_GRID_CHARGE)
 
 
@@ -611,7 +611,7 @@ async def test_the_executor_sends_nothing_before_it_refuses(
 
     steps = plan_commands(build_command(make_intent(energy_ac_kwh=0.5)))
 
-    with pytest.raises(ControlActionNotPermitted, match="live_charge_only"):
+    with pytest.raises(ControlActionNotPermitted, match="entity_not_executable"):
         await async_execute(hass, steps, intent=EXECUTION_INTENT_GRID_CHARGE)
 
     assert captured_calls == []
@@ -736,7 +736,18 @@ async def test_the_diagnostics_carry_the_whole_pipeline(
         "execution_scope",
     ):
         assert key in control, key
-    assert "only a stage-b grid charge may execute" in control["execution_scope"]
+    # **Updated for beta.27**, where the scope genuinely is two intents. Stale
+    # wording here would have been worse than cosmetic: this string is what a
+    # hardware download is read against, and it told a reader that export could not
+    # execute on a release that executes it.
+    scope = control["execution_scope"]
+    assert "two stage-b intents may execute" in scope
+    assert "grid_charge" in scope
+    assert "net_export inside an admitted quarter" in scope
+    # And the things that still cannot, named so the download stays unambiguous.
+    assert "serve_load" in scope
+    assert "still cannot export" in scope
+    assert "modes 6 and 7" in scope
 
 
 async def test_every_diagnostics_list_stays_within_the_cap(

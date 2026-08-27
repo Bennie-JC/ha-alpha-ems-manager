@@ -232,7 +232,7 @@ async def test_the_same_step_list_for_a_discharge_is_refused_as_one_unit(
     with pytest.raises(ControlActionNotPermitted) as raised:
         await async_execute(hass, steps, intent=EXECUTION_INTENT_GRID_CHARGE)
 
-    assert raised.value.reason == "live_charge_only"
+    assert raised.value.reason == "entity_not_executable"
     assert set(raised.value.entity_ids) == set(DISCHARGE_FAMILY.entities) - {
         DISCHARGE_FAMILY.timer
     }
