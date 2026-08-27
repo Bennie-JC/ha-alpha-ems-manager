@@ -2326,7 +2326,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     **self._export_limits(quarter, now),
                 )
                 if decision is not None:
-                    self._note_quarter_clamp(getattr(decision, "reason", None))
+                    self._note_quarter_clamp(decision.limited_by)
                     return decision
         return self._setpoint_for(
             None if self._carried is None else self._carried.target, now

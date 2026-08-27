@@ -426,9 +426,16 @@ def permitted_sign(intent: str | None) -> int | None:
 def sign_matches_intent(intent: str | None, power_kw: float) -> bool:
     """Return whether a signed power is the direction ``intent`` is allowed.
 
-    Zero always matches: it is what the direction gate produces when the target
-    would require a direction this release cannot command, and it is what the
-    cleanup writes. Commanding nothing is never the wrong direction.
+    Zero matches any **known** intent: it is what the direction gate produces when
+    the target would require a direction this release cannot command, and commanding
+    nothing is never the wrong direction.
+
+    An **unknown or missing** intent matches nothing at all, zero included, because
+    the question this function answers is "may this be commanded under this
+    authority?" and there is no authority. Deliberately stricter than
+    :func:`alphaess_device.dispatch_refusal`, which does permit a zero power with no
+    intent -- it has to, because the cleanup writes zero precisely when the run that
+    authorised it is over.
     """
     sign = permitted_sign(intent)
     if sign is None:
@@ -633,6 +640,25 @@ def decide_export(
     never compared.
     """
     export_rate_kw = progress.grid_rate_kw
+    # **No authorised export left means no discharge at all.** Not the discharge the
+    # identity would give: with the meter target spent, ``house - pv + 0`` is the
+    # power that would hold the meter at zero by supplying the house from the pack.
+    # That is ``serve_load``, which this release does not execute and which has no
+    # published meter target to be measured against -- so producing it here would
+    # execute a blocked intent under an export authorisation, on the tick path,
+    # every time an export finished early.
+    if export_rate_kw <= 0.0:
+        return _finish(
+            desired_grid_kw=house_load_kw - pv_kw,
+            house_load_kw=house_load_kw,
+            pv_kw=pv_kw,
+            required_kw=0.0,
+            calculated_kw=0.0,
+            signed_kw=0.0,
+            reason=DISPATCH_LIMIT_REMAINING_EXPORT,
+            last_applied_kw=last_applied_kw,
+            deadband_kw=deadband_kw,
+        )
     required_dispatch_kw = export_rate_to_battery_kw(
         house_load_kw=house_load_kw, pv_kw=pv_kw, export_kw=export_rate_kw
     )
