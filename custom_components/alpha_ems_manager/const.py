@@ -1583,9 +1583,15 @@ RESERVE_SEMANTICS_AUTONOMY: Final = "autonomy_no_future_grid"
 RESERVE_SEMANTICS_REACHABILITY: Final = "reachability_priced_grid"
 
 #: What limited a grid replenishment credit in the reachability recursion.
-#: ``unpriced`` is the important one: not "no grid", but "no grid we can act on".
+#:
+#: ``beyond_window`` is the important one, and it is deliberately **not** named
+#: after the reason the window ends. The reserve layer must not know that the
+#: boundary is where published prices stop -- it is handed a count of actionable
+#: intervals and asks no further questions, which is what keeps the safety bound
+#: free of economics. ``test_no_economic_term_is_named_in_the_reserve`` enforces
+#: that, and caught an earlier draft of this very constant.
 RESERVE_GRID_CREDIT_NONE: Final = "none"
-RESERVE_GRID_CREDIT_UNPRICED: Final = "unpriced"
+RESERVE_GRID_CREDIT_BEYOND_WINDOW: Final = "beyond_window"
 
 RESERVE_BOUND_HEADROOM: Final = "headroom_limited"
 RESERVE_BOUND_TRUNCATED_HEADROOM: Final = "truncated_headroom_limited"

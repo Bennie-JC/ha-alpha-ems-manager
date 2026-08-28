@@ -71,11 +71,16 @@ def prices_for(spread: float):
     )
 
 
-def solved(*, spread: float, margin: float, gain: float = 0.0):
+def solved(*, spread: float, margin: float, gain: float = 0.0, throughput: float = 0.0):
     """Return an outcome through the **real executor path**, not through ``solve``.
 
     Going through ``_solve_economic`` is the whole point: it is the layer that
     dropped the value, so a test that called ``solve`` would pass against the bug.
+
+    Deliberately **positional**, exactly as ``async_add_executor_job`` calls it.
+    That is what makes this suite able to catch a parameter added to the signature
+    and forgotten at the call site -- and beta.31 adding a third economic term is
+    precisely the change that could reintroduce the original fault.
     """
     return coordinator_module._solve_economic(
         LIMITS,
@@ -88,6 +93,7 @@ def solved(*, spread: float, margin: float, gain: float = 0.0):
         0.0,
         gain,
         margin,
+        throughput,
         True,
         True,
     )
@@ -134,6 +140,71 @@ def test_the_configured_margin_reaches_the_solve_call(monkeypatch) -> None:
     # And in its own slot: a positional mix-up would have swapped these two and
     # applied the trade gain as a per-kWh margin.
     assert seen["minimum_trade_gain_eur"] == 0.10
+
+
+def test_the_configured_throughput_cost_reaches_the_solve_call(monkeypatch) -> None:
+    """**The same guard for beta.31's third term, and for the same reason.**
+
+    Three economic terms now cross this boundary positionally. Two of them were
+    already spied on here; a third arriving without its own assertion is how the
+    original defect would return, because its default is zero and a stock install
+    would never notice.
+    """
+    seen: dict[str, object] = {}
+    real = coordinator_module.build_outcome
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(coordinator_module, "build_outcome", spy)
+
+    solved(spread=0.30, margin=0.25, gain=0.10, throughput=0.04)
+
+    assert seen["battery_throughput_cost_eur_per_kwh"] == 0.04
+    # Each in its own slot. All three are euros-per-something, so a positional
+    # slip would be silent and would charge movement as though it were purchase.
+    assert seen["grid_charge_margin_eur_per_kwh"] == 0.25
+    assert seen["minimum_trade_gain_eur"] == 0.10
+
+
+def test_the_three_economic_terms_have_disjoint_bases() -> None:
+    """**Case Y: no double counting, asserted on the bases rather than the totals.**
+
+    The three gates are all denominated in euros and all reduce buying, so the
+    only thing keeping them from double-charging the same energy is that each is
+    charged on a *different quantity*: one per run, one per grid-caused charge
+    kWh, one per kWh of movement in either direction.
+
+    A throughput cost is charged on a discharge; a grid-charge margin is not. If
+    that ever stopped being true, the two would be the same term under two names
+    and setting both would silently penalise buying twice.
+    """
+    plain = solved(spread=0.30, margin=0.0, gain=0.0)
+    with_margin = solved(spread=0.30, margin=0.05, gain=0.0)
+    with_throughput = solved(spread=0.30, margin=0.0, gain=0.0, throughput=0.05)
+
+    assert plain is not None and with_margin is not None
+    assert with_throughput is not None
+
+    # The margin's base is purchased energy only.
+    assert with_margin.desired.grid_charge_margin_eur > 0.0
+    assert with_margin.desired.battery_throughput_cost_eur == 0.0
+
+    # The throughput term's base includes the discharge half, which the margin
+    # cannot see at all -- so it is strictly larger than the purchased energy.
+    assert with_throughput.desired.battery_throughput_cost_eur > 0.0
+    assert with_throughput.desired.grid_charge_margin_eur == 0.0
+    assert (
+        with_throughput.desired.battery_throughput_kwh
+        > with_throughput.desired.marginal_grid_charge_kwh
+    )
+
+    # And neither is folded into ``cost_eur``, which must keep reconciling to
+    # grid energy at the interval's own prices.
+    assert plain.desired.cost_eur == pytest.approx(with_margin.desired.cost_eur) or (
+        with_margin.desired.planned_charge_ac_kwh <= plain.desired.planned_charge_ac_kwh
+    )
 
 
 def test_the_executor_call_passes_every_parameter_it_declares() -> None:
@@ -307,6 +378,7 @@ def test_the_margin_does_not_alter_export_allocation() -> None:
             0.0,
             0.0,
             margin,
+            0.0,
             False,
             True,
         )

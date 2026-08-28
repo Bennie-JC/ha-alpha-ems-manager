@@ -504,15 +504,25 @@ def test_the_headroom_flag_cannot_select_a_model() -> None:
 
 
 def test_the_authoritative_figure_is_named_once_and_the_rest_are_labelled() -> None:
-    """One authoritative builder, and two builders that say what they are.
+    """Two builders that answer different questions, and two counterfactuals.
 
-    Names carry the contract here: a reader reaching for a reserve gets
-    ``build_reserve``, and the two counterfactuals cannot be mistaken for it.
+    Names carry the contract here, and beta.31 made the contract explicit rather
+    than implied. ``build_reserve`` answers *"how much if we never buy again?"* --
+    an **autonomy** question -- and for six releases that figure was also the hard
+    floor the economic solver obeyed, which immobilised 96.9 % of the usable pack
+    on the reference installation against a 20 % physical floor.
+
+    ``build_reserve_reachable`` answers the question a hard bound should ask: *can
+    the pack hold the floor given replenishment that is physically possible and
+    actionable?* It is the one the production solver consumes. The autonomy figure
+    remains, published and consumed by diagnostics alone -- pinned by
+    ``test_the_autonomy_requirement_reaches_no_production_solve``.
     """
     public = {name for name in vars(reserve_module) if name.startswith("build_reserve")}
 
     assert public == {
         "build_reserve",
+        "build_reserve_reachable",
         "build_reserve_same_interval_only",
         "build_reserve_pv_blind",
         "build_reserve_snapshot",

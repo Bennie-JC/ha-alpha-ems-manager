@@ -116,7 +116,7 @@ from .const import (
     RESERVE_BOUND_TRUNCATED_HEADROOM,
     RESERVE_FINGERPRINT_CHARS,
     RESERVE_GRID_CREDIT_NONE,
-    RESERVE_GRID_CREDIT_UNPRICED,
+    RESERVE_GRID_CREDIT_BEYOND_WINDOW,
     RESERVE_HORIZON_CLOSED,
     RESERVE_HORIZON_TRUNCATED,
     RESERVE_MODEL_VERSION,
@@ -184,7 +184,7 @@ class ReserveInterval:
     grid_credit_allowed: bool = False
     #: What limited the grid credit, when one was attempted. ``none`` when it was
     #: unlimited, and ``unpriced`` beyond the horizon the optimiser can act in.
-    grid_credit_binding: str = RESERVE_GRID_CREDIT_UNPRICED
+    grid_credit_binding: str = RESERVE_GRID_CREDIT_BEYOND_WINDOW
 
 
 # -- the projection ----------------------------------------------------------
@@ -560,7 +560,7 @@ def _build(
     unserved: list[float] = [0.0] * total
     credited: list[float] = [0.0] * total
     grid_credited: list[float] = [0.0] * total
-    grid_binding: list[str] = [RESERVE_GRID_CREDIT_UNPRICED] * total
+    grid_binding: list[str] = [RESERVE_GRID_CREDIT_BEYOND_WINDOW] * total
     excess: list[float] = [0.0] * total
     constraints: list[tuple[str, ...]] = [()] * total
 

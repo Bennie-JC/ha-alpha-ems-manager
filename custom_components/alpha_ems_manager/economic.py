@@ -1930,6 +1930,14 @@ class EconomicOutcome:
     #: one where alignment regressed a direction keeps the beta.16 bucket.
     bucket_rule: str = ECONOMIC_BUCKET_RULE_CONSTANT
     safety_buy_runs: tuple[int, ...] = ()
+    #: The economic terms this outcome was solved under, published so a reader
+    #: never has to guess which thresholds produced the plan -- and so a replay
+    #: can reproduce it exactly. ``grid_charge_margin`` in particular spent a
+    #: release invisible, which is why no historical decision is reproducible.
+    edge_value_eur_per_kwh: float = 0.0
+    edge_creditable_kwh: float = float("inf")
+    battery_throughput_cost_eur_per_kwh: float = 0.0
+    grid_charge_margin_eur_per_kwh: float = 0.0
     #: Per charge run, ``(safety_buy_kwh, economic_buy_kwh)``, keyed by start
     #: index. Diagnostics only: nothing in :func:`solve` reads it, and it is
     #: derived from a solve that already happened rather than a new one.
@@ -2195,6 +2203,9 @@ def build_outcome(
     table_ms: float = 0.0,
     bucket_rule: str = ECONOMIC_BUCKET_RULE_CONSTANT,
     grid_charge_margin_eur_per_kwh: float = 0.0,
+    battery_throughput_cost_eur_per_kwh: float = 0.0,
+    edge_value_eur_per_kwh: float = 0.0,
+    edge_creditable_kwh: float = float("inf"),
 ) -> EconomicOutcome:
     """Run both solves and the label solve, and derive everything published.
 
@@ -2211,24 +2222,33 @@ def build_outcome(
     desired_permitted = frozenset(desired_actions)
     capability_permitted = frozenset(desired_actions & IMPLEMENTED_ACTIONS)
 
+    # Shared by every solve, so the only thing that differs between them stays
+    # the *reserve*. A relaxed plan priced on different economics would not be a
+    # counterfactual, it would be a different question.
+    economics = {
+        "minimum_trade_gain_eur": minimum_trade_gain_eur,
+        "grid_charge_margin_eur_per_kwh": grid_charge_margin_eur_per_kwh,
+        "battery_throughput_cost_eur_per_kwh": battery_throughput_cost_eur_per_kwh,
+        "edge_value_eur_per_kwh": edge_value_eur_per_kwh,
+        "edge_creditable_kwh": edge_creditable_kwh,
+    }
+
     started = time.perf_counter()
     desired = solve(
         table=table,
         horizon=horizon,
         start_energy_kwh=start_energy_kwh,
         terminal_floor_kwh=terminal_floor_kwh,
-        minimum_trade_gain_eur=minimum_trade_gain_eur,
         permitted=desired_permitted,
-        grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
+        **economics,
     )
     capability = solve(
         table=table,
         horizon=horizon,
         start_energy_kwh=start_energy_kwh,
         terminal_floor_kwh=terminal_floor_kwh,
-        minimum_trade_gain_eur=minimum_trade_gain_eur,
         permitted=capability_permitted,
-        grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
+        **economics,
     )
     relaxed_horizon = EconomicHorizon(
         demands=horizon.demands,
@@ -2241,9 +2261,8 @@ def build_outcome(
         horizon=relaxed_horizon,
         start_energy_kwh=start_energy_kwh,
         terminal_floor_kwh=terminal_floor_kwh,
-        minimum_trade_gain_eur=minimum_trade_gain_eur,
         permitted=desired_permitted,
-        grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
+        **economics,
     )
 
     # There is no fourth solve any more, and no comparison to publish.
@@ -2274,6 +2293,10 @@ def build_outcome(
         bucket_rule=bucket_rule,
         table_ms=table_ms,
         solve_ms=solve_ms,
+        edge_value_eur_per_kwh=edge_value_eur_per_kwh,
+        edge_creditable_kwh=edge_creditable_kwh,
+        battery_throughput_cost_eur_per_kwh=battery_throughput_cost_eur_per_kwh,
+        grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
         safety_buy_runs=_safety_buy_runs(desired, relaxed, table.bucket_kwh),
         safety_buy_attribution=_safety_buy_attribution(desired, relaxed),
     )
