@@ -1162,13 +1162,33 @@ def reserve_as_dict(
             "charges or discharges because of it, and never consults a price"
         ),
         "model_version": RESERVE_MODEL_VERSION,
+        # **Renamed in substance, kept in name.** ``authoritative`` was the right
+        # word for six releases and is now the wrong one: this figure is the
+        # **autonomy** requirement -- what must be stored if the grid is never used
+        # again -- and since beta.31 no solve consumes it. The keys stay so nothing
+        # downstream breaks; the semantics are stated so nobody reads it as a floor
+        # again. What the planner obeys is published under ``economic.reachability``.
         "authoritative": {
             "required_reserve_kwh": _round_kwh(required),
+            "autonomy_requirement_kwh": _round_kwh(required),
             "required_reserve_soc_percent": _round_soc(
                 projection.required_now_soc_percent
             ),
             "reachable": projection.reachable,
             "lower_bound_reason": projection.lower_bound_reason,
+            "semantics": projection.semantics,
+            "credits": ["pv"],
+            "assumes": "no_future_grid",
+            "consumed_by": "diagnostics_only",
+            "superseded_note": (
+                "this is the autonomy requirement and nothing enforces it. until "
+                "beta.31 it was Stage A's hard lexicographic floor, which on the "
+                "reference installation demanded 73 percent state of charge "
+                "against a 20 percent physical floor -- immobilising 96.9 percent "
+                "of the usable pack and making purchases compulsory at any price. "
+                "the planner now obeys the reachability requirement instead, which "
+                "credits replenishment that is physically possible and actionable"
+            ),
             "basis": RESERVE_BASIS,
         },
         "floor": {

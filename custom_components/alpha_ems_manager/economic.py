@@ -113,6 +113,12 @@ from .battery import (
 )
 from .const import (
     BATTERY_KWH_PRECISION,
+    BUY_REASON_ARBITRAGE,
+    BUY_REASON_FUTURE_SELF_USE,
+    BUY_REASON_MIXED,
+    BUY_REASON_REACHABILITY,
+    BUY_REASON_UNCERTAINTY,
+    BUY_REASON_UNKNOWN,
     ECONOMIC_ACTION_CHARGE,
     ECONOMIC_ACTION_CURTAIL,
     ECONOMIC_ACTION_DISCHARGE,
@@ -1978,6 +1984,10 @@ class EconomicOutcome:
     #: makes reachability honest: grid replenishment is credited inside it and
     #: never beyond it.
     actionable_interval_count: int = 0
+    #: The only compulsory purchase, ``max(0, reachability_now - stored)``. Carried
+    #: on the outcome because it needs the pack's *state*, which the solver does
+    #: not see -- and because every published purchase is attributed against it.
+    bridge_kwh_now: float | None = None
     #: Per charge run, ``(safety_buy_kwh, economic_buy_kwh)``, keyed by start
     #: index. Diagnostics only: nothing in :func:`solve` reads it, and it is
     #: derived from a solve that already happened rather than a new one.
@@ -2345,6 +2355,9 @@ def build_outcome(
         reachability=reachability,
         uncertainty=uncertainty,
         actionable_interval_count=actionable_interval_count,
+        bridge_kwh_now=(
+            None if reachability is None else reachability.bridge_kwh(start_energy_kwh)
+        ),
         safety_buy_runs=_safety_buy_runs(desired, relaxed, table.bucket_kwh),
         safety_buy_attribution=_safety_buy_attribution(desired, relaxed),
     )
@@ -2552,12 +2565,115 @@ ECONOMIC_DECIDES_NOTHING: str = (
 )
 
 
+def classify_purchase(
+    run: EconomicRun,
+    *,
+    bridge_kwh_now: float | None,
+    uncertainty_dc_kwh: float | None,
+    edge_value_eur_per_kwh: float,
+    survives_to_edge_kwh: float,
+) -> dict[str, Any]:
+    """Return why this charge run exists, and how much of it was unavoidable.
+
+    **Derived, never asserted.** The rule is the split between energy the physics
+    compelled and energy an economic gate let through:
+
+    * ``bridge_kwh_now`` is the *only* compulsory quantity -- what the pack needs
+      right now to stay reachable. Zero means nothing at all was compulsory.
+    * Whatever the run buys beyond it is discretionary, and had to clear the trade
+      gain, the grid-charge margin and the throughput cost to be here.
+
+    The discretionary half is then attributed by where its value comes from:
+    arbitrage if the run's own marginal cost is negative -- it pays for itself
+    inside the horizon -- and future self-use if it does not, meaning the payoff is
+    inventory surviving to the horizon edge at ``edge_value``.
+
+    A figure that cannot be derived honestly is published as ``None``. That is the
+    whole difference from ``safety_buy``, which always had an answer because the
+    answer was a label.
+    """
+    energy = max(0.0, run.energy_kwh)
+    if run.direction != ECONOMIC_DIRECTION_CHARGE:
+        return {
+            "classification": BUY_REASON_UNKNOWN,
+            "bridge_kwh_now": None,
+            "economic_extra_kwh": None,
+        }
+
+    if bridge_kwh_now is None:
+        return {
+            "classification": BUY_REASON_UNKNOWN,
+            "bridge_kwh_now": None,
+            "economic_extra_kwh": None,
+            "why_now": "reachability was not computed for this refresh",
+        }
+
+    compelled = min(energy, max(0.0, bridge_kwh_now))
+    discretionary = max(0.0, energy - compelled)
+    pays_for_itself = run.marginal_cost_eur < 0.0
+
+    if compelled > 0.0 and discretionary > 0.0:
+        label = BUY_REASON_MIXED
+    elif compelled > 0.0:
+        # The margin is part of the floor the bridge was measured against, so a
+        # bridge that exists only because of it is named for it.
+        label = (
+            BUY_REASON_UNCERTAINTY
+            if uncertainty_dc_kwh is not None and compelled <= uncertainty_dc_kwh
+            else BUY_REASON_REACHABILITY
+        )
+    elif pays_for_itself:
+        label = BUY_REASON_ARBITRAGE
+    elif edge_value_eur_per_kwh > 0.0 and survives_to_edge_kwh > 0.0:
+        label = BUY_REASON_FUTURE_SELF_USE
+    else:
+        label = BUY_REASON_UNKNOWN
+
+    return {
+        "classification": label,
+        "bridge_kwh_now": _round_kwh(bridge_kwh_now),
+        "compulsory_kwh": _round_kwh(compelled),
+        "economic_extra_kwh": _round_kwh(discretionary),
+        "why_now": (
+            "the pack cannot stay above its floor without this energy"
+            if compelled > 0.0
+            else "no energy was compulsory; this run cleared the economic gates"
+        ),
+        "why_this_much": (
+            f"{_round_kwh(compelled)} kWh compelled by reachability, "
+            f"{_round_kwh(discretionary)} kWh discretionary"
+        ),
+        "why_not_wait": (
+            "waiting would cross the floor"
+            if compelled >= energy and compelled > 0.0
+            else (
+                "this window is cheaper than the alternatives in the horizon"
+                if pays_for_itself
+                else "the energy is worth more held than the cost of buying it"
+            )
+        ),
+        "marginal_cost_eur": _round_eur(run.marginal_cost_eur),
+        "pays_for_itself_in_horizon": pays_for_itself,
+        "edge_value_eur_kwh": _round_eur(edge_value_eur_per_kwh),
+        "uncertainty_dc_kwh": (
+            None if uncertainty_dc_kwh is None else _round_kwh(uncertainty_dc_kwh)
+        ),
+        "rule": (
+            "bridge_kwh_now is the only compulsory purchase. everything above it "
+            "is discretionary and had to clear the trade gain, the grid-charge "
+            "margin and the throughput cost. a figure that cannot be derived "
+            "honestly is null rather than guessed"
+        ),
+    }
+
+
 def _run_as_dict(
     run: EconomicRun,
     *,
     safety_buy: bool,
     intervals: list[dict[str, Any]] | None = None,
     omitted: int = 0,
+    purchase: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return one planned run, bounded and flat.
 
@@ -2567,6 +2683,10 @@ def _run_as_dict(
     """
     return {
         "action": ECONOMIC_ACTION_SAFETY_BUY if safety_buy else run.action,
+        # **Why this purchase exists, derived rather than labelled.** ``None`` for a
+        # run that is not a charge, and for a refresh where reachability was not
+        # computed -- which is the honest answer rather than a reassuring one.
+        "purchase": purchase,
         "start_interval": run.start_index,
         "end_interval": run.end_index,
         "interval_count": run.interval_count,
@@ -2730,6 +2850,17 @@ def _runs_as_dicts(
                 safety_buy=run.start_index in outcome.safety_buy_runs,
                 intervals=rows,
                 omitted=omitted,
+                purchase=classify_purchase(
+                    run,
+                    bridge_kwh_now=outcome.bridge_kwh_now,
+                    uncertainty_dc_kwh=(
+                        None
+                        if outcome.uncertainty is None
+                        else outcome.uncertainty.total_dc_kwh
+                    ),
+                    edge_value_eur_per_kwh=outcome.edge_value_eur_per_kwh,
+                    survives_to_edge_kwh=desired.edge_energy_kwh,
+                ),
             )
         )
     return payload
@@ -3096,6 +3227,16 @@ def economic_as_dict(
     bucket_rule: str = ECONOMIC_BUCKET_RULE_CONSTANT,
     tomorrow_prices: str = ECONOMIC_TOMORROW_ABSENT,
     reserve_basis: str | None = None,
+    reachability: Any = None,
+    uncertainty: Any = None,
+    bridge_kwh_now: float | None = None,
+    actionable_interval_count: int = 0,
+    edge_value_eur_per_kwh: float = 0.0,
+    edge_creditable_kwh: float = float("inf"),
+    minimum_trade_gain_eur: float = 0.0,
+    grid_charge_margin_eur_per_kwh: float = 0.0,
+    battery_throughput_cost_eur_per_kwh: float = 0.0,
+    floor_energy_kwh: float = 0.0,
     bridge_requirement_kwh: float | None = None,
     pack_ceiling_kwh: float | None = None,
     execution_targets: list[dict[str, Any]] | None = None,
@@ -3189,6 +3330,62 @@ def economic_as_dict(
                 if bridge_requirement_kwh is None
                 else pack_ceiling_kwh is not None
                 and bridge_requirement_kwh > pack_ceiling_kwh
+            ),
+        },
+        # **What the planner actually obeyed, and what it valued.** Published
+        # whole rather than as a single number, because the whole point of beta.31
+        # is that a reader must be able to tell a physical bound from a price.
+        "planning": {
+            "reserve_semantics": (
+                None if reachability is None else reachability.semantics
+            ),
+            "reachability_now_dc_kwh": (
+                None
+                if reachability is None
+                else _round_kwh(reachability.required_now_dc_kwh)
+            ),
+            "hard_floor_dc_kwh": (
+                None if reachability is None else _round_kwh(floor_energy_kwh)
+            ),
+            "bridge_kwh_now": _round_kwh(bridge_kwh_now),
+            "actionable_intervals": actionable_interval_count,
+            "grid_credit_intervals": (
+                None if reachability is None else reachability.grid_credit_intervals
+            ),
+            "uncertainty": None if uncertainty is None else uncertainty.as_dict(),
+            "edge_value_eur_kwh": _round_eur(edge_value_eur_per_kwh),
+            "edge_creditable_kwh": (
+                None
+                if edge_creditable_kwh == float("inf")
+                else _round_kwh(edge_creditable_kwh)
+            ),
+            "edge_energy_kwh": _round_kwh(desired.edge_energy_kwh),
+            "edge_value_eur": _round_eur(desired.edge_value_eur),
+            "battery_throughput_kwh": _round_kwh(desired.battery_throughput_kwh),
+            "battery_throughput_cost_eur": _round_eur(
+                desired.battery_throughput_cost_eur
+            ),
+            "gates": {
+                "minimum_trade_gain_eur": minimum_trade_gain_eur,
+                "grid_charge_margin_eur_per_kwh": grid_charge_margin_eur_per_kwh,
+                "battery_throughput_cost_eur_per_kwh": (
+                    battery_throughput_cost_eur_per_kwh
+                ),
+                "bases_rule": (
+                    "three disjoint bases and they must stay disjoint: the trade "
+                    "gain is per discretionary run, the grid-charge margin is per "
+                    "kWh of grid-caused charging, the throughput cost is per kWh "
+                    "of movement in either direction. none of the three is a "
+                    "degradation model, and setting two of them to depreciation "
+                    "would charge the buy side twice"
+                ),
+            },
+            "rule": (
+                "bridge_kwh_now is the only compulsory purchase: max(0, "
+                "reachability_now - stored). zero means nothing is compulsory and "
+                "every further kWh must clear the economic gates. the reserve "
+                "here contains physics only -- it never prefers a cheap refill to "
+                "a dear one, which is the objective's job"
             ),
         },
         "reserve": {

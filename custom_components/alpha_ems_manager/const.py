@@ -1576,6 +1576,21 @@ RESERVE_HORIZON_TRUNCATED: Final = "truncated"
 #: have retained. Both are detected and reported; neither is ever corrected, and
 #: neither ever selects a different reserve model.
 RESERVE_BOUND_TRUNCATED: Final = "truncated"
+#: Why a planned grid charge exists. **A money-spending controller must be able
+#: to answer "why now, why this much, why not wait", and until beta.31 it could
+#: not**: ``safety_buy`` was a label applied after the fact by diffing two solves,
+#: so the payload could say a purchase was reserve-attributable without anything
+#: in the code having computed how much was actually unavoidable.
+#:
+#: These are ordered by how little choice there was. The first two are compelled
+#: by physics; the rest are economic decisions that had to clear a gate.
+BUY_REASON_REACHABILITY: Final = "reachability_bridge"
+BUY_REASON_UNCERTAINTY: Final = "uncertainty_margin"
+BUY_REASON_ARBITRAGE: Final = "economic_arbitrage"
+BUY_REASON_FUTURE_SELF_USE: Final = "strategic_future_self_use"
+BUY_REASON_MIXED: Final = "mixed"
+BUY_REASON_UNKNOWN: Final = "unknown"
+
 #: How long the reachability reserve must survive with **no credit at all**, in
 #: intervals. Four quarters, one hour.
 #:

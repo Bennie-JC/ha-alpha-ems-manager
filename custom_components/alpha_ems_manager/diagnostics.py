@@ -541,6 +541,33 @@ def _economic_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any
         bucket_rule=outcome.bucket_rule,
         tomorrow_prices=_economic_tomorrow(coordinator, plan),
         reserve_basis=basis,
+        # **What the planner obeyed, and what it valued.** Every one of these was
+        # computed at the same instant as the plan and is carried rather than
+        # recomputed here, so the payload cannot disagree with the decision.
+        reachability=outcome.reachability,
+        uncertainty=outcome.uncertainty,
+        bridge_kwh_now=(
+            None
+            if outcome.reachability is None or plan is None or plan.state is None
+            else outcome.reachability.bridge_kwh(plan.state.energy_kwh)
+        ),
+        actionable_interval_count=outcome.actionable_interval_count,
+        edge_value_eur_per_kwh=outcome.edge_value_eur_per_kwh,
+        edge_creditable_kwh=outcome.edge_creditable_kwh,
+        minimum_trade_gain_eur=config.minimum_trade_gain_eur,
+        # **Published for the first time in beta.31.** It was absent from the
+        # payload *and* from the settings fingerprint, so two installations
+        # differing by a whole per-kWh margin produced the same digest and no
+        # recorded decision could be reproduced.
+        grid_charge_margin_eur_per_kwh=config.grid_charge_margin_eur_per_kwh,
+        battery_throughput_cost_eur_per_kwh=(
+            config.battery_throughput_cost_eur_per_kwh
+        ),
+        floor_energy_kwh=(
+            0.0
+            if plan is None or plan.reserve_projection is None
+            else plan.reserve_projection.floor_energy_kwh
+        ),
         bridge_requirement_kwh=bridge,
         pack_ceiling_kwh=(
             None
@@ -554,6 +581,14 @@ def _economic_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any
         provenance={
             "settings": {
                 "minimum_trade_gain_eur": config.minimum_trade_gain_eur,
+                # Both per-kWh terms, published so the plan is reproducible from
+                # its own evidence. See the fingerprint note above.
+                "grid_charge_margin_eur_per_kwh": (
+                    config.grid_charge_margin_eur_per_kwh
+                ),
+                "battery_throughput_cost_eur_per_kwh": (
+                    config.battery_throughput_cost_eur_per_kwh
+                ),
                 "allow_grid_charging": config.allow_grid_charging,
                 "allow_battery_export": config.allow_battery_export,
                 "threshold_rule": (
