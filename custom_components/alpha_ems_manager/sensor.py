@@ -67,6 +67,7 @@ from .activity import (
     PlannedRun,
     RunContent,
     RunIdentity,
+    category_of,
     direction_of,
     logbook_payload,
     next_activity,
@@ -92,7 +93,6 @@ from .const import (
     ECONOMIC_BLOCKED_NO_PRIMITIVE_EXPORT,
     ECONOMIC_BLOCKED_NOT_ENABLED,
     ECONOMIC_EUR_PRECISION,
-    ECONOMIC_GAP_NONE,
     EXECUTION_STATE_ARMED,
     EXECUTION_STATE_PREPARED,
     EXECUTION_STATE_RUNNING,
@@ -606,8 +606,6 @@ def _planned_runs(coordinator: AlphaEmsCoordinator) -> tuple[PlannedRun, ...]:
     # well was labelled refused by a comparison it was never part of. A run whose
     # own direction has an actuator is not refused, whatever the plan-level
     # comparison concluded about some other run.
-    gap = outcome.capability_gap_reason
-    plan_refused = gap != ECONOMIC_GAP_NONE
     runs: list[PlannedRun] = []
     for run in outcome.desired.runs:
         start = _economic_instant(plan.target_day, run.start_index, count, tz)
@@ -619,10 +617,19 @@ def _planned_runs(coordinator: AlphaEmsCoordinator) -> tuple[PlannedRun, ...]:
             if run.start_index in outcome.safety_buy_runs
             else run.action
         )
+        # **beta.31: the category comes from the attribution, not from the label.**
+        # ``safety_buy_runs`` is a set of indices, so it can only ever say yes or
+        # no; the attribution says *how much* of the run was compulsory, which is
+        # what separates a Safety Buy from a Mixed Buy. Both come from the same
+        # reserve-relaxed counterfactual, so the word a user reads and the figures
+        # a diagnostic reader audits cannot drift apart.
+        category = category_of(
+            action, outcome.safety_buy_attribution.get(run.start_index)
+        )
         # ``run.action`` rather than the display label: a safety buy *is* a charge,
         # and an actuator exists for it. Testing the label would mark every
         # reserve-driven buy as impossible.
-        refused = plan_refused and run.action not in IMPLEMENTED_ACTIONS
+        executable = run.action in IMPLEMENTED_ACTIONS
         runs.append(
             PlannedRun(
                 identity=RunIdentity(
@@ -630,23 +637,11 @@ def _planned_runs(coordinator: AlphaEmsCoordinator) -> tuple[PlannedRun, ...]:
                     start_utc=dt_util.as_utc(start),
                 ),
                 content=RunContent(
-                    action=action,
-                    capability_action=outcome.capability_action,
-                    reason=outcome.reason,
+                    category=category,
                     energy_kwh=run.energy_kwh,
-                    battery_energy_kwh=(
-                        run.battery_charge_ac_kwh + run.battery_discharge_ac_kwh
-                    ),
-                    power_kw=run.first_power_kw,
-                    average_power_kw=run.average_power_kw,
-                    peak_power_kw=run.peak_power_kw,
                     end_utc=dt_util.as_utc(end),
-                    charge_source=run.charge_source,
-                    price_eur_kwh=run.average_price_eur_kwh,
-                    value_eur=-run.marginal_cost_eur,
-                    refused=refused,
-                    gap_reason=gap if refused else ECONOMIC_GAP_NONE,
                     window=f"{start:%H:%M}-{end:%H:%M}",
+                    executable=executable,
                 ),
             )
         )
@@ -658,14 +653,15 @@ def _economic_activity(
 ) -> ActivityEntry | None:
     """Return the Activity line this refresh deserves, or ``None`` for silence.
 
-    ``value_eur`` is the run's **marginal** cost, sign-flipped -- what it saved
-    against leaving the battery alone through the same intervals. Not the raw cash
-    flow, which is negative for every charge by construction and zero for the most
-    valuable discharge there is.
-
     ``now`` is the instant the coordinator published, not a fresh clock reading.
-    The announcement must describe the same moment the plan does, or a run could
-    be judged imminent against one clock and rendered against another.
+    The lifecycle must describe the same moment the plan does, or a run could be
+    judged imminent against one clock and rendered against another.
+
+    ``shadow`` is true for both non-writing modes, and the reason it is one flag
+    rather than the mode itself is that Activity has no business branching on
+    three values when the only question it asks is "may anything be sent". Off and
+    Shadow answer that identically; the difference between them is in
+    diagnostics, where the pipeline's own report says which one refused.
     """
     issued = (coordinator.data or {}).get("issued_at")
     if issued is None:
@@ -675,6 +671,7 @@ def _economic_activity(
         runs=_planned_runs(coordinator),
         now=dt_util.as_utc(issued),
         execution=_execution_view(coordinator),
+        shadow=coordinator.control_mode != CONTROL_MODE_ACTIVE,
     )
 
 
@@ -706,8 +703,18 @@ def _execution_view(coordinator: AlphaEmsCoordinator) -> ExecutionView | None:
                 direction=direction_of(report.get("purpose") or intent),
                 start_utc=dt_util.as_utc(start),
             )
+    end_utc = None
+    if isinstance(closes, str):
+        closing = dt_util.parse_datetime(closes)
+        if closing is not None:
+            end_utc = dt_util.as_utc(closing)
     return ExecutionView(
         identity=identity,
+        # **The lifecycle anchor.** Stage A's planned run and Stage B's admitted
+        # run are the same run, so they agree on when the window closes -- which
+        # is what lets a dispatch attach itself to the plan that was announced
+        # for it without either side inventing a shared key.
+        end_utc=end_utc,
         # "Under way, or would be": in shadow nothing is ever armed, so the
         # lifecycle is driven by the controller having an actionable target. The
         # wording is decided by ``executed``, not by this.
@@ -715,8 +722,6 @@ def _execution_view(coordinator: AlphaEmsCoordinator) -> ExecutionView | None:
         executed=bool(power.get("executed")),
         target_kwh=float(target.get("battery_target_kwh") or 0.0),
         delivered_kwh=float(progress.get("battery_realized_kwh") or 0.0),
-        initial_power_kw=float(power.get("requested_kw") or 0.0),
-        window=_execution_window(opens, closes),
         intent=intent,
         stop_reason=(report.get("result") or {}).get("stop_reason"),
         inhibit_reason=(report.get("result") or {}).get("inhibit_reason"),
@@ -730,20 +735,6 @@ def _execution_view(coordinator: AlphaEmsCoordinator) -> ExecutionView | None:
         # Set for exactly one refresh, and only after a write carrying an
         # activation actually succeeded.
         activation_confirmed=bool(coordinator.activation_confirmed),
-    )
-
-
-def _execution_window(opens: object, closes: object) -> str:
-    """Return the window as local wall-clock text, for one Activity line."""
-    if not isinstance(opens, str) or not isinstance(closes, str):
-        return ""
-    start = dt_util.parse_datetime(opens)
-    end = dt_util.parse_datetime(closes)
-    if start is None or end is None:
-        return ""
-    return (
-        f"{dt_util.as_local(start).strftime('%H:%M')}-"
-        f"{dt_util.as_local(end).strftime('%H:%M')}"
     )
 
 

@@ -42,10 +42,8 @@ import pytest
 
 from custom_components.alpha_ems_manager import economic as economic_module
 from custom_components.alpha_ems_manager.activity import (
-    PlannedRun,
     RunContent,
     RunIdentity,
-    direction_of,
     next_activity,
 )
 from custom_components.alpha_ems_manager.battery import (
@@ -61,10 +59,8 @@ from custom_components.alpha_ems_manager.const import (
     ECONOMIC_BUCKET_KWH,
     ECONOMIC_BUCKET_RULE_CONSTANT,
     ECONOMIC_BUCKET_STATE_BUDGET,
-    ECONOMIC_CHARGE_SOURCE_NONE,
     ECONOMIC_GAP_NO_PRIMITIVE,
     ECONOMIC_GAP_NONE,
-    ECONOMIC_REASON_EXPENSIVE_WINDOW,
 )
 from custom_components.alpha_ems_manager.economic import (
     IntervalPrice,
@@ -1207,18 +1203,33 @@ def test_keying_the_activity_identity_on_an_index_again_is_caught() -> None:
 
 
 def test_returning_to_bucket_and_hash_comparison_is_caught() -> None:
-    """Mutation: bucket the figures and hash them instead of using a deadband.
+    """Mutation: bucket the figures and hash them to decide whether to speak.
 
     A bucket boundary fires on a hundredth of a kilowatt while a fifth inside one
-    stays silent. A deadband measured from the announced value cannot flap.
+    stays silent. beta.16 replaced that with a deadband measured from the announced
+    value, which cannot flap; beta.31 went further and made the *identity* decide,
+    so there is no comparison of figures left to get wrong.
+
+    **The forbidden term list had to change, and the reason is worth stating.**
+    beta.31 does hash -- ``plan_id_for`` digests the plan identity to produce the
+    six characters a user reads. That is the opposite of the fault: it hashes what
+    two refreshes must agree *on*, not what they must be compared *by*. So the
+    mutation is now asserted where it lives: no energy, power or price figure may
+    appear in anything the id is derived from.
     """
     import inspect
 
     from custom_components.alpha_ems_manager import activity
 
     source = inspect.getsource(activity)
-    for forbidden in ("_digest", "hashlib", "fingerprint"):
-        assert forbidden not in source, forbidden
+    assert "fingerprint" not in source
+    # The identity is a category and an instant. Nothing measured in kilowatt-hours
+    # or euros may enter it, or a revision would mint a new plan.
+    identity_source = inspect.getsource(activity.plan_id_for)
+    for forbidden in ("energy", "kwh", "price", "power", "eur"):
+        assert forbidden not in identity_source.lower(), forbidden
+    assert set(activity.PlanIdentity.__dataclass_fields__) == {"category", "end_utc"}
+    # And the deadband is still what absorbs a revision, rather than a bucket.
     assert "ECONOMIC_DEADBAND_ENERGY_KWH" in source
 
 
@@ -1228,7 +1239,6 @@ def test_announcing_a_distant_run_is_caught() -> None:
     Exactly the reported symptom: an entry every quarter about a run eighteen
     hours out, whose far end moves every time the plan is rebuilt.
     """
-    from custom_components.alpha_ems_manager.activity import next_activity
 
     from .test_activity_announcements import NOW, make_run
 
@@ -1247,7 +1257,6 @@ def test_back_dating_an_elapsed_run_is_caught() -> None:
 
     A line describing a decision nobody could act on, written after the fact.
     """
-    from custom_components.alpha_ems_manager.activity import next_activity
 
     from .test_activity_announcements import NOW, make_run
 
@@ -1268,39 +1277,70 @@ def test_a_shadow_refresh_can_never_emit_an_execution_kind() -> None:
     the barrier says, because a shadow line indistinguishable from a live one is
     the one thing this surface cannot produce.
 
-    Asserted against the chooser rather than the payload, which is where the
-    decision is actually made.
+    **beta.31 makes it structural instead of verbal.** Shadow used to emit
+    ``would_start`` -- a distinct kind, worded carefully. It now emits *nothing*
+    for a start, because ``_started_entry`` returns early while ``executed`` is
+    false. A line that does not exist cannot be mistaken for a live one, and that
+    is a stronger guarantee than any wording.
     """
     from custom_components.alpha_ems_manager.activity import (
         ActivityEntry,
         ActivityState,
-        ExecutionMemory,
         ExecutionView,
-        _execution_entry,
+        _started_entry,
+        _terminal_entry,
         logbook_payload,
     )
     from custom_components.alpha_ems_manager.const import (
+        ECONOMIC_DIRECTION_CHARGE,
+        ECONOMIC_EVENT_ERROR,
+        ECONOMIC_EVENT_FINISHED,
         ECONOMIC_EVENT_STARTED,
         ECONOMIC_EVENT_STOPPED,
-        ECONOMIC_EVENT_WOULD_START,
         ECONOMIC_EXECUTION_EVENT_KINDS,
+        EXECUTION_STOP_TARGET_REACHED,
     )
 
-    # beta.19 added ``stopped`` as its counterpart: ``started`` alone meant a stop
-    # could only be inferred from silence.
-    assert ECONOMIC_EXECUTION_EVENT_KINDS == (
+    # beta.19 added ``stopped`` as ``started``'s counterpart; beta.31 added the
+    # two terminals, because a success and a failure are also claims about the
+    # battery.
+    assert set(ECONOMIC_EXECUTION_EVENT_KINDS) == {
         ECONOMIC_EVENT_STARTED,
         ECONOMIC_EVENT_STOPPED,
+        ECONOMIC_EVENT_FINISHED,
+        ECONOMIC_EVENT_ERROR,
+    }
+
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    end = now + timedelta(hours=1)
+    shadow_view = ExecutionView(
+        identity=RunIdentity(direction=ECONOMIC_DIRECTION_CHARGE, start_utc=now),
+        end_utc=end,
+        running=True,
+        executed=False,
+        intent="grid_charge",
+        activation_confirmed=True,
+        run_id="shadow-run",
     )
 
-    # A shadow run that is under way: nothing was sent, so it "would" start.
-    shadow = _execution_entry(
-        ActivityState(execution=ExecutionMemory()),
-        ExecutionView(running=True, executed=False, intent="grid_charge"),
-        now=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+    # Nothing at all, in either direction, however complete the evidence.
+    assert _started_entry(ActivityState(), shadow_view, now=now) is None
+    assert (
+        _terminal_entry(
+            ActivityState(),
+            ExecutionView(
+                identity=shadow_view.identity,
+                end_utc=end,
+                executed=False,
+                running=False,
+                intent="grid_charge",
+                stop_reason=EXECUTION_STOP_TARGET_REACHED,
+                run_id="shadow-run",
+            ),
+            now=now,
+        )
+        is None
     )
-    assert shadow is not None
-    assert shadow.kind == ECONOMIC_EVENT_WOULD_START
 
     # And the payload accepts the live kind, because this release does execute.
     payload = logbook_payload(
@@ -1519,50 +1559,36 @@ def test_the_payload_says_the_terminal_figures_are_gone_not_free() -> None:
 
 
 def test_an_activity_sentence_that_multiplies_out_wrongly_is_caught() -> None:
-    """First-interval battery power beside whole-run grid energy is the bug.
+    """First-interval battery power beside whole-run grid energy was the bug.
 
     The live beta.16 line read ``0.95 kW, 0.27 kWh``: a battery power at one
     boundary and a meter energy at another, in one sentence, with nothing saying
-    so. The mutation is quoting ``power_kw`` and ``energy_kwh`` together. The
-    released sentence quotes the *mean* power against the *battery* energy -- which
-    multiply out -- and names the meter figure separately.
-    """
-    content = RunContent(
-        action=ECONOMIC_ACTION_EXPORT,
-        capability_action=ECONOMIC_ACTION_EXPORT,
-        reason=ECONOMIC_REASON_EXPENSIVE_WINDOW,
-        energy_kwh=0.27,
-        battery_energy_kwh=0.95,
-        power_kw=0.95,
-        average_power_kw=0.95,
-        end_utc=datetime(2026, 8, 22, 17, 30, tzinfo=UTC),
-        charge_source=ECONOMIC_CHARGE_SOURCE_NONE,
-        price_eur_kwh=0.1496,
-        value_eur=0.04,
-        refused=False,
-        window="18:30-19:30",
-    )
-    run = PlannedRun(
-        identity=RunIdentity(
-            direction=direction_of(ECONOMIC_ACTION_EXPORT),
-            start_utc=datetime(2026, 8, 22, 16, 30, tzinfo=UTC),
-        ),
-        content=content,
-    )
-    entry = next_activity(
-        previous=None, runs=(run,), now=datetime(2026, 8, 22, 16, 20, tzinfo=UTC)
-    )
+    so. A reader who multiplied got nonsense and a reader who did not still could
+    not tell which quantity was which.
 
-    assert entry is not None
-    # The mean power times the run length is the battery energy, stated.
-    hours = 1.0
-    assert content.average_power_kw * hours == pytest.approx(
-        content.battery_energy_kwh, abs=0.01
-    )
-    assert "0.95 kWh from the battery" in entry.message
-    assert "0.27 kWh reaches the grid" in entry.message
-    # And the misleading pairing is absent: no bare "0.95 kW, 0.27 kWh".
-    assert "0.95 kW, 0.27 kWh" not in entry.message
+    **beta.31 removes the class of fault rather than the instance.** Activity
+    carries one energy and no power at all, so there is no pair of figures at
+    different boundaries left to put side by side -- and the mutation is not
+    "quote the wrong pair" but "give this surface the figures to quote", which the
+    dataclass refuses.
+    """
+    from custom_components.alpha_ems_manager.activity import ExecutionView
+
+    fields = set(RunContent.__dataclass_fields__)
+    assert fields == {"category", "energy_kwh", "end_utc", "window", "executable"}
+    # One energy, so the ambiguity is not expressible.
+    assert [f for f in fields if "energy" in f] == ["energy_kwh"]
+    for forbidden in (
+        "power_kw",
+        "average_power_kw",
+        "peak_power_kw",
+        "battery_energy_kwh",
+        "price_eur_kwh",
+        "value_eur",
+        "charge_source",
+    ):
+        assert forbidden not in fields, forbidden
+        assert forbidden not in ExecutionView.__dataclass_fields__, forbidden
 
 
 def test_inventing_a_price_for_an_absent_tomorrow_is_caught() -> None:

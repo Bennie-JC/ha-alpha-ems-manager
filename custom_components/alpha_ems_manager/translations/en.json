@@ -239,6 +239,38 @@
           "active": "Live"
         }
       }
+    },
+    "sensor": {
+      "control_state": {
+        "name": "Control State",
+        "state": {
+          "off": "Off",
+          "inhibited": "Inhibited",
+          "eligible": "Planned",
+          "idle": "Idle",
+          "executed": "Executing",
+          "error": "Error"
+        }
+      },
+      "battery_recommendation": {
+        "name": "Battery Recommendation",
+        "state": {
+          "hold": "Hold",
+          "charge": "Charge",
+          "discharge": "Discharge"
+        }
+      },
+      "economic_action": {
+        "name": "Economic Action",
+        "state": {
+          "hold": "Hold",
+          "charge": "Charge",
+          "discharge": "Discharge",
+          "export": "Export",
+          "safety_buy": "Safety Buy",
+          "curtail_pv": "Curtail"
+        }
+      }
     }
   }
 }

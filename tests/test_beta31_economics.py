@@ -33,6 +33,8 @@ from custom_components.alpha_ems_manager import reserve as reserve_module
 from custom_components.alpha_ems_manager.battery import build_limits
 from custom_components.alpha_ems_manager.const import (
     BUY_REASON_ARBITRAGE,
+    BUY_REASON_FUTURE_SELF_USE,
+    BUY_REASON_MIXED,
     BUY_REASON_REACHABILITY,
     RESERVE_SEMANTICS_AUTONOMY,
     RESERVE_SEMANTICS_REACHABILITY,
@@ -42,8 +44,10 @@ from custom_components.alpha_ems_manager.const import (
 from custom_components.alpha_ems_manager.economic import (
     IntervalPrice,
     actionable_intervals,
+    classify_purchase,
     edge_creditable_energy_kwh,
     edge_value_eur_per_kwh,
+    future_spread_for,
 )
 from custom_components.alpha_ems_manager.reserve import (
     build_reserve,
@@ -722,13 +726,16 @@ def test_a_purchase_explains_itself() -> None:
     results = replay(decision, [ARCH_REACHABILITY])
     assert results[ARCH_REACHABILITY].available
 
-    # A discretionary buy: nothing was compulsory, so the whole run is economic.
+    # A discretionary buy: nothing was compulsory, so the whole run is economic,
+    # and a named future interval prices it -- 0.60 later against 0.05 now.
     class _Run:
         action = "charge"
         direction = "charge"
         energy_kwh = 3.0
         marginal_cost_eur = -0.5
+        average_price_eur_kwh = 0.05
         start_index = 0
+        end_index = 7
 
     verdict = classify_purchase(
         _Run(),
@@ -736,6 +743,8 @@ def test_a_purchase_explains_itself() -> None:
         uncertainty_dc_kwh=0.5,
         edge_value_eur_per_kwh=0.2,
         survives_to_edge_kwh=1.0,
+        future_spread_eur_kwh=0.60 * 0.9487 - 0.05,
+        future_spread_price_eur_kwh=0.60,
     )
     assert verdict["classification"] == BUY_REASON_ARBITRAGE
     assert verdict["compulsory_kwh"] == 0.0
@@ -750,9 +759,200 @@ def test_a_purchase_explains_itself() -> None:
         uncertainty_dc_kwh=0.5,
         edge_value_eur_per_kwh=0.2,
         survives_to_edge_kwh=1.0,
+        future_spread_eur_kwh=0.50,
+        future_spread_price_eur_kwh=0.60,
     )
+    # Compulsion outranks the spread: the energy would have been bought anyway.
     assert compelled["classification"] == BUY_REASON_REACHABILITY
     assert compelled["economic_extra_kwh"] == 0.0
+
+
+class _Purchase:
+    """The smallest thing ``classify_purchase`` and ``future_spread_for`` read."""
+
+    action = "charge"
+    direction = "charge"
+
+    def __init__(
+        self,
+        *,
+        energy_kwh: float = 2.0,
+        marginal_cost_eur: float = 0.4,
+        price: float | None = 0.10,
+        start_index: int = 0,
+        end_index: int = 3,
+    ) -> None:
+        self.energy_kwh = energy_kwh
+        # Positive: this window does **not** pay for itself in its own right,
+        # which is exactly the case the old rule got wrong.
+        self.marginal_cost_eur = marginal_cost_eur
+        self.average_price_eur_kwh = price
+        self.start_index = start_index
+        self.end_index = end_index
+
+
+def _priced(values):
+    """Return the smallest stand-in for a solved plan's priced intervals."""
+
+    class _Interval:
+        def __init__(self, index, price):
+            self.index = index
+            self.import_price_eur_kwh = price
+
+    class _Plan:
+        intervals = tuple(_Interval(index, price) for index, price in enumerate(values))
+
+    return _Plan()
+
+
+def test_arbitrage_does_not_require_the_charging_window_to_pay_for_itself() -> None:
+    """The correction: buy at 0.10 now, displace a 0.38 import tonight.
+
+    That is arbitrage in every ordinary sense of the word, and the previous rule
+    called it ``strategic_future_self_use`` -- because it asked whether the
+    *charge run itself* showed a negative marginal cost, which for a purchase
+    measured against its own idle counterfactual is essentially never true. The
+    label was therefore close to unreachable and the strategic bucket absorbed
+    everything.
+
+    The numbers are the ones the correction was specified with, and the expected
+    spread is hand-computed: ``0.38 * 0.9487 - 0.10 = 0.26051`` EUR/kWh.
+    """
+    run = _Purchase(marginal_cost_eur=0.4, price=0.10, end_index=3)
+    plan = _priced([0.10] * 4 + [0.38] * 4)
+
+    spread, against = future_spread_for(run, plan, discharge_efficiency=0.9487)
+
+    assert against == 0.38
+    assert spread == pytest.approx(0.26051, abs=5e-5)
+
+    verdict = classify_purchase(
+        run,
+        bridge_kwh_now=0.0,
+        uncertainty_dc_kwh=0.0,
+        edge_value_eur_per_kwh=0.2,
+        survives_to_edge_kwh=2.0,
+        future_spread_eur_kwh=spread,
+        future_spread_price_eur_kwh=against,
+    )
+
+    assert verdict["classification"] == BUY_REASON_ARBITRAGE
+    # And the label does not rest on the run paying for itself.
+    assert verdict["pays_for_itself_in_horizon"] is False
+    assert verdict["future_spread_price_eur_kwh"] == 0.38
+    # The explanation names a price a reader can look up.
+    assert "0.38" in verdict["why_not_wait"]
+
+
+def test_a_purchase_with_no_named_future_window_is_strategic_not_arbitrage() -> None:
+    """The other side of the split, and why keeping both labels is worth it.
+
+    Same discretionary purchase, same edge value -- but every later interval is
+    no dearer than this one, so after the outbound conversion no concrete window
+    can be pointed at. The payoff is then the terminal replacement cost, which is
+    a general claim rather than an auditable spread.
+
+    Hand-computed: the best later price is 0.10, and ``0.10 * 0.9487 - 0.10`` is
+    negative, so there is no spread to name.
+    """
+    run = _Purchase(price=0.10, end_index=3)
+    plan = _priced([0.10] * 8)
+
+    spread, _ = future_spread_for(run, plan, discharge_efficiency=0.9487)
+    assert spread is not None and spread < 0.0
+
+    verdict = classify_purchase(
+        run,
+        bridge_kwh_now=0.0,
+        uncertainty_dc_kwh=0.0,
+        edge_value_eur_per_kwh=0.2,
+        survives_to_edge_kwh=2.0,
+        future_spread_eur_kwh=spread,
+        future_spread_price_eur_kwh=0.10,
+    )
+
+    assert verdict["classification"] == BUY_REASON_FUTURE_SELF_USE
+
+
+def test_the_spread_is_measured_strictly_after_the_run_ends() -> None:
+    """A purchase cannot displace an import that happens while it is charging.
+
+    The dear intervals here sit *inside* the run, so they are unavailable to the
+    attribution -- otherwise a run could be credited with displacing its own
+    charging window, which the plan's own cost term already accounts for.
+    """
+    run = _Purchase(price=0.10, start_index=0, end_index=3)
+    plan = _priced([0.10, 0.90, 0.90, 0.90] + [0.05] * 4)
+
+    spread, against = future_spread_for(run, plan, discharge_efficiency=0.9487)
+
+    assert against == 0.05
+    assert spread is not None and spread < 0.0
+
+    # And with nothing after the run at all, the figure is null, not zero.
+    tail = _Purchase(price=0.10, start_index=0, end_index=7)
+    assert future_spread_for(tail, plan, discharge_efficiency=0.9487) == (None, None)
+
+
+def test_the_spread_is_net_of_the_outbound_conversion_only() -> None:
+    """A one-cent move at 90 per cent efficiency is not a spread at all.
+
+    The inbound loss is already paid for in the energy bought, so crediting it
+    twice would manufacture arbitrage out of a nearly flat curve. Hand-computed:
+    ``0.20 * 0.90 - 0.19 = -0.01``, so a 0.19 to 0.20 move loses money.
+    """
+    run = _Purchase(price=0.19, end_index=3)
+    plan = _priced([0.19] * 4 + [0.20] * 4)
+
+    spread, _ = future_spread_for(run, plan, discharge_efficiency=0.90)
+    assert spread == pytest.approx(-0.01, abs=1e-9)
+
+    verdict = classify_purchase(
+        run,
+        bridge_kwh_now=0.0,
+        uncertainty_dc_kwh=0.0,
+        edge_value_eur_per_kwh=0.2,
+        survives_to_edge_kwh=2.0,
+        future_spread_eur_kwh=spread,
+        future_spread_price_eur_kwh=0.20,
+    )
+    assert verdict["classification"] == BUY_REASON_FUTURE_SELF_USE
+
+
+def test_compulsion_and_a_spread_together_are_reported_as_mixed() -> None:
+    """Attribution is about *why the energy is there*, and it can be both.
+
+    Half the run is what the reserve-relaxed counterfactual declines to buy, and
+    the other half cleared the gates against a named future price. Neither label
+    alone would be honest, so the classification says so and the two quantities
+    are published separately.
+    """
+    run = _Purchase(energy_kwh=2.0, price=0.10, end_index=3)
+
+    verdict = classify_purchase(
+        run,
+        attribution=(1.0, 1.0),
+        bridge_kwh_now=0.0,
+        uncertainty_dc_kwh=0.0,
+        edge_value_eur_per_kwh=0.2,
+        survives_to_edge_kwh=2.0,
+        future_spread_eur_kwh=0.26,
+        future_spread_price_eur_kwh=0.38,
+    )
+
+    assert verdict["classification"] == BUY_REASON_MIXED
+    assert verdict["compulsory_kwh"] == pytest.approx(1.0)
+    assert verdict["economic_extra_kwh"] == pytest.approx(1.0)
+    # The counterfactual decided this, not the head deficit, which was zero.
+    assert verdict["compulsory_basis"] == "reserve_relaxed_counterfactual"
+
+
+def test_a_run_with_no_price_can_claim_no_spread() -> None:
+    """An unpriced purchase is unknown, never assumed favourable."""
+    run = _Purchase(price=None, end_index=3)
+    plan = _priced([0.10] * 4 + [0.38] * 4)
+
+    assert future_spread_for(run, plan, discharge_efficiency=0.9487) == (None, None)
 
 
 def test_an_underivable_figure_is_null_rather_than_guessed() -> None:
@@ -764,7 +964,9 @@ def test_an_underivable_figure_is_null_rather_than_guessed() -> None:
         direction = "charge"
         energy_kwh = 1.0
         marginal_cost_eur = 0.1
+        average_price_eur_kwh = 0.1
         start_index = 0
+        end_index = 0
 
     verdict = classify_purchase(
         _Run(),

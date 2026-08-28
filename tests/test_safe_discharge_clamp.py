@@ -1168,15 +1168,16 @@ def test_the_clamp_reaches_no_activity_entry() -> None:
 
     from custom_components.alpha_ems_manager import activity
 
-    # The announcement policy reads planned runs, the clock and -- since
-    # beta.19 -- a narrow execution summary. Still nothing from the safety layer:
-    # no command, no power, no verdict, so a command reduced by 0.1 kW cannot
-    # produce a line.
+    # The lifecycle policy reads planned runs, the clock, a narrow execution
+    # summary and -- since beta.31 -- whether anything may be sent at all. Still
+    # nothing from the safety layer: no command, no power, no verdict, so a command
+    # reduced by 0.1 kW cannot produce a line.
     assert set(inspect.signature(activity.next_activity).parameters) == {
         "previous",
         "runs",
         "now",
         "execution",
+        "shadow",
     }
 
     source = inspect.getsource(activity)

@@ -40,6 +40,8 @@ from custom_components.alpha_ems_manager.const import (
     ECONOMIC_ADVICE_EVENT_KINDS,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     ECONOMIC_EVENT_CANCELLED,
+    ECONOMIC_EVENT_ERROR,
+    ECONOMIC_EVENT_FINISHED,
     ECONOMIC_EVENT_KINDS,
     ECONOMIC_EVENT_STARTED,
     ECONOMIC_EVENT_STOPPED,
@@ -332,25 +334,26 @@ def test_the_optimizer_does_not_plan_around_a_self_driving_feature(
 def test_the_activity_surface_sees_only_planned_runs_and_the_clock() -> None:
     """Strictly observational, enforced by the signature rather than by intent.
 
-    ``next_activity`` takes the runs already announced, the runs the plan now
-    holds, and the current instant. It cannot see the plan object, the control
-    report, the safety state or the recovery machinery, because they are not
-    arguments -- so a later phase that wants to log an execution event has to
-    change this signature, which is a visible act.
+    ``next_activity`` takes what has already been said, the runs the plan now
+    holds, the current instant and whether anything may be sent. It cannot see the
+    plan object, the control report, the safety state or the recovery machinery,
+    because they are not arguments -- so a later phase that wants to describe
+    something new has to change this signature, which is a visible act.
 
     ``now`` arrived in beta.16 and is a *value*, not a clock: the module reads no
-    time of its own, which is what keeps the whole announcement policy testable
+    time of its own, which is what keeps the whole lifecycle policy testable
     against fixed instants.
     """
     parameters = inspect.signature(activity_module.next_activity).parameters
 
-    # ``execution`` since beta.19, and its arrival is the whole point of the
-    # design: this module could not describe execution while execution was not an
-    # argument, and the docstring said changing that would have to be "a visible
-    # act". It is one, and the discipline it protected is intact -- what is passed
-    # is a narrow summary, not the controller, so Activity still cannot reach the
-    # rolling setpoint it must never report.
-    assert set(parameters) == {"previous", "runs", "now", "execution"}
+    # ``execution`` since beta.19 and ``shadow`` since beta.31, and each arrival
+    # is the design working as intended: this module could not describe execution
+    # while execution was not an argument, and the docstring said changing that
+    # would have to be "a visible act". Both were. The discipline they protected is
+    # intact -- what is passed is a narrow summary and one boolean, not the
+    # controller, so Activity still cannot reach the rolling setpoint it must never
+    # report.
+    assert set(parameters) == {"previous", "runs", "now", "execution", "shadow"}
     for parameter in parameters.values():
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
@@ -396,7 +399,18 @@ def test_the_event_kinds_partition_into_advice_and_execution() -> None:
     # shadow line is not a claim about the battery, and giving it an execution
     # kind would have forced the refusal below to be relaxed for the real case
     # too.
-    assert execution == {ECONOMIC_EVENT_STARTED, ECONOMIC_EVENT_STOPPED}
+    #
+    # beta.31 added ``finished`` and ``error`` to the execution side, because both
+    # assert something about the battery: a success says energy moved and an error
+    # says a command failed. Neither is reachable in Shadow, which emits no start
+    # and therefore no ending of either kind -- a Shadow lifecycle is planned and
+    # then cancelled, and both of those are advice.
+    assert execution == {
+        ECONOMIC_EVENT_STARTED,
+        ECONOMIC_EVENT_STOPPED,
+        ECONOMIC_EVENT_FINISHED,
+        ECONOMIC_EVENT_ERROR,
+    }
     assert ECONOMIC_EVENT_CANCELLED in advice
 
 
@@ -556,15 +570,16 @@ async def test_the_economic_surface_writes_nothing_in_active_mode(
     assert (coordinator.control_report or {}).get("last_write") is None
     for entry in logbook:
         assert entry["name"] == activity_module.ACTIVITY_NAME
-        # Every line disclaims execution. Two kinds of wording do it: the
-        # advisory qualifier on an advice line, and an explicit statement that no
-        # command was sent on a shadow lifecycle line -- the stronger of the two,
-        # because it names what did not happen rather than hedging about it.
-        lowered = entry["message"].lower()
-        assert any(
-            phrase in lowered
-            for phrase in ("advisory only", "no command sent", "no command was sent")
-        ), entry["message"]
+        # **Every line disclaims execution, in one word since beta.31.** Through
+        # beta.30 it was a whole sentence -- "Advisory only: no command is sent for
+        # this action." -- repeated on line after line until a reader stopped
+        # seeing it, which is worse than a short marker they do read.
+        assert entry["message"].endswith(("— Advisory", "— Shadow")), entry["message"]
+        # And the stronger claim, which the disclaimer was only ever a proxy for:
+        # no line says the battery did anything. A start, a success and an error
+        # are execution kinds and are unreachable for an action with no actuator.
+        assert " Started " not in entry["message"]
+        assert not entry["message"].startswith("Finished ")
 
     # And it did not repeat itself. The live symptom was a near-identical line
     # every quarter of an hour about a run already under way, so eight refreshes

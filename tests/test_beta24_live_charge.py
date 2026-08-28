@@ -63,6 +63,7 @@ from custom_components.alpha_ems_manager.alphaess_device import (
 from custom_components.alpha_ems_manager.const import (
     ACTION_CHARGE,
     ACTION_DISCHARGE,
+    ACTIVITY_CATEGORY_SAFETY_BUY,
     CONTROL_CUTOFF_MIN_PERCENT,
     CONTROL_EXECUTABLE_ACTIONS,
     CONTROL_MIN_POWER_KW,
@@ -70,6 +71,8 @@ from custom_components.alpha_ems_manager.const import (
     CONTROL_MODE_OFF,
     CONTROL_MODE_SHADOW,
     CONTROL_STATE_OFF,
+    ECONOMIC_DIRECTION_CHARGE,
+    ECONOMIC_EVENT_CANCELLED,
     EXECUTION_INTENT_GRID_CHARGE,
     EXECUTION_STOP_HEADROOM_REACHED,
     EXECUTION_STOP_SAFETY,
@@ -661,67 +664,139 @@ def test_the_headroom_stop_is_its_own_reason() -> None:
     had run out of room.
     """
     assert EXECUTION_STOP_HEADROOM_REACHED != EXECUTION_STOP_TARGET_REACHED
-    assert activity_module._STOP_PHRASES[EXECUTION_STOP_HEADROOM_REACHED] == "headroom"
+    # beta.31 sharpens this further: the two endings are not two phrasings of one
+    # event kind any more. Running out of room is a *cancellation* and meeting the
+    # target is a *success*, so a history view can tell them apart without reading
+    # the sentence at all.
+    assert activity_module._CANCEL_REASONS[EXECUTION_STOP_HEADROOM_REACHED] == (
+        "Headroom Reached"
+    )
+    assert EXECUTION_STOP_TARGET_REACHED not in activity_module._CANCEL_REASONS
 
 
 # ===========================================================================
-# F. the Activity lifecycle: three lines per run, and no more
+# F. the Activity lifecycle: three lines per plan, and no more
 # ===========================================================================
+#
+# **Rewritten for beta.31**, and the count did not change: three lines, once per
+# campaign. What changed is where the first of them comes from and how the
+# deduplication is keyed.
+#
+# beta.24 keyed all three on Stage B's ``run_id`` and took the "planned" line from
+# the controller's ``prepared`` state. That was correct for a Live campaign and
+# left Stage A's own advice churning beside it -- the two surfaces both spoke, and
+# the advice half re-announced the same campaign every fifteen minutes as the
+# horizon head advanced. beta.31 has **one** lifecycle: the plan's, keyed on the
+# window's end, with Stage B's run attaching to it when the run is admitted.
+
+
+LIFECYCLE_END = NOW + timedelta(hours=3)
+LIFECYCLE_START = NOW + timedelta(minutes=10)
+
+
+def planned_run(**overrides) -> activity_module.PlannedRun:
+    """Return the campaign as Stage A publishes it to Activity."""
+    params = {
+        "category": ACTIVITY_CATEGORY_SAFETY_BUY,
+        "energy_kwh": TARGET_KWH,
+        "end_utc": LIFECYCLE_END,
+        "window": "13:00-16:30",
+    }
+    params.update(overrides)
+    return activity_module.PlannedRun(
+        identity=activity_module.RunIdentity(
+            direction=ECONOMIC_DIRECTION_CHARGE, start_utc=LIFECYCLE_START
+        ),
+        content=activity_module.RunContent(**params),
+    )
 
 
 def view(**overrides):
     """Return an execution view for a charge run."""
     params = {
+        "identity": activity_module.RunIdentity(
+            direction=ECONOMIC_DIRECTION_CHARGE, start_utc=LIFECYCLE_START
+        ),
+        "end_utc": LIFECYCLE_END,
         "intent": EXECUTION_INTENT_GRID_CHARGE,
         "run_id": "run-1",
         "target_kwh": TARGET_KWH,
         "delivered_kwh": 0.0,
-        "initial_power_kw": 2.3,
-        "window": "13:00-16:30",
         "executed": True,
     }
     params.update(overrides)
     return activity_module.ExecutionView(**params)
 
 
-def entry_for(state, execution):
+def entry_for(state, execution, *, runs=None, now=None, shadow=False):
     """Return the lifecycle entry for one refresh, or ``None``."""
-    return activity_module._execution_entry(state, execution, now=NOW)
+    return activity_module.next_activity(
+        previous=state,
+        runs=(planned_run(),) if runs is None else runs,
+        now=NOW if now is None else now,
+        execution=execution,
+        shadow=shadow,
+    )
+
+
+def plan_id() -> str:
+    """Return the campaign's user-visible id."""
+    return activity_module.plan_id_for(
+        activity_module.PlanIdentity(
+            category=ACTIVITY_CATEGORY_SAFETY_BUY, end_utc=LIFECYCLE_END
+        )
+    )
 
 
 def test_the_three_lines_read_as_the_approved_wording() -> None:
-    """The user-facing shape, asserted exactly."""
-    assert activity_module._prepared_message(view()) == (
-        "Charge planned - 8.06 kWh - 2.3 kW - 13:00-16:30"
-    )
-    assert activity_module._started_message(view()) == (
-        "Grid charge started - 8.06 kWh - 2.3 kW"
-    )
-    assert (
-        activity_module._stopped_message(
-            view(delivered_kwh=8.06, stop_reason=EXECUTION_STOP_TARGET_REACHED)
-        )
-        == "Charge complete - 8.06 kWh"
-    )
+    """The user-facing shape, asserted exactly.
+
+    Three facts and a plan id, on one line each. beta.24's lines carried a power
+    as well -- "Charge planned - 8.06 kWh - 2.3 kW - 13:00-16:30" -- and a kW in a
+    plan announcement is a figure a reader can do nothing with: it is the
+    *first interval's* request, and it is revised every minute of the campaign.
+    """
+    state = None
+    messages = []
+    for execution in (
+        None,
+        view(running=True, activation_confirmed=True),
+        view(
+            running=False,
+            delivered_kwh=TARGET_KWH,
+            stop_reason=EXECUTION_STOP_TARGET_REACHED,
+        ),
+    ):
+        entry = entry_for(state, execution)
+        assert entry is not None
+        state = entry.state
+        messages.append(entry.message)
+
+    identifier = plan_id()
+    assert messages == [
+        f"Plan ID: {identifier} — Safety Buy Planned — 13:00-16:30 — 8.06 kWh",
+        f"Plan ID: {identifier} — Buy Started — Tracking 8.06 kWh",
+        f"Finished Plan ID: {identifier} — Success — Target Reached — 8.06 / 8.06 kWh",
+    ]
 
 
-def test_a_planned_line_is_said_once_per_run() -> None:
-    """Twenty prepared refreshes, one line."""
-    state = activity_module.ActivityState()
+def test_a_planned_line_is_said_once_per_plan() -> None:
+    """Twenty refreshes, one line."""
+    state = None
     lines = []
     for _ in range(20):
-        entry = entry_for(state, view(prepared=True))
+        entry = entry_for(state, None)
         if entry is not None:
             lines.append(entry.message)
             state = entry.state
 
     assert len(lines) == 1
-    assert lines[0].startswith("Charge planned")
+    assert "Safety Buy Planned" in lines[0]
 
 
-def test_a_started_line_is_said_once_per_run() -> None:
+def test_a_started_line_is_said_once_per_plan() -> None:
     """The activation succeeds once; twenty sustaining refreshes say nothing."""
-    state = activity_module.ActivityState()
+    state = entry_for(None, None).state
     first = entry_for(state, view(running=True, activation_confirmed=True))
     assert first is not None
     state = first.state
@@ -731,7 +806,7 @@ def test_a_started_line_is_said_once_per_run() -> None:
         for _ in range(20)
     ]
 
-    assert first.message == "Grid charge started - 8.06 kWh - 2.3 kW"
+    assert first.message == f"Plan ID: {plan_id()} — Buy Started — Tracking 8.06 kWh"
     assert quiet == [None] * 20
 
 
@@ -741,76 +816,123 @@ def test_started_is_never_said_from_an_armed_decision() -> None:
     An armed decision has computed a power and sent nothing. In Live, saying
     "started" about it would be a claim about a battery that has not moved.
     """
-    state = activity_module.ActivityState()
+    state = entry_for(None, None).state
     entry = entry_for(state, view(running=True, activation_confirmed=False))
 
     assert entry is None
 
 
-def test_shadow_says_would_start_and_never_the_live_wording() -> None:
-    """Whatever the barrier says. A shadow line must not read like a live one."""
-    state = activity_module.ActivityState()
-    entry = entry_for(state, view(running=True, executed=False))
+def test_shadow_says_nothing_at_all_rather_than_would_start() -> None:
+    """Stronger than beta.24's careful wording, and simpler.
 
-    assert entry is not None
-    assert entry.kind == "would_start"
-    assert "no command sent" in entry.message
-    assert not entry.message.startswith("Grid charge started")
+    beta.24 emitted a ``would_start`` kind with "no command sent" appended, so a
+    Shadow history looked exactly as busy as a Live one and every line needed the
+    disclaimer to stay honest. Shadow now shows the planning lifecycle and stops:
+    a line that does not exist cannot read like a live one.
+    """
+    state = entry_for(None, None, shadow=True).state
+    entry = entry_for(
+        state,
+        view(running=True, executed=False, activation_confirmed=True),
+        shadow=True,
+    )
+
+    assert entry is None
 
 
-def test_a_run_says_planned_started_and_ended_and_nothing_else() -> None:
+def test_a_plan_says_planned_started_and_finished_and_nothing_else() -> None:
     """A whole campaign: twenty-two refreshes, three lines."""
-    state = activity_module.ActivityState()
+    state = None
     messages = []
 
-    def step(execution) -> None:
+    def step(execution, runs=None) -> None:
         nonlocal state
-        entry = entry_for(state, execution)
+        entry = entry_for(state, execution, runs=runs)
         if entry is not None:
             messages.append(entry.message)
             state = entry.state
 
-    step(view(prepared=True))
-    for _ in range(4):
-        step(view(prepared=True))
+    for _ in range(5):
+        step(None)
     step(view(running=True, activation_confirmed=True))
-    for power in (2.3, 2.7, 3.1, 2.9):
+    # Sixteen sustaining refreshes, the power moving on each. Not one of them is a
+    # decision, and Activity is not even told what the power is.
+    for delivered in (1.0, 2.0, 3.0, 4.0):
         for _ in range(4):
-            step(view(running=True, initial_power_kw=power, delivered_kwh=1.0))
+            step(view(running=True, delivered_kwh=delivered))
     step(
         view(
-            running=False, delivered_kwh=8.06, stop_reason=EXECUTION_STOP_TARGET_REACHED
+            running=False,
+            delivered_kwh=TARGET_KWH,
+            stop_reason=EXECUTION_STOP_TARGET_REACHED,
         )
     )
 
+    identifier = plan_id()
     assert messages == [
-        "Charge planned - 8.06 kWh - 2.3 kW - 13:00-16:30",
-        "Grid charge started - 8.06 kWh - 2.3 kW",
-        "Charge complete - 8.06 kWh",
+        f"Plan ID: {identifier} — Safety Buy Planned — 13:00-16:30 — 8.06 kWh",
+        f"Plan ID: {identifier} — Buy Started — Tracking 8.06 kWh",
+        f"Finished Plan ID: {identifier} — Success — Target Reached — 8.06 / 8.06 kWh",
     ]
 
 
 def test_a_second_campaign_announces_itself() -> None:
-    """Deduplication is per run, not for ever. Two runs, two sets of lines."""
-    state = activity_module.ActivityState()
+    """Deduplication is per plan, not for ever. Two plans, two sets of lines."""
+    second_end = LIFECYCLE_END + timedelta(hours=4)
+    second = activity_module.PlannedRun(
+        identity=activity_module.RunIdentity(
+            direction=ECONOMIC_DIRECTION_CHARGE,
+            start_utc=second_end - timedelta(hours=1),
+        ),
+        content=activity_module.RunContent(
+            category=ACTIVITY_CATEGORY_SAFETY_BUY,
+            energy_kwh=4.0,
+            end_utc=second_end,
+            window="20:30-21:30",
+        ),
+    )
+    state = None
     messages = []
 
-    def step(execution) -> None:
+    def step(execution, runs, now) -> None:
         nonlocal state
-        entry = entry_for(state, execution)
+        entry = entry_for(state, execution, runs=runs, now=now)
         if entry is not None:
             messages.append(entry.message)
             state = entry.state
 
-    step(view(prepared=True))
-    step(view(running=True, activation_confirmed=True))
-    step(view(running=False, stop_reason=EXECUTION_STOP_STAGE_A_HOLD))
-    step(view(run_id="run-2", prepared=True))
-    step(view(run_id="run-2", running=True, activation_confirmed=True))
+    step(None, (planned_run(),), NOW)
+    step(view(running=True, activation_confirmed=True), (planned_run(),), NOW)
+    step(
+        view(running=False, stop_reason=EXECUTION_STOP_STAGE_A_HOLD),
+        (planned_run(),),
+        NOW,
+    )
+    step(None, (second,), second_end - timedelta(hours=1))
+    step(
+        view(
+            run_id="run-2",
+            end_utc=second_end,
+            target_kwh=4.0,
+            running=True,
+            activation_confirmed=True,
+        ),
+        (second,),
+        second_end - timedelta(hours=1),
+    )
 
-    assert len(messages) == 5
-    assert messages[3].startswith("Charge planned")
-    assert messages[4].startswith("Grid charge started")
+    assert len(messages) == 5, messages
+    assert "Safety Buy Planned — 20:30-21:30" in messages[3]
+    assert "Buy Started — Tracking 4.00 kWh" in messages[4]
+    # And the two campaigns carry different ids, so a history reader can separate
+    # them without reading the clock.
+    second_id = activity_module.plan_id_for(
+        activity_module.PlanIdentity(
+            category=ACTIVITY_CATEGORY_SAFETY_BUY, end_utc=second_end
+        )
+    )
+    assert plan_id() != second_id
+    assert second_id in messages[3]
 
 
 def test_no_line_is_produced_by_a_republication_or_a_revision() -> None:
@@ -915,16 +1037,25 @@ def test_deriving_started_from_the_controller_state_is_caught() -> None:
 
     assert mutated is True
     assert honest is False
-    assert entry_for(activity_module.ActivityState(), execution) is None
+    # Driven from the state where the plan has already been announced, so the only
+    # line the refresh could produce is the start -- and it does not.
+    assert entry_for(entry_for(None, None).state, execution) is None
 
 
 def test_keying_the_lifecycle_on_the_intent_is_caught() -> None:
-    """Two campaigns of the same intent must announce themselves twice."""
+    """Two campaigns of the same intent must announce themselves twice.
+
+    beta.31 moves the key again, and further: the lifecycle is the *plan's*, so two
+    campaigns of the same intent in different windows carry different plan ids
+    before Stage B has admitted either of them. The run id still separates them
+    once it exists, which is what attaches a dispatch to the plan announced for it.
+    """
     first = view()
-    second = view(run_id="run-2")
+    second = view(run_id="run-2", end_utc=LIFECYCLE_END + timedelta(hours=4))
 
     assert first.intent == second.intent
     assert first.run_id != second.run_id
+    assert first.end_utc != second.end_utc
 
 
 def test_clearing_the_record_before_the_reset_lands_is_caught() -> None:
@@ -1319,18 +1450,14 @@ async def test_a_live_campaign_says_three_things(
 
     await drive_live_charge(hass, config_data, frank, live_surface, quarters=8)
 
-    lifecycle = [
-        entry["message"]
-        for entry in logbook
-        if entry["message"].startswith(("Charge ", "Grid charge "))
-    ]
+    lifecycle = [entry["message"] for entry in logbook]
 
-    assert lifecycle, [entry["message"] for entry in logbook]
-    # One start at most, and it is the Live wording -- so it can only have come from
-    # a confirmed activation.
-    starts = [m for m in lifecycle if m.startswith("Grid charge started")]
+    assert lifecycle
+    # One start at most, and in Live it can only have come from a confirmed
+    # activation -- Shadow emits no start line at all.
+    starts = [m for m in lifecycle if " Started — " in m]
     assert len(starts) == 1, lifecycle
-    assert "no command sent" not in starts[0]
+    assert "Shadow" not in starts[0]
     # Nothing repeated, and far fewer lines than refreshes.
     assert len(lifecycle) == len(set(lifecycle)), lifecycle
     assert len(lifecycle) < 8, lifecycle
@@ -1505,11 +1632,16 @@ def test_the_headroom_branch_reports_the_headroom_reason() -> None:
     assert decision.demand.finished is True
     assert decision.stop_reason == EXECUTION_STOP_HEADROOM_REACHED
     assert decision.stop_reason != EXECUTION_STOP_TARGET_REACHED
-    assert (
-        activity_module._stopped_message(
-            view(delivered_kwh=6.2, stop_reason=decision.stop_reason)
-        )
-        == "Charge stopped - headroom - 6.20 / 8.06 kWh"
+    state = entry_for(None, None).state
+    state = entry_for(state, view(running=True, activation_confirmed=True)).state
+    ended = entry_for(
+        state,
+        view(running=False, delivered_kwh=6.2, stop_reason=decision.stop_reason),
+    )
+    assert ended is not None
+    assert ended.kind == ECONOMIC_EVENT_CANCELLED
+    assert ended.message == (
+        f"Canceled Plan ID: {plan_id()} — Headroom Reached — 6.20 / 8.06 kWh"
     )
 
 
@@ -1588,33 +1720,68 @@ def test_a_supersession_of_the_same_intent_still_announces_the_new_run() -> None
     silently swallowed, and a user would watch a different campaign under the last
     campaign's headline.
     """
-    state = activity_module.ActivityState()
-
+    second_end = LIFECYCLE_END + timedelta(hours=4)
+    second = activity_module.PlannedRun(
+        identity=activity_module.RunIdentity(
+            direction=ECONOMIC_DIRECTION_CHARGE,
+            start_utc=second_end - timedelta(hours=1),
+        ),
+        content=activity_module.RunContent(
+            category=ACTIVITY_CATEGORY_SAFETY_BUY,
+            energy_kwh=4.0,
+            end_utc=second_end,
+            window="20:30-21:30",
+        ),
+    )
+    state = entry_for(None, None).state
     first = entry_for(state, view(running=True, activation_confirmed=True))
     assert first is not None
-    assert first.state.execution.started_run == "run-1"
+    assert first.state.open[0].run_id == "run-1"
 
-    second = entry_for(
-        first.state, view(run_id="run-2", running=True, activation_confirmed=True)
+    # The second campaign replaces the first with no intervening stop: the plan
+    # simply holds a different run next refresh.
+    later = second_end - timedelta(hours=1)
+    cancelled = entry_for(first.state, None, runs=(second,), now=later)
+    assert cancelled is not None
+    assert cancelled.kind == ECONOMIC_EVENT_CANCELLED
+
+    announced = entry_for(cancelled.state, None, runs=(second,), now=later)
+    assert announced is not None
+    assert "Safety Buy Planned — 20:30-21:30" in announced.message
+
+    started = entry_for(
+        announced.state,
+        view(
+            run_id="run-2",
+            end_utc=second_end,
+            target_kwh=4.0,
+            running=True,
+            activation_confirmed=True,
+        ),
+        runs=(second,),
+        now=later,
+    )
+    assert started is not None
+    assert " Buy Started — " in started.message
+    assert started.state.open[0].run_id == "run-2"
+
+
+def test_the_planned_line_is_also_keyed_on_the_plan_rather_than_the_intent() -> None:
+    """The same distinction, on the other end of the lifecycle.
+
+    Two campaigns of the same intent in different windows are two plans, and each
+    is announced once. Under beta.30's intent keying the second was swallowed and a
+    user watched a different campaign under the last campaign's headline.
+    """
+    second_end = LIFECYCLE_END + timedelta(hours=4)
+    first_id = plan_id()
+    second_id = activity_module.plan_id_for(
+        activity_module.PlanIdentity(
+            category=ACTIVITY_CATEGORY_SAFETY_BUY, end_utc=second_end
+        )
     )
 
-    assert second is not None
-    assert second.message.startswith("Grid charge started")
-    assert second.state.execution.started_run == "run-2"
-
-
-def test_the_planned_line_is_also_keyed_on_the_run_rather_than_the_intent() -> None:
-    """The same distinction, on the other end of the lifecycle."""
-    state = activity_module.ActivityState()
-
-    first = entry_for(state, view(prepared=True))
-    assert first is not None
-    assert first.state.execution.planned_run == "run-1"
-
-    second = entry_for(first.state, view(run_id="run-2", prepared=True))
-
-    assert second is not None
-    assert second.state.execution.planned_run == "run-2"
+    assert first_id != second_id
 
 
 # ===========================================================================

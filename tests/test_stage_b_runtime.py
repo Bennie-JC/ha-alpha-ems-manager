@@ -301,25 +301,29 @@ async def test_a_long_run_does_not_produce_a_line_every_quarter(
             runs.append(run_id)
 
     messages = [entry["message"] for entry in logbook]
-    # The execution surface, told apart from the Phase-3 advice lines by its own
-    # vocabulary. Those churn with the reserve window and always have.
-    lifecycle = [
-        m for m in messages if m.startswith(("Charge ", "Discharge ", "Export "))
-    ]
+    # **beta.31: every line is a plan lifecycle line**, so there is no longer an
+    # advice surface to tell the execution surface apart from -- the Phase-3
+    # sentences that churned with the reserve window are gone, and their churn with
+    # them. The whole log is the thing under test.
+    plans = {entry.get("plan_id") for entry in logbook if entry.get("plan_id")}
 
     # Something was said, or the silence proves nothing.
     assert messages
-    assert lifecycle
-    # Two campaigns, and at most one planned, one start and one end for each.
-    assert len(runs) == 2, runs
-    assert len(lifecycle) <= 3 * len(runs), lifecycle
-    # Nothing about the ten routine refreshes in between.
-    assert len(lifecycle) < 12, lifecycle
-    # One planned line and one start line per campaign at most. A third of either
-    # would mean the deduplication key had stopped identifying the run -- which is
-    # the failure this replaced the uniqueness assertion to catch.
-    assert sum(1 for m in lifecycle if " planned - " in m) <= len(runs), lifecycle
-    assert sum(1 for m in lifecycle if " would start - " in m) <= len(runs), lifecycle
+    assert plans
+    # At most three lines per plan: planned once, started at most once, and one
+    # terminal. A fourth would mean the lifecycle key had stopped identifying the
+    # plan -- which is the failure this assertion exists to catch.
+    assert len(messages) <= 3 * len(plans), messages
+    # Nothing about the routine refreshes in between: twelve refreshes, and far
+    # fewer lines than refreshes.
+    assert len(messages) < 12, messages
+    for plan_id in plans:
+        lines = [e["message"] for e in logbook if e.get("plan_id") == plan_id]
+        assert sum(1 for m in lines if " Planned — " in m) <= 1, lines
+        assert sum(1 for m in lines if " Started — " in m) <= 1, lines
+        assert sum(1 for m in lines if m.startswith(("Finished ", "Canceled "))) <= 1, (
+            lines
+        )
     assert writes == []
 
 

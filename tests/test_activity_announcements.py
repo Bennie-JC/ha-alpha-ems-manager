@@ -1,30 +1,20 @@
-"""One message per run, and the proof that the old spam cannot come back.
+"""When a plan is worth announcing, and when silence is the right answer.
 
-The live logbook showed this, every quarter of an hour, for hours:
+The announcement *policy* -- as distinct from the lifecycle, which
+``test_beta31_activity`` covers. Three rules, each with its own history:
 
-    11:45 -> charge 11:45-15:00
-    12:00 -> charge 12:00-15:00
-    12:15 -> charge 12:15-15:30
-    12:30 -> charge 12:30-15:45
+* **Imminence.** A run more than one planning interval away is silent, however
+  many times the plan is recomputed. The plan's far end moves constantly and
+  announcing that produced an entry every fifteen minutes about something nobody
+  could act on.
+* **No back-dating.** A window that has already closed is never announced.
+  Describing a decision nobody could act on is worse than saying nothing.
+* **Absolute instants.** The old fingerprint keyed on an index counted from the
+  target day's midnight, so at the day boundary every index dropped by a whole day
+  and the announcement fired again with no change in meaning.
 
-Technically honest and completely unreadable. The plan really was recomputed each
-quarter and its remaining energy really did shrink -- but nothing had been
-*decided* differently, and a log that cannot tell those apart is noise.
-
-Three causes, all fixed here and each with its own regression:
-
-* the run's identity was keyed on ``start_index``, a horizon-relative index that
-  advances every refresh while a run is under way;
-* midnight rebased every index by a whole day with no change in meaning;
-* the figures were bucketed and hashed, so a hundredth of a kilowatt across a
-  boundary spoke while a fifth of a kilowatt inside one stayed silent.
-
-And one policy change: a run is announced when it is **imminent**, not whenever it
-exists. That single rule removes the overwhelming majority of the old traffic.
-
-Every case here drives the real :func:`next_activity` against fixed instants. No
-clock is read anywhere in the module under test, which is what makes that
-possible.
+Every case drives the real :func:`next_activity` against fixed instants. No clock
+is read anywhere in the module under test, which is what makes that possible.
 """
 
 from __future__ import annotations
@@ -34,39 +24,23 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from custom_components.alpha_ems_manager.activity import (
-    ActivityState,
     PlannedRun,
     RunContent,
     RunIdentity,
     direction_of,
-    logbook_payload,
     next_activity,
 )
 from custom_components.alpha_ems_manager.const import (
-    CONTROL_EXECUTION_AVAILABLE,
-    CONTROL_MIN_POWER_KW,
-    ECONOMIC_ACTION_CHARGE,
+    ACTIVITY_CATEGORY_ECONOMIC_BUY,
+    ACTIVITY_CATEGORY_ECONOMIC_SELL,
+    ACTIVITY_CATEGORY_SAFETY_BUY,
     ECONOMIC_ACTION_DISCHARGE,
     ECONOMIC_ACTION_EXPORT,
     ECONOMIC_ANNOUNCE_LEAD_MINUTES,
-    ECONOMIC_BUCKET_KWH,
-    ECONOMIC_CHARGE_SOURCE_MIXED,
-    ECONOMIC_CHARGE_SOURCE_PRODUCTION,
-    ECONOMIC_DEADBAND_ENERGY_KWH,
-    ECONOMIC_DEADBAND_MINUTES,
-    ECONOMIC_DEADBAND_POWER_KW,
     ECONOMIC_DIRECTION_CHARGE,
     ECONOMIC_DIRECTION_DISCHARGE,
     ECONOMIC_EVENT_CANCELLED,
-    ECONOMIC_EVENT_CHANGED,
-    ECONOMIC_EVENT_ENDED,
     ECONOMIC_EVENT_PLANNED,
-    ECONOMIC_EVENT_REFUSED,
-    ECONOMIC_EVENT_STARTED,
-    ECONOMIC_GAP_FORECAST_INFEASIBLE,
-    ECONOMIC_GAP_NO_PRIMITIVE,
-    ECONOMIC_GAP_NONE,
-    ECONOMIC_REASON_CHEAP_WINDOW,
     QUARTER_MINUTES,
 )
 
@@ -78,45 +52,30 @@ def make_run(
     *,
     start_minutes: float,
     duration_minutes: float = 60.0,
-    action: str = ECONOMIC_ACTION_CHARGE,
+    category: str = ACTIVITY_CATEGORY_SAFETY_BUY,
     energy_kwh: float = 6.5,
-    power_kw: float = 8.7,
-    battery_energy_kwh: float | None = None,
-    average_power_kw: float | None = None,
-    charge_source: str = ECONOMIC_CHARGE_SOURCE_MIXED,
-    refused: bool = False,
-    gap_reason: str = ECONOMIC_GAP_NO_PRIMITIVE,
     now: datetime = NOW,
 ) -> PlannedRun:
     """Return one planned run, positioned relative to ``now``."""
     start = now + timedelta(minutes=start_minutes)
     end = start + timedelta(minutes=duration_minutes)
+    direction = (
+        ECONOMIC_DIRECTION_DISCHARGE
+        if category == ACTIVITY_CATEGORY_ECONOMIC_SELL
+        else ECONOMIC_DIRECTION_CHARGE
+    )
     return PlannedRun(
-        identity=RunIdentity(direction=direction_of(action), start_utc=start),
+        identity=RunIdentity(direction=direction, start_utc=start),
         content=RunContent(
-            action=action,
-            capability_action=(ECONOMIC_ACTION_DISCHARGE if refused else action),
-            reason=ECONOMIC_REASON_CHEAP_WINDOW,
+            category=category,
             energy_kwh=energy_kwh,
-            battery_energy_kwh=(
-                energy_kwh if battery_energy_kwh is None else battery_energy_kwh
-            ),
-            power_kw=power_kw,
-            average_power_kw=(
-                power_kw if average_power_kw is None else average_power_kw
-            ),
             end_utc=end,
-            charge_source=charge_source,
-            price_eur_kwh=0.12,
-            value_eur=1.23,
-            refused=refused,
             window=f"{start:%H:%M}-{end:%H:%M}",
-            gap_reason=(gap_reason if refused else ECONOMIC_GAP_NONE),
         ),
     )
 
 
-def announce(run: PlannedRun, *, now: datetime = NOW) -> ActivityState:
+def announce(run: PlannedRun, *, now: datetime = NOW):
     """Return the state after announcing one run, asserting it was announced."""
     entry = next_activity(previous=None, runs=(run,), now=now)
     assert entry is not None, "the run was expected to be announced"
@@ -124,7 +83,7 @@ def announce(run: PlannedRun, *, now: datetime = NOW) -> ActivityState:
 
 
 # ===========================================================================
-# A. announcement timing
+# A. imminence
 # ===========================================================================
 
 
@@ -151,12 +110,10 @@ def test_a_run_within_one_interval_is_announced_once(lead_minutes: float) -> Non
 
     assert entry is not None
     assert entry.kind == ECONOMIC_EVENT_PLANNED
-    assert "plans to charge the battery" in entry.message
+    assert "Safety Buy Planned" in entry.message
     assert "6.50 kWh" in entry.message
-    # A charge is executable since beta.24, so this line is not advisory. It still
-    # must not read as though the battery had already moved.
-    assert "Advisory only" not in entry.message
-    assert "started" not in entry.message
+    # It must not read as though the battery had already moved.
+    assert "Started" not in entry.message
 
 
 def test_the_lead_time_is_exactly_one_planning_interval() -> None:
@@ -164,12 +121,19 @@ def test_the_lead_time_is_exactly_one_planning_interval() -> None:
     assert ECONOMIC_ANNOUNCE_LEAD_MINUTES == QUARTER_MINUTES == 15
 
 
-def test_announcing_the_same_run_again_says_nothing() -> None:
-    """The plan is recomputed; the decision is not new."""
-    run = make_run(start_minutes=10)
-    state = announce(run)
+def test_a_distant_run_beside_an_imminent_one_stays_silent() -> None:
+    """Only the imminent one is news, and it speaks exactly once."""
+    imminent = make_run(start_minutes=10)
+    distant = make_run(start_minutes=600, category=ACTIVITY_CATEGORY_ECONOMIC_SELL)
 
-    assert next_activity(previous=state, runs=(run,), now=NOW) is None
+    entry = next_activity(previous=None, runs=(imminent, distant), now=NOW)
+    assert entry is not None
+    assert entry.kind == ECONOMIC_EVENT_PLANNED
+    assert "Safety Buy" in entry.message
+
+    assert (
+        next_activity(previous=entry.state, runs=(imminent, distant), now=NOW) is None
+    )
 
 
 # ===========================================================================
@@ -180,51 +144,40 @@ def test_announcing_the_same_run_again_says_nothing() -> None:
 def test_ten_refreshes_during_a_running_charge_produce_no_further_entries() -> None:
     """The exact symptom from the live logbook, as a regression.
 
-    A three-hour charge run, refreshed every quarter while it runs. Its remaining
-    energy shrinks and its first-interval power moves as the horizon consumes it --
-    which is arithmetic, not a decision. Under the old fingerprint each of these
-    produced an entry.
+    A three-hour charge run, refreshed every quarter while it runs. Its start
+    advances as the horizon consumes it and its remaining energy shrinks -- which
+    is arithmetic, not a decision. Under the old fingerprint each of these
+    produced an entry; under beta.30's identity the *start* moving produced two,
+    a false "finished" and a fresh announcement.
     """
     start = NOW + timedelta(minutes=10)
-    first = make_run(start_minutes=10, duration_minutes=180, energy_kwh=12.0)
-    state = announce(first)
+    end = start + timedelta(minutes=180)
+    state = announce(make_run(start_minutes=10, duration_minutes=180, energy_kwh=12.0))
 
     entries = []
     remaining = 12.0
     for step in range(1, 11):
         now = NOW + step * QUARTER
-        # The horizon has consumed `step` quarters of the run.
+        # The horizon has consumed `step` quarters of the run: its head advances
+        # and its remaining energy falls. Its end does not move.
         remaining -= 1.0
         run = PlannedRun(
-            identity=RunIdentity(direction=ECONOMIC_DIRECTION_CHARGE, start_utc=start),
-            content=first.content.__class__(
-                **{
-                    **{
-                        field: getattr(first.content, field)
-                        for field in first.content.__dataclass_fields__
-                    },
-                    "energy_kwh": remaining,
-                    "power_kw": 8.7 - 0.05 * step,
-                }
+            identity=RunIdentity(
+                direction=ECONOMIC_DIRECTION_CHARGE, start_utc=start + step * QUARTER
+            ),
+            content=RunContent(
+                category=ACTIVITY_CATEGORY_SAFETY_BUY,
+                energy_kwh=remaining,
+                end_utc=end,
+                window=f"{start + step * QUARTER:%H:%M}-{end:%H:%M}",
             ),
         )
         entry = next_activity(previous=state, runs=(run,), now=now)
         if entry is not None:
-            entries.append((step, entry.kind))
+            entries.append((step, entry.kind, entry.message))
             state = entry.state
 
     assert entries == [], f"the running run spoke {len(entries)} more times"
-
-
-def test_the_identity_survives_the_horizon_advancing() -> None:
-    """The root cause. The start instant does not move; an index did."""
-    start = NOW + timedelta(minutes=10)
-    identities = {
-        RunIdentity(direction=ECONOMIC_DIRECTION_CHARGE, start_utc=start)
-        for _ in range(5)
-    }
-
-    assert len(identities) == 1
 
 
 def test_crossing_midnight_produces_no_entry() -> None:
@@ -235,198 +188,25 @@ def test_crossing_midnight_produces_no_entry() -> None:
     with no change in meaning.
     """
     evening = datetime(2026, 8, 22, 23, 50, tzinfo=UTC)
-    start = datetime(2026, 8, 23, 0, 0, tzinfo=UTC)
-    run = PlannedRun(
-        identity=RunIdentity(direction=ECONOMIC_DIRECTION_CHARGE, start_utc=start),
-        content=make_run(start_minutes=10, now=evening).content,
-    )
+    run = make_run(start_minutes=10, now=evening)
     state = announce(run, now=evening)
 
     after_midnight = datetime(2026, 8, 23, 0, 5, tzinfo=UTC)
     assert next_activity(previous=state, runs=(run,), now=after_midnight) is None
 
 
-def test_a_run_relabelled_from_discharge_to_export_is_the_same_run() -> None:
+def test_a_run_relabelled_from_discharge_to_export_is_the_same_direction() -> None:
     """One physical discharge, two labels, one decision.
 
-    The label flips as house load rises and falls beneath a constant battery
-    discharge. Identity is the *direction*, so the flip is invisible -- and the
-    content comparison deliberately ignores the label too.
+    The label alternates as house load rises and falls beneath a discharge; the
+    direction does not, and only the direction belongs in an identity.
     """
-    start = NOW + timedelta(minutes=10)
-    as_discharge = make_run(start_minutes=10, action=ECONOMIC_ACTION_DISCHARGE)
-    state = announce(as_discharge)
-
-    as_export = PlannedRun(
-        identity=RunIdentity(direction=ECONOMIC_DIRECTION_DISCHARGE, start_utc=start),
-        content=make_run(start_minutes=10, action=ECONOMIC_ACTION_EXPORT).content,
-    )
-
-    assert as_discharge.identity == as_export.identity
-    assert next_activity(previous=state, runs=(as_export,), now=NOW) is None
+    assert direction_of(ECONOMIC_ACTION_DISCHARGE) == ECONOMIC_DIRECTION_DISCHARGE
+    assert direction_of(ECONOMIC_ACTION_EXPORT) == ECONOMIC_DIRECTION_DISCHARGE
 
 
 # ===========================================================================
-# C. material change, and the deadbands
-# ===========================================================================
-
-
-def test_the_deadbands_are_existing_constants_not_chosen_percentages() -> None:
-    """Each one is a quantity the system already could not distinguish below."""
-    assert ECONOMIC_DEADBAND_ENERGY_KWH == ECONOMIC_BUCKET_KWH == 0.25
-    assert ECONOMIC_DEADBAND_POWER_KW == CONTROL_MIN_POWER_KW == 0.2
-    assert ECONOMIC_DEADBAND_MINUTES == QUARTER_MINUTES == 15
-
-
-@pytest.mark.parametrize(
-    ("energy_delta", "power_delta"),
-    [(0.24, 0.0), (0.0, 0.19), (0.1, 0.1), (-0.24, -0.19)],
-)
-def test_drift_inside_the_deadbands_is_silent(
-    energy_delta: float, power_delta: float
-) -> None:
-    """A plan that moves by less than the system can express has not moved."""
-    run = make_run(start_minutes=10)
-    state = announce(run)
-    drifted = make_run(
-        start_minutes=10,
-        energy_kwh=6.5 + energy_delta,
-        power_kw=8.7 + power_delta,
-    )
-
-    assert next_activity(previous=state, runs=(drifted,), now=NOW) is None
-
-
-def test_a_boundary_cannot_flap_the_way_a_bucket_could() -> None:
-    """The old failure mode, stated as a property.
-
-    Bucket-and-hash fired whenever a value crossed a boundary, however small the
-    step. A deadband is measured from the *announced* value, so repeated tiny
-    drifts in the same direction stay silent until they add up to something real.
-    """
-    run = make_run(start_minutes=10, energy_kwh=6.5)
-    state = announce(run)
-
-    for step in range(1, 5):
-        nudged = make_run(start_minutes=10, energy_kwh=6.5 + 0.05 * step)
-        assert next_activity(previous=state, runs=(nudged,), now=NOW) is None
-
-
-@pytest.mark.parametrize(
-    ("energy_kwh", "power_kw"),
-    [(6.5 + 0.3, 8.7), (6.5, 8.7 + 0.3), (6.5 - 1.0, 8.7)],
-)
-def test_a_change_beyond_a_deadband_speaks_exactly_once(
-    energy_kwh: float, power_kw: float
-) -> None:
-    """One entry, and then silence until it moves again."""
-    run = make_run(start_minutes=10)
-    state = announce(run)
-    changed = make_run(start_minutes=10, energy_kwh=energy_kwh, power_kw=power_kw)
-
-    entry = next_activity(previous=state, runs=(changed,), now=NOW)
-    assert entry is not None
-    assert entry.kind == ECONOMIC_EVENT_CHANGED
-    assert "has changed its plan" in entry.message
-
-    assert next_activity(previous=entry.state, runs=(changed,), now=NOW) is None
-
-
-def test_a_running_run_is_not_re_announced_for_its_shrinking_energy() -> None:
-    """Content is only compared while the run has not started.
-
-    Once it is under way its remaining energy and power decay as the horizon
-    consumes it. Comparing those would reproduce the spam exactly.
-    """
-    start = NOW - timedelta(minutes=30)
-    running = PlannedRun(
-        identity=RunIdentity(direction=ECONOMIC_DIRECTION_CHARGE, start_utc=start),
-        content=make_run(start_minutes=-30, duration_minutes=120).content,
-    )
-    state = announce(running)
-    shrunk = PlannedRun(
-        identity=running.identity,
-        content=make_run(
-            start_minutes=-30, duration_minutes=120, energy_kwh=1.0, power_kw=2.0
-        ).content,
-    )
-
-    assert next_activity(previous=state, runs=(shrunk,), now=NOW) is None
-
-
-def test_a_running_run_that_ends_much_earlier_does_speak() -> None:
-    """The one change that matters during a run: it is being cut short."""
-    start = NOW - timedelta(minutes=30)
-    running = PlannedRun(
-        identity=RunIdentity(direction=ECONOMIC_DIRECTION_CHARGE, start_utc=start),
-        content=make_run(start_minutes=-30, duration_minutes=120).content,
-    )
-    state = announce(running)
-    cut_short = PlannedRun(
-        identity=running.identity,
-        content=make_run(start_minutes=-30, duration_minutes=35).content,
-    )
-
-    entry = next_activity(previous=state, runs=(cut_short,), now=NOW)
-    assert entry is not None
-    assert entry.kind == ECONOMIC_EVENT_CHANGED
-
-
-# ===========================================================================
-# D. retraction
-# ===========================================================================
-
-
-def test_a_future_run_that_disappears_is_cancelled_once() -> None:
-    """An announcement left standing when the plan dropped it would be a lie."""
-    run = make_run(start_minutes=10)
-    state = announce(run)
-
-    entry = next_activity(previous=state, runs=(), now=NOW)
-    assert entry is not None
-    assert entry.kind == ECONOMIC_EVENT_CANCELLED
-    assert "no longer plans to" in entry.message
-    assert "before its window opened" in entry.message
-
-    assert next_activity(previous=entry.state, runs=(), now=NOW) is None
-
-
-def test_a_run_whose_window_has_passed_is_ended_once() -> None:
-    """Its window elapsed rather than its advice being withdrawn.
-
-    Announced while it was under way -- which is the only way a past run can have
-    been announced at all, since a finished one is never back-dated -- and then
-    evaluated after its window closed.
-    """
-    run = make_run(start_minutes=-30, duration_minutes=60)
-    state = announce(run)
-    later = NOW + timedelta(minutes=45)
-
-    entry = next_activity(previous=state, runs=(), now=later)
-    assert entry is not None
-    assert entry.kind == ECONOMIC_EVENT_ENDED
-    assert "has finished the planned window" in entry.message
-
-    assert next_activity(previous=entry.state, runs=(), now=later) is None
-
-
-def test_a_direction_reversal_is_a_cancellation_and_a_new_run() -> None:
-    """A charge that becomes a discharge is not the same decision changed."""
-    charge = make_run(start_minutes=10, action=ECONOMIC_ACTION_CHARGE)
-    state = announce(charge)
-    discharge = make_run(start_minutes=10, action=ECONOMIC_ACTION_DISCHARGE)
-
-    first = next_activity(previous=state, runs=(discharge,), now=NOW)
-    assert first is not None
-    assert first.kind == ECONOMIC_EVENT_CANCELLED
-
-    second = next_activity(previous=first.state, runs=(discharge,), now=NOW)
-    assert second is not None
-    assert second.kind == ECONOMIC_EVENT_PLANNED
-
-
-# ===========================================================================
-# E. never back-date, and at most one entry per refresh
+# C. never back-date
 # ===========================================================================
 
 
@@ -444,189 +224,71 @@ def test_a_run_already_under_way_is_announced_once_after_a_reload() -> None:
     entry = next_activity(previous=None, runs=(running,), now=NOW)
     assert entry is not None
     assert entry.kind == ECONOMIC_EVENT_PLANNED
-    assert "part way through" in entry.message
 
     assert next_activity(previous=entry.state, runs=(running,), now=NOW) is None
 
 
-def test_only_one_entry_is_produced_per_refresh() -> None:
-    """Even when several things happened, and the rest self-heal next refresh."""
-    # Announced ten minutes ago, when it was fifteen minutes from starting; it
-    # has still not begun, so its withdrawal is a cancellation rather than an end.
-    gone = make_run(start_minutes=5, duration_minutes=60)
-    state = announce(gone, now=NOW - timedelta(minutes=10))
-    arriving = make_run(start_minutes=5, action=ECONOMIC_ACTION_DISCHARGE)
+def test_a_future_run_that_disappears_is_cancelled_once() -> None:
+    """An announcement left standing when the plan dropped it would be a lie."""
+    run = make_run(start_minutes=10)
+    state = announce(run)
 
-    first = next_activity(previous=state, runs=(arriving,), now=NOW)
+    entry = next_activity(previous=state, runs=(), now=NOW)
+    assert entry is not None
+    assert entry.kind == ECONOMIC_EVENT_CANCELLED
+    assert "Plan Replaced" in entry.message
+
+    assert next_activity(previous=entry.state, runs=(), now=NOW) is None
+
+
+def test_a_run_whose_window_has_passed_reads_as_expired_not_as_replaced() -> None:
+    """The distinction beta.30 could not make, and the one a reader needs.
+
+    "has finished the planned window" was said about both, so a plan superseded
+    three hours early and a plan whose window genuinely elapsed produced the same
+    line. They are different events and now they read differently.
+    """
+    run = make_run(start_minutes=-30, duration_minutes=60)
+    state = announce(run)
+    later = NOW + timedelta(minutes=45)
+
+    entry = next_activity(previous=state, runs=(), now=later)
+    assert entry is not None
+    assert entry.kind == ECONOMIC_EVENT_CANCELLED
+    assert "Window Expired" in entry.message
+
+    assert next_activity(previous=entry.state, runs=(), now=later) is None
+
+
+def test_a_direction_reversal_is_a_cancellation_and_a_new_plan() -> None:
+    """A charge that becomes a discharge is not the same decision changed."""
+    charge = make_run(start_minutes=10)
+    state = announce(charge)
+    sell = make_run(start_minutes=10, category=ACTIVITY_CATEGORY_ECONOMIC_SELL)
+
+    first = next_activity(previous=state, runs=(sell,), now=NOW)
     assert first is not None
     assert first.kind == ECONOMIC_EVENT_CANCELLED
 
-    second = next_activity(previous=first.state, runs=(arriving,), now=NOW)
+    second = next_activity(previous=first.state, runs=(sell,), now=NOW)
     assert second is not None
     assert second.kind == ECONOMIC_EVENT_PLANNED
+    assert "Economic Sell Planned" in second.message
 
 
-def test_a_distant_run_beside_an_imminent_one_stays_silent() -> None:
-    """Only the imminent one is news."""
-    imminent = make_run(start_minutes=10)
-    distant = make_run(start_minutes=600, action=ECONOMIC_ACTION_DISCHARGE)
+def test_a_closed_plan_is_never_announced_a_second_time() -> None:
+    """The rule that makes "Planned appears exactly once" hold across a gap.
 
-    entry = next_activity(previous=None, runs=(imminent, distant), now=NOW)
-    assert entry is not None
-    assert entry.kind == ECONOMIC_EVENT_PLANNED
-
-    assert (
-        next_activity(previous=entry.state, runs=(imminent, distant), now=NOW) is None
-    )
-
-
-def test_the_announced_set_is_bounded() -> None:
-    """A plan publishes at most eight runs, so remembering more is unreachable."""
-    from custom_components.alpha_ems_manager.const import MAX_ECONOMIC_RUNS_TRACKED
-
-    state = ActivityState()
-    for index in range(MAX_ECONOMIC_RUNS_TRACKED + 4):
-        state = state.with_announced(make_run(start_minutes=index * 30))
-
-    assert len(state.announced) == MAX_ECONOMIC_RUNS_TRACKED
-
-
-# ===========================================================================
-# F. what the sentence says
-# ===========================================================================
-
-
-def test_a_charge_run_says_where_its_energy_comes_from() -> None:
-    """So "charge 6.5 kWh" cannot read as "buy 6.5 kWh"."""
-    solar = make_run(start_minutes=10, charge_source=ECONOMIC_CHARGE_SOURCE_PRODUCTION)
-    entry = next_activity(previous=None, runs=(solar,), now=NOW)
-
-    assert entry is not None
-    assert "almost entirely from your own production" in entry.message
-
-
-def test_an_unexecutable_action_still_carries_the_advisory_qualifier() -> None:
-    """**The invariant, and beta.24 narrowed it rather than dropping it.**
-
-    Until beta.23 nothing executed, so every advice line disclaimed. beta.24
-    executes a charge, so a charge line that still called itself advisory would be
-    false -- but a discharge or an export is as advisory as it ever was, and that
-    is the direction where a missing disclaimer would matter.
+    A plan id is derived from its identity, so a plan that terminates and then
+    reappears in a later solve would otherwise be announced again under the same
+    id -- "Finished, then Planned" for one plan, which the lifecycle forbids.
     """
-    for action in (ECONOMIC_ACTION_DISCHARGE, ECONOMIC_ACTION_EXPORT):
-        run = make_run(start_minutes=10, action=action)
-        planned = next_activity(previous=None, runs=(run,), now=NOW)
-        cancelled = next_activity(previous=planned.state, runs=(), now=NOW)
-        ended = next_activity(
-            previous=announce(
-                make_run(start_minutes=-10, duration_minutes=30, action=action)
-            ),
-            runs=(),
-            now=NOW + timedelta(minutes=45),
-        )
+    run = make_run(start_minutes=10, category=ACTIVITY_CATEGORY_ECONOMIC_BUY)
+    state = announce(run)
 
-        for entry in (planned, cancelled, ended):
-            assert entry is not None
-            # **The qualifier survives; its wording had to change.** "This
-            # release sends no command" became false in beta.25, and a disclaimer
-            # a user learns to disbelieve is worse than none -- so it now names
-            # the *action* rather than the release.
-            assert "Advisory only: no command is sent for this action." in entry.message
-            assert "started" not in entry.message
+    cancelled = next_activity(previous=state, runs=(), now=NOW)
+    assert cancelled is not None
+    assert cancelled.kind == ECONOMIC_EVENT_CANCELLED
 
-
-def test_a_charge_advice_line_no_longer_claims_to_be_advisory() -> None:
-    """It can execute now, so saying otherwise would be the false statement.
-
-    The other half of the old invariant survives untouched: an advice line still
-    never claims the battery moved. Planning to charge is not charging, and this is
-    the surface where those two are easiest to confuse.
-    """
-    run = make_run(start_minutes=10, action=ECONOMIC_ACTION_CHARGE)
-    planned = next_activity(previous=None, runs=(run,), now=NOW)
-    cancelled = next_activity(previous=planned.state, runs=(), now=NOW)
-
-    for entry in (planned, cancelled):
-        assert entry is not None
-        assert "Advisory only" not in entry.message
-        assert "started" not in entry.message
-
-
-def test_a_refused_run_says_what_it_wanted_and_what_is_possible() -> None:
-    """The capability gap, in a sentence."""
-    run = make_run(start_minutes=10, action=ECONOMIC_ACTION_EXPORT, refused=True)
-    entry = next_activity(previous=None, runs=(run,), now=NOW)
-
-    assert entry is not None
-    assert entry.kind == ECONOMIC_EVENT_REFUSED
-    assert "wants to export to the grid" in entry.message
-    assert "No actuator in this release can do that" in entry.message
-
-
-def test_a_forecast_gap_does_not_claim_the_action_is_impossible() -> None:
-    """**The sentence was wrong twice over for a charge, and this is the second.**
-
-    ``forecast_infeasible`` is what fires when the restricted plan simply works out
-    differently -- not when nothing could do the job. Saying "no actuator can do
-    that" beside a charge, which beta.20 executes, would be plainly false.
-    """
-    run = make_run(
-        start_minutes=10,
-        action=ECONOMIC_ACTION_CHARGE,
-        refused=True,
-        gap_reason=ECONOMIC_GAP_FORECAST_INFEASIBLE,
-    )
-    entry = next_activity(previous=None, runs=(run,), now=NOW)
-
-    assert entry is not None
-    assert entry.kind == ECONOMIC_EVENT_REFUSED
-    assert "No actuator" not in entry.message
-    assert "comes out" in entry.message
-    assert "best available action is to" in entry.message
-
-
-def test_the_execution_kind_is_accepted_only_because_this_release_executes() -> None:
-    """**The guard is unchanged; the world it guards against is what moved.**
-
-    Through beta.23 this surface could never say ``started``, and the refusal was
-    the proof. beta.24 executes a charge, so the kind is accepted -- and the guard
-    still stands behind it, keyed on the barrier rather than on a version, so a
-    release that goes back to executing nothing goes back to refusing it.
-
-    Shadow is a separate question and is answered elsewhere: it emits
-    ``would_start``, never this kind, whatever the barrier says.
-    """
-    from custom_components.alpha_ems_manager.activity import ActivityEntry
-
-    assert CONTROL_EXECUTION_AVAILABLE is True
-    entry = ActivityEntry(
-        kind=ECONOMIC_EVENT_STARTED, message="anything", state=ActivityState()
-    )
-
-    payload = logbook_payload(entry, domain="alpha_ems_manager", entity_id="sensor.x")
-    assert payload["message"] == "anything"
-
-
-def test_cancelled_is_now_an_advice_kind_and_is_accepted() -> None:
-    """Withdrawing advice that never began is advice, not execution."""
-    from custom_components.alpha_ems_manager.activity import ActivityEntry
-
-    entry = ActivityEntry(
-        kind=ECONOMIC_EVENT_CANCELLED, message="withdrawn", state=ActivityState()
-    )
-    payload = logbook_payload(
-        entry, domain="alpha_ems_manager", entity_id="sensor.alpha_ems_economic_action"
-    )
-
-    assert payload["entity_id"] == "sensor.alpha_ems_economic_action"
-
-
-def test_the_module_reads_no_clock_of_its_own() -> None:
-    """``now`` is a value. That is what makes every case above deterministic."""
-    import inspect
-
-    from custom_components.alpha_ems_manager import activity
-
-    source = inspect.getsource(activity)
-    for forbidden in ("utcnow", "dt_util", "datetime.now(", "time.time"):
-        assert forbidden not in source, forbidden
+    # The same plan, back in the plan, at the same window.
+    assert next_activity(previous=cancelled.state, runs=(run,), now=NOW) is None

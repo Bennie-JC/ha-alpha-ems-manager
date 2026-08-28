@@ -1,116 +1,109 @@
-"""The Activity surface: what the optimizer intends, said once, when it matters.
+"""The Activity surface: one plan, one lifecycle, at most a handful of lines.
 
-Four properties define this module, and each one is enforced by the shape of the
-code rather than by a convention:
+Four properties define this module, and each is enforced by the shape of the code
+rather than by a convention:
 
-**It is strictly observational.** :func:`next_activity` receives planned runs, the
-previously announced ones and the current instant -- and nothing else. It cannot
-see the plan object, the control report, the safety state or the recovery
-machinery, because they are not arguments. A later phase that wants to log an
-execution event has to change this signature, which is a visible act.
+**It is strictly observational.** :func:`next_activity` receives the planned runs,
+what has already been said, the current instant and whether anything can actually
+be sent -- and nothing else. It cannot see the plan object, the control report,
+the safety state or the recovery machinery, because they are not arguments.
 
 **Nothing reads it back.** No code in this integration subscribes to the event, no
 figure is derived from it, and an installation with the recorder removed produces
 identical numbers. Activity is a write-only tap.
 
-**It cannot claim the battery did anything.** While
-``CONTROL_EXECUTION_AVAILABLE`` is false the execution kind is refused outright,
-and every advice entry carries the advisory qualifier. An Activity line reading
-"charge started" on a release that sends no command would be a lie about the
-hardware, which is the single failure mode this surface must not have.
+**It cannot claim the battery did anything it did not do.** A start, a success and
+an error are execution-class kinds, refused outright while nothing is executable,
+and unreachable in Shadow -- where a lifecycle can only be planned and then
+cancelled.
 
-**One message per run.** This is what beta.16 fixes, and it needs its own
-explanation.
+**It cannot print a figure it should not.** :class:`RunContent` carries a
+category, an energy, a window and an instant. No power, no price, no expected
+value, no reserve arithmetic, no charge-source prose. Those are not filtered out
+of the sentence; they are *absent from the input*, which is a much stronger
+guarantee than a test on a string.
 
-Why the old design spammed
---------------------------
+Why this was rebuilt in beta.31
+-------------------------------
 
-Until beta.16 the decision to speak was a hash of the published run, keyed among
-other things on ``start_index`` -- a chronological index counted from midnight of
-the plan's target day. Three things followed, and all three were visible in the
-live logbook:
+The live Activity history was unreadable, and an export of it made the mechanism
+plain. One charge campaign, ending at 16:15, reported itself planned and then
+"finished" **six times** as its start slid 08:45 -> 09:15 -> 10:30 -> 11:15 ->
+11:45 -> 12:15 and its energy shrank 13.33 -> 13.06 -> 11.67 -> 11.11 -> 10.83 ->
+11.11 kWh. Of 79 messages in the export, roughly 47 were that churn.
 
-* **An in-progress run churned every quarter.** The horizon begins at
-  ``elapsed_intervals + 1``, so each refresh drops the leading interval of a
-  running run: its ``start_index`` advances, its remaining energy shrinks, and the
-  hash changed. One entry every fifteen minutes, for hours, about a decision that
-  had not changed at all.
-* **Midnight rebased everything.** Tomorrow's indices became today's, dropping by
-  a whole day's worth with no change in wall-clock meaning.
-* **Bucket boundaries flapped.** The figures were bucketed and hashed, so a
-  drift of a hundredth of a kilowatt across a boundary spoke while a drift of a
-  fifth of a kilowatt inside one stayed silent.
+Two independent faults produced it.
+
+**The lifecycle was keyed on the wrong end of the window.** Identity was
+``(direction, start_utc)``, and the horizon head is ``elapsed_intervals + 1`` --
+so the *start* of a run already under way advances every single refresh while
+nothing about the decision changes. The run then failed to match what had been
+announced, so the old record was retired ("has finished the planned window") and
+the new one announced afresh. Both lines were false: the window had not finished,
+and nothing new had been planned.
+
+**And "finished" was said about a window, not about a plan.** A superseded
+announcement is not a completed campaign, and describing it as one is the single
+most misleading thing this surface has ever done.
 
 What replaces it
 ----------------
 
-**Identity is separated from content.**
+**The lifecycle is anchored on the window's end.** ``(category, end_utc)`` is what
+a person means by "the four o'clock charge": the head of the horizon walks
+forward under it, its energy is revised, its start moves -- and the thing it is
+*for* does not move at all. In the export above, all six announcements share one
+end, so they are one lifecycle and one Planned line.
 
-*Identity* is ``(direction, start_utc)``: the direction the battery moves and the
-absolute instant the run begins. Direction rather than the action *label*, because
-one physical discharge carries both ``discharge`` and ``export`` as house load
-rises and falls beneath it -- the label changes, the decision does not. An
-absolute instant rather than an index, because an index is relative to a day and a
-horizon and neither is what a person means by "the two o'clock charge".
+**One plan, at most three lines.** ``Planned`` once, ``Buy Started`` at most once,
+then exactly one terminal: ``Success``, ``Canceled`` or ``Error``. Each is
+structural: the lifecycle record carries what has been said, and a plan id whose
+terminal has been emitted is closed and can never be announced again.
 
-*Content* is what the sentence says: energy, power, end, price, character. It is
-compared against the **announced** value with a deadband, never bucketed and
-hashed. A deadband measured from the announced value cannot flap at a boundary;
-that is the whole reason for the change.
+**A refresh is not an event.** A re-solve that moves the target by less than a
+bucket, or the window's end by no more than one planning interval, produces
+nothing at all. Only a change to the *category*, the *direction* or a materially
+different window ends one lifecycle and begins another -- and then the old plan is
+cancelled as replaced rather than quietly overwritten.
 
-**Announcement waits until the run is imminent.** A run more than one planning
-interval away is silent, however many times the plan is recomputed. That single
-rule removes the overwhelming majority of the old traffic, and it is what makes an
-entry worth reading: it is about something that is about to happen.
+**Every line is one short line.** Plan id, what kind of plan, when, how much. The
+kW figures, the prices, the expected value, the edge value, the reserve
+explanation and the solver's reason all stay in diagnostics, where a reader can go
+looking for them.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from hashlib import sha1
 
 from .const import (
-    CONTROL_EXECUTABLE_ACTIONS,
+    ACTIVITY_CATEGORY_CURTAILMENT,
+    ACTIVITY_CATEGORY_ECONOMIC_BUY,
+    ACTIVITY_CATEGORY_ECONOMIC_DISCHARGE,
+    ACTIVITY_CATEGORY_ECONOMIC_SELL,
+    ACTIVITY_CATEGORY_MIXED_BUY,
+    ACTIVITY_CATEGORY_SAFETY_BUY,
     CONTROL_EXECUTION_AVAILABLE,
     ECONOMIC_ACTION_CHARGE,
     ECONOMIC_ACTION_CURTAIL,
     ECONOMIC_ACTION_DISCHARGE,
     ECONOMIC_ACTION_EXPORT,
-    ECONOMIC_ACTION_HOLD,
     ECONOMIC_ACTION_SAFETY_BUY,
     ECONOMIC_ANNOUNCE_LEAD_MINUTES,
-    ECONOMIC_CHARGE_SOURCE_GRID,
-    ECONOMIC_CHARGE_SOURCE_MIXED,
-    ECONOMIC_CHARGE_SOURCE_PRODUCTION,
     ECONOMIC_DEADBAND_ENERGY_KWH,
     ECONOMIC_DEADBAND_MINUTES,
-    ECONOMIC_DEADBAND_POWER_KW,
     ECONOMIC_DIRECTION_CHARGE,
     ECONOMIC_DIRECTION_DISCHARGE,
     ECONOMIC_EVENT_AVAILABLE,
     ECONOMIC_EVENT_CANCELLED,
-    ECONOMIC_EVENT_CHANGED,
-    ECONOMIC_EVENT_ENDED,
+    ECONOMIC_EVENT_ERROR,
+    ECONOMIC_EVENT_FINISHED,
     ECONOMIC_EVENT_INHIBITED,
     ECONOMIC_EVENT_PLANNED,
-    ECONOMIC_EVENT_REFUSED,
     ECONOMIC_EVENT_STARTED,
-    ECONOMIC_EVENT_STOPPED,
-    ECONOMIC_EVENT_WOULD_START,
-    ECONOMIC_EVENT_WOULD_STOP,
     ECONOMIC_EXECUTION_EVENT_KINDS,
-    ECONOMIC_GAP_FORECAST_INFEASIBLE,
-    ECONOMIC_GAP_NONE,
-    ECONOMIC_REASON_CHEAP_WINDOW,
-    ECONOMIC_REASON_EXPENSIVE_WINDOW,
-    ECONOMIC_REASON_MAKE_HEADROOM,
-    ECONOMIC_REASON_NEGATIVE_EXPORT,
-    ECONOMIC_REASON_NO_ACTION,
-    ECONOMIC_REASON_RESERVE_RECOVERY,
-    ECONOMIC_REASON_SAFETY_BUY,
-    EXECUTION_INTENT_GRID_CHARGE,
-    EXECUTION_INTENT_NET_EXPORT,
-    EXECUTION_INTENT_SERVE_LOAD,
     EXECUTION_STOP_EXECUTION_ERROR,
     EXECUTION_STOP_GRID_CEILING,
     EXECUTION_STOP_HEADROOM_REACHED,
@@ -130,59 +123,109 @@ from .const import (
 )
 from .execution import TARGET_TOLERANCE_KWH
 
-#: The name every entry is filed under. Fixed, so a user can filter the logbook on
-#: it, and deliberately not the entity's friendly name -- that is renameable and a
-#: filter built on it would silently stop matching.
-ACTIVITY_NAME = "Economic plan"
-
-#: The suffix that keeps an advisory entry honest. Appended whenever the action
-#: being described is one this release cannot execute.
+#: The name every entry is filed under.
 #:
-#: **No longer "always", since beta.25.** A charge reaches the inverter; a
-#: discharge, an export and a curtailment do not. Saying "this release sends no
-#: command" on every line would now be false on the lines that matter most, and a
-#: disclaimer a user learns to disbelieve is worse than none.
-_ADVISORY = "Advisory only: no command is sent for this action."
+#: **"Alpha EMS" since beta.31.** It was "Economic plan", which was accurate in
+#: beta.16 when the surface carried nothing but Stage-A advice, and stopped being
+#: accurate the moment it began reporting real dispatches: "Economic plan - Grid
+#: charge started" reads as though the plan started rather than the battery.
+#:
+#: Fixed rather than taken from the entity's friendly name, which is renameable --
+#: a logbook filter built on that would silently stop matching. Renaming it does
+#: break a filter someone built on the old string, and that is the whole cost: no
+#: entity id changes, no state changes, and nothing in the integration reads it.
+ACTIVITY_NAME = "Alpha EMS"
 
-#: How each action reads in a sentence, as a verb phrase.
-_VERBS = {
-    ECONOMIC_ACTION_CHARGE: "charge the battery",
-    ECONOMIC_ACTION_SAFETY_BUY: "buy energy to protect the reserve",
-    ECONOMIC_ACTION_DISCHARGE: "discharge the battery to the house",
-    ECONOMIC_ACTION_EXPORT: "export to the grid",
-    ECONOMIC_ACTION_CURTAIL: "decline photovoltaic production",
-    ECONOMIC_ACTION_HOLD: "hold",
+#: How each plan category reads in front of a user.
+_CATEGORY_LABELS = {
+    ACTIVITY_CATEGORY_SAFETY_BUY: "Safety Buy",
+    ACTIVITY_CATEGORY_ECONOMIC_BUY: "Economic Buy",
+    ACTIVITY_CATEGORY_MIXED_BUY: "Mixed Buy",
+    ACTIVITY_CATEGORY_ECONOMIC_SELL: "Economic Sell",
+    ACTIVITY_CATEGORY_ECONOMIC_DISCHARGE: "Economic Discharge",
+    ACTIVITY_CATEGORY_CURTAILMENT: "Curtailment",
 }
 
-#: How each reason reads. Bounded, like the vocabulary it renders.
-_REASONS = {
-    ECONOMIC_REASON_CHEAP_WINDOW: "the price is low in this window",
-    ECONOMIC_REASON_EXPENSIVE_WINDOW: "the price is high in this window",
-    ECONOMIC_REASON_SAFETY_BUY: "the reserve cannot be met from production",
-    ECONOMIC_REASON_MAKE_HEADROOM: "room is needed for forecast production",
-    ECONOMIC_REASON_NEGATIVE_EXPORT: "export is priced below zero",
-    ECONOMIC_REASON_RESERVE_RECOVERY: "the reserve is short and must be restored",
-    ECONOMIC_REASON_NO_ACTION: "no action pays for itself",
+#: The one word a start and a finish are described with, per category.
+_CATEGORY_VERBS = {
+    ACTIVITY_CATEGORY_SAFETY_BUY: "Buy",
+    ACTIVITY_CATEGORY_ECONOMIC_BUY: "Buy",
+    ACTIVITY_CATEGORY_MIXED_BUY: "Buy",
+    ACTIVITY_CATEGORY_ECONOMIC_SELL: "Sell",
+    ACTIVITY_CATEGORY_ECONOMIC_DISCHARGE: "Discharge",
+    ACTIVITY_CATEGORY_CURTAILMENT: "Curtailment",
 }
 
-#: How a charge run's energy source reads. The distinction the live installation
-#: made necessary: a run that put 4.48 kWh in the battery while importing 1.55 kWh
-#: must not be described as buying 4.48 kWh.
-_SOURCES = {
-    ECONOMIC_CHARGE_SOURCE_PRODUCTION: "almost entirely from your own production",
-    ECONOMIC_CHARGE_SOURCE_MIXED: "partly from your own production",
-    ECONOMIC_CHARGE_SOURCE_GRID: "from the grid",
+#: The same word from the direction alone, for a lifecycle adopted from a running
+#: dispatch after a reload -- where the category that produced it is no longer
+#: knowable and inventing one would be a guess about the user's money.
+_DIRECTION_VERBS = {
+    ECONOMIC_DIRECTION_CHARGE: "Buy",
+    ECONOMIC_DIRECTION_DISCHARGE: "Sell",
 }
+
+#: Which direction each category moves the battery.
+_CATEGORY_DIRECTIONS = {
+    ACTIVITY_CATEGORY_SAFETY_BUY: ECONOMIC_DIRECTION_CHARGE,
+    ACTIVITY_CATEGORY_ECONOMIC_BUY: ECONOMIC_DIRECTION_CHARGE,
+    ACTIVITY_CATEGORY_MIXED_BUY: ECONOMIC_DIRECTION_CHARGE,
+    ACTIVITY_CATEGORY_ECONOMIC_SELL: ECONOMIC_DIRECTION_DISCHARGE,
+    ACTIVITY_CATEGORY_ECONOMIC_DISCHARGE: ECONOMIC_DIRECTION_DISCHARGE,
+}
+
+#: Why a lifecycle ended without succeeding, in a phrase rather than a token.
+#:
+#: No internal vocabulary reaches this surface: no module names, no state names,
+#: no snake_case. A reader is told what happened to their battery, not which
+#: branch fired -- the branch is in diagnostics, where it belongs.
+_CANCEL_REASONS: dict[str, str] = {
+    EXECUTION_STOP_PLAN_REPLACED: "Plan Replaced",
+    EXECUTION_STOP_WINDOW_ENDED: "Window Expired",
+    EXECUTION_STOP_STALE_PLAN: "Plan Expired",
+    EXECUTION_STOP_STAGE_A_HOLD: "No Longer Economically Valid",
+    EXECUTION_STOP_SWITCHED_TO_SHADOW: "Control Mode Changed",
+    EXECUTION_STOP_SWITCHED_OFF: "Control Mode Changed",
+    EXECUTION_STOP_OWNERSHIP_CONFLICT: "Ownership Lost",
+    EXECUTION_STOP_SAFETY: "Safety Stop",
+    EXECUTION_STOP_HEADROOM_REACHED: "Headroom Reached",
+    EXECUTION_STOP_GRID_CEILING: "Grid Limit Reached",
+    EXECUTION_STOP_RESERVE_LIMIT: "Reserve Limit Reached",
+}
+
+#: Why a lifecycle ended in a failure. Separate from the map above because the
+#: distinction is the one a reader most needs: a cancelled plan is the optimizer
+#: changing its mind, and an error is something that needs looking at.
+_ERROR_REASONS: dict[str, str] = {
+    EXECUTION_STOP_EXECUTION_ERROR: "Command Failed",
+    EXECUTION_STOP_TIMER_NOT_REFRESHED: "Timer Not Refreshed",
+    EXECUTION_STOP_NO_CHARGE_CEILING: "No Charge Limit",
+}
+
+#: What to say when a plan is withdrawn and no stop reason was recorded, which is
+#: every Stage-A retraction: the plan simply stopped being in the plan.
+_CANCEL_REPLACED = "Plan Replaced"
+_CANCEL_EXPIRED = "Window Expired"
+
+#: The marker a Shadow line carries. One word, appended, and that is deliberate:
+#: through beta.30 every advisory line carried a whole sentence -- "Advisory only:
+#: no command is sent for this action." -- repeated on line after line until a
+#: reader stopped seeing it. A disclaimer nobody reads is worse than a short one
+#: they do.
+_SHADOW_MARKER = "Shadow"
+
+#: The same, for an action no actuator in this release can perform. Distinct from
+#: Shadow because the causes are different and a user can act on one of them: the
+#: mode is theirs to change, the missing actuator is not.
+_ADVISORY_MARKER = "Advisory"
 
 
 @dataclass(frozen=True, slots=True)
 class RunIdentity:
-    """Which run this is, in terms that survive a replan.
+    """Which *run* this is: what the battery does, and when it begins.
 
-    ``direction`` rather than the action label, and an absolute instant rather
-    than an index. Immune to horizon shifting, to midnight rebasing, and to a
-    label flipping between ``discharge`` and ``export`` under a varying house
-    load.
+    Retained from beta.16, and no longer the lifecycle key -- see
+    :class:`PlanIdentity` for why. It is still what :func:`_due` reads, because
+    whether a run is worth announcing is a question about its **start**.
     """
 
     direction: str
@@ -190,38 +233,51 @@ class RunIdentity:
 
 
 @dataclass(frozen=True, slots=True)
-class RunContent:
-    """What the sentence says about a run, and what a change is measured on."""
+class PlanIdentity:
+    """Which *plan* this is, in terms that survive twenty re-solves.
 
-    action: str
-    capability_action: str
-    reason: str
-    #: The flow the action controls, at the boundary the action is paid at:
-    #: battery AC for a charge or a discharge, **grid** export for an export,
-    #: production declined for a curtailment.
-    energy_kwh: float
-    #: What the battery itself moved across the run, always at the battery. Held
-    #: separately because for an export these are different quantities at
-    #: different boundaries, and beta.16 put both in one sentence without saying
-    #: so: "0.95 kW, 0.27 kWh" read as arithmetic and was not.
-    battery_energy_kwh: float
-    #: First-interval battery power, which is what the entity publishes.
-    power_kw: float
-    #: Mean battery power across the whole run. The figure that actually
-    #: multiplies out against ``battery_energy_kwh``.
-    average_power_kw: float
+    ``category`` rather than the action label, and the window's **end** rather
+    than its start.
+
+    The end, because the horizon's head is ``elapsed_intervals + 1``: a run
+    already under way loses its leading interval on every refresh, so its start
+    advances every fifteen minutes while the decision does not change at all. Its
+    end does not move. Anchoring identity on the start is precisely what made one
+    campaign announce itself six times.
+
+    The category, because "Safety Buy becomes Economic Buy" is a genuinely
+    different plan -- the money is being spent for a different reason -- while
+    ``discharge`` flipping to ``export`` under a varying house load is not.
+    """
+
+    category: str
     end_utc: datetime
-    charge_source: str
-    price_eur_kwh: float | None
-    value_eur: float
-    refused: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RunContent:
+    """What a lifecycle line may say about a run. Deliberately four fields.
+
+    **What is missing is the design.** Through beta.30 this carried the first and
+    mean and peak power, the battery energy beside the grid energy, the average
+    price, the expected value, the charge source and the solver's reason -- and
+    the sentence built from them ran to three clauses and two disclaimers. All of
+    it is still published, in diagnostics and in the entity's attributes, which is
+    where a reader who wants it goes.
+
+    Removing the fields rather than declining to print them is what makes "no kW
+    in Activity" a property of the code instead of an assertion about a string.
+    """
+
+    category: str
+    #: What the plan moves, at the boundary the plan is paid at. One figure.
+    energy_kwh: float
+    end_utc: datetime
+    #: The window as local wall-clock text, resolved by the caller that owns the
+    #: calendar. This module reads no clock and knows no timezone.
     window: str
-    #: The largest power any single quarter commands. Defaulted and last, so the
-    #: dataclass ordering rule is not the thing that breaks.
-    peak_power_kw: float = 0.0
-    #: Why the capability plan differs, when it does. Defaulted and last, so the
-    #: dataclass ordering rule is not the thing that breaks.
-    gap_reason: str = ECONOMIC_GAP_NONE
+    #: Whether an actuator in this release can perform the action at all.
+    executable: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,20 +285,19 @@ class PlannedRun:
     """One run of the current plan, with its instants already resolved.
 
     Built by the caller, which owns the calendar. Keeping index-to-instant
-    arithmetic out of this module is what lets the whole announcement policy be
+    arithmetic out of this module is what lets the whole lifecycle policy be
     exercised against plain values.
     """
 
     identity: RunIdentity
     content: RunContent
 
-
-@dataclass(frozen=True, slots=True)
-class AnnouncedRun:
-    """A run that has already been spoken about, and what was said."""
-
-    identity: RunIdentity
-    content: RunContent
+    @property
+    def plan_identity(self) -> PlanIdentity:
+        """Return the lifecycle this run belongs to."""
+        return PlanIdentity(
+            category=self.content.category, end_utc=self.content.end_utc
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,48 +306,41 @@ class ExecutionView:
 
     A deliberately narrow reading rather than the controller's own state. Activity
     must not be able to reach into the controller and start describing its
-    arithmetic -- the quarter-by-quarter setpoint corrections are precisely what
+    arithmetic -- the quarter-by-quarter setpoint corrections are exactly what
     this surface must never carry, and the cheapest way to guarantee that is not
     to hand them over.
 
-    ``executed`` is what separates a Shadow line from a Live one. While the
-    execution barrier stands it is always false, and the wording follows it: a
-    Shadow run says what it *would* have done and never claims the battery moved.
+    ``executed`` is what separates Shadow from Live, and in beta.31 it does more
+    than choose a wording: while it is false **no start, success or error is
+    emitted at all**. Shadow shows the planning lifecycle and stops there.
     """
 
-    #: The run being executed, so lifecycle lines share the plan's identity.
+    #: The run being executed, so a lifecycle can be matched to it by direction.
     identity: RunIdentity | None = None
+    #: When the admitted run's window closes -- the lifecycle anchor, so a running
+    #: dispatch attaches to the plan that was announced for it.
+    end_utc: datetime | None = None
     #: Whether a dispatch is actually under way.
     running: bool = False
-    #: Whether a command physically went out. False for as long as
-    #: :data:`~.const.CONTROL_EXECUTION_AVAILABLE` is, which is every release so
-    #: far -- stated against the constant rather than a version number, so it
-    #: cannot go stale the way a version can.
+    #: Whether a command physically went out.
     executed: bool = False
     target_kwh: float = 0.0
     delivered_kwh: float = 0.0
-    initial_power_kw: float = 0.0
-    window: str = ""
     intent: str = ""
     stop_reason: str | None = None
     inhibit_reason: str | None = None
-    #: The Stage-B run identity, and the key the lifecycle is deduplicated on.
-    #:
-    #: **The run rather than the intent, and that is what makes beta.24's three
-    #: lines exactly three.** A run id is minted once when a run is admitted and is
-    #: stable for the whole campaign, while ``plan_id``, the revision, the window
-    #: and the requested power all churn every refresh. Keying on the intent -- the
-    #: beta.19 choice, kept for the reserve-guard path whose identity genuinely does
-    #: advance every quarter -- cannot tell one charge campaign from the next.
+    #: The Stage-B run identity: minted once when a run is admitted and stable for
+    #: the whole campaign. Carried on the lifecycle so a second campaign for the
+    #: same window is a second lifecycle.
     run_id: str | None = None
     #: Whether a run is admitted and waiting for its window to open.
     prepared: bool = False
     #: Whether a write carrying an activation actually succeeded this refresh.
     #:
-    #: **This, and nothing else, is what "started" may be said about.** Derived from
-    #: the controller state it would have said "started" for an *armed* decision --
-    #: computed, sent nothing -- which on a release that writes is the one claim
-    #: that must not be wrong.
+    #: **This, and nothing else, is what "started" may be said about.** Derived
+    #: from the controller state it would have said "started" for an *armed*
+    #: decision -- computed, sent nothing -- which on a release that writes is the
+    #: one claim that must not be wrong.
     activation_confirmed: bool = False
 
     @property
@@ -302,88 +350,95 @@ class ExecutionView:
 
 
 @dataclass(frozen=True, slots=True)
-class ExecutionMemory:
-    """What has already been said about execution, so it is not said twice.
+class Lifecycle:
+    """One plan, and everything already said about it.
 
-    Separate from ``announced`` because the two answer different questions. A plan
-    is announced once because it was *planned*; a dispatch is announced once
-    because it *started*, and the same plan can be announced and then never start.
-    Collapsing them would make a start event impossible to distinguish from the
-    plan line that preceded it.
+    The record *is* the deduplication. "Planned appears exactly once" is not a
+    filter applied to a stream of candidate events; it is the absence of any path
+    from an existing record to a second Planned line.
     """
 
-    #: The intent whose start has been announced, if any.
-    #:
-    #: The **intent**, not the run identity, and the difference is load-bearing. A
-    #: run driven by the reserve begins at *now*, so its start instant advances
-    #: every quarter and its identity with it -- keying on that re-announced the
-    #: same physical campaign every fifteen minutes, which is precisely the spam
-    #: this surface exists to prevent.
-    #:
-    #: An intent changes when the campaign genuinely changes: charging becomes
-    #: discharging, or serving load becomes exporting. Those are worth a line. A
-    #: window sliding forward under a campaign that is still running is not.
-    started: str | None = None
-    #: The run whose plan, start and end have each been announced, at most once.
-    #:
-    #: Three keys rather than one, because the three events are independent: a run
-    #: can be planned and never start, or start and be stopped by something that
-    #: was not its own target. Each holds a ``run_id``, so a second campaign
-    #: announces itself and a hundred refreshes of the first do not.
-    planned_run: str | None = None
-    started_run: str | None = None
-    ended_run: str | None = None
-    #: The inhibit reason last spoken about, so a standing condition is reported
-    #: on the transition and then left alone. Repeating it every refresh is the
-    #: exact spam this surface exists to avoid.
-    inhibit_reason: str | None = None
-    #: The mode last spoken about.
-    mode: str | None = None
+    plan_id: str
+    identity: PlanIdentity
+    direction: str
+    #: What was announced, so a revision can be measured against it rather than
+    #: against the previous revision -- a deadband measured from a moving value
+    #: ratchets, and this one cannot.
+    energy_kwh: float
+    window: str
+    started: bool = False
+    #: The Stage-B run this lifecycle was executed by, once one exists.
+    run_id: str | None = None
+    #: Whether the plan was only ever advice: Shadow, or an action with no
+    #: actuator. Carried so the terminal line marks itself the same way the
+    #: Planned line did.
+    advisory: bool = False
+    shadow: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class ActivityState:
-    """Every run announced so far, bounded.
+    """Every lifecycle in flight, plus the ones already closed. Bounded.
 
     Reset by a reload, which costs at most one redundant line and buys not
     persisting a logbook cursor. The alternative -- storing it -- would make an
     observational surface a thing that can be restored wrong.
     """
 
-    announced: tuple[AnnouncedRun, ...] = ()
-    #: What has been said about execution. Session-scoped like the rest of this
-    #: state, for the same reason: a reload costs at most one redundant line and
-    #: buys not restoring an observational cursor wrongly.
-    execution: ExecutionMemory = field(default_factory=ExecutionMemory)
+    open: tuple[Lifecycle, ...] = ()
+    #: Plan ids whose terminal event has been emitted.
+    #:
+    #: **Why a separate set rather than deleting the record.** A plan id is derived
+    #: deterministically from its identity, so a plan that terminates and then
+    #: reappears in a later solve would otherwise be announced again under the same
+    #: id -- "Finished, then Planned" for one plan, which the lifecycle forbids. A
+    #: closed id is closed for the session.
+    closed: tuple[str, ...] = ()
+    #: The inhibit reason last spoken about, so a standing condition is reported on
+    #: the transition and then left alone.
+    inhibit_reason: str | None = None
 
-    def with_execution(self, memory: ExecutionMemory) -> ActivityState:
-        """Return this state with its execution memory replaced."""
-        return ActivityState(announced=self.announced, execution=memory)
+    def find(self, identity: PlanIdentity) -> Lifecycle | None:
+        """Return the open lifecycle this plan belongs to, or ``None``.
 
-    def find(self, identity: RunIdentity) -> AnnouncedRun | None:
-        """Return the announced record for ``identity``, or ``None``."""
-        for entry in self.announced:
-            if entry.identity == identity:
+        Matched on the category exactly and the window's end **within one
+        planning interval**, because one interval is precisely the drift a
+        re-solve introduces: the horizon head advances by one, and a run's last
+        interval can be trimmed or extended by one as demand is revised. More
+        than that is a different window, and a different window is a different
+        plan.
+        """
+        for entry in self.open:
+            if entry.identity.category != identity.category:
+                continue
+            if _within_window_tolerance(entry.identity.end_utc, identity.end_utc):
                 return entry
         return None
 
-    def with_announced(self, run: PlannedRun) -> ActivityState:
-        """Return this state plus (or updating) one announced run."""
-        kept = tuple(e for e in self.announced if e.identity != run.identity)
-        record = AnnouncedRun(identity=run.identity, content=run.content)
-        # Newest last, oldest dropped first: the cap can only ever discard a run
-        # whose window is furthest behind us.
+    def with_open(self, lifecycle: Lifecycle) -> ActivityState:
+        """Return this state with one lifecycle recorded or replaced."""
+        kept = tuple(e for e in self.open if e.plan_id != lifecycle.plan_id)
         return ActivityState(
-            announced=(*kept, record)[-MAX_ECONOMIC_RUNS_TRACKED:],
-            execution=self.execution,
+            # Newest last, oldest dropped first: the cap can only ever discard a
+            # lifecycle whose window is furthest behind us.
+            open=(*kept, lifecycle)[-MAX_ECONOMIC_RUNS_TRACKED:],
+            closed=self.closed,
+            inhibit_reason=self.inhibit_reason,
         )
 
-    def without(self, identity: RunIdentity) -> ActivityState:
-        """Return this state with one announced run forgotten."""
+    def with_closed(self, plan_id: str) -> ActivityState:
+        """Return this state with one lifecycle terminated."""
         return ActivityState(
-            announced=tuple(e for e in self.announced if e.identity != identity),
-            execution=self.execution,
+            open=tuple(e for e in self.open if e.plan_id != plan_id),
+            closed=(*(c for c in self.closed if c != plan_id), plan_id)[
+                -MAX_ECONOMIC_RUNS_TRACKED:
+            ],
+            inhibit_reason=self.inhibit_reason,
         )
+
+    def with_inhibit(self, reason: str | None) -> ActivityState:
+        """Return this state with the spoken-about inhibit reason replaced."""
+        return ActivityState(open=self.open, closed=self.closed, inhibit_reason=reason)
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,6 +448,9 @@ class ActivityEntry:
     kind: str
     message: str
     state: ActivityState
+    #: The lifecycle the line belongs to, so a reader of the event -- or a test --
+    #: can group three lines without parsing the sentence.
+    plan_id: str | None = None
 
 
 def next_activity(
@@ -401,6 +459,7 @@ def next_activity(
     runs: tuple[PlannedRun, ...],
     now: datetime,
     execution: ExecutionView | None = None,
+    shadow: bool = False,
 ) -> ActivityEntry | None:
     """Return the one entry this refresh deserves, or ``None`` for silence.
 
@@ -408,340 +467,440 @@ def next_activity(
     refresh; anything else waits for the next one, which is fifteen minutes away
     and self-healing.
 
-    **The signature widened in beta.19, and that was the point.** This module used
-    to be unable to describe execution because execution was not an argument, and
-    the docstring said a later phase wanting to log one would have to change the
-    signature -- "which is a visible act". This is that act. What has *not*
-    changed is the discipline: ``execution`` is a narrow view rather than the
-    controller's state, so Activity still cannot reach the rolling setpoint.
+    **The signature widened again in beta.31, and as before that is the point.**
+    This module's contract is that anything it can describe must be an argument,
+    so a surface that gains a voice does so visibly. ``shadow`` is the fourth such
+    widening: whether the integration is permitted to write is a property of the
+    whole surface rather than of one run or of Stage B's report, and it decides
+    something structural -- while it is true, no start, success or error is
+    emitted at all.
 
-    Priority: execution lifecycle first, then retraction, then change, then
-    announcement. Execution leads because a dispatch that started or stopped is a
-    thing that happened to the battery, and a line about a plan is a thing that
-    might happen -- the first outranks the second whenever both are true.
+    Priority: a terminal first, then a start, then a retraction, then an
+    announcement, then the standing conditions. A terminal leads because an
+    ending that goes unrecorded leaves the previous line standing as though it
+    were still true, which is the fault beta.31 exists to fix.
 
-    What is deliberately silent: every routine quarter. A run under way whose
-    power moved from 2.1 to 2.3 kW produces nothing here, because that is
-    arithmetic rather than a decision and reporting it was the largest source of
-    the old spam. It is in diagnostics, where a reader can go looking.
+    What is deliberately silent: **every routine refresh.** A plan whose target
+    moved by less than a bucket, or whose window end moved by no more than one
+    planning interval, produces nothing here. That is arithmetic rather than a
+    decision, and reporting it was the entire source of the old spam.
     """
     state = previous or ActivityState()
-    live = {run.identity: run for run in runs}
 
     if execution is not None:
-        entry = _execution_entry(state, execution, now=now)
+        entry = _terminal_entry(state, execution, now=now)
+        if entry is not None:
+            return entry
+        entry = _started_entry(state, execution, now=now)
         if entry is not None:
             return entry
 
-    # 1. Something we spoke about is gone.
-    for record in state.announced:
-        if record.identity in live:
-            continue
-        started = record.identity.start_utc <= now
-        return ActivityEntry(
-            kind=ECONOMIC_EVENT_ENDED if started else ECONOMIC_EVENT_CANCELLED,
-            message=(_ended_message(record) if started else _cancelled_message(record)),
-            state=state.without(record.identity),
-        )
-
-    # 2. Something we spoke about has materially moved.
-    for record in state.announced:
-        run = live.get(record.identity)
-        if run is None:  # pragma: no cover - handled above
-            continue
-        if _materially_changed(record.content, run.content, now=now, run=run):
-            return ActivityEntry(
-                kind=ECONOMIC_EVENT_CHANGED,
-                message=_message(ECONOMIC_EVENT_CHANGED, run, now=now),
-                state=state.with_announced(run),
-            )
-
-    # 3. Something new is imminent.
+    live = {}
     for run in runs:
-        if state.find(run.identity) is not None:
+        identity = run.plan_identity
+        live[identity] = run
+
+    # A plan we spoke about is no longer in the plan, and no Stage-B run accounted
+    # for it. Said before anything new, so a history never shows two open plans
+    # for one window.
+    for lifecycle in state.open:
+        if any(
+            lifecycle.identity.category == identity.category
+            and _within_window_tolerance(lifecycle.identity.end_utc, identity.end_utc)
+            for identity in live
+        ):
+            continue
+        expired = lifecycle.identity.end_utc <= now
+        reason = _CANCEL_EXPIRED if expired else _CANCEL_REPLACED
+        # **The figures come from the plan being cancelled, not from Stage B's
+        # current target.** A campaign that had started still reports how far it
+        # got -- a superseded plan that moved 1.4 kWh is a different thing from one
+        # that never began -- but the *denominator* has to be what this plan
+        # announced. Stage B's target has already been revised by the refresh that
+        # replaced the plan, so quoting it would put the new plan's figure beside
+        # the old plan's progress.
+        delivered = None if execution is None else execution.delivered_kwh
+        return _cancelled(state, lifecycle, reason, delivered_kwh=delivered)
+
+    # Something new is imminent. Once per plan id, ever.
+    for run in runs:
+        identity = run.plan_identity
+        if state.find(identity) is not None:
+            continue
+        plan_id = plan_id_for(identity)
+        if plan_id in state.closed:
             continue
         if not _due(run, now=now):
             continue
-        kind = ECONOMIC_EVENT_REFUSED if run.content.refused else ECONOMIC_EVENT_PLANNED
-        return ActivityEntry(
-            kind=kind,
-            message=_message(kind, run, now=now),
-            state=state.with_announced(run),
+        advisory = not run.content.executable
+        lifecycle = Lifecycle(
+            plan_id=plan_id,
+            identity=identity,
+            direction=_direction_for(identity.category),
+            energy_kwh=run.content.energy_kwh,
+            window=run.content.window,
+            advisory=advisory,
+            shadow=shadow,
         )
-
-    return None
-
-
-def _execution_entry(
-    state: ActivityState, execution: ExecutionView, *, now: datetime
-) -> ActivityEntry | None:
-    """Return an execution lifecycle line, or ``None`` when nothing changed.
-
-    **Three lines per run and nothing else**, plus the two standing conditions --
-    an inhibit and the mode. A run is planned once, starts once and ends once, each
-    keyed on its own ``run_id``, so a campaign spanning twenty refreshes produces
-    three entries rather than twenty.
-
-    Nothing here can be reached by a republication, an affirmation, a revision
-    bump, a power change, a budget change or a forecast change. That is structural
-    rather than filtered: those things are not among the conditions below, so there
-    is no path from them to a line.
-    """
-    memory = state.execution
-    run_id = execution.run_id
-
-    # A dispatch stopped, or turned into a different campaign. Said before anything
-    # else about it, because a stop that goes unrecorded leaves the last line
-    # standing as though it were still true.
-    ended_already = run_id is not None and memory.ended_run == run_id
-    if (
-        memory.started is not None
-        and not ended_already
-        and (not execution.running or execution.intent != memory.started)
-    ):
-        return ActivityEntry(
-            kind=(
-                ECONOMIC_EVENT_STOPPED
-                if execution.executed
-                else ECONOMIC_EVENT_WOULD_STOP
-            ),
-            message=_stopped_message(execution),
-            state=state.with_execution(
-                ExecutionMemory(
-                    started=None,
-                    planned_run=memory.planned_run,
-                    started_run=memory.started_run,
-                    ended_run=run_id or memory.ended_run,
-                    inhibit_reason=memory.inhibit_reason,
-                    mode=memory.mode,
-                )
-            ),
-        )
-
-    # A dispatch started. **Once per run**, and in Live only once a write carrying
-    # an activation has actually succeeded -- an armed decision has computed a
-    # power and sent nothing, and calling that "started" would be the one claim a
-    # release that writes must not get wrong. Shadow says "would start" from the
-    # controller state, which is all it has and all it claims.
-    started_this_run = run_id is not None and memory.started_run == run_id
-    began = execution.activation_confirmed if execution.executed else execution.running
-    if began and execution.intent and not started_this_run:
-        return ActivityEntry(
-            kind=(
-                ECONOMIC_EVENT_STARTED
-                if execution.executed
-                else ECONOMIC_EVENT_WOULD_START
-            ),
-            message=_started_message(execution),
-            state=state.with_execution(
-                ExecutionMemory(
-                    started=execution.intent,
-                    planned_run=memory.planned_run,
-                    started_run=run_id or memory.started_run,
-                    ended_run=memory.ended_run,
-                    inhibit_reason=memory.inhibit_reason,
-                    mode=memory.mode,
-                )
-            ),
-        )
-
-    # A run is admitted and its window has not opened. One line, roughly a quarter
-    # of an hour ahead, so a reader sees what is about to happen before it does.
-    planned_this_run = run_id is not None and memory.planned_run == run_id
-    if execution.prepared and run_id is not None and not planned_this_run:
         return ActivityEntry(
             kind=ECONOMIC_EVENT_PLANNED,
-            message=_prepared_message(execution),
-            state=state.with_execution(
-                ExecutionMemory(
-                    started=memory.started,
-                    planned_run=run_id,
-                    started_run=memory.started_run,
-                    ended_run=memory.ended_run,
-                    inhibit_reason=memory.inhibit_reason,
-                    mode=memory.mode,
-                )
-            ),
+            message=_planned_message(lifecycle),
+            state=state.with_open(lifecycle),
+            plan_id=plan_id,
         )
 
-    # A standing condition changed. The transition speaks; the condition does not.
-    if execution.inhibit_reason != memory.inhibit_reason:
-        began = execution.inhibit_reason is not None
-        return ActivityEntry(
-            kind=ECONOMIC_EVENT_INHIBITED if began else ECONOMIC_EVENT_AVAILABLE,
-            message=(
-                f"Execution inhibited: {execution.inhibit_reason}."
-                if began
-                else "Execution available again."
-            ),
-            state=state.with_execution(
-                ExecutionMemory(
-                    started=memory.started,
-                    planned_run=memory.planned_run,
-                    started_run=memory.started_run,
-                    ended_run=memory.ended_run,
-                    inhibit_reason=execution.inhibit_reason,
-                    mode=memory.mode,
-                )
-            ),
-        )
+    if execution is not None:
+        # **Adoption comes last, and the ordering is load-bearing.** A start with
+        # no lifecycle to attach to is only an anomaly once the plan has had its
+        # turn to announce one. Reached before the announcement it produced a
+        # second "Started" line under a second plan id for one physical dispatch,
+        # because a refresh spent on a cancellation left the replacement plan
+        # unannounced and the next refresh's start had nothing to match.
+        entry = _started_entry(state, execution, now=now, adopt=True)
+        if entry is not None:
+            return entry
+        entry = _inhibit_entry(state, execution)
+        if entry is not None:
+            return entry
 
     return None
 
 
-def _prepared_message(execution: ExecutionView) -> str:
-    """Return the line for a run that is admitted and waiting for its window.
+# ---------------------------------------------------------------------------
+# the lifecycle transitions
+# ---------------------------------------------------------------------------
 
-    Three facts and a clock: how much, roughly how fast, and when. Said about a
-    quarter of an hour before anything happens, which is when a reader can still do
-    something about it.
 
-    It does not explain where the plan came from, and it says nothing about a
-    revision, a publication or a horizon. A reader wants to know their battery is
-    about to buy 8.06 kWh between one and half past four.
+def _terminal_entry(
+    state: ActivityState, execution: ExecutionView, *, now: datetime
+) -> ActivityEntry | None:
+    """Return the one terminal line a finished dispatch deserves, or ``None``.
+
+    Reachable only in Live: a Shadow lifecycle ends through the retraction path
+    above, because a plan that never physically started cannot have succeeded or
+    failed at anything.
+
+    **Exactly one, and it is structural.** The lifecycle is closed in the state
+    returned with the line, and a closed plan id matches nothing afterwards -- so
+    a hundred further refreshes carrying the same ``stop_reason`` produce nothing.
     """
-    subject = _STOP_SUBJECTS.get(execution.intent, "Plan")
-    parts = [f"{subject} planned", f"{execution.target_kwh:.2f} kWh"]
-    if execution.initial_power_kw > 0.0:
-        parts.append(f"{execution.initial_power_kw:.1f} kW")
-    if execution.window:
-        parts.append(execution.window)
-    line = " - ".join(parts)
-    # In Shadow this plan is going nowhere, and the line has to say so. Every entry
-    # in the log carries the disclaimer in Shadow; a "planned" line that omitted it
-    # would be the one place a reader could mistake a shadow plan for a live one.
-    return line if execution.executed else f"{line}, no command sent"
-
-
-def _started_message(execution: ExecutionView) -> str:
-    """Return the line for a dispatch beginning.
-
-    Short, and honest about which of the two things happened. A Live line is only
-    reachable once an activation write has actually succeeded, so "started" is a
-    statement about the battery rather than about the controller. A Shadow run says
-    what it *would* have done, which is all it can claim.
-    """
-    subject = _STOP_SUBJECTS.get(execution.intent, "Plan")
-    figures = f"{execution.target_kwh:.2f} kWh"
-    if execution.initial_power_kw > 0.0:
-        figures += f" - {execution.initial_power_kw:.1f} kW"
     if not execution.executed:
-        return f"{subject} would start - {figures}, no command sent"
-    verb = "Grid charge started" if subject == "Charge" else f"{subject} started"
-    return f"{verb} - {figures}"
-
-
-#: What each stop reason is called in front of a user.
-#:
-#: **The whole of the wording layer, and until beta.23 there was none.** The line
-#: read ``execution.stop_reason or "plan ended"``, so a real reason rendered as its
-#: raw constant -- "Dispatch stopped: grid_energy_ceiling." -- and an absent one
-#: rendered as the fallback. Since the reason was ownership-gated and no mode can
-#: reach ownership, the fallback was the only thing that ever printed, for every
-#: reason the controller computes.
-#:
-#: No internal vocabulary reaches this surface: no module names, no state names, no
-#: snake_case. A reader is told what happened to their battery, not which branch
-#: fired -- the branch is in diagnostics, where it belongs.
-_STOP_PHRASES: dict[str, str] = {
-    EXECUTION_STOP_STAGE_A_HOLD: "cancelled",
-    EXECUTION_STOP_WINDOW_ENDED: "window ended",
-    EXECUTION_STOP_TARGET_REACHED: "complete",
-    EXECUTION_STOP_HEADROOM_REACHED: "headroom",
-    EXECUTION_STOP_PLAN_REPLACED: "plan replaced",
-    EXECUTION_STOP_STALE_PLAN: "plan expired",
-    EXECUTION_STOP_GRID_CEILING: "grid limit",
-    EXECUTION_STOP_SWITCHED_TO_SHADOW: "switched to shadow",
-    EXECUTION_STOP_SWITCHED_OFF: "switched off",
-    # The five below are declared in the vocabulary and never assigned by the
-    # controller. They carry a phrase so that no identifier can ever leak into a
-    # sentence if one of them starts being emitted, and they are deliberately
-    # plain rather than reassuring.
-    EXECUTION_STOP_SAFETY: "stopped for safety",
-    EXECUTION_STOP_RESERVE_LIMIT: "reserve limit reached",
-    EXECUTION_STOP_OWNERSHIP_CONFLICT: "ownership unclear",
-    EXECUTION_STOP_EXECUTION_ERROR: "the command failed",
-    EXECUTION_STOP_NO_CHARGE_CEILING: "no charge limit",
-    # Reachable from beta.24: the device dead-man did not move when the run was
-    # re-armed, so the run is ended deliberately rather than left to expire.
-    EXECUTION_STOP_TIMER_NOT_REFRESHED: "timer not refreshed",
-}
-
-#: What the run was doing, in one word, from the intent it carried.
-_STOP_SUBJECTS: dict[str, str] = {
-    EXECUTION_INTENT_GRID_CHARGE: "Charge",
-    EXECUTION_INTENT_SERVE_LOAD: "Discharge",
-    EXECUTION_INTENT_NET_EXPORT: "Export",
-}
-
-
-def _stopped_message(execution: ExecutionView) -> str:
-    """Return the line for a run ending. Short, and specific about why.
-
-    Three shapes, because three kinds of ending read differently:
-
-    * **complete** -- the plan was met. ``Charge complete - 8.06 kWh``, one figure
-      when delivered and asked-for agree inside the completion tolerance, because
-      printing both invites a reader to hunt for a difference that is not there;
-    * **cancelled** -- Stage A withdrew the plan. ``Charge cancelled - 1.76 / 8.06
-      kWh``. Nothing went wrong, and the word says so;
-    * **stopped** -- something bound. ``Charge stopped - headroom - 6.20 / 8.06
-      kWh``, and likewise for the window, the grid limit, freshness and the
-      dead-man.
-
-    A safety stop quotes no figures. The reason is the whole of the message, and a
-    reader chasing a decimal is a reader not reading the word "safety".
-
-    No internal vocabulary reaches any of it: no ``stage_a_hold``, no
-    ``max_end_energy_kwh``, no revision, no snake_case. The branch that fired is in
-    diagnostics, where it belongs.
-
-    **Shadow still says that no command was sent.** Dropping it would make a shadow
-    line and a live line identical, and on the modes this release ships that is the
-    one clause the line cannot lose. The exact phrase matters: a boundary test
-    requires every line in the log to disclaim execution from a fixed vocabulary.
-    """
-    subject = _STOP_SUBJECTS.get(execution.intent, "Plan")
+        return None
+    lifecycle = _lifecycle_for(state, execution)
+    if lifecycle is None or not lifecycle.started:
+        return None
+    if execution.running and execution.stop_reason is None:
+        return None
     reason = execution.stop_reason or ""
-    phrase = _STOP_PHRASES.get(reason, "plan ended")
 
-    if reason == EXECUTION_STOP_SAFETY:
-        line = f"{subject} stopped - safety"
-    elif reason == EXECUTION_STOP_EXECUTION_ERROR:
-        line = f"{subject} failed - command error"
-    elif reason == EXECUTION_STOP_TARGET_REACHED:
-        short_by = execution.target_kwh - execution.delivered_kwh
-        figures = (
-            f"{execution.target_kwh:.2f} kWh"
-            if short_by <= TARGET_TOLERANCE_KWH
-            else f"{execution.delivered_kwh:.2f} / {execution.target_kwh:.2f} kWh"
+    if reason == EXECUTION_STOP_TARGET_REACHED:
+        return _finished(state, lifecycle, execution)
+    if reason in _ERROR_REASONS:
+        return ActivityEntry(
+            kind=ECONOMIC_EVENT_ERROR,
+            message=(
+                f"Finished Plan ID: {lifecycle.plan_id} — Error — "
+                f"{_ERROR_REASONS[reason]}"
+            ),
+            state=state.with_closed(lifecycle.plan_id),
+            plan_id=lifecycle.plan_id,
         )
-        line = f"{subject} complete - {figures}"
-    elif reason == EXECUTION_STOP_STAGE_A_HOLD:
-        line = (
-            f"{subject} cancelled - {execution.delivered_kwh:.2f} / "
-            f"{execution.target_kwh:.2f} kWh"
-        )
-    else:
-        line = (
-            f"{subject} stopped - {phrase} - {execution.delivered_kwh:.2f} / "
-            f"{execution.target_kwh:.2f} kWh"
-        )
-    return line if execution.executed else f"{line}, no command sent"
+    return _cancelled(
+        state,
+        lifecycle,
+        _CANCEL_REASONS.get(reason, _CANCEL_REPLACED),
+        execution=execution,
+    )
+
+
+def _started_entry(
+    state: ActivityState,
+    execution: ExecutionView,
+    *,
+    now: datetime,
+    adopt: bool = False,
+) -> ActivityEntry | None:
+    """Return the line for a dispatch beginning, or ``None``.
+
+    **Live only, and only once a write carrying an activation has succeeded.** An
+    armed decision has computed a power and sent nothing; calling that "started"
+    would be the one claim a release that writes must not get wrong.
+
+    Shadow is answered structurally rather than by wording. Through beta.30 it
+    emitted ``would_start`` / ``would_stop``, which meant a Shadow history looked
+    exactly as busy as a Live one and every line needed a disclaimer to stay
+    honest. It now emits nothing here at all: Shadow shows what was planned, and
+    diagnostics show what would have been sent.
+    """
+    if not execution.executed or not execution.activation_confirmed:
+        return None
+    if not execution.intent:
+        return None
+    lifecycle = _lifecycle_for(state, execution)
+    if lifecycle is not None and lifecycle.started:
+        return None
+    if lifecycle is None:
+        # A dispatch under way with no lifecycle to attach it to. Deferred until
+        # after the announcement pass -- see the call site -- so that a plan which
+        # simply has not been announced yet is announced rather than adopted under
+        # a synthetic id.
+        if not adopt:
+            return None
+        # What remains is a dispatch this session never announced and the plan no
+        # longer contains: a reload mid-campaign, essentially. Adopted rather than
+        # skipped, because a start that goes unrecorded leaves the later terminal
+        # line referring to a plan id the history has never seen. The category is
+        # unknowable at this point and is left empty rather than guessed.
+        lifecycle = _adopted(execution)
+        if lifecycle is None:
+            return None
+        if lifecycle.plan_id in state.closed:
+            return None
+
+    started = Lifecycle(
+        plan_id=lifecycle.plan_id,
+        identity=lifecycle.identity,
+        direction=lifecycle.direction,
+        energy_kwh=lifecycle.energy_kwh,
+        window=lifecycle.window,
+        started=True,
+        run_id=execution.run_id,
+        advisory=lifecycle.advisory,
+        shadow=lifecycle.shadow,
+    )
+    verb = _verb_for(lifecycle)
+    return ActivityEntry(
+        kind=ECONOMIC_EVENT_STARTED,
+        message=(
+            f"Plan ID: {started.plan_id} — {verb} Started — "
+            f"Tracking {execution.target_kwh:.2f} kWh"
+        ),
+        state=state.with_open(started),
+        plan_id=started.plan_id,
+    )
+
+
+def _inhibit_entry(
+    state: ActivityState, execution: ExecutionView
+) -> ActivityEntry | None:
+    """Return the line for a standing condition beginning or ending.
+
+    Transitions only: repeating an inhibit every refresh is the exact spam this
+    surface exists to avoid. Not part of any plan's lifecycle, so it carries no
+    plan id -- it is a statement about the pipeline, not about a purchase.
+    """
+    if execution.inhibit_reason == state.inhibit_reason:
+        return None
+    began = execution.inhibit_reason is not None
+    return ActivityEntry(
+        kind=ECONOMIC_EVENT_INHIBITED if began else ECONOMIC_EVENT_AVAILABLE,
+        message=(
+            f"Execution Inhibited — {_humanise(execution.inhibit_reason)}"
+            if began
+            else "Execution Available"
+        ),
+        state=state.with_inhibit(execution.inhibit_reason),
+    )
+
+
+def _finished(
+    state: ActivityState, lifecycle: Lifecycle, execution: ExecutionView
+) -> ActivityEntry:
+    """Return the success line for a plan that met its target.
+
+    Two shapes, and the difference is worth the branch: naming "Target Reached"
+    when delivery landed inside the completion tolerance tells a reader the two
+    figures beside it are the same number twice rather than a discrepancy they
+    should be hunting for.
+    """
+    short_by = execution.target_kwh - execution.delivered_kwh
+    exact = " — Target Reached" if short_by <= TARGET_TOLERANCE_KWH else ""
+    return ActivityEntry(
+        kind=ECONOMIC_EVENT_FINISHED,
+        message=(
+            f"Finished Plan ID: {lifecycle.plan_id} — Success{exact} — "
+            f"{execution.delivered_kwh:.2f} / {execution.target_kwh:.2f} kWh"
+        ),
+        state=state.with_closed(lifecycle.plan_id),
+        plan_id=lifecycle.plan_id,
+    )
+
+
+def _cancelled(
+    state: ActivityState,
+    lifecycle: Lifecycle,
+    reason: str,
+    *,
+    execution: ExecutionView | None = None,
+    delivered_kwh: float | None = None,
+) -> ActivityEntry:
+    """Return the line for a plan that ended without succeeding.
+
+    The figures appear only when the plan had actually started. A plan withdrawn
+    before its window opened moved no energy, so quoting ``0.00 / 2.22 kWh``
+    beside it would invite a reader to look for a fault where there is only a
+    change of mind.
+
+    Two sources for the pair, because there are two situations. When **Stage B**
+    ended the run, its own target is the right denominator -- that is the number
+    the run was tracking. When the **plan** withdrew it, Stage B's target has
+    already moved on, so the denominator is what this plan announced.
+    """
+    line = f"Canceled Plan ID: {lifecycle.plan_id} — {reason}"
+    if lifecycle.started and execution is not None:
+        line += f" — {execution.delivered_kwh:.2f} / {execution.target_kwh:.2f} kWh"
+    elif lifecycle.started and delivered_kwh is not None:
+        line += f" — {delivered_kwh:.2f} / {lifecycle.energy_kwh:.2f} kWh"
+    return ActivityEntry(
+        kind=ECONOMIC_EVENT_CANCELLED,
+        message=_marked(line, lifecycle),
+        state=state.with_closed(lifecycle.plan_id),
+        plan_id=lifecycle.plan_id,
+    )
+
+
+def _planned_message(lifecycle: Lifecycle) -> str:
+    """Return the line for a plan that has just been made.
+
+    Four facts in one line: which plan, what kind, when, how much. That is the
+    whole of it, and the beta.30 line it replaces ran to two sentences, five
+    figures at three different boundaries and a disclaimer.
+    """
+    label = _CATEGORY_LABELS.get(lifecycle.identity.category, "Plan")
+    line = (
+        f"Plan ID: {lifecycle.plan_id} — {label} Planned — "
+        f"{lifecycle.window} — {lifecycle.energy_kwh:.2f} kWh"
+    )
+    return _marked(line, lifecycle)
+
+
+def _marked(line: str, lifecycle: Lifecycle) -> str:
+    """Append the Shadow or Advisory marker, if either applies.
+
+    One word each, and never both: Shadow subsumes the question, because in
+    Shadow nothing is sent whatever the actuator could have done.
+    """
+    if lifecycle.shadow:
+        return f"{line} — {_SHADOW_MARKER}"
+    if lifecycle.advisory:
+        return f"{line} — {_ADVISORY_MARKER}"
+    return line
+
+
+# ---------------------------------------------------------------------------
+# identity
+# ---------------------------------------------------------------------------
+
+
+def plan_id_for(identity: PlanIdentity) -> str:
+    """Return the short, stable, user-visible id for a plan.
+
+    Derived from the identity rather than minted from a counter, which buys two
+    things. A reload mid-campaign recovers the same id, so a history does not
+    show one plan under two names. And the id is reproducible from a diagnostic:
+    a reader with the category and the window end can compute it and confirm
+    which lines belong together.
+
+    Six hex characters. Enough that two plans in one horizon will not collide,
+    short enough to read out loud, and not a UUID -- an id a person cannot say is
+    an id a person will not use.
+    """
+    minute = identity.end_utc.replace(second=0, microsecond=0)
+    digest = sha1(f"{identity.category}|{minute.isoformat()}".encode())
+    return digest.hexdigest()[:6]
+
+
+def _within_window_tolerance(left: datetime, right: datetime) -> bool:
+    """Return whether two window ends mean the same window."""
+    return abs((left - right).total_seconds()) <= ECONOMIC_DEADBAND_MINUTES * 60
+
+
+def _lifecycle_for(state: ActivityState, execution: ExecutionView) -> Lifecycle | None:
+    """Return the open lifecycle a running dispatch belongs to, or ``None``.
+
+    By ``run_id`` first, which is exact: it is minted once when a run is admitted
+    and stable for the whole campaign, so a lifecycle that has already been
+    attached stays attached however far the window is later revised.
+
+    Otherwise by direction and window end, which is how the *first* attachment
+    happens -- Stage B's admitted run and Stage A's planned run are the same run,
+    so they agree on both.
+    """
+    if execution.run_id is not None:
+        for entry in state.open:
+            if entry.run_id == execution.run_id:
+                return entry
+    direction = None if execution.identity is None else execution.identity.direction
+    if direction is None or execution.end_utc is None:
+        return None
+    for entry in state.open:
+        if entry.direction != direction:
+            continue
+        if _within_window_tolerance(entry.identity.end_utc, execution.end_utc):
+            return entry
+    return None
+
+
+def _adopted(execution: ExecutionView) -> Lifecycle | None:
+    """Return a lifecycle inferred from a dispatch nobody announced.
+
+    Only reachable after a reload during a live campaign. The category is left
+    empty because it is genuinely not knowable from Stage B's report, and a
+    guessed one would be a claim about why the user's money is being spent.
+    """
+    if execution.identity is None or execution.end_utc is None:
+        return None
+    identity = PlanIdentity(category="", end_utc=execution.end_utc)
+    return Lifecycle(
+        plan_id=plan_id_for(identity),
+        identity=identity,
+        direction=execution.identity.direction,
+        energy_kwh=execution.target_kwh,
+        window="",
+        run_id=execution.run_id,
+    )
+
+
+def _direction_for(category: str) -> str:
+    """Return the direction a category moves the battery."""
+    return _CATEGORY_DIRECTIONS.get(category, category)
+
+
+def _verb_for(lifecycle: Lifecycle) -> str:
+    """Return the one word a start is described with."""
+    verb = _CATEGORY_VERBS.get(lifecycle.identity.category)
+    if verb is not None:
+        return verb
+    return _DIRECTION_VERBS.get(lifecycle.direction, "Plan")
+
+
+def _humanise(token: str | None) -> str:
+    """Return an internal token as something a person can read.
+
+    A deliberate compromise, and the only one on this surface. The safety gate
+    has more than twenty refusal reasons and they are genuinely informative, so
+    an explicit table would either go stale or flatten them all to "blocked".
+    Splitting on the underscore and capitalising is deterministic, adds no
+    vocabulary of its own, and cannot silently stop matching a reason the gate
+    starts emitting.
+    """
+    if not token:
+        return "Unknown"
+    return token.replace("_", " ").title()
 
 
 def _due(run: PlannedRun, *, now: datetime) -> bool:
     """Return whether this run is close enough to be worth announcing.
 
-    Three cases, and the third is the one that keeps the log honest:
+    Four cases, and the last two are what keep the log honest:
 
     * more than one planning interval away -- **silent.** The plan is rebuilt
       every quarter and its far end moves constantly; announcing that is what
       produced an entry every fifteen minutes about a run eighteen hours out.
     * within one planning interval of starting -- announce. This is the last
       refresh before it begins.
-    * already started and never announced -- announce once, in the in-progress
-      form. Covers a reload, and a plan that first appears after its own start.
+    * already started and never announced -- announce once, which covers a reload
+      and a plan that first appears after its own start.
     * already **finished** and never announced -- **silent.** Back-dating an
       announcement for a window that has closed would describe a decision nobody
       could act on.
@@ -754,34 +913,34 @@ def _due(run: PlannedRun, *, now: datetime) -> bool:
     return run.content.end_utc > now
 
 
-def _materially_changed(
-    announced: RunContent, current: RunContent, *, now: datetime, run: PlannedRun
-) -> bool:
-    """Return whether a run has moved enough to be worth saying again.
+def materially_changed(lifecycle: Lifecycle, run: PlannedRun) -> bool:
+    """Return whether a re-solve moved a plan enough to be a different plan.
 
-    Each deadband is an existing project constant rather than a chosen
-    percentage, and each is measured against the **announced** value so it cannot
-    flap across a boundary.
+    **Published, and it answers nothing that the identity does not.** That is the
+    point of the beta.31 shape and the reason this function exists only as
+    documentation of it: a change big enough to matter changes the *identity* --
+    the category, or the window end by more than one interval -- and therefore
+    ends one lifecycle and begins another through the ordinary paths. A change too
+    small to matter changes nothing at all.
 
-    Two things are deliberately *not* compared:
-
-    * the action **label**, because ``discharge`` and ``export`` alternate under a
-      varying house load without the decision changing;
-    * for a run already under way, its remaining energy and power. Those decay as
-      the horizon consumes the run -- that is arithmetic, not a decision, and
-      reporting it was the single largest source of the old spam.
+    So the answer here is never used to decide whether to speak; it is used by the
+    tests to state which of the two cases a given revision falls into, and by a
+    reader trying to understand why a 13.33 -> 11.11 kWh revision that spoke six
+    times in beta.30 is silent now.
     """
-    if announced.refused != current.refused:
+    identity = run.plan_identity
+    if lifecycle.identity.category != identity.category:
         return True
-    if abs((current.end_utc - announced.end_utc).total_seconds()) > (
-        ECONOMIC_DEADBAND_MINUTES * 60
-    ):
+    if not _within_window_tolerance(lifecycle.identity.end_utc, identity.end_utc):
         return True
-    if run.identity.start_utc <= now:
-        return False
-    if abs(current.energy_kwh - announced.energy_kwh) > ECONOMIC_DEADBAND_ENERGY_KWH:
-        return True
-    return abs(current.power_kw - announced.power_kw) > ECONOMIC_DEADBAND_POWER_KW
+    return abs(run.content.energy_kwh - lifecycle.energy_kwh) > (
+        ECONOMIC_DEADBAND_ENERGY_KWH
+    )
+
+
+# ---------------------------------------------------------------------------
+# the emitter boundary
+# ---------------------------------------------------------------------------
 
 
 def logbook_payload(entry: ActivityEntry, *, domain: str, entity_id: str) -> dict:
@@ -792,9 +951,9 @@ def logbook_payload(entry: ActivityEntry, *, domain: str, entity_id: str) -> dic
     the entity's own history -- which is where a user looking at the economic
     action will look for it.
 
-    Refuses the execution kind while the barrier stands. A guard rather than an
-    assumption: the caller cannot produce one today, and if a later change makes
-    it possible the refusal is what stops the release claiming the battery moved.
+    Refuses an execution kind while the barrier stands. A guard rather than an
+    assumption: if a later change makes one reachable on a release that sends
+    nothing, the refusal is what stops it claiming the battery moved.
     """
     if entry.kind in ECONOMIC_EXECUTION_EVENT_KINDS and not CONTROL_EXECUTION_AVAILABLE:
         raise ValueError(
@@ -806,170 +965,17 @@ def logbook_payload(entry: ActivityEntry, *, domain: str, entity_id: str) -> dic
         "message": entry.message,
         "domain": domain,
         "entity_id": entity_id,
+        # The lifecycle key, so a consumer can group three lines without parsing
+        # the sentence. Absent for the two standing conditions, which belong to no
+        # plan.
+        **({} if entry.plan_id is None else {"plan_id": entry.plan_id}),
     }
-
-
-def _verb(action: str) -> str:
-    """Return the verb phrase for an action."""
-    return _VERBS.get(action, action)
-
-
-def _quantity(content: RunContent) -> str:
-    """Return the figures worth stating, each with the boundary it belongs to.
-
-    The live beta.16 line read ``export to the grid 0.95 kW, 0.27 kWh during
-    18:30-19:30``. Every figure in it was true and the sentence was still
-    misleading: 0.95 kW was the **battery** discharging in the first interval,
-    0.27 kWh was what reached the **meter** across the whole run, and the
-    remainder covered the house. A reader who multiplies gets nonsense, and a
-    reader who does not still cannot tell which quantity was which.
-
-    So: the mean power, because it is the one that multiplies out against the
-    battery energy; the battery movement; and, when the two differ, what actually
-    reached the grid. A curtailment commands no battery power at all, so quoting
-    ``0.00 kW`` beside it would read as a fault rather than as an absence.
-
-    **The mean is not the dispatch intensity, and saying only the mean implied it
-    was.** A campaign reading "3.50 kW average" bought at 10 kW in two quarters
-    and absorbed free production in eleven more; another read "5.50 kW average"
-    for eight quarters near 8 kW followed by a 1 kW reserve tail. Both are
-    correct plans that a single mean describes badly.
-
-    So the peak is named whenever it differs materially from the mean -- by the
-    same deadband the announcement policy uses, so one number appears on a flat
-    campaign and two only when the second carries information. The per-quarter
-    detail stays in diagnostics; this line is not the place for it.
-    """
-    if content.action == ECONOMIC_ACTION_CURTAIL:
-        return f"{content.energy_kwh:.2f} kWh of production"
-    varies = (
-        content.peak_power_kw - content.average_power_kw > ECONOMIC_DEADBAND_POWER_KW
-    )
-    power = (
-        f"peak {content.peak_power_kw:.2f} kW, campaign average "
-        f"{content.average_power_kw:.2f} kW"
-        if varies
-        else f"{content.average_power_kw:.2f} kW average"
-    )
-    battery = f"{power} ({content.battery_energy_kwh:.2f} kWh from the battery)"
-    if content.action != ECONOMIC_ACTION_EXPORT:
-        return battery
-    # An export is paid at the meter, so the meter figure has to be present --
-    # and named as the meter figure.
-    return (
-        f"{battery}, of which {content.energy_kwh:.2f} kWh reaches the grid"
-        " and the rest covers the house"
-    )
-
-
-def _source_clause(content: RunContent) -> str:
-    """Return where a charge run's energy comes from, or nothing.
-
-    Only for a charge, and only when it can be stated exactly. "charged 4.48 kWh"
-    read as "bought 4.48 kWh" on the live installation, where 1.55 kWh was even
-    site import and the rest was the sun.
-    """
-    phrase = _SOURCES.get(content.charge_source)
-    if phrase is None:
-        return ""
-    return f", {phrase}"
-
-
-def _advisory_suffix(action: str = "") -> str:
-    """Return the advisory disclaimer for a plan line, or nothing.
-
-    **Per action since beta.24, because the answer stopped being the same for
-    every direction.** Until beta.23 nothing executed, so every advice line
-    carried the disclaimer and one constant decided it. beta.24 executes a charge
-    and nothing else, so a charge line that still called itself advisory would be
-    false, and a discharge or export line that dropped the disclaimer would be
-    false in the more dangerous direction.
-
-    An unknown or absent action is treated as advisory. Claiming executability is
-    the one mistake worth being asymmetric about.
-    """
-    return "" if action in CONTROL_EXECUTABLE_ACTIONS else f" {_ADVISORY}"
-
-
-def _ended_message(record: AnnouncedRun) -> str:
-    """Return the line for a run whose window has passed."""
-    return (
-        f"has finished the planned window to {_verb(record.content.action)}"
-        f" ({record.content.window}).{_advisory_suffix(record.content.action)}"
-    )
-
-
-def _cancelled_message(record: AnnouncedRun) -> str:
-    """Return the line for advice withdrawn before it began."""
-    # "before its window opened" rather than "before it started": nothing here
-    # ever starts, and a sentence a reader could take as a claim about the
-    # battery is the one thing this surface must not produce.
-    return (
-        f"no longer plans to {_verb(record.content.action)}"
-        f" ({record.content.window}); the plan changed before its window opened."
-        f"{_advisory_suffix(record.content.action)}"
-    )
-
-
-def _message(kind: str, run: PlannedRun, *, now: datetime) -> str:
-    """Return the line for advice that stands."""
-    content = run.content
-    running = run.identity.start_utc <= now
-    if kind == ECONOMIC_EVENT_REFUSED:
-        lead = "wants to"
-    elif kind == ECONOMIC_EVENT_CHANGED:
-        lead = (
-            "has changed its plan and now intends to"
-            if running
-            else ("has changed its plan and now plans to")
-        )
-    elif running:
-        lead = "is part way through a window to"
-    else:
-        lead = "plans to"
-
-    parts = [f"{lead} {_verb(content.action)}"]
-    if content.window:
-        parts.append(f"during {content.window}:")
-    else:
-        parts.append("--")
-    parts.append(_quantity(content))
-    sentence = " ".join(parts) + _source_clause(content)
-    sentence += f", because {_REASONS.get(content.reason, 'unknown')}."
-
-    if kind == ECONOMIC_EVENT_REFUSED:
-        instead = _verb(content.capability_action)
-        # **Keyed on why, rather than asserting one cause for all of them.** The
-        # sentence used to say "no actuator can do that" unconditionally, which was
-        # wrong twice over for a charge: an actuator exists, and the reason that
-        # actually fires for a charge desire is that the restricted plan works out
-        # differently, not that the action is impossible.
-        if content.gap_reason == ECONOMIC_GAP_FORECAST_INFEASIBLE:
-            sentence += (
-                f" Working only with charging and discharging the plan comes out"
-                f" differently, so the best available action is to {instead}, at a"
-                f" cost of {content.value_eur:.2f} EUR."
-            )
-        else:
-            sentence += (
-                f" No actuator in this release can do that, so the best available"
-                f" action is to {instead}, at a cost of {content.value_eur:.2f} EUR."
-            )
-    else:
-        sentence += f" Expected value {content.value_eur:.2f} EUR."
-
-    if content.price_eur_kwh is not None:
-        sentence += f" Price {content.price_eur_kwh:.4f} EUR/kWh."
-
-    sentence += _advisory_suffix(content.action)
-    return sentence
 
 
 def direction_of(action: str) -> str:
     """Return the battery direction an action label implies.
 
     The label is what a run is *called*; the direction is what the battery does.
-    Only the direction belongs in an identity.
     """
     if action in (ECONOMIC_ACTION_CHARGE, ECONOMIC_ACTION_SAFETY_BUY):
         return ECONOMIC_DIRECTION_CHARGE
@@ -978,15 +984,50 @@ def direction_of(action: str) -> str:
     return action
 
 
+def category_of(action: str, attribution: tuple[float, float] | None) -> str:
+    """Return the plan category for one run.
+
+    The buy categories come from the **purchase attribution**, which is the
+    reserve-relaxed counterfactual's own split of compelled against
+    discretionary energy -- the same pair
+    :func:`economic.classify_purchase` labels a run with. So the words a user
+    reads on the Activity line and the figures a reader audits in diagnostics
+    come from one measurement, and cannot drift apart.
+
+    A charge with no attribution at all is an economic buy: the counterfactual
+    declined to buy anything, which is precisely what "nothing was compulsory"
+    means.
+    """
+    if action in (ECONOMIC_ACTION_CHARGE, ECONOMIC_ACTION_SAFETY_BUY):
+        compelled, discretionary = attribution or (0.0, 0.0)
+        if compelled > 0.0 and discretionary > 0.0:
+            return ACTIVITY_CATEGORY_MIXED_BUY
+        if compelled > 0.0:
+            return ACTIVITY_CATEGORY_SAFETY_BUY
+        return ACTIVITY_CATEGORY_ECONOMIC_BUY
+    if action == ECONOMIC_ACTION_EXPORT:
+        return ACTIVITY_CATEGORY_ECONOMIC_SELL
+    if action == ECONOMIC_ACTION_DISCHARGE:
+        return ACTIVITY_CATEGORY_ECONOMIC_DISCHARGE
+    if action == ECONOMIC_ACTION_CURTAIL:
+        return ACTIVITY_CATEGORY_CURTAILMENT
+    return action
+
+
 __all__ = [
     "ACTIVITY_NAME",
     "ActivityEntry",
     "ActivityState",
-    "AnnouncedRun",
+    "ExecutionView",
+    "Lifecycle",
+    "PlanIdentity",
     "PlannedRun",
     "RunContent",
     "RunIdentity",
+    "category_of",
     "direction_of",
     "logbook_payload",
+    "materially_changed",
     "next_activity",
+    "plan_id_for",
 ]

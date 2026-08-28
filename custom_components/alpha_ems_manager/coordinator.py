@@ -120,6 +120,7 @@ from .const import (
     CONTROL_REFUSE_MARKER_NOT_VERIFIED,
     CONTROL_REFUSE_STOP_NOT_VERIFIED,
     CONTROL_STATE_ELIGIBLE,
+    CONTROL_STATE_ERROR,
     CONTROL_STATE_EXECUTED,
     CONTROL_STATE_IDLE,
     CONTROL_STATE_INHIBITED,
@@ -884,8 +885,29 @@ def _execution_block(report: dict[str, Any] | None) -> dict[str, Any] | None:
     return block if isinstance(block, dict) else None
 
 
-def _mark_execution_error(report: dict[str, Any] | None, reason: str) -> None:
-    """Record an execution error without assuming the report is well-formed."""
+def _mark_execution_error(
+    report: dict[str, Any] | None, reason: str, *, failed: bool = True
+) -> None:
+    """Record an execution error without assuming the report is well-formed.
+
+    ``failed`` separates the two things that reach here, and beta.31 needed the
+    distinction because it now shows on an entity. A *refusal* -- the execution
+    barrier declining before the first service call -- is the expected outcome of a
+    non-writing release and says nothing went wrong. A *failure* -- a rejected
+    write, or one that could not be read back -- is something a user should look
+    at.
+
+    Until beta.31 both left the report's own ``state`` at whatever eligibility had
+    computed *before* the write was attempted, so a failed command published as
+    ``eligible`` or ``inhibited``. A reader watching the Control State entity could
+    not tell a refresh that sent nothing from one whose command failed, which is
+    the single most important distinction the entity can carry.
+    """
+    if failed and isinstance(report, dict):
+        # Set on the report rather than at the call sites, so a future error path
+        # cannot forget it. Before the block lookup, because an error is an error
+        # whether or not the execution block came out well-formed.
+        report["state"] = CONTROL_STATE_ERROR
     block = _execution_block(report)
     if block is None:
         return
@@ -6855,7 +6877,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # dispatch that did start.
             if claiming:
                 self._clear_execution_record()
-            _mark_execution_error(report, "execution_unavailable")
+            # Not a failure: the barrier refused, which is what it is for.
+            _mark_execution_error(report, "execution_unavailable", failed=False)
         except Exception:
             # **A failed write costs the write, never the refresh.** The send site
             # sits outside ``_build_control_report_safely`` -- it has to, because it

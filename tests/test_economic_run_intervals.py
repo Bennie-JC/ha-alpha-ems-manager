@@ -14,8 +14,6 @@ breakdown *describes* the plan and that the plan is unchanged by describing it.
 
 from __future__ import annotations
 
-import dataclasses
-
 import pytest
 
 from custom_components.alpha_ems_manager.activity import next_activity
@@ -23,7 +21,6 @@ from custom_components.alpha_ems_manager.battery import build_limits
 from custom_components.alpha_ems_manager.const import (
     BATTERY_KWH_PRECISION,
     ECONOMIC_ACTION_CHARGE,
-    ECONOMIC_ACTION_EXPORT,
     MAX_ECONOMIC_RUN_INTERVALS_REPORTED,
     MAX_ECONOMIC_RUNS_REPORTED,
 )
@@ -289,53 +286,55 @@ def test_publishing_the_breakdown_changes_no_allocation() -> None:
 
 
 # ===========================================================================
-# Activity: peak and mean are different figures
+# The peak and the mean are different figures -- and neither is Activity's
 # ===========================================================================
+#
+# **Rewritten for beta.31.** These cases used to assert that the Activity line
+# read "peak 8.00 kW, campaign average 4.46 kW", which fixed a real fault: "4.46
+# kW average" read as the dispatch intensity for a campaign that ran at 8 kW
+# through the peak and 1 kW in a reserve tail.
+#
+# The fix was right and its *location* was wrong. Activity is a plan lifecycle in
+# one line, and a reader asking how a campaign was shaped is asking something a
+# table answers better than a sentence can. So the two figures are asserted where
+# a reader now finds them, and Activity is asserted to carry neither -- which it
+# cannot, because ``RunContent`` has no power field to print.
 
 
-def announced(*, action: str, average: float, peak: float) -> str:
-    """Return the Activity line for a run of a given power shape."""
-    run = make_run(start_minutes=10, duration_minutes=195, action=action)
-    content = dataclasses.replace(
-        run.content,
-        average_power_kw=average,
-        peak_power_kw=peak,
-        battery_energy_kwh=14.5,
-        energy_kwh=11.92,
-    )
-    entry = next_activity(
-        previous=None, runs=(dataclasses.replace(run, content=content),), now=NOW
-    )
-    assert entry is not None
-    return entry.message
+def test_the_published_run_names_the_peak_beside_the_mean() -> None:
+    """**The misleading figure, corrected -- on the surface that can carry it.**
 
-
-def test_a_varying_campaign_names_the_peak_beside_the_mean() -> None:
-    """**The misleading figure, corrected.**
-
-    "4.46 kW average" read as the dispatch intensity for a campaign that ran at
-    8 kW through the peak and 1 kW in a reserve tail. Both numbers now appear, and
-    which is which is stated.
+    This is the same thirteen-quarter campaign the top of this file dissects: two
+    quarters at full power that bought, and eleven that stored production. A single
+    mean describes it badly, so all three figures are published per run and each is
+    named for what it is.
     """
-    message = announced(action=ECONOMIC_ACTION_EXPORT, average=4.46, peak=8.0)
+    runs = payload_for()["runs"]
+    assert runs, "the campaign must publish a run for the figures to be read from"
+    run = runs[0]
 
-    assert "peak 8.00 kW" in message
-    assert "campaign average 4.46 kW" in message
-
-
-def test_a_flat_campaign_still_reports_one_figure() -> None:
-    """Not noisier. A second number is only worth printing when it differs."""
-    message = announced(action=ECONOMIC_ACTION_EXPORT, average=8.0, peak=8.0)
-
-    assert "8.00 kW average" in message
-    assert "peak" not in message
-    assert "campaign average" not in message
+    assert run["peak_power_kw"] is not None
+    assert run["average_power_kw"] is not None
+    assert run["first_power_kw"] is not None
+    # Genuinely different on a varying campaign, or the distinction would be
+    # untested whatever the keys say.
+    assert run["peak_power_kw"] > run["average_power_kw"]
 
 
-def test_the_activity_line_carries_no_per_quarter_detail() -> None:
-    """Detail belongs in diagnostics. Activity is a timeline, not a table."""
-    message = announced(action=ECONOMIC_ACTION_CHARGE, average=3.50, peak=10.0)
+def test_the_activity_line_carries_no_power_at_all() -> None:
+    """Detail belongs in diagnostics. Activity is a timeline, not a table.
 
-    assert "absorbing" not in message
-    assert "interval" not in message
-    assert message.count("kWh") <= 2
+    Asserted structurally as well as on the string: the input carries no power, so
+    there is no path from a solved run's power shape to an Activity sentence.
+    """
+    from custom_components.alpha_ems_manager.activity import RunContent
+
+    entry = next_activity(previous=None, runs=(make_run(start_minutes=10),), now=NOW)
+    assert entry is not None
+
+    assert "kW" not in entry.message.replace("kWh", "")
+    assert "peak" not in entry.message
+    assert "average" not in entry.message
+    assert "interval" not in entry.message
+    for field in ("power_kw", "average_power_kw", "peak_power_kw"):
+        assert field not in RunContent.__dataclass_fields__, field

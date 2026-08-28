@@ -1988,6 +1988,10 @@ class EconomicOutcome:
     #: on the outcome because it needs the pack's *state*, which the solver does
     #: not see -- and because every published purchase is attributed against it.
     bridge_kwh_now: float | None = None
+    #: The pack's outbound conversion efficiency, carried so a purchase can be
+    #: attributed to a future avoided import without this module having to name an
+    #: efficiency of its own.
+    discharge_efficiency: float = 1.0
     #: The same problem solved under beta.30's economics, for comparison only.
     #: ``None`` unless Shadow asked for it. **Temporary**, and flagged as such in
     #: the payload: it doubles the solve to publish something no decision reads.
@@ -2402,6 +2406,7 @@ def build_outcome(
         bridge_kwh_now=(
             None if reachability is None else reachability.bridge_kwh(start_energy_kwh)
         ),
+        discharge_efficiency=table.limits.discharge_efficiency,
         safety_buy_runs=_safety_buy_runs(desired, relaxed, table.bucket_kwh),
         safety_buy_attribution=_safety_buy_attribution(desired, relaxed),
         legacy=legacy,
@@ -2618,6 +2623,8 @@ def classify_purchase(
     edge_value_eur_per_kwh: float,
     survives_to_edge_kwh: float,
     attribution: tuple[float, float] | None = None,
+    future_spread_eur_kwh: float | None = None,
+    future_spread_price_eur_kwh: float | None = None,
 ) -> dict[str, Any]:
     """Return why this charge run exists, and how much of it was unavoidable.
 
@@ -2641,10 +2648,23 @@ def classify_purchase(
     exists to fix -- and it is the reason the counterfactual, not the head figure,
     decides.
 
-    The discretionary half is then attributed by where its value comes from:
-    arbitrage if the run's own marginal cost is negative -- it pays for itself
-    inside the horizon -- and future self-use if it does not, meaning the payoff is
-    inventory surviving to the horizon edge at ``edge_value``.
+    The discretionary half is then attributed by **where its value comes from**,
+    and the test is a known future spread rather than a run that pays for itself:
+
+    * ``economic_arbitrage`` -- a *concrete* future interval, inside the priced
+      horizon, whose import price beats this purchase by more than the outbound
+      conversion costs. Buying at 0.10 to displace a 0.38 import tonight is
+      arbitrage, and an earlier draft of this function said it was not: it asked
+      whether the *charging window itself* showed a net saving, which for a charge
+      run measured against its own idle counterfactual is essentially never true.
+      That made the label unreachable and pushed every discretionary purchase into
+      the strategic bucket.
+    * ``strategic_future_self_use`` -- the energy is worth holding on general
+      grounds, but no specific window in the horizon can be pointed at. Its payoff
+      is the terminal value, which is a replacement cost rather than a spread.
+
+    The distinction is worth keeping precisely because one of them is auditable
+    against a price a reader can look up and the other is not.
 
     A figure that cannot be derived honestly is published as ``None``. That is the
     whole difference from ``safety_buy``, which always had an answer because the
@@ -2672,6 +2692,8 @@ def classify_purchase(
         compelled = min(energy, max(0.0, bridge_kwh_now))
     discretionary = max(0.0, energy - compelled)
     pays_for_itself = run.marginal_cost_eur < 0.0
+    # A concrete spread beats a general claim: it names an interval and a price.
+    has_spread = future_spread_eur_kwh is not None and future_spread_eur_kwh > 0.0
 
     if compelled > 0.0 and discretionary > 0.0:
         label = BUY_REASON_MIXED
@@ -2683,7 +2705,7 @@ def classify_purchase(
             if uncertainty_dc_kwh is not None and compelled <= uncertainty_dc_kwh
             else BUY_REASON_REACHABILITY
         )
-    elif pays_for_itself:
+    elif has_spread:
         label = BUY_REASON_ARBITRAGE
     elif edge_value_eur_per_kwh > 0.0 and survives_to_edge_kwh > 0.0:
         label = BUY_REASON_FUTURE_SELF_USE
@@ -2718,13 +2740,25 @@ def classify_purchase(
             "waiting would cross the floor"
             if compelled >= energy and compelled > 0.0
             else (
-                "this window is cheaper than the alternatives in the horizon"
-                if pays_for_itself
+                "a later interval in this horizon imports at "
+                f"{_round_eur(future_spread_price_eur_kwh)} EUR/kWh, which this "
+                "purchase displaces"
+                if has_spread
                 else "the energy is worth more held than the cost of buying it"
             )
         ),
         "marginal_cost_eur": _round_eur(run.marginal_cost_eur),
         "pays_for_itself_in_horizon": pays_for_itself,
+        # The spread the label rests on, and the price it was measured against, so
+        # a reader can check the attribution against a figure they can look up.
+        "future_spread_eur_kwh": (
+            None if future_spread_eur_kwh is None else _round_eur(future_spread_eur_kwh)
+        ),
+        "future_spread_price_eur_kwh": (
+            None
+            if future_spread_price_eur_kwh is None
+            else _round_eur(future_spread_price_eur_kwh)
+        ),
         "edge_value_eur_kwh": _round_eur(edge_value_eur_per_kwh),
         "uncertainty_dc_kwh": (
             None if uncertainty_dc_kwh is None else _round_kwh(uncertainty_dc_kwh)
@@ -2887,6 +2921,37 @@ def _run_intervals(
     return rows, omitted
 
 
+def future_spread_for(
+    run: EconomicRun,
+    plan: EconomicPlan,
+    *,
+    discharge_efficiency: float,
+) -> tuple[float | None, float | None]:
+    """Return the best known spread this purchase can be attributed to.
+
+    ``(spread_eur_kwh, the import price it was measured against)``, or
+    ``(None, None)`` when nothing in the horizon after this run can be pointed at.
+
+    The comparison is the honest one for stored energy: a kWh bought now and
+    discharged later returns ``price * eta_discharge`` of avoided import, because
+    only the outbound conversion is still to come -- the inbound loss is already
+    paid for in what was bought. Measured strictly *after* the run ends, since a
+    purchase cannot displace an import that has already happened.
+    """
+    buy_price = run.average_price_eur_kwh
+    if buy_price is None or discharge_efficiency <= 0.0:
+        return (None, None)
+    later = [
+        entry.import_price_eur_kwh
+        for entry in plan.intervals
+        if entry.index > run.end_index and entry.import_price_eur_kwh is not None
+    ]
+    if not later:
+        return (None, None)
+    best = max(later)
+    return (best * discharge_efficiency - buy_price, best)
+
+
 def _runs_as_dicts(
     outcome: EconomicOutcome,
     desired: EconomicPlan,
@@ -2905,6 +2970,15 @@ def _runs_as_dicts(
     # length read ``null``. A real snapshot showed interval 44 carrying 12.39 kWh
     # where its requirement was 5.67. Zipping against ``demands`` removes the
     # possibility: both sides now name the same interval.
+    # The spread each charge run can be attributed to, computed once from the
+    # plan's own published prices so the label and the figure cannot disagree.
+    _spreads = {
+        run.start_index: future_spread_for(
+            run, desired, discharge_efficiency=outcome.discharge_efficiency
+        )
+        for run in runs
+        if run.direction == ECONOMIC_DIRECTION_CHARGE
+    }
     reserve = {
         demand.index: value
         for demand, value in zip(
@@ -2927,6 +3001,12 @@ def _runs_as_dicts(
                 purchase=classify_purchase(
                     run,
                     attribution=outcome.safety_buy_attribution.get(run.start_index),
+                    future_spread_eur_kwh=_spreads.get(run.start_index, (None, None))[
+                        0
+                    ],
+                    future_spread_price_eur_kwh=(
+                        _spreads.get(run.start_index, (None, None))[1]
+                    ),
                     bridge_kwh_now=outcome.bridge_kwh_now,
                     uncertainty_dc_kwh=(
                         None

@@ -239,6 +239,38 @@
           "active": "Live"
         }
       }
+    },
+    "sensor": {
+      "control_state": {
+        "name": "Regelstatus",
+        "state": {
+          "off": "Uit",
+          "inhibited": "Geblokkeerd",
+          "eligible": "Gepland",
+          "idle": "Rust",
+          "executed": "Actief",
+          "error": "Fout"
+        }
+      },
+      "battery_recommendation": {
+        "name": "Batterijadvies",
+        "state": {
+          "hold": "Vasthouden",
+          "charge": "Laden",
+          "discharge": "Ontladen"
+        }
+      },
+      "economic_action": {
+        "name": "Economische actie",
+        "state": {
+          "hold": "Vasthouden",
+          "charge": "Laden",
+          "discharge": "Ontladen",
+          "export": "Terugleveren",
+          "safety_buy": "Reserve-inkoop",
+          "curtail_pv": "Afregelen"
+        }
+      }
     }
   }
 }

@@ -45,6 +45,8 @@ from custom_components.alpha_ems_manager.economic import (
     classify_purchase,
     edge_creditable_energy_kwh,
     edge_value_eur_per_kwh,
+    future_spread_for,
+    select_bucket_kwh,
 )
 from custom_components.alpha_ems_manager.reserve import (
     build_reserve,
@@ -65,7 +67,16 @@ from custom_components.alpha_ems_manager.simulation import IntervalDemand
 CHARGE_KW = 2.0
 CAPACITY_KWH = 21.6
 FLOOR_SOC = 20.0
-BUCKET_KWH = 0.26352
+
+#: **The lattice is chosen the way production chooses it**, and an earlier draft of
+#: this suite hardcoded one. That mattered: ``select_bucket_kwh`` aligns the bucket
+#: so a maximum-power quarter divides exactly, giving 0.237 kWh for a 2 kW path and
+#: two whole buckets per quarter. The hardcoded 0.2635 belonged to the 10 kW
+#: installation and left 1.8 buckets, floored to **one** -- halving the effective
+#: charge rate, stretching every purchase over twice as many quarters, and
+#: producing a transient reachability violation that was pure lattice artefact.
+#: Nothing about the optimiser was wrong; the test was measuring a battery
+#: production would never configure.
 
 #: A = an intermediate bridge window, dearer. B = the cheapest main refill.
 #: C = a later, second-cheapest window.
@@ -120,7 +131,8 @@ def _plan(
     """Solve the winter shape and return everything the assertions need."""
     limits, demands, prices = _world(charge_kw)
     floor = limits.energy_for_soc(FLOOR_SOC)
-    table = build_physics_table(limits, floor_energy_kwh=floor, bucket_kwh=BUCKET_KWH)
+    bucket, _rule = select_bucket_kwh(limits, floor_energy_kwh=floor)
+    table = build_physics_table(limits, floor_energy_kwh=floor, bucket_kwh=bucket)
     actionable = actionable_intervals(demands, prices)
     probe = build_reserve_reachable(
         limits=limits,
@@ -220,6 +232,9 @@ def _charge_runs(outcome):
             if run.start_index in WINDOW_C
             else "stretch"
         )
+        spread, against = future_spread_for(
+            run, outcome.desired, discharge_efficiency=outcome.discharge_efficiency
+        )
         found.append(
             (
                 label,
@@ -227,6 +242,11 @@ def _charge_runs(outcome):
                 classify_purchase(
                     run,
                     attribution=outcome.safety_buy_attribution.get(run.start_index),
+                    # **The same arguments production passes**, the future spread
+                    # included: a helper that classified with a different input
+                    # would be asserting a label the installation never produces.
+                    future_spread_eur_kwh=spread,
+                    future_spread_price_eur_kwh=against,
                     bridge_kwh_now=outcome.bridge_kwh_now,
                     uncertainty_dc_kwh=outcome.uncertainty.total_dc_kwh,
                     edge_value_eur_per_kwh=outcome.edge_value_eur_per_kwh,
@@ -310,18 +330,21 @@ def test_the_chain_puts_the_largest_purchase_at_the_cheapest_window() -> None:
 
 
 def test_a_later_window_is_used_only_when_it_earns_its_place() -> None:
-    """C is bought at a zero gain and declined at a real one.
+    """C is taken below its value and declined above it, and the gate decides.
 
-    The arithmetic is close enough to be worth stating: C buys about 1.11 kWh at
-    0.09 against a terminal value near 0.266, which earns roughly 0.195 -- just
-    under a 0.20 trade gain. So the same window is taken or left depending on the
-    gate alone, which is what a gate is for.
+    The arithmetic is worth stating because it is close: C buys 2.00 kWh at 0.09
+    against a terminal value of 0.2656, so it earns about 0.35 EUR. It survives a
+    0.30 trade gain and dies at 0.40 -- the same window, the same physics, the same
+    price, taken or left on the threshold alone. That is what a gate is for, and it
+    is the mechanism that stops a freed pack buying everything that is merely
+    cheap.
     """
-    free = _bought_in(_plan(45.0, gain=0.0)["plan"], WINDOW_C)
-    gated = _bought_in(_plan(45.0, gain=0.20)["plan"], WINDOW_C)
-
-    assert free > 0.0
-    assert gated == 0.0
+    assert _bought_in(_plan(45.0, gain=0.30)["plan"], WINDOW_C) > 0.0
+    assert _bought_in(_plan(45.0, gain=0.40)["plan"], WINDOW_C) == 0.0
+    # And the earlier windows, whose spread against the 0.75 stretch is far
+    # larger, are untouched by a threshold that removes C.
+    assert _bought_in(_plan(45.0, gain=0.40)["plan"], WINDOW_A) > 0.0
+    assert _bought_in(_plan(45.0, gain=0.40)["plan"], WINDOW_B) > 0.0
 
 
 # ===========================================================================
@@ -386,24 +409,22 @@ def test_a_zero_head_bridge_does_not_mean_nothing_was_compulsory() -> None:
     of the fault this release exists to fix. The compulsory share is now taken from
     the reserve-relaxed counterfactual, and this is the case that separates them.
     """
-    result = _plan(50.0, gain=5.0)
+    result = _plan(46.0, gain=5.0)
     outcome = result["outcome"]
     reachability = result["reachability"]
 
     # The head is satisfied; the curve ahead is not.
     assert outcome.bridge_kwh_now == 0.0
-    assert reachability.peak_required_dc_kwh > result["limits"].energy_for_soc(50.0)
+    assert reachability.peak_required_dc_kwh > result["limits"].energy_for_soc(46.0)
 
     runs = _charge_runs(outcome)
     assert runs, "a purchase the pack cannot decline must still be planned"
     for _label, _run, verdict in runs:
         assert verdict["compulsory_kwh"] > 0.0, verdict
         assert verdict["compulsory_basis"] == "reserve_relaxed_counterfactual"
-        # ``uncertainty_margin`` is the right label here, and the classifier
-        # reaching it unaided is worth noting: at 50 % the pack holds 10.80 kWh
-        # against a curve peaking at 10.855, of which 0.63 is the bounded margin
-        # -- so without the margin there would be no deficit at all, and the
-        # purchase exists *because of* it rather than despite it.
+        # The head asks 9.590 kWh (44.4 %) and the curve peaks at 10.855 (50.3 %)
+        # four quarters later, so a pack at 46 % clears the head and not the peak:
+        # 1.25 kWh is compulsory with a head bridge of exactly zero.
         assert verdict["classification"] in (
             BUY_REASON_REACHABILITY,
             BUY_REASON_UNCERTAINTY,
@@ -416,19 +437,24 @@ def test_a_zero_head_bridge_does_not_mean_nothing_was_compulsory() -> None:
 def test_the_compulsory_amount_shrinks_as_the_pack_rises() -> None:
     """Monotonic, and zero once the pack clears the curve's peak.
 
-    The cleanest evidence that the compulsory quantity is a real physical figure
-    rather than a label: it tracks the deficit, and it disappears when there is
-    none. Asserted under a prohibitive gain so nothing discretionary is present.
+    **Asserted on the bridge rather than on the purchase**, and the distinction is
+    the point. The compulsory quantity is a physical deficit and it does fall
+    monotonically -- 3.11, 2.03, 0.95, 0.00 across 30 to 45 per cent. What a plan
+    *buys* is compulsory plus discretionary, and the discretionary half responds to
+    the whole trajectory, so it is not monotone in the starting state and must not
+    be asserted as though it were.
     """
-    bought = {
-        soc: _bought_in(_plan(soc, gain=5.0)["plan"], WINDOW_A)
-        for soc in (40.0, 45.0, 50.0, 51.0, 55.0, 60.0)
+    bridges = {
+        soc: _plan(soc, gain=5.0)["reachability"].bridge_kwh(
+            _limits().energy_for_soc(soc)
+        )
+        for soc in (30.0, 35.0, 40.0, 45.0, 55.0)
     }
 
-    assert bought[40.0] >= bought[45.0] >= bought[50.0] >= bought[51.0]
-    # 55 % is 11.88 kWh, above the 10.855 kWh peak, so nothing is compulsory.
-    assert bought[55.0] == 0.0
-    assert bought[60.0] == 0.0
+    assert bridges[30.0] > bridges[35.0] > bridges[40.0] > 0.0
+    # 44.4 % is the head requirement, so anything above it has no head deficit.
+    assert bridges[45.0] == 0.0
+    assert bridges[55.0] == 0.0
 
 
 # ===========================================================================

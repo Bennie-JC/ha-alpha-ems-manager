@@ -35,12 +35,18 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.alpha_ems_manager import activity as activity_module
 from custom_components.alpha_ems_manager import execution as execution_module
 from custom_components.alpha_ems_manager.const import (
+    ACTIVITY_CATEGORY_SAFETY_BUY,
     CONTROL_MODE_SHADOW,
+    ECONOMIC_DIRECTION_CHARGE,
+    ECONOMIC_EVENT_CANCELLED,
+    ECONOMIC_EVENT_ERROR,
+    ECONOMIC_EVENT_FINISHED,
+    ECONOMIC_EVENT_PLANNED,
     EXECUTION_INTENT_GRID_CHARGE,
     EXECUTION_INTENT_NET_EXPORT,
-    EXECUTION_INTENT_SERVE_LOAD,
     EXECUTION_STATE_ARMED,
     EXECUTION_STATE_IDLE,
+    EXECUTION_STOP_EXECUTION_ERROR,
     EXECUTION_STOP_GRID_CEILING,
     EXECUTION_STOP_PLAN_REPLACED,
     EXECUTION_STOP_REASONS,
@@ -446,155 +452,232 @@ def test_the_basis_changes_no_decision() -> None:
 # ===========================================================================
 # D. the wording, which is what a person actually reads
 # ===========================================================================
+#
+# **Rewritten for beta.31, and the claims are unchanged.** These cases used to
+# drive ``activity._stopped_message`` -- one sentence with the reason interpolated
+# into it. A run ending is now one of three lifecycle *terminals*, so the same
+# four claims are made against the real ``next_activity`` instead:
+#
+#   * every declared stop reason has wording of its own;
+#   * no reason reaches a person as an identifier;
+#   * the line stays one short clause;
+#   * the endings a reader must tell apart read differently.
+#
+# What has genuinely changed is the shape of the answer. beta.30 said "Charge
+# stopped - grid limit - 1.76 / 8.06 kWh" for six different endings and "Charge
+# complete" for the seventh, so *whether it worked* had to be read out of an
+# adjective. beta.31 answers that first, in the event kind: a success, a
+# cancellation and an error are three kinds, and the reason is detail beneath it.
 
 
-def view(**overrides) -> object:
-    """Return an execution view for a run that has stopped, Shadow by default."""
+LIFECYCLE_END = datetime(2026, 3, 14, 16, 30, tzinfo=UTC)
+LIFECYCLE_START = LIFECYCLE_END - timedelta(hours=2)
+
+
+def _lifecycle_run() -> activity_module.PlannedRun:
+    """Return the incident's charge campaign as Activity now sees it."""
+    return activity_module.PlannedRun(
+        identity=activity_module.RunIdentity(
+            direction=ECONOMIC_DIRECTION_CHARGE, start_utc=LIFECYCLE_START
+        ),
+        content=activity_module.RunContent(
+            category=ACTIVITY_CATEGORY_SAFETY_BUY,
+            energy_kwh=TARGET_KWH,
+            end_utc=LIFECYCLE_END,
+            window="14:30-16:30",
+        ),
+    )
+
+
+def _dispatch(**overrides) -> activity_module.ExecutionView:
+    """Return Stage B's view of the incident's run, Live by default."""
     params = {
+        "identity": activity_module.RunIdentity(
+            direction=ECONOMIC_DIRECTION_CHARGE, start_utc=LIFECYCLE_START
+        ),
+        "end_utc": LIFECYCLE_END,
         "target_kwh": TARGET_KWH,
         "delivered_kwh": REALIZED_KWH,
         "intent": EXECUTION_INTENT_GRID_CHARGE,
-        "stop_reason": EXECUTION_STOP_STAGE_A_HOLD,
-        "executed": False,
+        "run_id": "incident",
+        "executed": True,
+        "running": True,
     }
     params.update(overrides)
     return activity_module.ExecutionView(**params)
 
 
-def line(**overrides) -> str:
-    """Return the sentence a stopped run produces."""
-    return activity_module._stopped_message(view(**overrides))
+def terminal(reason: str, **overrides):
+    """Return the ``(kind, message)`` a run ending for ``reason`` produces.
+
+    A whole campaign is driven -- planned, started, ended -- because a terminal is
+    only reachable from a lifecycle that started, which is itself one of the
+    guarantees: nothing can report a battery stopping that never reported it
+    starting.
+    """
+    run = _lifecycle_run()
+    state = None
+    for now, execution in (
+        (LIFECYCLE_START - timedelta(minutes=10), None),
+        (LIFECYCLE_START, _dispatch(activation_confirmed=True, **overrides)),
+        (
+            LIFECYCLE_START + timedelta(minutes=30),
+            _dispatch(running=False, stop_reason=reason, **overrides),
+        ),
+    ):
+        entry = activity_module.next_activity(
+            previous=state, runs=(run,), now=now, execution=execution
+        )
+        assert entry is not None, (reason, now)
+        state = entry.state
+    return entry.kind, entry.message
 
 
 def test_the_incident_now_reads_as_a_sentence_about_a_battery() -> None:
     """**The observed line was "Shadow run finished: plan ended." and nothing else.**
 
-    Three facts in one clause: what it was doing, why it stopped, how far it got.
-    The disclaimer stays -- while the barrier stands, a Shadow line that reads like
-    a Live one is the one thing this release cannot publish.
+    It now names the plan, says the ending was a cancellation rather than a
+    failure, gives the reason in words, and quotes how far the run got.
     """
-    # beta.24 renamed the withdrawal outcome: "cancelled" is what a withdrawn plan
-    # is, and "plan ended" said nothing about which of six endings had happened.
-    assert line() == "Charge cancelled - 1.76 / 8.06 kWh, no command sent"
+    kind, message = terminal(EXECUTION_STOP_STAGE_A_HOLD)
+
+    assert kind == ECONOMIC_EVENT_CANCELLED
+    assert "No Longer Economically Valid" in message
+    assert "1.76 / 8.06 kWh" in message
 
 
-def test_a_live_line_drops_the_disclaimer_and_nothing_else() -> None:
-    """Same three facts. The difference between the modes is one clause."""
-    assert line(executed=True) == "Charge cancelled - 1.76 / 8.06 kWh"
+def test_a_success_and_a_failure_are_different_kinds_not_different_adjectives() -> None:
+    """The distinction a reader needs first, answered before any wording.
+
+    beta.30 put all three outcomes in one kind and left the difference to a word
+    inside the sentence, so a history view could not filter or count them.
+    """
+    assert terminal(EXECUTION_STOP_TARGET_REACHED)[0] == ECONOMIC_EVENT_FINISHED
+    assert terminal(EXECUTION_STOP_EXECUTION_ERROR)[0] == ECONOMIC_EVENT_ERROR
+    assert terminal(EXECUTION_STOP_STAGE_A_HOLD)[0] == ECONOMIC_EVENT_CANCELLED
 
 
 def test_the_reasons_a_reader_must_tell_apart_read_differently() -> None:
-    """Withdrawal, the window, the target, replacement, freshness, the budget."""
-    sentences = {
-        reason: line(stop_reason=reason, executed=True) for reason in REACHABLE
-    }
+    """Withdrawal, the window, the target, replacement, freshness, the budget.
 
-    assert len(set(sentences.values())) == len(REACHABLE)
-    assert sentences[EXECUTION_STOP_STAGE_A_HOLD] == (
-        "Charge cancelled - 1.76 / 8.06 kWh"
-    )
-    assert sentences[EXECUTION_STOP_WINDOW_ENDED] == (
-        "Charge stopped - window ended - 1.76 / 8.06 kWh"
-    )
-    # Short of the target here, so both figures are quoted. The one-figure form is
-    # asserted on its own below.
-    assert sentences[EXECUTION_STOP_TARGET_REACHED] == (
-        "Charge complete - 1.76 / 8.06 kWh"
-    )
-    assert sentences[EXECUTION_STOP_PLAN_REPLACED] == (
-        "Charge stopped - plan replaced - 1.76 / 8.06 kWh"
-    )
-    assert sentences[EXECUTION_STOP_STALE_PLAN] == (
-        "Charge stopped - plan expired - 1.76 / 8.06 kWh"
-    )
-    assert sentences[EXECUTION_STOP_GRID_CEILING] == (
-        "Charge stopped - grid limit - 1.76 / 8.06 kWh"
-    )
-
-
-def test_a_reached_target_quotes_one_figure() -> None:
-    """Inside the completion tolerance the two figures are the same number, and
-    printing both invites a reader to hunt for a difference that is not there.
-
-    Outside it they are genuinely different and both are quoted: a run that stopped
-    at 1.76 of 8.06 did not complete, whatever branch reported it.
+    ``switched_off`` and ``switched_to_shadow`` deliberately share one phrase:
+    both are the user changing the mode, and a reader does not need to know which
+    of the two positions the switch landed in -- that is in diagnostics.
     """
-    met = line(
-        stop_reason=EXECUTION_STOP_TARGET_REACHED, delivered_kwh=8.02, executed=True
-    )
-    short = line(stop_reason=EXECUTION_STOP_TARGET_REACHED, executed=True)
+    rendered = {reason: terminal(reason)[1] for reason in REACHABLE}
+    modes = (EXECUTION_STOP_SWITCHED_OFF, EXECUTION_STOP_SWITCHED_TO_SHADOW)
 
-    assert met == "Charge complete - 8.06 kWh"
-    assert met.count("/") == 0
-    assert short.count("/") == 1
+    distinct = {m for r, m in rendered.items() if r not in modes}
+    assert len(distinct) == len(REACHABLE) - len(modes)
+    assert rendered[modes[0]] == rendered[modes[1]]
+    assert "Window Expired" in rendered[EXECUTION_STOP_WINDOW_ENDED]
+    assert "Plan Replaced" in rendered[EXECUTION_STOP_PLAN_REPLACED]
+    assert "Plan Expired" in rendered[EXECUTION_STOP_STALE_PLAN]
+    assert "Grid Limit Reached" in rendered[EXECUTION_STOP_GRID_CEILING]
+    assert "Control Mode Changed" in rendered[EXECUTION_STOP_SWITCHED_OFF]
 
 
-def test_the_subject_follows_the_intent() -> None:
-    """A discharge that stops is not a charge that stops."""
-    assert line(intent=EXECUTION_INTENT_SERVE_LOAD, executed=True).startswith(
-        "Discharge "
-    )
-    assert line(intent=EXECUTION_INTENT_NET_EXPORT, executed=True).startswith("Export ")
-    # An intent the wording layer does not know is described, not guessed at.
-    assert line(intent="", executed=True).startswith("Plan ")
+def test_a_reached_target_quotes_the_pair_and_says_when_they_agree() -> None:
+    """Inside the completion tolerance the two figures are the same number twice.
+
+    Both are still printed -- the format is one line and one shape -- and "Target
+    Reached" tells the reader that the numbers beside it are not a discrepancy
+    they should be hunting for.
+    """
+    met = terminal(EXECUTION_STOP_TARGET_REACHED, delivered_kwh=8.02)[1]
+    short = terminal(EXECUTION_STOP_TARGET_REACHED)[1]
+
+    assert "Success — Target Reached — 8.02 / 8.06 kWh" in met
+    assert "Target Reached" not in short
+    assert "1.76 / 8.06 kWh" in short
 
 
 def test_no_reason_reaches_a_person_as_an_identifier() -> None:
     """**Every** declared constant, not only the reachable ones.
 
     The old line interpolated ``stop_reason`` raw, so a Live grid-budget stop read
-    "Dispatch stopped: grid_energy_ceiling." A constant that acquires a branch later
-    must not acquire that sentence with it.
+    "Dispatch stopped: grid_energy_ceiling." A constant that acquires a branch
+    later must not acquire that sentence with it.
     """
     for reason in EXECUTION_STOP_REASONS:
-        rendered = line(stop_reason=reason, executed=True)
+        _, rendered = terminal(reason)
 
         # No snake_case, which is the actual shape of an identifier leak.
         assert "_" not in rendered, rendered
-        # And no multi-word constant appears verbatim. Single-word constants are
-        # excluded on purpose: ``safety`` is an ordinary English word, and
-        # "stopped for safety" is a sentence rather than a leaked symbol.
         if "_" in reason:
             assert reason not in rendered, rendered
-        # Nor may internal vocabulary arrive spelled out.
         lowered = rendered.lower()
         for term in ("stage a", "stage b", "carry", "affirm", "shadow run", "dispatch"):
             assert term not in lowered, rendered
 
 
 def test_every_declared_reason_has_wording_of_its_own() -> None:
-    """No constant may fall through to the generic phrase."""
-    phrases = activity_module._STOP_PHRASES
+    """No constant may fall through to the generic phrase.
 
-    assert set(EXECUTION_STOP_REASONS) <= set(phrases)
-    assert len(set(phrases.values())) == len(phrases)
-    assert all(phrase and phrase == phrase.lower() for phrase in phrases.values())
+    The two tables partition the reasons: a cancellation is the optimizer or the
+    world changing its mind, an error is something that needs looking at, and
+    ``target_reached`` is neither because it is the success. Nothing may be in both
+    tables, and nothing may be in neither.
+    """
+    cancels = activity_module._CANCEL_REASONS
+    errors = activity_module._ERROR_REASONS
+    declared = set(EXECUTION_STOP_REASONS)
+
+    assert not set(cancels) & set(errors)
+    assert declared == set(cancels) | set(errors) | {EXECUTION_STOP_TARGET_REACHED}
+    for phrase in (*cancels.values(), *errors.values()):
+        assert phrase and phrase == phrase.title(), phrase
 
 
 def test_the_line_stays_one_short_clause() -> None:
-    """No paragraph, no second sentence, nothing about what happens next.
-
-    The line must not read as though it explains the Economic Action beside it --
-    that implied causation is exactly what sent this investigation down the wrong
-    path.
-    """
+    """No paragraph, no second sentence, nothing about what happens next."""
     for reason in EXECUTION_STOP_REASONS:
-        for executed in (True, False):
-            rendered = line(stop_reason=reason, executed=executed)
+        _, rendered = terminal(reason)
 
-            assert not rendered.endswith("."), rendered
-            # The longest legitimate form is 73 characters, and the bound is set
-            # just above it so a new phrase cannot quietly grow into a paragraph.
-            assert len(rendered) <= 76, rendered
-            assert "because" not in rendered.lower(), rendered
-            assert "\n" not in rendered, rendered
+        assert not rendered.endswith("."), rendered
+        assert ". " not in rendered, rendered
+        assert len(rendered) <= 90, (len(rendered), rendered)
+        assert "because" not in rendered.lower(), rendered
+        assert "\n" not in rendered, rendered
 
 
-def test_an_unknown_constant_still_produces_a_sentence() -> None:
-    """The fallback stays reachable in principle and unreachable in practice."""
-    assert line(stop_reason="a_reason_from_the_future", executed=True) == (
-        "Charge stopped - plan ended - 1.76 / 8.06 kWh"
+def test_an_unknown_constant_still_produces_a_line() -> None:
+    """The fallback stays reachable in principle and unreachable in practice.
+
+    A reason from the future is a cancellation rather than an error, which is the
+    safe direction: calling an unknown ending a failure would raise an alarm the
+    code has no evidence for.
+    """
+    kind, message = terminal("a_reason_from_the_future")
+
+    assert kind == ECONOMIC_EVENT_CANCELLED
+    assert "Plan Replaced" in message
+
+
+def test_shadow_reaches_no_terminal_at_all() -> None:
+    """Because it reaches no start, and a terminal without a start is a claim.
+
+    beta.30 emitted ``would_stop`` here, which meant a Shadow history looked
+    exactly as busy as a Live one and every line needed a disclaimer to stay
+    honest. The plan's own retraction is what ends a Shadow lifecycle.
+    """
+    run = _lifecycle_run()
+    entry = activity_module.next_activity(
+        previous=None,
+        runs=(run,),
+        now=LIFECYCLE_START,
+        execution=_dispatch(
+            executed=False,
+            activation_confirmed=True,
+            running=False,
+            stop_reason=EXECUTION_STOP_TARGET_REACHED,
+        ),
+        shadow=True,
     )
+
+    assert entry is not None
+    assert entry.kind == ECONOMIC_EVENT_PLANNED
+    assert entry.message.endswith("— Shadow")
 
 
 # ===========================================================================
@@ -639,22 +722,31 @@ def test_reverting_the_wording_to_the_bare_fallback_is_caught() -> None:
         assert old_wording(None) == "plan ended"
         # Live populated it, and printed the constant.
         assert old_wording(reason) == reason
-        assert reason not in line(stop_reason=reason, executed=True)
+        assert reason not in terminal(reason)[1]
 
-    # And the fallback no longer describes eight different endings identically.
-    rendered = {line(stop_reason=r, executed=True) for r in REACHABLE}
-    assert len(rendered) == len(REACHABLE)
+    # And the fallback no longer describes eight different endings identically:
+    # the two mode reasons share a phrase deliberately, and the rest are distinct.
+    modes = {EXECUTION_STOP_SWITCHED_OFF, EXECUTION_STOP_SWITCHED_TO_SHADOW}
+    rendered = {terminal(r)[1] for r in REACHABLE if r not in modes}
+    assert len(rendered) == len(REACHABLE) - len(modes)
 
 
 def test_a_known_reason_falling_back_to_the_generic_phrase_is_caught() -> None:
-    """Only an unknown constant may reach the fallback."""
-    generic = line(stop_reason="a_reason_from_the_future", executed=True)
+    """Only an unknown constant may reach the fallback.
 
-    # beta.24 gave withdrawal its own word, so no reachable reason shares the
-    # fallback phrase any more -- there is no longer an exception to make.
-    assert activity_module._STOP_PHRASES[EXECUTION_STOP_STAGE_A_HOLD] == "cancelled"
+    ``plan_replaced`` is the exception and it is not one: its own phrase *is* the
+    fallback phrase, because a replacement is exactly what an unrecognised ending
+    is assumed to be.
+    """
+    generic = terminal("a_reason_from_the_future")[1]
+
+    assert activity_module._CANCEL_REASONS[EXECUTION_STOP_STAGE_A_HOLD] == (
+        "No Longer Economically Valid"
+    )
     for reason in REACHABLE:
-        assert line(stop_reason=reason, executed=True) != generic, reason
+        if reason == EXECUTION_STOP_PLAN_REPLACED:
+            continue
+        assert terminal(reason)[1] != generic, reason
 
 
 def test_treating_the_export_recommendation_as_a_supersession_is_caught() -> None:
@@ -730,8 +822,8 @@ def test_switching_out_of_live_still_reports_from_the_shadow_side() -> None:
 
     assert decision.state == EXECUTION_STATE_ARMED
     assert EXECUTION_STOP_SWITCHED_TO_SHADOW in EXECUTION_STOP_REASONS
-    assert activity_module._STOP_PHRASES[EXECUTION_STOP_SWITCHED_TO_SHADOW] == (
-        "switched to shadow"
+    assert activity_module._CANCEL_REASONS[EXECUTION_STOP_SWITCHED_TO_SHADOW] == (
+        "Control Mode Changed"
     )
 
 

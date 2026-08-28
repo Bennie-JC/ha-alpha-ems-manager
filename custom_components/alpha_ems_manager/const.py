@@ -847,6 +847,16 @@ CONTROL_MODE_OPTIONS: Final = (
 #: is still false, so in this release it is unreachable by construction, exactly
 #: as ``started`` is on the Activity surface.
 CONTROL_STATE_EXECUTED: Final = "executed"
+#: A command was sent and could not be confirmed, or the device refused it.
+#:
+#: **beta.31, and it names a runtime meaning the sensor previously hid.** The
+#: staged-write path already marks the report with an execution error and returns
+#: -- but the state it left behind was whatever eligibility had computed before
+#: the write was attempted, so a failed command published as ``eligible`` or
+#: ``inhibited``. A reader watching the entity could not tell a refresh that sent
+#: nothing from one whose command failed, which is the single most important
+#: distinction the entity can carry.
+CONTROL_STATE_ERROR: Final = "error"
 CONTROL_STATE_OFF: Final = "off"
 CONTROL_STATE_INHIBITED: Final = "inhibited"
 CONTROL_STATE_ELIGIBLE: Final = "eligible"
@@ -861,6 +871,11 @@ CONTROL_STATE_OPTIONS: Final = (
     # changes a barrier rather than an entity's enumeration, and a dashboard built
     # against beta.19 does not acquire a new state it has never seen.
     CONTROL_STATE_EXECUTED,
+    # beta.31. **Additive**: every value an automation could already be matching
+    # on still exists and still means what it meant, so nothing built against
+    # beta.30 breaks. What changes is that a failed write stops being reported as
+    # though it were an eligibility outcome.
+    CONTROL_STATE_ERROR,
 )
 
 # --- Phase 4: configuration keys ----------------------------------------------
@@ -2902,10 +2917,25 @@ ECONOMIC_EVENT_WOULD_STOP: Final = "would_stop"
 ECONOMIC_EVENT_INHIBITED: Final = "inhibited"
 ECONOMIC_EVENT_AVAILABLE: Final = "available"
 
+#: A plan lifecycle reached its terminal state. **beta.31**, and the reason the
+#: two below exist rather than ``stopped`` doing all three jobs: a reader needs to
+#: know which of *succeeded*, *was called off* and *failed* happened, and a single
+#: kind carrying a reason string made every one of them look alike in a history
+#: view. ``finished`` is a success and nothing else; ``error`` is a failure and
+#: nothing else; ``cancelled`` covers every ending that is neither.
+#:
+#: Both are **execution-class**, because both assert something about the battery:
+#: ``finished`` says energy moved, ``error`` says a command failed. Neither is
+#: reachable in Shadow, where a lifecycle can only be planned and then cancelled.
+ECONOMIC_EVENT_FINISHED: Final = "finished"
+ECONOMIC_EVENT_ERROR: Final = "error"
+
 ECONOMIC_EVENT_KINDS: Final = (
     ECONOMIC_EVENT_PLANNED,
     ECONOMIC_EVENT_CHANGED,
     ECONOMIC_EVENT_STARTED,
+    ECONOMIC_EVENT_FINISHED,
+    ECONOMIC_EVENT_ERROR,
     ECONOMIC_EVENT_STOPPED,
     ECONOMIC_EVENT_WOULD_START,
     ECONOMIC_EVENT_WOULD_STOP,
@@ -2955,6 +2985,41 @@ ECONOMIC_ADVICE_EVENT_KINDS: Final = (
 ECONOMIC_EXECUTION_EVENT_KINDS: Final = (
     ECONOMIC_EVENT_STARTED,
     ECONOMIC_EVENT_STOPPED,
+    # beta.31. A success asserts that energy moved and an error asserts that a
+    # command failed, so both belong on the side of the barrier that is refused
+    # while nothing can be sent.
+    ECONOMIC_EVENT_FINISHED,
+    ECONOMIC_EVENT_ERROR,
+)
+
+#: What kind of plan a lifecycle is, in the terms a person reads.
+#:
+#: **beta.31.** Activity used to render the optimizer's own action label, which is
+#: a Stage-A word: ``safety_buy``, ``charge``, ``export``. A reader does not want
+#: to know which branch of the solver produced a run; they want to know whether
+#: their battery is about to buy something it had no choice about, buy something
+#: because it was cheap, or sell.
+#:
+#: Six rather than the four a buy/sell split would give, because two directions
+#: this release cannot execute still get planned and still deserve an honest name.
+#: The three buy categories come from the purchase attribution -- the same
+#: compelled/discretionary split :func:`economic.classify_purchase` publishes --
+#: so the category a user reads and the attribution a diagnostic reader audits
+#: cannot disagree.
+ACTIVITY_CATEGORY_SAFETY_BUY: Final = "safety_buy"
+ACTIVITY_CATEGORY_ECONOMIC_BUY: Final = "economic_buy"
+ACTIVITY_CATEGORY_MIXED_BUY: Final = "mixed_buy"
+ACTIVITY_CATEGORY_ECONOMIC_SELL: Final = "economic_sell"
+ACTIVITY_CATEGORY_ECONOMIC_DISCHARGE: Final = "economic_discharge"
+ACTIVITY_CATEGORY_CURTAILMENT: Final = "curtailment"
+
+ACTIVITY_CATEGORIES: Final = (
+    ACTIVITY_CATEGORY_SAFETY_BUY,
+    ACTIVITY_CATEGORY_ECONOMIC_BUY,
+    ACTIVITY_CATEGORY_MIXED_BUY,
+    ACTIVITY_CATEGORY_ECONOMIC_SELL,
+    ACTIVITY_CATEGORY_ECONOMIC_DISCHARGE,
+    ACTIVITY_CATEGORY_CURTAILMENT,
 )
 
 #: How far an announced run must move before it is worth a second Activity entry.
