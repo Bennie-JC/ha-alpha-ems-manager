@@ -41,6 +41,7 @@ from .const import (
     FORECAST_RAW_RETENTION_DAYS,
     FORECAST_STORAGE_VERSION,
     FORECAST_SUMMARY_RETENTION_DAYS,
+    MAX_DECISION_RECORDS_PUBLISHED,
     MAX_HISTORY_DAYS,
     MIN_DAY_COMPLETENESS,
     MIN_QUARTER_COVERAGE,
@@ -503,6 +504,28 @@ async def _forecast_history_report(
             ),
         },
         "storage": storage,
+        # **The replay input, and the reason any economic claim here is checkable.**
+        # Scalars and fingerprints only: the forecast and price evidence layers
+        # already retain their own series for a year, so what is kept here is the
+        # part that was genuinely unrecoverable -- the pack energy at the instant of
+        # each decision, the gates in force, and the relaxed counterfactual.
+        #
+        # Bounded twice over: the store keeps two days, and only the most recent
+        # entries are published, because a payload is read by a person.
+        "decision_records": {
+            "retained": len(coordinator.store.decisions),
+            "published": min(
+                len(coordinator.store.decisions), MAX_DECISION_RECORDS_PUBLISHED
+            ),
+            "records": coordinator.store.decisions[-MAX_DECISION_RECORDS_PUBLISHED:],
+            "rule": (
+                "one record per Stage-A refresh, oldest first. relaxed_cost_eur is "
+                "the same solve with the reserve relaxed to the hard floor, so its "
+                "difference from cost_eur is what the reserve cost that refresh. "
+                "read by diagnostics and the offline replay harness, and by no "
+                "decision path"
+            ),
+        },
     }
 
 

@@ -160,6 +160,7 @@ from .const import (
     LOG_THROTTLE_SECONDS,
     MAX_COMPLETED_QUARTERS_REPORTED,
     MAX_CONTROL_EVENTS_REPORTED,
+    MAX_DISPATCH_START_ACTIVE_SAMPLES,
     MAX_DISPATCH_START_SAMPLES_REPORTED,
     MAX_PHYSICAL_DECISIONS_REPORTED,
     MAX_SAMPLE_GAP_SECONDS,
@@ -1328,10 +1329,30 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._dispatch_start_samples: deque[dict[str, Any]] = deque(
             maxlen=MAX_DISPATCH_START_SAMPLES_REPORTED
         )
+        #: The same samples, but **only those taken while a dispatch was running.**
+        #:
+        #: The ring above is ordered and evicted by time, so a run that ends is
+        #: followed by hours of idle ``raw=0`` samples that push the only
+        #: informative entries out. Measured: beta.30's probe captured a real Live
+        #: charge at 03:15 and by 12:00 every one of its thirty-two entries read
+        #: ``0`` with ``phase: before_start``. The register's meaning is still
+        #: unmeasured for exactly that reason -- a retention fault, not a probe
+        #: fault. Nothing idle is ever appended here.
+        self._dispatch_start_active: deque[dict[str, Any]] = deque(
+            maxlen=MAX_DISPATCH_START_ACTIVE_SAMPLES
+        )
         #: Where the execution lifecycle is, and when it got there.
         self._lifecycle: str = LIFECYCLE_IDLE
         self._lifecycle_at: datetime | None = None
         self._lifecycle_previous: str | None = None
+        #: When tomorrow's prices were first observed to be available, this session.
+        #:
+        #: **A measurement nobody has taken.** The unknown-price policy turns on how
+        #: long the unpriced tail actually lasts, and the integration refuses to
+        #: predict the publication time -- correctly, since day-ahead can publish
+        #: early or late. So it is recorded when it happens instead. Session-local:
+        #: a restart forgets it rather than restating a stale claim.
+        self._tomorrow_prices_available_at: str | None = None
         #: The bounded history of finished execution quarters.
         self._completed_quarters: deque[dict[str, Any]] = deque(
             maxlen=MAX_COMPLETED_QUARTERS_REPORTED
@@ -2485,6 +2506,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ),
             }
         )
+        # **The same sample, kept where nothing idle can displace it.** An idle
+        # sample carries no information about the register's meaning -- it reads
+        # zero -- so letting one evict a sample taken during a run is how beta.30
+        # lost the only capture it had.
+        if active:
+            self._dispatch_start_active.append(self._dispatch_start_samples[-1])
 
     @callback
     def _refresh_executing_quarter(self, now: datetime) -> CarriedQuarter | None:
@@ -2562,6 +2589,134 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "the state from four others computed at different instants"
             ),
         }
+
+    @callback
+    def _record_decision(
+        self,
+        outcome: Any,
+        *,
+        now: datetime,
+        plan: Any,
+        planning: Any,
+    ) -> None:
+        """Persist one compact, replayable record of this Stage-A decision.
+
+        **Scalars and fingerprints, never the series.** The forecast and price
+        evidence layers already retain their own inputs for a year, so duplicating
+        them here would cost megabytes to store what is already on disk. What was
+        genuinely unrecoverable is the pack energy at the instant of the decision
+        and the settings it was made under -- and both are here.
+
+        Nothing reads this except diagnostics and the offline replay harness. It is
+        written after the plan exists, so a record can never describe a decision
+        that was not made.
+        """
+        state = None if plan is None else plan.state
+        desired = None if outcome is None else outcome.desired
+        relaxed = None if outcome is None else outcome.relaxed
+        config = self.config
+        uncertainty = None if outcome is None else outcome.uncertainty
+        self.store.record_decision(
+            {
+                "decision_at": now.isoformat(),
+                "start_energy_kwh": None if state is None else state.energy_kwh,
+                "start_soc_percent": None if state is None else state.soc_percent,
+                # The gates in force. Published *and* fingerprinted since beta.31:
+                # until then the digest omitted both per-kWh terms, so two
+                # installations differing by a whole margin looked identical and no
+                # recorded decision could be reproduced.
+                "minimum_trade_gain_eur": config.minimum_trade_gain_eur,
+                "grid_charge_margin_eur_per_kwh": (
+                    config.grid_charge_margin_eur_per_kwh
+                ),
+                "battery_throughput_cost_eur_per_kwh": (
+                    config.battery_throughput_cost_eur_per_kwh
+                ),
+                "allow_grid_charging": config.allow_grid_charging,
+                "allow_battery_export": config.allow_battery_export,
+                "floor_energy_kwh": (
+                    None if planning is None else self._floor_energy_for_record(plan)
+                ),
+                "actionable_intervals": (
+                    None if planning is None else planning.actionable_intervals
+                ),
+                "reachability_now_dc_kwh": (
+                    None
+                    if planning is None or planning.reachability is None
+                    else planning.reachability.required_now_dc_kwh
+                ),
+                "autonomy_now_dc_kwh": (
+                    None
+                    if plan is None or plan.reserve_projection is None
+                    else plan.reserve_projection.required_now_dc_kwh
+                ),
+                "bridge_kwh_now": (None if outcome is None else outcome.bridge_kwh_now),
+                "uncertainty_total_dc_kwh": (
+                    None if uncertainty is None else uncertainty.total_dc_kwh
+                ),
+                "uncertainty_blind_dc_kwh": (
+                    None if uncertainty is None else uncertainty.blind_dc_kwh
+                ),
+                "uncertainty_statistical_dc_kwh": (
+                    None if uncertainty is None else uncertainty.statistical_dc_kwh
+                ),
+                "uncertainty_binding": (
+                    None if uncertainty is None else uncertainty.binding
+                ),
+                "edge_value_eur_kwh": (
+                    None if outcome is None else outcome.edge_value_eur_per_kwh
+                ),
+                "edge_energy_kwh": None if desired is None else desired.edge_energy_kwh,
+                "edge_value_eur": None if desired is None else desired.edge_value_eur,
+                "action": None if desired is None else desired.action,
+                "cost_eur": None if desired is None else desired.cost_eur,
+                "hold_cost_eur": None if desired is None else desired.hold_cost_eur,
+                # **The counterfactual, and it is the number that matters.** The
+                # same solver, the same horizon, the same prices, with the reserve
+                # relaxed to the hard floor. Its difference from ``cost_eur`` is
+                # what the reserve is costing -- and it was already being computed
+                # every refresh before beta.31 published it.
+                "relaxed_cost_eur": None if relaxed is None else relaxed.cost_eur,
+                "grid_import_kwh": (
+                    None if desired is None else desired.planned_grid_import_kwh
+                ),
+                "grid_export_kwh": (
+                    None if desired is None else desired.planned_grid_export_kwh
+                ),
+                "battery_throughput_kwh": (
+                    None if desired is None else desired.battery_throughput_kwh
+                ),
+                "violation_kwh": None if desired is None else desired.violation_kwh,
+                "run_count": 0 if desired is None else len(desired.runs),
+                # Fingerprints, so the series behind the decision can be found in
+                # the evidence layers that already keep them for a year.
+                "tomorrow_prices_available": self._tomorrow_prices_available(),
+                "tomorrow_prices_available_at": self._tomorrow_prices_available_at,
+            }
+        )
+
+    @callback
+    def _floor_energy_for_record(self, plan: Any) -> float | None:
+        """Return the configured hard floor as energy, for the decision record."""
+        projection = None if plan is None else plan.reserve_projection
+        return None if projection is None else projection.floor_energy_kwh
+
+    @callback
+    def _tomorrow_prices_available(self) -> bool | None:
+        """Return whether tomorrow is priceable, from the source's own signal.
+
+        Read, never predicted. The publication *time* is deliberately not modelled
+        anywhere in this integration -- day-ahead can publish early or late -- so
+        the transition instant is **observed** and recorded instead. That is the
+        measurement the unknown-price policy needs and nobody has ever taken.
+        """
+        forecast = self.price_forecasts.get(self._tomorrow_date())
+        return None if forecast is None else forecast.available
+
+    @callback
+    def _tomorrow_date(self) -> Any:
+        """Return tomorrow's civil date in the configured zone."""
+        return (dt_util.now() + timedelta(days=1)).date()
 
     @callback
     def _forecast_mae_kwh_per_interval(self) -> float | None:
@@ -4058,6 +4213,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # the structure guarantees rather than something a test checks.
         price_forecasts = self._price_forecasts_safely(now=now, today=today, tz=tz)
         self.price_forecasts = price_forecasts
+        # **The one measurement the unknown-price policy needs and nobody has
+        # taken.** The publication *time* is deliberately not modelled anywhere --
+        # day-ahead can publish early or late -- so the instant tomorrow first
+        # becomes priceable is observed instead. Recorded once per session; a later
+        # refresh must not overwrite it with a fresher clock reading.
+        if self._tomorrow_prices_available_at is None:
+            tomorrow_forecast = price_forecasts.get(now.date() + timedelta(days=1))
+            if tomorrow_forecast is not None and tomorrow_forecast.available:
+                self._tomorrow_prices_available_at = now.isoformat()
         await self._async_record_price_evidence_safely(
             forecasts=price_forecasts, now=now, tz=tz
         )
@@ -4311,7 +4475,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # every interval, and its own forecast outlives the price horizon.
         terminal = floor_energy
 
-        return await self.hass.async_add_executor_job(
+        outcome = await self.hass.async_add_executor_job(
             _solve_economic,
             limits,
             floor_energy,
@@ -4328,6 +4492,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.config.allow_grid_charging,
             self.config.allow_battery_export,
         )
+        # **Written after the plan exists**, so a record can never describe a
+        # decision that was not made. This is the only thing standing between a
+        # money-spending optimiser and an unauditable one.
+        self._record_decision(outcome, now=dt_util.now(), plan=plan, planning=planning)
+        return outcome
 
     @callback
     def _remember_execution_revisions(self) -> None:
@@ -7212,6 +7381,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         stage_b["quarter"] = self._quarter_block(now)
         stage_b["lifecycle"] = self._lifecycle_block()
         stage_b["dispatch_start_probe"] = list(self._dispatch_start_samples)
+        stage_b["dispatch_start_active_probe"] = {
+            "samples": list(self._dispatch_start_active),
+            "count": len(self._dispatch_start_active),
+            "rule": (
+                "appended only while a dispatch is running, so an idle sample can "
+                "never displace one taken during a run. this is where the "
+                "register's semantics will be read from: raw_delta_since_previous "
+                "separates a fixed start instant from elapsed seconds from a "
+                "countdown, and a jump at phase after_rearm would show the re-arm "
+                "re-anchoring it. diagnostic only -- dispatch_start is not an "
+                "ownership factor and must not become one again"
+            ),
+        }
         stage_b["admitted_plan"] = None if self._plan is None else self._plan.as_dict()
         stage_b["physical_decisions"] = list(self._physical_decisions)
         stage_b["write_boundary"] = {

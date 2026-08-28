@@ -2576,6 +2576,13 @@ MAX_DISPATCH_START_ACTIVE_SAMPLES: Final = 24
 #: that already keep a year.
 MAX_DECISION_RECORDS_RETAINED: Final = 192
 
+#: How many of those records to put in a diagnostics download.
+#:
+#: Far fewer than are retained, because a payload is read by a person and two
+#: days of quarter-hour records is seven hundred lines of scalars. The replay
+#: harness reads the store, not the payload.
+MAX_DECISION_RECORDS_PUBLISHED: Final = 16
+
 #: Why a Stage-A decision was recorded, so a reader can tell a routine refresh
 #: from one that actually changed the plan.
 DECISION_RECORD_REASON_REFRESH: Final = "refresh"

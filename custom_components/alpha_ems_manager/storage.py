@@ -62,6 +62,7 @@ from .const import (
     BALANCE_SAMPLE_WINDOW,
     DAY_TYPE_WEEKDAY,
     DAY_TYPE_WEEKEND,
+    MAX_DECISION_RECORDS_RETAINED,
     MAX_HISTORY_DAYS,
     MIN_DAY_COMPLETENESS,
     QUARTER_MINUTES,
@@ -650,6 +651,18 @@ class _LearningStoreBackend(Store[dict[str, Any]]):
 class LearningStore:
     """Loads, prunes and persists the learning history for one config entry."""
 
+    def record_decision(self, entry: dict[str, Any]) -> None:
+        """Append one Stage-A decision record, evicting the oldest.
+
+        Append-only and bounded at :data:`MAX_DECISION_RECORDS_RETAINED`, which is
+        two days of quarter-hour refreshes -- long enough to replay a weekend
+        against a changed architecture, short enough that this never becomes a
+        database. The caller decides what a record contains; this only bounds it.
+        """
+        self.decisions.append(entry)
+        if len(self.decisions) > MAX_DECISION_RECORDS_RETAINED:
+            del self.decisions[:-MAX_DECISION_RECORDS_RETAINED]
+
     def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
         """Initialise a per-entry store.
 
@@ -679,6 +692,20 @@ class LearningStore:
         #: restart should reconstruct those from evidence, not trust a snapshot.
         self.execution_revisions: dict[str, dict[str, Any]] = {}
         self.execution_record: dict[str, Any] | None = None
+        #: One compact record per Stage-A refresh, oldest first, bounded.
+        #:
+        #: **Without this nothing this optimiser decides is auditable.** The
+        #: attempt to reconstruct two real days of purchases from beta.30 evidence
+        #: failed on three missing inputs: a twelve-entry quarter ring that had
+        #: already dropped every night campaign, no historical price series in the
+        #: payload, and -- decisively -- no record of the pack energy at the moment
+        #: each decision was made, which is the initial condition of any replay.
+        #:
+        #: Scalars and fingerprints only, deliberately. The forecast and price
+        #: evidence layers already retain their own series for a year, so storing
+        #: them again per refresh would cost megabytes to duplicate what is already
+        #: on disk. What could not be recovered from anywhere is here.
+        self.decisions: list[dict[str, Any]] = []
         #: Set when the document could not be read at all. While true the store
         #: refuses to write, because an empty in-memory history must never be
         #: allowed to overwrite a file whose only problem may have been a
@@ -741,6 +768,15 @@ class LearningStore:
             record = execution.get("record")
             self.execution_record = dict(record) if isinstance(record, dict) else None
 
+        # Additive since beta.31, so a document written by any earlier release
+        # simply has no decisions and starts collecting them. Read defensively:
+        # a malformed list costs the replay history and must not cost the load.
+        decisions = raw.get("decisions")
+        if isinstance(decisions, list):
+            self.decisions = [
+                dict(entry) for entry in decisions if isinstance(entry, dict)
+            ][-MAX_DECISION_RECORDS_RETAINED:]
+
     def to_dict(self) -> dict[str, Any]:
         """Return the full serialisable document."""
         payload: dict[str, Any] = {
@@ -756,6 +792,12 @@ class LearningStore:
             execution["revisions"] = self.execution_revisions
         if self.execution_record is not None:
             execution["record"] = self.execution_record
+        if self.decisions:
+            # Omitted while empty, exactly as ``execution`` is: an installation
+            # that has never planned anything writes the same document it always
+            # did, and ``test_the_stored_document_has_the_documented_schema`` keeps
+            # that promise honest.
+            payload["decisions"] = self.decisions[-MAX_DECISION_RECORDS_RETAINED:]
         if execution:
             # Omitted entirely while there is nothing to remember, so a document
             # from an installation that has never armed anything is byte-identical
