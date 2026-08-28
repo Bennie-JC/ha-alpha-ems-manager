@@ -28,9 +28,11 @@ from custom_components.alpha_ems_manager.const import (
     STORAGE_MINOR_VERSION,
 )
 
+from .conftest import BATTERY_SOC, set_sensor
 from .forecast_helpers import NORMAL, history_before, local, refresh_at, seed
 from .frank_capture import synthetic_day
 from .live_capability import assert_charge_only_capability
+from .test_beta24_live_charge import charge_now_price
 from .test_control_modes import set_mode
 from .test_economic_published import allow_trading
 
@@ -43,7 +45,25 @@ async def prepared(
     """Return a coordinator with prices, history and a mode, ready to refresh."""
     coordinator = entry.runtime_data
     seed(coordinator, history_before(NORMAL))
-    frank.publish(today=synthetic_day(NORMAL), tomorrow=None)
+    # **A pack that actually needs the energy it is about to buy.**
+    #
+    # The shared fixture starts at 55 %, which on this battery covers the whole
+    # forecast evening -- so under beta.31 the correct plan is to *hold*, and these
+    # suites would have nothing to execute. That was never visible before, because
+    # the autonomy reserve made a purchase compulsory regardless of whether the
+    # energy was needed or what it cost.
+    #
+    # Dropping to 30 % states the premise these suites always relied on: there is
+    # more demand ahead than the pack holds, so buying in the cheap window is
+    # genuinely the right answer and Stage B has a real charge to execute.
+    set_sensor(hass, BATTERY_SOC, 30, "%", "battery")
+    await hass.async_block_till_done()
+    # beta.31: a price shape that gives the plan an economic *reason* to charge at
+    # the moment these suites refresh. Until beta.31 the charge appeared because
+    # the whole-horizon autonomy reserve made a purchase compulsory at any price;
+    # reachability makes nothing compulsory while the pack can hold its floor, so a
+    # fixture wanting a charge now has to say why. See ``charge_now_price``.
+    frank.publish(today=synthetic_day(NORMAL, price_at=charge_now_price), tomorrow=None)
     allow_trading(coordinator, allow_grid_charging=True, allow_battery_export=True)
     await set_mode(hass, mode)
     return coordinator

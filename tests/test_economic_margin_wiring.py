@@ -94,6 +94,10 @@ def solved(*, spread: float, margin: float, gain: float = 0.0, throughput: float
         gain,
         margin,
         throughput,
+        # The forecast MAE, which beta.31 added: the statistical half of the
+        # uncertainty margin. ``None`` means "no history yet", which the margin
+        # reads as no statistical claim rather than as no error.
+        None,
         True,
         True,
     )
@@ -379,6 +383,7 @@ def test_the_margin_does_not_alter_export_allocation() -> None:
             0.0,
             margin,
             0.0,
+            None,
             False,
             True,
         )

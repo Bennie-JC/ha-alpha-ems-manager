@@ -1085,6 +1085,70 @@ def live_surface(hass: HomeAssistant, control_surface: None) -> LiveSurface:
     return LiveSurface(hass)
 
 
+def charge_now_price(index: int, moment) -> float:
+    """Return a wholesale day with a deep morning trough and a dear evening.
+
+    **Why this fixture had to change in beta.31, and it is the point of the whole
+    release.** These suites drive a Live charge at 10:00 and then assert things
+    about executing it. Until beta.31 the charge appeared for a reason nobody had
+    asked for: the whole-horizon autonomy reserve sat above stored energy, the
+    objective compared ``(violation, cost)`` lexicographically, and so a purchase
+    was *compulsory* whatever the price. The default sawtooth here -- six cents of
+    wholesale spread -- never had to justify anything.
+
+    Reachability makes no purchase compulsory when the pack can hold its floor, so
+    a fixture that wants a charge now has to say **why**: cheap now, dear later.
+    That is a strictly better fixture. It exercises the same Stage-B machinery
+    through the path production will actually take, and if the economics ever stop
+    forming a charge here, that is a real finding rather than a broken mock.
+
+    A plausible Dutch shape: cheap overnight, cheap again around midday when the
+    sun is on the system, dear through the evening peak. Two troughs because these
+    suites refresh at two different times -- some at 00:00-01:15, some at
+    10:00-11:00 -- and both need a reason to buy.
+
+    Two details are load bearing, and both were found by watching the optimiser
+    correctly decline to do what the fixture wanted:
+
+    * **Each trough rises** rather than being flat. Across a flat trough every
+      quarter is an equally good place to buy, so the search picks one arbitrarily
+      and may defer the charge past the moment the fixture refreshes at.
+    * **The overnight trough is strictly the cheaper of the two.** With both
+      starting at the same price, a plan made at 00:15 can see the 09:00 trough and
+      is right to wait for it -- which is good economics and a useless fixture.
+
+    Indices are quarter-hours from local midnight.
+    """
+    del moment
+    if index < 20:  # 00:00-05:00, the deepest trough
+        return 0.005 + 0.001 * index
+    if 36 <= index < 52:  # 09:00-13:00, a shallower one
+        return 0.06 + 0.002 * (index - 36)
+    if 68 <= index < 92:  # 17:00-23:00, the evening peak
+        return 0.34
+    return 0.12
+
+
+def sell_now_price(index: int, moment) -> float:
+    """Return a day where the profitable move now is to **sell**, not to buy.
+
+    The mirror of :func:`charge_now_price`, and it exists for the suites that are
+    about the *advisory* half of the economic surface. Only a charge is executable
+    in this release, so those suites need runs whose action is deliberately not --
+    an export or a discharge -- and a buy-shaped fixture would hand them a charge
+    line that correctly carries no advisory disclaimer.
+
+    Dear 10:00-13:00 so selling now pays, cheap 14:00-19:00 so refilling later is
+    cheap, ordinary otherwise. Indices are quarter-hours from local midnight.
+    """
+    del moment
+    if 40 <= index < 52:
+        return 0.40
+    if 56 <= index < 76:
+        return 0.02
+    return 0.12
+
+
 async def live_coordinator(hass: HomeAssistant, config_data: dict):
     """Return a loaded coordinator with command sending enabled and Live selected."""
     from custom_components.alpha_ems_manager.const import (
@@ -1124,7 +1188,7 @@ async def drive_live_charge(
 
     coordinator = await live_coordinator(hass, config_data)
     seed(coordinator, history_before(NORMAL))
-    frank.publish(today=synthetic_day(NORMAL), tomorrow=None)
+    frank.publish(today=synthetic_day(NORMAL, price_at=charge_now_price), tomorrow=None)
     allow_trading(coordinator, allow_grid_charging=True, allow_battery_export=True)
 
     trace = []

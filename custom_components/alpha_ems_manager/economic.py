@@ -995,6 +995,33 @@ class EconomicHorizon:
         return len(self.demands)
 
 
+def actionable_intervals(
+    demands: Sequence[IntervalDemand],
+    prices: Sequence[IntervalPrice],
+) -> int:
+    """Return how many leading intervals the optimiser can actually act in.
+
+    The contiguous prefix where a price exists *and* a demand is forecast -- the
+    same prefix :func:`build_horizon` keeps, computed separately because the
+    reachability reserve needs the count *before* the horizon can be built, and
+    the horizon needs the reserve. Deriving it from prices and demands alone
+    breaks that circularity without either input having to know about the other.
+
+    This is the number handed to the reachability recursion as
+    ``grid_credit_intervals``, and it is the whole of what the reserve layer is
+    told: a count, with no hint of why the window ends. Inside it a refill can be
+    priced and chosen; beyond it, nothing may be assumed.
+    """
+    count = 0
+    for position, demand in enumerate(demands):
+        if position >= len(prices) or not prices[position].known:
+            break
+        if demand.net_demand_kwh is None:
+            break
+        count += 1
+    return count
+
+
 def build_horizon(
     *,
     demands: Sequence[IntervalDemand],
@@ -1938,6 +1965,19 @@ class EconomicOutcome:
     edge_creditable_kwh: float = float("inf")
     battery_throughput_cost_eur_per_kwh: float = 0.0
     grid_charge_margin_eur_per_kwh: float = 0.0
+    #: The **autonomy** curve, verbatim, and consumed by no solve since beta.31.
+    #: Kept because "could this pack ride out the forecast with no grid at all?"
+    #: is a real question -- it simply is not the question a hard bound may ask.
+    autonomy: tuple[float | None, ...] = ()
+    #: The **reachability** projection the solver actually obeyed, and the bounded
+    #: margin added to its floor. Published so a reader can see the constraint
+    #: rather than infer it from the plan it produced.
+    reachability: Any = None
+    uncertainty: Any = None
+    #: How many leading intervals could be priced and acted in. The boundary that
+    #: makes reachability honest: grid replenishment is credited inside it and
+    #: never beyond it.
+    actionable_interval_count: int = 0
     #: Per charge run, ``(safety_buy_kwh, economic_buy_kwh)``, keyed by start
     #: index. Diagnostics only: nothing in :func:`solve` reads it, and it is
     #: derived from a solve that already happened rather than a new one.
@@ -2206,6 +2246,10 @@ def build_outcome(
     battery_throughput_cost_eur_per_kwh: float = 0.0,
     edge_value_eur_per_kwh: float = 0.0,
     edge_creditable_kwh: float = float("inf"),
+    autonomy: tuple[float | None, ...] = (),
+    reachability: Any = None,
+    uncertainty: Any = None,
+    actionable_interval_count: int = 0,
 ) -> EconomicOutcome:
     """Run both solves and the label solve, and derive everything published.
 
@@ -2297,6 +2341,10 @@ def build_outcome(
         edge_creditable_kwh=edge_creditable_kwh,
         battery_throughput_cost_eur_per_kwh=battery_throughput_cost_eur_per_kwh,
         grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
+        autonomy=autonomy,
+        reachability=reachability,
+        uncertainty=uncertainty,
+        actionable_interval_count=actionable_interval_count,
         safety_buy_runs=_safety_buy_runs(desired, relaxed, table.bucket_kwh),
         safety_buy_attribution=_safety_buy_attribution(desired, relaxed),
     )

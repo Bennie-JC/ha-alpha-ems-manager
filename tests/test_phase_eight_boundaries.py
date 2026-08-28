@@ -524,7 +524,15 @@ async def test_the_economic_surface_writes_nothing_in_active_mode(
 
     coordinator = setup_integration.runtime_data
     seed(coordinator, history_before(NORMAL))
-    frank.publish(today=synthetic_day(NORMAL), tomorrow=None)
+    # beta.31: the plan needs a reason to act now, and for *this* test the action
+    # must be one that is not executable -- an export or a discharge. Only a charge
+    # executes in this release, and ``_advisory_suffix`` is right to omit the
+    # disclaimer from a charge line: calling an executable action advisory would be
+    # the false claim. So a sell-shaped day, which is precisely what the advisory
+    # half of the economic surface is made of.
+    from .test_beta24_live_charge import sell_now_price
+
+    frank.publish(today=synthetic_day(NORMAL, price_at=sell_now_price), tomorrow=None)
     # Both opt-ins on: the state that gives the optimizer something to advise,
     # and therefore the state in which a write would actually be tempting.
     allow_trading(coordinator, allow_grid_charging=True, allow_battery_export=True)

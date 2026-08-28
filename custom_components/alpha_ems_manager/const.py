@@ -1576,6 +1576,46 @@ RESERVE_HORIZON_TRUNCATED: Final = "truncated"
 #: have retained. Both are detected and reported; neither is ever corrected, and
 #: neither ever selects a different reserve model.
 RESERVE_BOUND_TRUNCATED: Final = "truncated"
+#: How long the reachability reserve must survive with **no credit at all**, in
+#: intervals. Four quarters, one hour.
+#:
+#: **The question a standard deviation cannot answer.** Reachability credits
+#: replenishment that requires *this controller to act successfully* -- to hold
+#: ownership, win the write, and have a grid on the other end. Forecast error says
+#: nothing about any of that. So one component of the margin is not statistical at
+#: all: it is the demand of the next hour, credited with nothing, so that a Home
+#: Assistant restart, a refused ownership check, a deaf actuator or a brief outage
+#: is survivable from the floor without help.
+#:
+#: One hour is four replan cycles at the quarter-hour cadence and sixty ticks at
+#: the physical one. Long enough that no single failure spans it; short enough
+#: that it costs a fraction of a kWh rather than a reserve.
+UNCERTAINTY_BLIND_INTERVALS: Final = 4
+
+#: How many mean absolute errors of margin to carry, per root-interval.
+#:
+#: One. The margin grows as ``MAE * sqrt(n)`` because independent per-interval
+#: errors partially cancel rather than accumulating linearly, and ``n`` is the
+#: distance to the replenishment actually depended on -- not the horizon length,
+#: which would make the margin a property of how far the forecast happens to
+#: reach.
+UNCERTAINTY_MAE_FACTOR: Final = 1.0
+
+#: The hard ceiling on the whole margin, as a fraction of usable capacity.
+#:
+#: **Five per cent, and the cap is the point.** The reference installation runs a
+#: 27 % weighted forecast error, and no honest reading of that figure turns into
+#: "keep the pack full" -- but an uncapped statistical margin eventually would,
+#: and it would be the autonomy reserve returning under a new name. On 21.6 kWh
+#: this is 1.08 kWh, about five points of state of charge.
+UNCERTAINTY_CAP_FRACTION: Final = 0.05
+
+#: Which half of the margin is in force. Published because they answer different
+#: questions and a reader must not have to guess which one produced the number.
+UNCERTAINTY_BINDING_BLIND: Final = "blind_window"
+UNCERTAINTY_BINDING_STATISTICAL: Final = "forecast_error"
+UNCERTAINTY_BINDING_CAP: Final = "capped"
+
 #: Which requirement a reserve projection is. Published beside the number so a
 #: reader with only the JSON can tell them apart -- for six releases the autonomy
 #: figure and a safety floor wore the same field name.

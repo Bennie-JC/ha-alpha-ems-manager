@@ -238,11 +238,14 @@ from .dispatch import decide as decide_setpoint
 from .economic import (
     EconomicOutcome,
     IntervalPrice,
+    actionable_intervals,
     build_economic_snapshot,
     build_horizon,
     build_outcome,
     build_physics_table,
     desired_grid_kw_at,
+    edge_creditable_energy_kwh,
+    edge_value_eur_per_kwh,
     execution_revision,
     execution_target,
     fingerprint_settings,
@@ -345,8 +348,10 @@ from .quarter import (
 from .realized import realized_window, soc_series_to_energy
 from .reserve import (
     ReserveProjection,
+    build_reserve_reachable,
     build_reserve_snapshot,
     fingerprint_battery_config,
+    uncertainty_margin,
 )
 from .safety import (
     ControlContext,
@@ -734,6 +739,35 @@ def _bucket_for(limits: BatteryLimits, floor_energy_kwh: float) -> tuple[float, 
     return chosen
 
 
+@dataclass(frozen=True, slots=True)
+class PlanningInputs:
+    """Everything beta.31 added to the planning decision, computed in one place.
+
+    **A bundle rather than six more positional arguments**, because
+    ``async_add_executor_job`` passes positionally and a list that long is a
+    silently-shifted argument waiting to happen -- which is exactly the fault
+    ``test_the_executor_call_passes_every_parameter_it_declares`` exists to catch.
+
+    It also keeps the seam. ``_solve_economic`` stays a pure function of its
+    inputs: a caller may hand it any reserve curve and any edge value, which is
+    what lets a suite vary one economic term at a time. ``None`` at the call site
+    means *the pre-beta.31 question* -- enforce the curve you were given, value
+    the horizon edge at nothing -- so every existing test still describes the
+    behaviour it was written for, and the production switch is one argument.
+    """
+
+    #: The curve the solver must obey. Reachability in production; whatever the
+    #: caller supplies in a test.
+    enforced_reserve: tuple[float | None, ...]
+    #: The autonomy curve, carried for diagnostics and consumed by no solve.
+    autonomy_reserve: tuple[float | None, ...]
+    reachability: Any
+    uncertainty: Any
+    actionable_intervals: int
+    edge_value_eur_per_kwh: float
+    edge_creditable_kwh: float
+
+
 def _solve_economic(
     limits: BatteryLimits,
     floor_energy_kwh: float,
@@ -746,6 +780,7 @@ def _solve_economic(
     minimum_trade_gain_eur: float,
     grid_charge_margin_eur_per_kwh: float,
     battery_throughput_cost_eur_per_kwh: float,
+    planning: PlanningInputs | None,
     allow_grid_charging: bool,
     allow_battery_export: bool,
 ) -> EconomicOutcome | None:
@@ -771,14 +806,32 @@ def _solve_economic(
         return None
     table_ms = (time.perf_counter() - started) * 1000.0
 
+    # **What the solver obeys, and it is decided by the caller.**
+    #
+    # ``raw_reserve`` used to be handed straight in, and it is the **autonomy**
+    # curve: the minimum stored energy if the grid is never used again, over the
+    # whole forecast. As a hard lexicographic floor that demanded 73 % state of
+    # charge against a 20 % physical floor on the reference installation --
+    # immobilising 96.9 % of the usable pack and making purchases compulsory at
+    # any price.
+    #
+    # Since beta.31 production passes a ``PlanningInputs`` carrying the
+    # **reachability** curve instead: can the pack hold the floor given
+    # replenishment that is physically possible and actionable? No bundle means
+    # the older question, which is what keeps every pre-beta.31 suite meaningful.
+    enforced_reserve = raw_reserve if planning is None else planning.enforced_reserve
+    edge_value = 0.0 if planning is None else planning.edge_value_eur_per_kwh
+    edge_creditable = float("inf") if planning is None else planning.edge_creditable_kwh
+
     horizon = build_horizon(
         demands=demands,
         prices=prices,
-        required_reserve_kwh=raw_reserve,
+        required_reserve_kwh=enforced_reserve,
         table=table,
     )
     if not horizon.intervals:
         return None
+
     return build_outcome(
         table=table,
         horizon=horizon,
@@ -793,6 +846,14 @@ def _solve_economic(
         reserve_above_capacity_kwh=reserve_above_capacity_kwh,
         table_ms=table_ms,
         bucket_rule=bucket_rule,
+        edge_value_eur_per_kwh=edge_value,
+        edge_creditable_kwh=edge_creditable,
+        autonomy=raw_reserve if planning is None else planning.autonomy_reserve,
+        reachability=None if planning is None else planning.reachability,
+        uncertainty=None if planning is None else planning.uncertainty,
+        actionable_interval_count=(
+            0 if planning is None else planning.actionable_intervals
+        ),
     )
 
 
@@ -2503,6 +2564,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
 
     @callback
+    def _forecast_mae_kwh_per_interval(self) -> float | None:
+        """Return the load forecast's mean absolute error, or ``None``.
+
+        The **only** forecast-quality figure that reaches a planning decision, and
+        it reaches exactly one: the statistical half of the uncertainty margin.
+        ``None`` when there is not yet enough history to compare, which the margin
+        reads as "no statistical claim" rather than as "no error".
+        """
+        record = self.last_record
+        window = None if record is None else getattr(record, "window", None)
+        return None if window is None else getattr(window, "mae_kwh", None)
+
+    @callback
     def _executing_intent(self) -> str | None:
         """Return the intent currently being executed, or ``None``.
 
@@ -4169,6 +4243,62 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             (value - ceiling for value in raw_reserve if value is not None),
             default=0.0,
         )
+        # ============ the beta.31 switch, and it is these lines ============
+        #
+        # Everything above still computes the **autonomy** requirement, and it is
+        # still reported. What changes is which curve the solver is made to obey.
+        #
+        # Two passes over the reachability recursion, and they are exact rather
+        # than iterative: the uncertainty margin depends on the demands and on the
+        # distance to the first replenishment, neither of which moves when the
+        # floor does. The first pass locates that distance; the second applies the
+        # margin as the recursion's own floor.
+        actionable = actionable_intervals(demands, prices)
+        probe = build_reserve_reachable(
+            limits=limits,
+            floor_energy_kwh=floor_energy,
+            demands=demands,
+            grid_credit_intervals=actionable,
+        )
+        margin = uncertainty_margin(
+            probe,
+            mae_kwh_per_interval=self._forecast_mae_kwh_per_interval(),
+            usable_capacity_kwh=limits.capacity_kwh,
+        )
+        reachability = build_reserve_reachable(
+            limits=limits,
+            # The hard floor plus a bounded margin, and nothing else. The floor is
+            # enforced by the clamp regardless of anything decided here, so a
+            # planning error is an expensive import rather than battery harm.
+            floor_energy_kwh=floor_energy + margin.total_dc_kwh,
+            demands=demands,
+            grid_credit_intervals=actionable,
+        )
+
+        # **What a kWh still in the pack is worth when the prices run out.**
+        # Neither a wall nor a cliff -- see ``edge_value_eur_per_kwh``. Withdrawn
+        # to the extent forecast production needs the room, so terminal value can
+        # never pay for displacing free energy.
+        planning = PlanningInputs(
+            enforced_reserve=tuple(
+                entry.required_dc_kwh for entry in reachability.intervals
+            ),
+            autonomy_reserve=raw_reserve,
+            reachability=reachability,
+            uncertainty=margin,
+            actionable_intervals=actionable,
+            edge_value_eur_per_kwh=edge_value_eur_per_kwh(
+                prices[:actionable],
+                discharge_efficiency=limits.discharge_efficiency,
+            ),
+            edge_creditable_kwh=edge_creditable_energy_kwh(
+                ceiling_kwh=limits.energy_for_soc(limits.max_soc_percent),
+                forecast_surplus_kwh=sum(
+                    demand.surplus_kwh for demand in demands[:actionable]
+                ),
+            ),
+        )
+
         # The configured physical floor, and nothing else.
         #
         # Until beta.18 this was the hold trajectory's end energy, on the reading
@@ -4194,6 +4324,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.config.minimum_trade_gain_eur,
             self.config.grid_charge_margin_eur_per_kwh,
             self.config.battery_throughput_cost_eur_per_kwh,
+            planning,
             self.config.allow_grid_charging,
             self.config.allow_battery_export,
         )

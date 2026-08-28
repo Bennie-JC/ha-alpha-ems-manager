@@ -38,6 +38,7 @@ from .conftest import FakeFrank
 from .forecast_helpers import NORMAL, history_before, local, refresh_at, seed
 from .frank_capture import synthetic_day
 from .live_capability import assert_charge_only_capability
+from .test_beta24_live_charge import charge_now_price
 
 ECONOMIC_ENTITY = "sensor.alpha_ems_economic_action"
 
@@ -82,7 +83,11 @@ async def drive(coordinator, frank: FakeFrank, *, hour: int = 12) -> None:
     deliberately do not.
     """
     seed(coordinator, history_before(NORMAL))
-    frank.publish(today=synthetic_day(NORMAL), tomorrow=None)
+    # beta.31: a shape that gives the plan a *reason* to act. The default sawtooth
+    # carried six cents of wholesale spread and relied on the autonomy reserve to
+    # make a purchase compulsory; reachability makes nothing compulsory while the
+    # pack can hold its floor, so a fixture wanting a run has to justify one.
+    frank.publish(today=synthetic_day(NORMAL, price_at=charge_now_price), tomorrow=None)
     await refresh_at(coordinator, local(NORMAL, hour, 5))
 
 

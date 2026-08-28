@@ -115,8 +115,8 @@ from .const import (
     RESERVE_BOUND_TRUNCATED,
     RESERVE_BOUND_TRUNCATED_HEADROOM,
     RESERVE_FINGERPRINT_CHARS,
-    RESERVE_GRID_CREDIT_NONE,
     RESERVE_GRID_CREDIT_BEYOND_WINDOW,
+    RESERVE_GRID_CREDIT_NONE,
     RESERVE_HORIZON_CLOSED,
     RESERVE_HORIZON_TRUNCATED,
     RESERVE_MODEL_VERSION,
@@ -126,6 +126,12 @@ from .const import (
     RESERVE_UNAVAILABLE_FORECAST,
     RESERVE_UNAVAILABLE_HORIZON_INCOMPLETE,
     RESERVE_UNAVAILABLE_LIMITS,
+    UNCERTAINTY_BINDING_BLIND,
+    UNCERTAINTY_BINDING_CAP,
+    UNCERTAINTY_BINDING_STATISTICAL,
+    UNCERTAINTY_BLIND_INTERVALS,
+    UNCERTAINTY_CAP_FRACTION,
+    UNCERTAINTY_MAE_FACTOR,
 )
 from .simulation import IntervalDemand
 
@@ -788,6 +794,148 @@ def build_reserve_pv_blind(
         demands=blind,
         credit_surplus=False,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class UncertaintyMargin:
+    """How much room above the floor the forecast's own error justifies.
+
+    Two components answering two different questions, reported separately and
+    never summed:
+
+    * :attr:`blind_dc_kwh` -- **structural**. What the next hour needs if nothing
+      replenishes and this controller cannot act. Not a statistic.
+    * :attr:`statistical_dc_kwh` -- **forecast error** to the replenishment the
+      plan actually depends on.
+
+    The margin in force is the larger of the two, capped. ``max`` rather than a
+    sum because they are not independent risks to be added: each is a lower bound
+    on the same quantity -- how wrong the near future can be -- and adding them
+    would double-count the same hour.
+    """
+
+    blind_dc_kwh: float
+    statistical_dc_kwh: float
+    cap_dc_kwh: float
+    intervals_to_refill: int
+    mae_kwh_per_interval: float | None
+
+    @property
+    def total_dc_kwh(self) -> float:
+        """Return the margin actually applied, DC. Bounded by construction."""
+        return min(self.cap_dc_kwh, max(self.blind_dc_kwh, self.statistical_dc_kwh))
+
+    @property
+    def binding(self) -> str:
+        """Return which component set the applied margin."""
+        larger = max(self.blind_dc_kwh, self.statistical_dc_kwh)
+        if larger > self.cap_dc_kwh:
+            return UNCERTAINTY_BINDING_CAP
+        if self.blind_dc_kwh >= self.statistical_dc_kwh:
+            return UNCERTAINTY_BINDING_BLIND
+        return UNCERTAINTY_BINDING_STATISTICAL
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the publishable form. Every component, never just the total."""
+        return {
+            "total_dc_kwh": _round_kwh(self.total_dc_kwh),
+            "blind_dc_kwh": _round_kwh(self.blind_dc_kwh),
+            "statistical_dc_kwh": _round_kwh(self.statistical_dc_kwh),
+            "cap_dc_kwh": _round_kwh(self.cap_dc_kwh),
+            "binding": self.binding,
+            "blind_intervals": UNCERTAINTY_BLIND_INTERVALS,
+            "intervals_to_refill": self.intervals_to_refill,
+            "mae_kwh_per_interval": self.mae_kwh_per_interval,
+            "rule": (
+                "the larger of a structural blind-window requirement and a "
+                "forecast-error term, capped at a fixed fraction of usable "
+                "capacity. max rather than sum: both bound the same hour. the "
+                "cap exists so a large forecast error can never become a full "
+                "pack, which is the autonomy reserve under another name"
+            ),
+        }
+
+
+def uncertainty_margin(
+    projection: ReserveProjection,
+    *,
+    mae_kwh_per_interval: float | None,
+    usable_capacity_kwh: float,
+) -> UncertaintyMargin:
+    """Return the bounded room above the floor, in DC energy.
+
+    Both components are expressed in AC energy first, because demand and forecast
+    error are both AC quantities, and crossed to DC **through the clamp** -- the
+    ratio is read from :func:`_withdrawal` rather than from an efficiency this
+    module would otherwise have to name. No second physics.
+
+    ``intervals_to_refill`` is the distance to the first interval that can
+    replenish at all, from either source. Small when a refill is imminent, which
+    is correct: forecast error matters far less when the pack can be topped up in
+    the next quarter than when it cannot be topped up for a day.
+    """
+    limits = projection.limits
+    cap = max(0.0, UNCERTAINTY_CAP_FRACTION * usable_capacity_kwh)
+    probes = _probe_states(limits)
+    intervals = projection.intervals
+
+    to_refill = len(intervals)
+    for position, interval in enumerate(intervals):
+        surplus = (
+            projection.demands[position].surplus_kwh
+            if position < len(projection.demands)
+            else 0.0
+        )
+        if interval.grid_credit_allowed or surplus > 0.0:
+            to_refill = position
+            break
+
+    if probes is None or not intervals:  # pragma: no cover - limits preclude it
+        return UncertaintyMargin(
+            blind_dc_kwh=0.0,
+            statistical_dc_kwh=0.0,
+            cap_dc_kwh=cap,
+            intervals_to_refill=to_refill,
+            mae_kwh_per_interval=mae_kwh_per_interval,
+        )
+    full, _empty = probes
+
+    blind_ac = 0.0
+    for demand in projection.demands[:UNCERTAINTY_BLIND_INTERVALS]:
+        net = demand.net_demand_kwh
+        if net:
+            blind_ac += net
+
+    statistical_ac = 0.0
+    if mae_kwh_per_interval is not None and mae_kwh_per_interval > 0.0:
+        statistical_ac = (
+            UNCERTAINTY_MAE_FACTOR * mae_kwh_per_interval * math.sqrt(max(1, to_refill))
+        )
+
+    return UncertaintyMargin(
+        blind_dc_kwh=_dc_for_ac(full, blind_ac),
+        statistical_dc_kwh=_dc_for_ac(full, statistical_ac),
+        cap_dc_kwh=cap,
+        intervals_to_refill=to_refill,
+        mae_kwh_per_interval=mae_kwh_per_interval,
+    )
+
+
+def _dc_for_ac(full: BatteryState, ac_kwh: float) -> float:
+    """Return the DC energy the clamp says it costs to deliver ``ac_kwh``.
+
+    The ratio comes from the clamp's own answer for one reference discharge, so
+    the AC-to-DC crossing happens where it is implemented and this module still
+    divides by no efficiency of its own.
+    """
+    if ac_kwh <= 0.0:
+        return 0.0
+    reference_dc, reference_ac, _constraints = _withdrawal(
+        full, full.limits.max_discharge_kw
+    )
+    if reference_ac <= 0.0:  # pragma: no cover - a usable pack always serves some
+        return ac_kwh
+    return ac_kwh * (reference_dc / reference_ac)
 
 
 # -- comparison against the present, and against the projection -------------
