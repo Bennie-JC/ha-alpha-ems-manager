@@ -1576,6 +1576,17 @@ RESERVE_HORIZON_TRUNCATED: Final = "truncated"
 #: have retained. Both are detected and reported; neither is ever corrected, and
 #: neither ever selects a different reserve model.
 RESERVE_BOUND_TRUNCATED: Final = "truncated"
+#: Which requirement a reserve projection is. Published beside the number so a
+#: reader with only the JSON can tell them apart -- for six releases the autonomy
+#: figure and a safety floor wore the same field name.
+RESERVE_SEMANTICS_AUTONOMY: Final = "autonomy_no_future_grid"
+RESERVE_SEMANTICS_REACHABILITY: Final = "reachability_priced_grid"
+
+#: What limited a grid replenishment credit in the reachability recursion.
+#: ``unpriced`` is the important one: not "no grid", but "no grid we can act on".
+RESERVE_GRID_CREDIT_NONE: Final = "none"
+RESERVE_GRID_CREDIT_UNPRICED: Final = "unpriced"
+
 RESERVE_BOUND_HEADROOM: Final = "headroom_limited"
 RESERVE_BOUND_TRUNCATED_HEADROOM: Final = "truncated_headroom_limited"
 
@@ -1817,6 +1828,37 @@ MAX_MINIMUM_TRADE_GAIN_EUR: Final = 5.0
 CONF_GRID_CHARGE_MARGIN_EUR_PER_KWH: Final = "grid_charge_margin_eur_per_kwh"
 DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH: Final = 0.0
 MIN_GRID_CHARGE_MARGIN_EUR_PER_KWH: Final = 0.0
+
+#: What one kWh through the battery costs in wear, in euros per kWh of **AC
+#: throughput in both directions**: ``charge_ac + discharge_ac``.
+#:
+#: **The third economic term, and the only one on the discharge side.** The two
+#: above gate *buying* -- one per run, one per grid-caused kWh -- so nothing at
+#: all priced the discharge and export half. Freeing the pack from the autonomy
+#: reserve gives the optimiser far more room to move energy, and room without a
+#: price on movement is how a newly-freed optimiser finds churn.
+#:
+#: **The default is 0.0, and that is a derivation rather than a shrug.** The
+#: obvious figure -- system cost over rated cycles -- is 11000 / (10000 x 21.6) =
+#: 0.051 EUR per discharged kWh, or 0.025 across both directions. Both are wrong
+#: as *marginal* costs, for two reasons. Most of that capital is the inverter and
+#: the installation, which are sunk however the pack is cycled. And decisively:
+#: ten thousand cycles at roughly one a day is twenty-seven years, so **calendar
+#: life ends this battery long before cycle count does** -- a cycle not used is
+#: not a cycle kept, and the marginal cost of one more ordinary cycle is about
+#: nothing. It becomes real only past ~2 cycles/day, where the two limits
+#: converge; that shape is convex, and a convex term would need throughput-so-far
+#: as a fourth solver dimension. So this is offered linear, defaulted off, and
+#: documented -- not guessed at.
+#:
+#: **Three disjoint bases, and they must stay disjoint.** ``minimum_trade_gain``
+#: is per run; ``grid_charge_margin`` is per grid-caused charge kWh; this is per
+#: kWh of total throughput. Setting two of them to "depreciation" double-charges
+#: the buy side, which is why none of the three is named after it.
+CONF_BATTERY_THROUGHPUT_COST_EUR_PER_KWH: Final = "battery_throughput_cost_eur_per_kwh"
+DEFAULT_BATTERY_THROUGHPUT_COST_EUR_PER_KWH: Final = 0.0
+MIN_BATTERY_THROUGHPUT_COST_EUR_PER_KWH: Final = 0.0
+MAX_BATTERY_THROUGHPUT_COST_EUR_PER_KWH: Final = 1.0
 
 #: A ceiling, in kWh, on how much grid energy one Live charge run may buy.
 #:
@@ -2433,13 +2475,50 @@ CADENCE_QUARTER_REFRESH: Final = "quarter_refresh"
 CADENCE_OFF_REFRESH: Final = "off_refresh"
 
 #: The bounded history of completed execution quarters.
-MAX_COMPLETED_QUARTERS_REPORTED: Final = 12
+#: How many completed quarters to publish and retain.
+#:
+#: **96, one civil day, and the number is the whole point.** At 12 this ring held
+#: three hours, so by the time a diagnostic was downloaded every night charge
+#: campaign had already been evicted -- and with the per-interval prices absent
+#: from the payload as well, no purchase this integration had ever made could be
+#: costed afterwards. An optimiser that spends real money and cannot show its
+#: receipts is not auditable, whatever its diagnostics say.
+MAX_COMPLETED_QUARTERS_REPORTED: Final = 96
 
 #: How many dispatch-start probe samples to keep.
 #:
 #: A twenty-minute run is ~20 sixty-second ticks plus two refreshes, so this holds
 #: one whole run including the arm and the samples after the stop.
 MAX_DISPATCH_START_SAMPLES_REPORTED: Final = 32
+
+#: How many **active-run** dispatch-start samples to keep, separately.
+#:
+#: **The ring above cannot answer the question it was built for.** It is ordered
+#: by time and evicted by time, so a run that ends is followed by hours of idle
+#: ``raw=0`` samples that push the only informative entries out. Measured: the
+#: beta.30 probe captured a real Live charge at 03:15 and by 12:00 every one of
+#: its thirty-two entries read ``0`` with ``phase: before_start``.
+#:
+#: This ring is appended to **only while a dispatch is running**, so an idle
+#: sample can never displace an active one and the evidence survives until the
+#: next run overwrites it. Twenty-four entries covers a dead-man lease at the
+#: sixty-second tick, which is longer than any single run can last.
+MAX_DISPATCH_START_ACTIVE_SAMPLES: Final = 24
+
+#: How many Stage-A decision records to retain for replay.
+#:
+#: **Bounded and append-only, deliberately not a database.** One record per
+#: quarter-hour refresh, so 192 is two days -- long enough to replay a full
+#: weekend against a changed architecture, short enough that the payload stays
+#: readable and the store stays small. The point is reproducibility, not history:
+#: anything older is better answered by the forecast and price evidence layers
+#: that already keep a year.
+MAX_DECISION_RECORDS_RETAINED: Final = 192
+
+#: Why a Stage-A decision was recorded, so a reader can tell a routine refresh
+#: from one that actually changed the plan.
+DECISION_RECORD_REASON_REFRESH: Final = "refresh"
+DECISION_RECORD_REASON_REVISION: Final = "revision"
 
 #: The causal-claim schema this release writes and will accept.
 #:

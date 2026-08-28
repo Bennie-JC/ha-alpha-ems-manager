@@ -68,6 +68,10 @@ CONFIG = {
 }
 SETTINGS = {
     "minimum_trade_gain_eur": 0.10,
+    # beta.31: both per-kWh terms are part of the digest and have no defaults, so
+    # a caller cannot silently omit the setting its plan actually rested on.
+    "grid_charge_margin_eur_per_kwh": 0.0,
+    "battery_throughput_cost_eur_per_kwh": 0.0,
     "allow_grid_charging": False,
     "allow_battery_export": False,
     "bucket_kwh": 0.25,

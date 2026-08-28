@@ -115,10 +115,14 @@ from .const import (
     RESERVE_BOUND_TRUNCATED,
     RESERVE_BOUND_TRUNCATED_HEADROOM,
     RESERVE_FINGERPRINT_CHARS,
+    RESERVE_GRID_CREDIT_NONE,
+    RESERVE_GRID_CREDIT_UNPRICED,
     RESERVE_HORIZON_CLOSED,
     RESERVE_HORIZON_TRUNCATED,
     RESERVE_MODEL_VERSION,
     RESERVE_REPLENISHMENT_ASSUMPTION,
+    RESERVE_SEMANTICS_AUTONOMY,
+    RESERVE_SEMANTICS_REACHABILITY,
     RESERVE_UNAVAILABLE_FORECAST,
     RESERVE_UNAVAILABLE_HORIZON_INCOMPLETE,
     RESERVE_UNAVAILABLE_LIMITS,
@@ -169,6 +173,18 @@ class ReserveInterval:
     headroom_excess_dc_kwh: float
     #: Which limits bound this interval, from the clamp. Empty when none did.
     constraints: tuple[str, ...] = ()
+    #: AC energy a **grid** charge could have added here, credited against
+    #: accumulated deficit exactly as production is. Zero in the autonomy
+    #: recursion, which cannot represent grid replenishment at all, and zero in
+    #: the reachability recursion beyond the priced horizon -- see
+    #: :func:`build_reserve_reachable` for why that boundary is the whole design.
+    grid_credited_ac_kwh: float = 0.0
+    #: Whether grid replenishment was creditable in this interval. ``False`` is
+    #: not "no grid": it is "no grid we can act on and price".
+    grid_credit_allowed: bool = False
+    #: What limited the grid credit, when one was attempted. ``none`` when it was
+    #: unlimited, and ``unpriced`` beyond the horizon the optimiser can act in.
+    grid_credit_binding: str = RESERVE_GRID_CREDIT_UNPRICED
 
 
 # -- the projection ----------------------------------------------------------
@@ -200,6 +216,46 @@ class ReserveProjection:
     credited_surplus: bool
     available: bool
     unavailable_reason: str | None = None
+    #: How many leading intervals could credit grid replenishment. ``0`` makes
+    #: this the autonomy projection; anything else makes it a reachability one.
+    grid_credit_intervals: int = 0
+
+    @property
+    def credits_grid(self) -> bool:
+        """Return whether this projection represents grid replenishment at all.
+
+        The one question that separates the two recursions, and the reason the
+        answer must be published beside the number: a figure that assumes the
+        grid will never be used again is a very different object from one that
+        does not, and for six releases they wore the same name.
+        """
+        return self.grid_credit_intervals > 0
+
+    @property
+    def semantics(self) -> str:
+        """Return which requirement this is, for a reader who has only the JSON."""
+        return (
+            RESERVE_SEMANTICS_REACHABILITY
+            if self.credits_grid
+            else RESERVE_SEMANTICS_AUTONOMY
+        )
+
+    def bridge_kwh(self, stored_dc_kwh: float | None) -> float | None:
+        """Return the only grid energy this projection makes *compulsory*.
+
+        ``max(0, required_now - stored)``. Everything above it is discretionary
+        and must clear the economic gates; nothing below it can be declined,
+        because declining it means crossing the floor the clamp enforces anyway.
+
+        **The invariant this exists to make checkable:** a bridge of zero means
+        no purchase is compulsory. Before beta.31 there was no such quantity, so
+        "why this much" had no answer in the code -- ``safety_buy`` was a label
+        applied by diffing two solves after the fact.
+        """
+        required = self.required_now_dc_kwh
+        if required is None or stored_dc_kwh is None:
+            return None
+        return max(0.0, required - stored_dc_kwh)
 
     # -- what the entity reads -------------------------------------------
 
@@ -465,6 +521,7 @@ def _build(
     floor_energy_kwh: float,
     demands: Sequence[IntervalDemand],
     credit_surplus: bool,
+    grid_credit_intervals: int = 0,
 ) -> ReserveProjection:
     """Walk the horizon backwards once. Pure, total, and it never raises."""
     ceiling = limits.energy_for_soc(limits.max_soc_percent)
@@ -502,6 +559,8 @@ def _build(
     servable: list[float] = [0.0] * total
     unserved: list[float] = [0.0] * total
     credited: list[float] = [0.0] * total
+    grid_credited: list[float] = [0.0] * total
+    grid_binding: list[str] = [RESERVE_GRID_CREDIT_UNPRICED] * total
     excess: list[float] = [0.0] * total
     constraints: list[tuple[str, ...]] = [()] * total
 
@@ -533,9 +592,38 @@ def _build(
             )
             credited[position] = credited_ac
 
-        constraints[position] = tuple(discharge_constraints) + tuple(charge_constraints)
+        # **The one term that turns autonomy into reachability**, and it is the
+        # same call production already uses for the sun. A grid-connected battery
+        # can be refilled; a requirement computed as though it never will be is
+        # not a safety figure but a pessimistic policy wearing physics.
+        #
+        # Credited only in the leading ``grid_credit_intervals`` -- the prefix the
+        # optimiser can actually *price and act on*. Beyond it the credit is zero,
+        # because assuming a refill nobody has quoted would be inventing the one
+        # thing we do not know, and "unknown price" must not become "free energy".
+        #
+        # Asked at full charge power against an empty pack, exactly as the surplus
+        # is. That is the correct convention rather than a convenient one: the
+        # requirement binds when the pack is *low*, which is precisely when
+        # headroom is largest, so a headroom-limited credit would be the
+        # understatement. The clamp still applies every real limit, and the
+        # deficit floor below caps the credit at the deficit so it can never bank.
+        grid_dc = 0.0
+        grid_constraints: tuple[str, ...] = ()
+        if position < grid_credit_intervals:
+            grid_dc, grid_ac, grid_constraints = _credit(empty, limits.max_charge_kw)
+            grid_credited[position] = grid_ac
+            grid_binding[position] = (
+                grid_constraints[0] if grid_constraints else RESERVE_GRID_CREDIT_NONE
+            )
 
-        signed = withdrawal_dc - credit_dc
+        constraints[position] = (
+            tuple(discharge_constraints)
+            + tuple(charge_constraints)
+            + tuple(grid_constraints)
+        )
+
+        signed = withdrawal_dc - credit_dc - grid_dc
         deficit = max(0.0, signed + deficit)
         required[position] = floor_energy_kwh + deficit
         excess[position] = max(0.0, required[position] - ceiling)
@@ -551,6 +639,9 @@ def _build(
             credited_ac_kwh=credited[position],
             headroom_excess_dc_kwh=excess[position],
             constraints=constraints[position],
+            grid_credited_ac_kwh=grid_credited[position],
+            grid_credit_allowed=position < grid_credit_intervals,
+            grid_credit_binding=grid_binding[position],
         )
         for position in range(total)
     )
@@ -577,6 +668,7 @@ def _build(
         unavailable_reason=(
             None if answered else RESERVE_UNAVAILABLE_HORIZON_INCOMPLETE
         ),
+        grid_credit_intervals=grid_credit_intervals,
     )
 
 
@@ -599,6 +691,48 @@ def build_reserve(
         floor_energy_kwh=floor_energy_kwh,
         demands=demands,
         credit_surplus=True,
+    )
+
+
+def build_reserve_reachable(
+    *,
+    limits: BatteryLimits,
+    floor_energy_kwh: float,
+    demands: Sequence[IntervalDemand],
+    grid_credit_intervals: int,
+) -> ReserveProjection:
+    """Return the requirement that admits grid replenishment. **The safety bound.**
+
+    :func:`build_reserve` answers *"how much must be stored if we never buy
+    again?"* -- an **autonomy** question, and a genuinely useful one. What it is
+    not is a safety floor for a battery with a grid connection, and using it as
+    one immobilised 96.9 % of the discretionary pack on the reference
+    installation while the physical floor was 20 %.
+
+    This answers the question a hard constraint should ask: *can the pack stay
+    above the floor given replenishment that is physically possible and that the
+    optimiser can act on?* The recursion, the clamp, the conversions and the
+    deficit cap are all the same; the only difference is one more credit term.
+
+    ``grid_credit_intervals`` is the length of the leading prefix where grid
+    charging may be credited, and the caller must pass the **priced** horizon
+    length. That boundary is the design, not a detail:
+
+    * inside it, a refill is credited because the optimiser can see it, price it
+      and choose it -- and the objective, not this function, decides which one;
+    * beyond it, nothing is credited, because a price nobody has published cannot
+      be acted on, and crediting it would assume away the single unknown.
+
+    **This function still contains physics only.** It does not read a price, rank
+    an interval, or prefer a cheap refill to a dear one. Pass ``0`` and it is the
+    autonomy recursion exactly.
+    """
+    return _build(
+        limits=limits,
+        floor_energy_kwh=floor_energy_kwh,
+        demands=demands,
+        credit_surplus=True,
+        grid_credit_intervals=max(0, grid_credit_intervals),
     )
 
 

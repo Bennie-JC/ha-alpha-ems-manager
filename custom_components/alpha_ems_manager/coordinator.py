@@ -92,6 +92,7 @@ from .const import (
     CONF_BATTERY_POWER_SIGN,
     CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_SOC_ENTITY,
+    CONF_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
     CONF_CONTROL_EXECUTION_ENABLED,
     CONF_CONTROL_EXPORT_MARGIN_PERCENT,
     CONF_CONTROL_HORIZON_MINUTES,
@@ -127,6 +128,7 @@ from .const import (
     DEFAULT_BATTERY_MIN_SOC_PERCENT,
     DEFAULT_BATTERY_POWER_SIGN,
     DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+    DEFAULT_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
     DEFAULT_CONTROL_EXECUTION_ENABLED,
     DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
     DEFAULT_CONTROL_HORIZON_MINUTES,
@@ -592,6 +594,10 @@ class SourceConfig:
     #: the execution flag above, which cannot change anything in this release.
     minimum_trade_gain_eur: float
     grid_charge_margin_eur_per_kwh: float
+    #: Wear per kWh of AC throughput in both directions. Off by default; see
+    #: :data:`CONF_BATTERY_THROUGHPUT_COST_EUR_PER_KWH` for why the honest default
+    #: is zero rather than a plausible-looking couple of cents.
+    battery_throughput_cost_eur_per_kwh: float
     allow_grid_charging: bool
     allow_battery_export: bool
 
@@ -668,6 +674,14 @@ class SourceConfig:
                 value(CONF_GRID_CHARGE_MARGIN_EUR_PER_KWH),
                 DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH,
             ),
+            # **Read here or it silently does nothing.** The beta.21 lesson: the
+            # margin above was accepted by ``solve`` and present in the config for
+            # a whole release while this reader was the missing link, and stock
+            # installs never noticed because the default is zero.
+            battery_throughput_cost_eur_per_kwh=_number(
+                value(CONF_BATTERY_THROUGHPUT_COST_EUR_PER_KWH),
+                DEFAULT_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
+            ),
             allow_grid_charging=bool(
                 value(CONF_ALLOW_GRID_CHARGING, DEFAULT_ALLOW_GRID_CHARGING)
             ),
@@ -731,6 +745,7 @@ def _solve_economic(
     reserve_above_capacity_kwh: float,
     minimum_trade_gain_eur: float,
     grid_charge_margin_eur_per_kwh: float,
+    battery_throughput_cost_eur_per_kwh: float,
     allow_grid_charging: bool,
     allow_battery_export: bool,
 ) -> EconomicOutcome | None:
@@ -772,6 +787,7 @@ def _solve_economic(
         floor_energy_kwh=floor_energy_kwh,
         minimum_trade_gain_eur=minimum_trade_gain_eur,
         grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
+        battery_throughput_cost_eur_per_kwh=battery_throughput_cost_eur_per_kwh,
         allow_grid_charging=allow_grid_charging,
         allow_battery_export=allow_battery_export,
         reserve_above_capacity_kwh=reserve_above_capacity_kwh,
@@ -4177,6 +4193,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             max(0.0, above_capacity),
             self.config.minimum_trade_gain_eur,
             self.config.grid_charge_margin_eur_per_kwh,
+            self.config.battery_throughput_cost_eur_per_kwh,
             self.config.allow_grid_charging,
             self.config.allow_battery_export,
         )
@@ -5417,6 +5434,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
             settings_fingerprint=fingerprint_settings(
                 minimum_trade_gain_eur=self.config.minimum_trade_gain_eur,
+                grid_charge_margin_eur_per_kwh=(
+                    self.config.grid_charge_margin_eur_per_kwh
+                ),
+                battery_throughput_cost_eur_per_kwh=(
+                    self.config.battery_throughput_cost_eur_per_kwh
+                ),
                 allow_grid_charging=self.config.allow_grid_charging,
                 allow_battery_export=self.config.allow_battery_export,
                 bucket_kwh=outcome.bucket_kwh,

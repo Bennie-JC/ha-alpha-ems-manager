@@ -832,6 +832,18 @@ class EconomicPlan:
     #: allowed to understate what the plan earns.
     grid_charge_margin_eur: float = 0.0
     marginal_grid_charge_kwh: float = 0.0
+    #: AC energy this plan moves through the battery, both directions summed, and
+    #: what the throughput term charged for it. **The churn measure**: a plan that
+    #: earns the same money on twice the throughput is the worse plan, and before
+    #: beta.31 nothing in the payload said so. Notional like the two above.
+    battery_throughput_kwh: float = 0.0
+    battery_throughput_cost_eur: float = 0.0
+    #: What the terminal inventory was worth, and the energy it was worth it on.
+    #: ``edge_value_eur`` is a *credit*, so it raises expected value rather than
+    #: lowering cost -- energy left in the pack at the price horizon's end is an
+    #: asset, not a saving.
+    edge_energy_kwh: float = 0.0
+    edge_value_eur: float = 0.0
 
     # -- what the entity reads --------------------------------------------
 
@@ -895,7 +907,15 @@ class EconomicPlan:
         it is not money anybody pays. Reporting a gain net of it would understate
         what the plan actually earns.
         """
-        return (self.hold_cost_eur - self.cost_eur) - self.switching_cost_eur
+        return (
+            (self.hold_cost_eur - self.cost_eur)
+            - self.switching_cost_eur
+            # Terminal inventory is an asset the plan ends holding, so it *raises*
+            # what the plan is worth. Reported inside the gain rather than folded
+            # into ``cost_eur``, which must keep reconciling to grid energy at the
+            # interval's own prices -- the same discipline as the margin.
+            + self.edge_value_eur
+        )
 
     # -- totals -----------------------------------------------------------
 
@@ -1022,6 +1042,83 @@ def build_horizon(
     )
 
 
+def edge_value_eur_per_kwh(
+    prices: Sequence[IntervalPrice],
+    *,
+    discharge_efficiency: float,
+) -> float:
+    """Return what a kWh still in the pack is worth when the prices run out.
+
+    **The horizon edge must be neither a wall nor a cliff.** The autonomy reserve
+    made it a wall -- provisioning a whole unpriced day with a hard bound, which
+    immobilised the pack. Removing it entirely makes it a cliff: energy above the
+    terminal floor becomes worth exactly zero, so the plan sells it at whatever
+    export pays. Both faults have one cause, an unpriced future represented as a
+    *bound* instead of a *value*, and one fix.
+
+    The figure is a **replacement cost**: what it would cost to buy this kWh back
+    at a price we have actually seen. So the solver becomes indifferent between
+    holding a kWh to the edge and buying one in the cheapest visible quarter,
+    which removes the incentive to hoard and the incentive to dump in one number.
+
+    Four deliberate choices, each ruling out a failure:
+
+    * **The 25th percentile, not the minimum.** ``min`` is the least robust
+      statistic there is: one freak-cheap quarter drags the whole estimate down
+      and the planner *under-holds*. The quantile absorbs an outlier.
+    * **Floored at zero.** Negative wholesale intervals are routine here, and a
+      negative edge value would make the objective *reward dumping* energy at the
+      horizon's end -- a real pathology, not a corner case.
+    * **Capped at the dearest price seen.** A kWh can never be worth more than
+      the most anyone was ever charged for one, so "pay anything to hold
+      inventory" is structurally impossible rather than merely unlikely.
+    * **Discharge efficiency only, never round trip.** The energy is *already
+      stored*; only the outbound conversion remains. Charging it the inbound loss
+      as well would understate stock by about five per cent.
+
+    Only prices that exist. No forecast, no assumed tomorrow, and no slope
+    carried from the previous refresh -- that last would be a temporal feedback
+    loop, which is precisely the ratcheting beta.18 removed from the old terminal
+    constraint.
+    """
+    known = sorted(
+        price.import_eur_kwh
+        for price in prices
+        if price.import_eur_kwh is not None and math.isfinite(price.import_eur_kwh)
+    )
+    if not known or discharge_efficiency <= 0.0:
+        return 0.0
+    index = max(0, min(len(known) - 1, int(0.25 * (len(known) - 1) + 0.5)))
+    ceiling = discharge_efficiency * known[-1]
+    if ceiling <= 0.0:
+        return 0.0
+    return max(0.0, min(discharge_efficiency * known[index], ceiling))
+
+
+def edge_creditable_energy_kwh(
+    *,
+    ceiling_kwh: float,
+    forecast_surplus_kwh: float,
+) -> float:
+    """Return how much terminal inventory may be *valued*, given incoming sun.
+
+    **Terminal value must not pay for displacing free energy.** A pack held full
+    at the horizon edge has nowhere to put the surplus a forecast says is
+    arriving, so its last kWh is not worth its replacement cost -- it is worth
+    that cost *minus* the production it locks out, which for free production is
+    the whole of it.
+
+    So the credited energy is capped at the room the surplus needs. Above the cap
+    the inventory is still physically there and still reported in
+    ``edge_energy_kwh``; it simply earns nothing, which is the honest price of
+    energy that is about to arrive for free.
+
+    No PV accounting is duplicated: the surplus is the same quantity the reserve
+    recursion already nets, and the ceiling is the battery's own.
+    """
+    return max(0.0, ceiling_kwh - max(0.0, forecast_surplus_kwh))
+
+
 # -- the solver --------------------------------------------------------------
 
 #: A value that is worse than any reachable one, for an infeasible state. A
@@ -1039,6 +1136,9 @@ def solve(
     minimum_trade_gain_eur: float,
     permitted: frozenset[str],
     grid_charge_margin_eur_per_kwh: float = 0.0,
+    battery_throughput_cost_eur_per_kwh: float = 0.0,
+    edge_value_eur_per_kwh: float = 0.0,
+    edge_creditable_kwh: float = float("inf"),
 ) -> EconomicPlan:
     """Return the least-cost plan over the horizon. Pure, total, never raises.
 
@@ -1118,12 +1218,26 @@ def solve(
     value: list[list[tuple[float, float]]] = [
         [_UNREACHABLE for _ in _RUN_STATES] for _ in range(buckets + 1)
     ]
+    # **Where the edge value enters, and it is one line of arithmetic.** The
+    # terminal condition used to be a pure feasibility test carrying no price,
+    # which is exactly what made energy above the floor worth nothing at the
+    # horizon end. Seeding it with ``-v_edge * E`` gives terminal inventory an
+    # explicit worth, so the backward induction trades it against today prices at
+    # the margin instead of against a wall. A *credit*, hence a negative cost.
+    #
+    # It cannot reintroduce "pay anything": it is finite, bounded above by the
+    # dearest price seen, and it lives in the second element of the pair, so
+    # reserve feasibility still dominates it lexicographically.
+    edge_credit = [
+        edge_value_eur_per_kwh * min(table.energy(bucket), edge_creditable_kwh)
+        for bucket in range(buckets + 1)
+    ]
     for bucket in range(buckets + 1):
-        # The terminal condition: end no worse off than doing nothing would have.
-        # It carries no price, so it cannot be traded against revenue.
         feasible = bucket >= terminal_bucket
         for run in _RUN_STATES:
-            value[bucket][run] = (0.0, 0.0) if feasible else _UNREACHABLE
+            value[bucket][run] = (
+                (0.0, -edge_credit[bucket]) if feasible else _UNREACHABLE
+            )
 
     choice: list[list[list[int]]] = [
         [[-1 for _ in _RUN_STATES] for _ in range(buckets + 1)] for _ in range(count)
@@ -1168,6 +1282,22 @@ def solve(
                     # only when its benefit clears purchase cost plus margin.
                     if grid_charge_margin_eur_per_kwh > 0.0:
                         cost += grid_charge_margin_eur_per_kwh * outcome.grid_charge_kwh
+                    # **The only per-kWh cost on the discharge side.** Charged on
+                    # AC throughput in *both* directions, so four shallow cycles
+                    # cost four times what one equivalent cycle does and the
+                    # search prefers the deep one at equal revenue. Local for the
+                    # same reason as the margin above: it depends only on this
+                    # interval's own movement, so it needs no accumulated-energy
+                    # axis and adds no solver dimension.
+                    #
+                    # A different base from the margin, deliberately: that one
+                    # measures *purchased* energy, this one measures *movement*.
+                    # Neither is depreciation, and conflating them would charge
+                    # grid charging twice.
+                    if battery_throughput_cost_eur_per_kwh > 0.0:
+                        cost += battery_throughput_cost_eur_per_kwh * (
+                            outcome.charge_ac_kwh + outcome.discharge_ac_kwh
+                        )
                     candidate = (
                         onward[0] + violations[move.target],
                         onward[1] + cost,
@@ -1203,6 +1333,9 @@ def solve(
         minimum_trade_gain_eur=minimum_trade_gain_eur,
         permitted=permitted,
         grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
+        battery_throughput_cost_eur_per_kwh=battery_throughput_cost_eur_per_kwh,
+        edge_value_eur_per_kwh=edge_value_eur_per_kwh,
+        edge_creditable_kwh=edge_creditable_kwh,
     )
 
 
@@ -1465,6 +1598,9 @@ def _walk_forward(
     minimum_trade_gain_eur: float,
     permitted: frozenset[str],
     grid_charge_margin_eur_per_kwh: float = 0.0,
+    battery_throughput_cost_eur_per_kwh: float = 0.0,
+    edge_value_eur_per_kwh: float = 0.0,
+    edge_creditable_kwh: float = float("inf"),
 ) -> EconomicPlan:
     """Replay the chosen moves to produce the plan the caller reads.
 
@@ -1479,6 +1615,7 @@ def _walk_forward(
     total_switching = 0.0
     total_margin = 0.0
     total_grid_charge = 0.0
+    total_throughput = 0.0
     total_violation = 0.0
     worst_shortfall = 0.0
     first_violation: int | None = None
@@ -1500,6 +1637,8 @@ def _walk_forward(
         # switching cost is kept out of it.
         total_margin += grid_charge_margin_eur_per_kwh * outcome.grid_charge_kwh
         total_grid_charge += outcome.grid_charge_kwh
+        # Both directions, because churn is movement rather than purchase.
+        total_throughput += outcome.charge_ac_kwh + outcome.discharge_ac_kwh
         total_cost += outcome.cost_eur
 
         landed = table.energy(move.target)
@@ -1547,6 +1686,14 @@ def _walk_forward(
         ),
         switching_cost_eur=total_switching,
         grid_charge_margin_eur=total_margin,
+        battery_throughput_kwh=total_throughput,
+        battery_throughput_cost_eur=(
+            battery_throughput_cost_eur_per_kwh * total_throughput
+        ),
+        edge_energy_kwh=table.energy(bucket),
+        edge_value_eur=(
+            edge_value_eur_per_kwh * min(table.energy(bucket), edge_creditable_kwh)
+        ),
         marginal_grid_charge_kwh=total_grid_charge,
         terminal_floor_kwh=terminal_floor_kwh,
         terminal_binding=bucket <= terminal_bucket,
@@ -3122,6 +3269,8 @@ def fingerprint_economic(
 def fingerprint_settings(
     *,
     minimum_trade_gain_eur: float,
+    grid_charge_margin_eur_per_kwh: float,
+    battery_throughput_cost_eur_per_kwh: float,
     allow_grid_charging: bool,
     allow_battery_export: bool,
     bucket_kwh: float,
@@ -3131,10 +3280,24 @@ def fingerprint_settings(
     Separate from the battery-configuration digest because these are the user's
     *economic* choices rather than their hardware, and a later phase asking "why
     did it want that" needs to know which threshold was in force.
+
+    **All three economic terms are required arguments, and beta.31 added the two
+    that were missing.** Until then this digest covered only the fixed per-run
+    threshold, so two installations differing by a whole per-kWh margin produced
+    the *same* fingerprint -- which means a recorded decision could not be
+    replayed, because the settings it was made under were not recoverable from
+    the evidence. They are keyword-only and **have no defaults** on purpose: a
+    parameter with a default is a setting a future caller can silently drop, and
+    that is exactly how ``grid_charge_margin_eur_per_kwh`` spent a release doing
+    nothing.
     """
     return _digest(
         {
             "minimum_trade_gain_eur": minimum_trade_gain_eur,
+            "grid_charge_margin_eur_per_kwh": grid_charge_margin_eur_per_kwh,
+            "battery_throughput_cost_eur_per_kwh": (
+                battery_throughput_cost_eur_per_kwh
+            ),
             "allow_grid_charging": allow_grid_charging,
             "allow_battery_export": allow_battery_export,
             "bucket_kwh": bucket_kwh,
