@@ -9,6 +9,268 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.31] - 2026-08-28
+
+**The economic correctness release.** `beta.30` fixed the controller's hands;
+`beta.31` fixes what it is told to do. The planner had been spending real money to
+maintain a reserve that was conceptually wrong for an economic battery, and its own
+code measured the bill.
+
+Stage B is unchanged. `execution.py`, `safety.py`, `dispatch.py`, `control.py`,
+`quarter.py`, `alphaess_device.py` and `alphaess_adapter.py` are **not touched at
+all** since `v1.0.0-beta.30`.
+
+### Fixed: the reserve assumed the grid would never be used again
+
+The dynamic reserve was a **price-blind, no-grid-ever-again autonomy requirement over
+a 36-hour horizon**, imposed as a hard lexicographic floor inside a 12-hour priced
+window. `build_reserve(limits, floor_energy_kwh, demands)` took three arguments: no
+price, no charge term. Future *sun* was credited 7.3 kWh of replenishment; the future
+*grid* was not representable at all — and the grid is the more reliable and more
+controllable of the two.
+
+Measured on the live installation at 12:00 on 2026-08-28: `required_reserve_kwh` 15.8
+(**73.1 % SoC**) against a 4.32 kWh floor, `margin_to_reserve_kwh` 0.36 out of 11.84
+kWh usable — **96.9 % of the discretionary pack immobilised**. The curve peaked at
+17.18 kWh at 16:45, above the 16.157 kWh actually stored, so a violation was
+unavoidable; violations outrank cost lexicographically, so the solver had to buy at
+any price. It bought 1.94 kWh at 0.244–0.258 €/kWh and exported the surplus at
+0.158–0.212 €/kWh in the same twelve hours. The relaxed re-solve the code already
+runs every refresh measured the cost of that constraint at **€1.3185** for one
+afternoon.
+
+The constraint also **self-disabled exactly when the risk was real**: the
+whole-horizon bridge runs 33–61 kWh in winter against a 22 kWh pack, so every winter
+horizon violates, the first lexicographic term ties, and economics resumes. Its grip
+was tightest in the summer shoulder where the danger was lowest.
+
+### Added: reachability hard, edge priced
+
+One extra term in the existing recursion, and one in the objective. No second physics
+— every conversion still goes through `apply_request`.
+
+```
+R_reach[n] = F
+R_reach[i] = max(F, R_reach[i+1] + discharge(i) - pv_credit(i) - grid_credit(i))
+```
+
+`grid_credit(i)` is what a full-power grid charge could add in interval `i`, through
+the same clamp `_credit()` already uses for production — so headroom-limited,
+power-limited and efficiency-correct. It is **zero for every interval beyond the
+priced horizon**, and that single clause is the whole design: inside the window the
+optimiser can see, price and choose a refill; beyond it, it cannot, and assuming one
+would be assuming away the one thing it does not know.
+
+This stays a hard lexicographic constraint, and now deserves to be, because it
+encodes only physics. The 20 % floor is its unconditional terminal condition.
+
+The unpriced tail becomes a **value** rather than a bound: `- v_edge x E(N)` in the
+cost term, where `v_edge = clamp(eta_discharge x Q25(known import), 0,
+eta_discharge x max known import)`. A kWh still in the pack when prices run out is
+worth what the cheapest refill actually visible would cost. Bounded by construction,
+so it can never produce "pay anything"; self-consistent, so the solver is indifferent
+between holding a kWh to the edge and buying one at that price — which removes the
+hoarding incentive and the dumping incentive with one parameter. The credited edge
+energy is capped by the room forecast production still needs.
+
+A bounded uncertainty margin is the **only** place forecast error enters:
+`u = min(U_MAX, max(u_blind, u_statistical))`, with `u_blind` four quarters of demand
+at zero credit — a structural control-failure buffer — and `u_statistical` the
+forecast MAE scaled by the square root of the intervals to the next refill. `U_MAX`
+is 5 % of usable capacity, so 27 % WAPE can never become "keep the pack full".
+
+### Added: every discretionary purchase passes the economic gates
+
+Reserve-protection charging used to bypass `minimum_trade_gain_eur` entirely — the
+lexicographic term laundered a purchase past the economic gate. Reachability is now
+the only exemption, and a reachability purchase is unavoidable by construction.
+
+Three disjoint bases, none overlapping: `minimum_trade_gain_eur` per run,
+`grid_charge_margin_eur_per_kwh` per grid-caused charge kWh, and a new
+`battery_throughput_cost_eur_per_kwh` on `charge_ac + discharge_ac`. The last one
+exists because `beta.31` makes micro-cycling cheap for the first time, and adding
+freedom without the cost of using it is how a newly-freed optimiser finds a way to
+lose money the constrained one never could.
+
+`grid_charge_margin_eur_per_kwh` was accepted by `solve` and read into the runtime
+config, and the executor call between them was the gap. It is now plumbed through and
+**published** — in the planning diagnostics, the decision record and the settings
+fingerprint — so the number a user reads is the number their money was spent under.
+The resolution order is unchanged: `entry.options`, then `entry.data`, then the
+default. **No migration touches an explicitly configured value.**
+
+### Added: economic attribution, so a purchase can answer for itself
+
+Every grid charge now answers *why now*, *why this much* and *why not wait*, with a
+named classification: `reachability_bridge`, `uncertainty_margin`,
+`economic_arbitrage`, `strategic_future_self_use`, `mixed` or `unknown`.
+
+Two corrections came out of writing the tests, and both were real defects.
+
+The compulsory share is what the **reserve-relaxed counterfactual declines to buy**,
+not the deficit at the horizon head. The requirement is a *curve* and it usually peaks
+ahead of the head: on a winter shape the head asked 9.59 kWh while the curve peaked at
+10.855 four quarters later, so a pack at 10.80 had a head bridge of **zero** and
+0.56 kWh it could not decline. Reporting that as discretionary would have been the
+mirror of the fault this release exists to fix.
+
+And `economic_arbitrage` no longer requires the charging window to pay for itself. It
+asked whether the run's own marginal cost was negative, which for a purchase measured
+against its own idle counterfactual is essentially never true — so the label was close
+to unreachable and the strategic bucket absorbed everything. It is now a *concrete*
+future interval inside the priced horizon whose import price beats the purchase after
+the outbound conversion, published together with the price it was measured against.
+Buying at 0.10 to displace a 0.38 import tonight is arbitrage.
+
+### Added: winter chained replenishment, proven
+
+A pack at 45 % facing two 16-quarter stretches at 0.75 €/kWh that draw 0.70 kWh a
+quarter against a 2 kW charge path delivering 0.5. Solved on the production lattice:
+**zero violation**, minimum SoC 24.2 %, end 32.9 %, and a chain rather than a state
+machine — 2.00 kWh at 0.28, 4.00 kWh at 0.04, 2.00 kWh at 0.09, **nothing** bought
+during either expensive stretch, and 9.45 kWh of import avoided.
+
+The first window buys exactly what its four quarters can physically deliver. The
+cheap main window lies on the far side of 11.20 kWh of demand that 5.400 kWh of usable
+inventory cannot cover, so each of those 2.00 kWh displaces a kWh that would cost
+0.75 — €0.94 saved. All three runs are entirely discretionary; nothing bypassed the
+gate.
+
+### Added: economic auditability
+
+No economic claim about this system was auditable before. `MAX_COMPLETED_QUARTERS_REPORTED`
+held three hours, there was no historical price series, and the pack energy at decision
+time was recorded nowhere — so the night campaigns could not be costed even in
+principle.
+
+A bounded, append-only **decision record** now persists what each refresh solved:
+start energy, the demand and price series, the floor, the limits and the settings
+fingerprint. A replay harness runs the **production** solver over it and compares four
+architectures — the old autonomy floor, the new reachability plan, floor-relaxed, and a
+cheapest-feasible no-export baseline. The quarter ring holds a full day.
+
+In Shadow only, a fourth solve publishes `beta.30`'s plan beside `beta.31`'s on
+identical inputs, so the change of architecture can be *watched* rather than trusted.
+It is off in Live, off by default, flagged temporary, and no decision reads it.
+
+### Changed: Activity is a plan lifecycle, not a refresh log
+
+An export of the real Activity history held 79 messages, roughly **47 of them churn**
+about plans that had not changed. One charge campaign ending at 16:15 announced itself
+planned and then *"has finished the planned window"* **six times** while its start slid
+08:45 → 12:15 and its energy shrank 13.33 → 11.11 kWh. Both halves of each pair were
+false: nothing new had been planned, and nothing had finished — the announcement had
+been superseded.
+
+Identity was `(direction, start_utc)`, and the horizon head is
+`elapsed_intervals + 1`, so a running campaign's start advances every refresh. Its end
+does not. The lifecycle is now anchored on `(category, end_utc)` with a one-interval
+tolerance, and a **plan id** is a six-character digest of that identity — stable across
+a reload, and reproducible from a diagnostic.
+
+One plan, at most three lines. `Planned` once, `Started` at most once, then exactly one
+terminal — `Success`, `Canceled` or `Error`. Structural rather than filtered: the
+record carries what has been said and a terminated id is closed, so there is no path
+from a refresh to a second line.
+
+```
+Plan ID: 9175fa — Safety Buy Planned — 15:15-16:15 — 2.22 kWh
+Plan ID: 9175fa — Buy Started — Tracking 2.22 kWh
+Finished Plan ID: 9175fa — Success — Target Reached — 2.22 / 2.22 kWh
+Canceled Plan ID: 9175fa — Plan Replaced — 1.40 / 2.22 kWh
+Finished Plan ID: 9175fa — Error — Command Failed
+```
+
+Activity **cannot** print a figure it should not, because `RunContent` carries only a
+category, an energy, a window and an instant. No power, no price, no expected value, no
+charge-source prose, no reserve arithmetic — all of it stays in diagnostics, where it
+was verified rather than assumed to remain. The repeated *"Advisory only: no command is
+sent for this action."* becomes one word, `— Shadow` or `— Advisory`; a disclaimer a
+reader learns to skip is worse than a short one they read. Shadow now emits no start,
+success or error **at all**, which is a stronger guarantee than any wording.
+
+Two defects were found while building it. A start with no lifecycle to attach to was
+adopting one before the plan had had its turn to announce, so one physical dispatch
+produced two `Started` lines under two plan ids. And a cancelled campaign took its
+denominator from Stage B's *current* target, which the replacing refresh has already
+revised — putting two plans in one fraction.
+
+The event name is now **`Alpha EMS`**. It was `Economic plan`, which was accurate when
+the surface carried nothing but Stage-A advice and stopped being accurate the moment it
+reported real dispatches.
+
+### Changed: professional Control State labels, with no breaking rename
+
+Every existing state value is unchanged and still means what it meant, so an automation
+matching `executed` still matches `executed`. Home Assistant renders an `ENUM` sensor's
+state through the translation layer, exactly as `select.control_mode` has since
+Phase 4:
+
+| internal | English | Dutch |
+|---|---|---|
+| `off` | Off | Uit |
+| `inhibited` | Inhibited | Geblokkeerd |
+| `eligible` | Planned | Gepland |
+| `idle` | Idle | Rust |
+| `executed` | Executing | Actief |
+| `error` | Error | Fout |
+
+`error` is **added**, and additive is not breaking. A failed write previously published
+whatever eligibility had computed *before* the write was attempted, so a reader could
+not tell a refresh that sent nothing from one whose command failed. It is set inside
+`_mark_execution_error` so a future error path cannot forget it; the execution
+*barrier* is explicitly not a failure.
+
+`Starting`, `Updating`, `Completed` and `Canceled` were **declined**. There is no
+refresh between deciding to write and the write landing; a setpoint correction happens
+on the sixty-second tick, so `Updating` would flip the entity every minute of a
+campaign; and plan terminals belong to the Activity lifecycle, where a plan id ties
+them to what they terminated. `battery_recommendation` and `economic_action` were
+labelled too, because they appear in the same history view.
+
+### Not changed
+
+Verified by AST against `v1.0.0-beta.30`: `decide`, `carry_forward`, `carry_plan`,
+`ownership_of`, `withdrawal_basis`, `rolling_power_kw`, `demand_for`,
+`quarter_intent_for`, `evaluate`, `absorbing_capacity_kw`, `safe_discharge_power_kw`,
+`direction_permitted`, `authorize_start`, `authorize_export`, `authorize_reset`,
+`permitted_sign`, `tick_energy_cap_kw`, `write_refusal` and
+`steps_outside_capability` — nineteen primitives, all byte-identical. Seven Stage-B
+modules are untouched entirely.
+
+`CONTROL_EXECUTABLE_ACTIONS` is still `{charge}` for the unconditional set;
+`serve_load` remains unexecutable; the Force Charging and Force Discharging helper
+families are written for neither Live intent; `TARGET_TOLERANCE_KWH` is still `0.25`;
+the dead-man remains a failsafe, foreign Dispatch is still never touched, and the 20 %
+physical floor is unconditional.
+
+The whole-horizon autonomy figure is **kept and renamed** `autonomy_requirement_kwh`,
+published with `credits: ["pv"]` and consumed by nothing. A pinned test asserts it
+reaches no solver input.
+
+**Physical PV curtailment is still not executed.** Its fail-safe direction is *restore
+generation* — the inverse of every other actuator here — and it needs its own reviewed
+actuator design.
+
+### Beta status
+
+**`net_export` has still never executed on real hardware.** Live grid charging was
+validated on the live installation in `beta.26` and repaired structurally in
+`beta.30`; exporting has been proven only in tests. If an economically valid export
+plan occurs on this release it will execute, under all of `beta.30`'s fail-closed
+safety — watch your grid meter during the first planned export quarter.
+
+`beta.31` materially changes Stage-A economic planning and will now be evaluated in
+**supervised Live operation** on the real installation. Phase 8 is not
+hardware-complete.
+
+### Upgrading
+
+Nothing to migrate. `STORAGE_MINOR_VERSION` is unchanged and the decision record loads
+additively — an installation upgrading from `beta.30` simply starts recording. Your
+configured `minimum_trade_gain_eur`, `grid_charge_margin_eur_per_kwh`, minimum SoC,
+battery power limits and control mode are all preserved exactly as saved.
+
 ## [1.0.0-beta.30] - 2026-08-28
 
 **The structural execution fix.** A full-night hardware run of `beta.29` produced
@@ -4197,7 +4459,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.30...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.31...HEAD
+[1.0.0-beta.31]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.30...v1.0.0-beta.31
 [1.0.0-beta.30]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.29...v1.0.0-beta.30
 [1.0.0-beta.29]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.28...v1.0.0-beta.29
 [1.0.0-beta.28]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.27...v1.0.0-beta.28

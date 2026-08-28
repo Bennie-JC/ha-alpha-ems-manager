@@ -19,12 +19,12 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.30` — a public beta.**
+> **Current release: `1.0.0-beta.31` — a public beta.**
 >
 > Stage A is feature-complete. Stage B — the physical execution controller — is
 > wired end to end and, from beta.24, **can charge your battery**. From beta.27 it
 > executes each 15-minute plan interval as an explicit energy target, and can also
-> **export to the grid** when the plan says so. Covered by 3827 automated tests.
+> **export to the grid** when the plan says so. Covered by 3913 automated tests.
 >
 > **Two actions are executable: buying energy into the battery, and selling it back
 > out.** Serving the house from the battery, and curtailing production, are
@@ -55,14 +55,22 @@ switched off.
 > you enable *Live* on this release, watch your grid meter during the first planned
 > export quarter.
 >
-> **`beta.30` is the first release whose controller can actually hold the wheel.**
-> Every release from `beta.24` proved ownership of a running dispatch against a
-> vendor register whose meaning had never been measured — and on the real inverter
-> that proof could never succeed. The controller could start a charge and then not
-> correct it, not stop it, and not clean up after it: the hardware dead-man ended
-> every run. `beta.30` proves ownership from evidence Alpha EMS writes itself, and
-> also fixes a boundary fault that skipped every second quarter of a multi-quarter
-> run. **If you are running anything earlier, upgrade.**
+> **`beta.31` changes how the battery decides to spend money.** Until now the
+> planner held whatever inventory would have covered the whole forecast *with no
+> further grid purchase ever* — a figure that reached 73 % SoC against a 20 % floor
+> and immobilised 97 % of the usable pack. It credited future sun and refused to
+> credit the future grid, so it paid real money to hold energy it did not need.
+> `beta.31` makes the hard constraint physical reachability, prices the inventory
+> left at the end of the priced horizon instead of bounding it, and puts every
+> discretionary purchase through the economic gates. The pack is now working
+> inventory: buy low, displace expensive import, let the charge fall, refill at the
+> next attractive feasible window.
+>
+> **`beta.30` was the release whose controller could finally hold the wheel** —
+> ownership proven from evidence Alpha EMS writes itself, and the boundary fault
+> that skipped every second quarter of a multi-quarter run. All of that Stage-B
+> behaviour is carried into `beta.31` unchanged, byte for byte.
+> **If you are running anything earlier, upgrade.**
 >
 > **This integration is not in the HACS default repository.** Install it as a
 > HACS *custom repository* — see [Installation](#installation). A submission for
@@ -95,7 +103,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.30` is not offered.
+     dialog if `1.0.0-beta.31` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
