@@ -1988,6 +1988,10 @@ class EconomicOutcome:
     #: on the outcome because it needs the pack's *state*, which the solver does
     #: not see -- and because every published purchase is attributed against it.
     bridge_kwh_now: float | None = None
+    #: The same problem solved under beta.30's economics, for comparison only.
+    #: ``None`` unless Shadow asked for it. **Temporary**, and flagged as such in
+    #: the payload: it doubles the solve to publish something no decision reads.
+    legacy: EconomicPlan | None = None
     #: Per charge run, ``(safety_buy_kwh, economic_buy_kwh)``, keyed by start
     #: index. Diagnostics only: nothing in :func:`solve` reads it, and it is
     #: derived from a solve that already happened rather than a new one.
@@ -2260,6 +2264,7 @@ def build_outcome(
     reachability: Any = None,
     uncertainty: Any = None,
     actionable_interval_count: int = 0,
+    compare_legacy: bool = False,
 ) -> EconomicOutcome:
     """Run both solves and the label solve, and derive everything published.
 
@@ -2319,7 +2324,46 @@ def build_outcome(
         **economics,
     )
 
-    # There is no fourth solve any more, and no comparison to publish.
+    # **A fourth solve, and only in Shadow.** ``legacy`` is the same problem under
+    # beta.30's economics: the whole-horizon autonomy curve as a hard floor, and no
+    # value on terminal inventory. It exists so the change can be *watched* against
+    # live inputs before it is trusted with money -- which is the only honest way to
+    # gate a change of this size, since the historical days needed to replay it
+    # offline were never recorded.
+    #
+    # Off by default and off in Live, because it doubles the solve for a payload
+    # nobody reads while the plan is executing. **Temporary**: it should be removed
+    # once the replay shows the new architecture dominating on recorded days.
+    legacy = None
+    if compare_legacy and autonomy:
+        legacy_horizon = EconomicHorizon(
+            demands=horizon.demands,
+            prices=horizon.prices,
+            planning_reserve_kwh=tuple(
+                table.energy(min(table.bucket_at_or_above(value), table.buckets))
+                if value is not None
+                else floor_energy_kwh
+                for value in autonomy[: len(horizon.demands)]
+            ),
+            limited_by=horizon.limited_by,
+        )
+        if len(legacy_horizon.planning_reserve_kwh) == len(horizon.demands):
+            legacy = solve(
+                table=table,
+                horizon=legacy_horizon,
+                start_energy_kwh=start_energy_kwh,
+                terminal_floor_kwh=terminal_floor_kwh,
+                permitted=desired_permitted,
+                minimum_trade_gain_eur=minimum_trade_gain_eur,
+                grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
+                battery_throughput_cost_eur_per_kwh=(
+                    battery_throughput_cost_eur_per_kwh
+                ),
+                # No terminal value: that is precisely what beta.30 did not have.
+                edge_value_eur_per_kwh=0.0,
+            )
+
+    # There is no *fifth* solve, and no comparison to publish beyond it.
     #
     # beta.16 and beta.17 ran one with the terminal bound relaxed to the
     # configured floor, to price what the hold-end constraint cost. Candidate B
@@ -2360,6 +2404,7 @@ def build_outcome(
         ),
         safety_buy_runs=_safety_buy_runs(desired, relaxed, table.bucket_kwh),
         safety_buy_attribution=_safety_buy_attribution(desired, relaxed),
+        legacy=legacy,
     )
 
 
@@ -2864,6 +2909,71 @@ def _runs_as_dicts(
             )
         )
     return payload
+
+
+def _legacy_comparison(outcome: EconomicOutcome) -> dict[str, Any] | None:
+    """Return beta.30's plan beside beta.31's, on identical inputs.
+
+    ``None`` unless the fourth solve ran. Published so the change of architecture
+    can be *watched* on live data before it is trusted with money: the two plans
+    saw the same prices, the same forecast and the same pack, and differ only in
+    which reserve they obeyed and whether terminal inventory was worth anything.
+
+    **Temporary and diagnostic.** Only one planner controls hardware, and it is
+    always the new one; this is the other one's answer, for reading.
+    """
+    legacy = outcome.legacy
+    if legacy is None:
+        return None
+    new = outcome.desired
+    return {
+        "legacy_beta30_plan": _comparison_row(legacy),
+        "new_beta31_plan": _comparison_row(new),
+        "delta": {
+            "grid_import_kwh": _round_kwh(
+                new.planned_grid_import_kwh - legacy.planned_grid_import_kwh
+            ),
+            "cost_eur": _round_eur(new.cost_eur - legacy.cost_eur),
+            "throughput_kwh": _round_kwh(
+                new.battery_throughput_kwh - legacy.battery_throughput_kwh
+            ),
+            "end_energy_dc_kwh": _round_kwh(
+                new.end_energy_dc_kwh - legacy.end_energy_dc_kwh
+            ),
+            "reserve_violation_kwh": _round_kwh(
+                new.violation_kwh - legacy.violation_kwh
+            ),
+        },
+        "rule": (
+            "the same inputs under both architectures. legacy obeys the "
+            "whole-horizon autonomy curve as a hard floor and puts no value on "
+            "terminal inventory, which is beta.30 exactly. only the new plan ever "
+            "reaches hardware -- this is comparison only, it is computed in shadow "
+            "alone, and it is temporary: it should be removed once the replay "
+            "shows the new architecture dominating on recorded days"
+        ),
+    }
+
+
+def _comparison_row(plan: EconomicPlan) -> dict[str, Any]:
+    """Return the figures the two architectures are compared on."""
+    return {
+        "action": plan.action,
+        "cost_eur": _round_eur(plan.cost_eur),
+        "expected_net_value_eur": _round_eur(plan.expected_net_value_eur),
+        "grid_import_kwh": _round_kwh(plan.planned_grid_import_kwh),
+        "grid_export_kwh": _round_kwh(plan.planned_grid_export_kwh),
+        "battery_charge_ac_kwh": _round_kwh(plan.planned_charge_ac_kwh),
+        "battery_discharge_ac_kwh": _round_kwh(plan.planned_discharge_ac_kwh),
+        "battery_throughput_kwh": _round_kwh(plan.battery_throughput_kwh),
+        "end_energy_dc_kwh": _round_kwh(plan.end_energy_dc_kwh),
+        "edge_energy_kwh": _round_kwh(plan.edge_energy_kwh),
+        "edge_value_eur": _round_eur(plan.edge_value_eur),
+        "reserve_violation_kwh": _round_kwh(plan.violation_kwh),
+        "run_count": len(plan.runs),
+        "direction_changes": plan.direction_changes,
+        "switching_cost_eur": _round_eur(plan.switching_cost_eur),
+    }
 
 
 def _plan_totals(plan: EconomicPlan) -> dict[str, Any]:
@@ -3482,6 +3592,7 @@ def economic_as_dict(
                 "state count; bucket_rule says which rule produced this lattice"
             ),
         },
+        "legacy_comparison": _legacy_comparison(outcome),
         "runs": _runs_as_dicts(outcome, desired, runs),
         "runs_total": len(desired.runs),
         "basis": ECONOMIC_BASIS,

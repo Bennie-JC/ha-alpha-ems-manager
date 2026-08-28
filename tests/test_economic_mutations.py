@@ -2152,11 +2152,19 @@ def test_fabricating_a_false_first_run_comparison_is_caught() -> None:
 
 
 def test_running_a_fourth_solve_to_price_nothing_is_caught() -> None:
-    """The comparison solve is gone, and its absence is worth pinning.
+    """The comparison solve that priced nothing is still gone. A fourth now exists
+    for a different reason, and it is bounded.
 
-    Three remain: desired, capability, and the reserve-relaxed solve that labels a
-    safety buy. A fourth would cost a quarter of a second per refresh to compute a
-    difference that is identically zero by construction.
+    beta.18 removed a fourth solve because its difference from the third was
+    *identically zero by construction* -- it re-solved the same problem and
+    published a zero as though a constraint cost nothing. That guard stands, and
+    this test still enforces it: nothing here may re-solve an identical problem.
+
+    beta.31 adds a fourth that solves a **different** problem: the same inputs
+    under the previous architecture, so a change of economics can be watched
+    against live data before it is trusted with money. Three things keep it from
+    becoming the fault beta.18 removed -- it is gated behind ``compare_legacy``, it
+    is requested in Shadow alone, and it is documented as temporary.
     """
     source = pathlib.Path(economic_module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -2171,4 +2179,15 @@ def test_running_a_fourth_solve_to_price_nothing_is_caught() -> None:
                 ):
                     calls += 1
 
-    assert calls == 3
+    # Three unconditional, plus one that only runs when a caller asks for the
+    # architecture comparison. Asserted as an exact count so a fifth is a visible
+    # decision rather than a quiet cost.
+    assert calls == 4
+
+    # And the fourth is genuinely conditional: it cannot run unless asked.
+    guarded = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If) and "compare_legacy" in ast.dump(node.test)
+    ]
+    assert guarded, "the legacy comparison solve must be behind compare_legacy"

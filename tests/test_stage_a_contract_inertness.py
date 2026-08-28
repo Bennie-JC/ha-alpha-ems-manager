@@ -104,6 +104,10 @@ def test_the_solve_count_is_unchanged_at_three() -> None:
     A field that needed one more solve to compute would be a performance
     regression dressed as reporting, and would be easy to miss: the plan would be
     identical and every figure correct.
+
+    Four appear in the source since beta.31, and the fourth is behind
+    ``compare_legacy`` -- requested in Shadow alone and documented as temporary. An
+    unconditional fifth would be exactly the regression this test exists to catch.
     """
     source = pathlib.Path(economic_module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -118,7 +122,8 @@ def test_the_solve_count_is_unchanged_at_three() -> None:
                 ):
                     calls += 1
 
-    assert calls == 3
+    # The fourth is conditional; see ``compare_legacy``.
+    assert calls == 4
 
 
 def test_the_balance_helper_cannot_reach_the_solver() -> None:

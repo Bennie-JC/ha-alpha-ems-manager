@@ -116,6 +116,7 @@ from .const import (
     CONTROL_MODE_ACTIVE,
     CONTROL_MODE_OFF,
     CONTROL_MODE_OPTIONS,
+    CONTROL_MODE_SHADOW,
     CONTROL_REFUSE_MARKER_NOT_VERIFIED,
     CONTROL_REFUSE_STOP_NOT_VERIFIED,
     CONTROL_STATE_ELIGIBLE,
@@ -767,6 +768,14 @@ class PlanningInputs:
     actionable_intervals: int
     edge_value_eur_per_kwh: float
     edge_creditable_kwh: float
+    #: Whether to also solve the problem under beta.30's economics, for reading.
+    #:
+    #: **Shadow only, and temporary.** It doubles the solve to publish something no
+    #: decision consumes, which is worth it exactly once: while the change of
+    #: architecture is being watched against live inputs before it is trusted with
+    #: money. Never in Live, where the plan is executing and the payload is not
+    #: being read.
+    compare_legacy: bool = False
 
 
 def _solve_economic(
@@ -821,6 +830,7 @@ def _solve_economic(
     # replenishment that is physically possible and actionable? No bundle means
     # the older question, which is what keeps every pre-beta.31 suite meaningful.
     enforced_reserve = raw_reserve if planning is None else planning.enforced_reserve
+    compare_legacy = planning is not None and planning.compare_legacy
     edge_value = 0.0 if planning is None else planning.edge_value_eur_per_kwh
     edge_creditable = float("inf") if planning is None else planning.edge_creditable_kwh
 
@@ -849,6 +859,7 @@ def _solve_economic(
         bucket_rule=bucket_rule,
         edge_value_eur_per_kwh=edge_value,
         edge_creditable_kwh=edge_creditable,
+        compare_legacy=compare_legacy,
         autonomy=raw_reserve if planning is None else planning.autonomy_reserve,
         reachability=None if planning is None else planning.reachability,
         uncertainty=None if planning is None else planning.uncertainty,
@@ -4455,6 +4466,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 prices[:actionable],
                 discharge_efficiency=limits.discharge_efficiency,
             ),
+            compare_legacy=self.control_mode == CONTROL_MODE_SHADOW,
             edge_creditable_kwh=edge_creditable_energy_kwh(
                 ceiling_kwh=limits.energy_for_soc(limits.max_soc_percent),
                 forecast_surplus_kwh=sum(

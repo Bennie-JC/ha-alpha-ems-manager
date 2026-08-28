@@ -568,10 +568,13 @@ def test_the_terminal_comparison_is_absent_rather_than_zero() -> None:
 
 
 def test_the_solver_runs_three_solves_not_four() -> None:
-    """Removing the comparison removed its solve, and that is a saving.
+    """Three unconditional solves, plus one that must be asked for.
 
-    Desired, capability and the reserve-relaxed label solve remain. The fourth
-    existed only to price the constraint beta.18 deleted.
+    Desired, capability and the reserve-relaxed label solve run every refresh. The
+    fourth beta.18 deleted priced a constraint that no longer existed, so its
+    difference was identically zero; the fourth beta.31 adds solves the same inputs
+    under the *previous* architecture, which is a different number and a temporary
+    one. It runs only when ``compare_legacy`` is set, which only Shadow does.
     """
     tree = ast.parse(pathlib.Path(economic_module.__file__).read_text(encoding="utf-8"))
     calls = 0
@@ -585,7 +588,8 @@ def test_the_solver_runs_three_solves_not_four() -> None:
                 ):
                     calls += 1
 
-    assert calls == 3
+    # The fourth is conditional; see ``compare_legacy``.
+    assert calls == 4
 
 
 def test_the_published_plan_is_the_only_plan() -> None:
