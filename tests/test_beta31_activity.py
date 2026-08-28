@@ -112,8 +112,8 @@ def dispatch(
     end: datetime,
     direction: str = ECONOMIC_DIRECTION_CHARGE,
     intent: str = EXECUTION_INTENT_GRID_CHARGE,
-    target_kwh: float = 2.22,
-    delivered_kwh: float = 0.0,
+    objective_target_kwh: float = 2.22,
+    objective_realized_kwh: float = 0.0,
     run_id: str = "run-1",
     executed: bool = True,
     activation_confirmed: bool = False,
@@ -127,8 +127,8 @@ def dispatch(
         end_utc=end,
         running=running,
         executed=executed,
-        target_kwh=target_kwh,
-        delivered_kwh=delivered_kwh,
+        objective_target_kwh=objective_target_kwh,
+        objective_realized_kwh=objective_realized_kwh,
         intent=intent,
         stop_reason=stop_reason,
         run_id=run_id,
@@ -391,7 +391,10 @@ def _campaign(
                 NOW + 2 * QUARTER,
                 (run,),
                 dispatch(
-                    end=end, direction=direction, intent=intent, delivered_kwh=1.10
+                    end=end,
+                    direction=direction,
+                    intent=intent,
+                    objective_realized_kwh=1.10,
                 ),
             ),
             (
@@ -401,7 +404,7 @@ def _campaign(
                     end=end,
                     direction=direction,
                     intent=intent,
-                    delivered_kwh=2.22,
+                    objective_realized_kwh=2.22,
                     running=False,
                     stop_reason=EXECUTION_STOP_TARGET_REACHED,
                 ),
@@ -526,7 +529,7 @@ def test_ownership_lost_during_execution_ends_the_plan_once() -> None:
     run = run_at(start=NOW + QUARTER, end=end)
     lost = dispatch(
         end=end,
-        delivered_kwh=0.80,
+        objective_realized_kwh=0.80,
         running=False,
         stop_reason=EXECUTION_STOP_OWNERSHIP_CONFLICT,
     )
@@ -571,7 +574,12 @@ def test_a_command_failure_is_an_error_and_not_a_cancellation() -> None:
     )
 
     assert lines[-1][0] == ECONOMIC_EVENT_ERROR
-    assert "Error — Command Failed" in lines[-1][1]
+    # **``Failed``, since beta.32.** ``Finished ... — Error`` was
+    # self-contradictory in four words: a plan does not finish by failing. The
+    # event *kind* is unchanged, so nothing a consumer subscribes to moved.
+    assert lines[-1][1].startswith("Failed Plan ID:")
+    assert "Command Failed" in lines[-1][1]
+    assert "Finished" not in lines[-1][1]
 
 
 def test_refreshes_after_completion_produce_nothing() -> None:
@@ -580,7 +588,7 @@ def test_refreshes_after_completion_produce_nothing() -> None:
     run = run_at(start=NOW + QUARTER, end=end)
     done = dispatch(
         end=end,
-        delivered_kwh=2.22,
+        objective_realized_kwh=2.22,
         running=False,
         stop_reason=EXECUTION_STOP_TARGET_REACHED,
     )
@@ -624,7 +632,7 @@ def test_a_plan_replaced_mid_execution_ends_once_and_the_next_is_separate() -> N
                 (second,),
                 dispatch(
                     end=first_end,
-                    delivered_kwh=1.40,
+                    objective_realized_kwh=1.40,
                     running=False,
                     stop_reason=EXECUTION_STOP_PLAN_REPLACED,
                 ),
@@ -663,7 +671,7 @@ def test_a_mode_change_during_execution_reads_as_a_mode_change() -> None:
                 (run,),
                 dispatch(
                     end=end,
-                    delivered_kwh=0.55,
+                    objective_realized_kwh=0.55,
                     running=False,
                     stop_reason=EXECUTION_STOP_SWITCHED_TO_SHADOW,
                 ),
@@ -715,7 +723,7 @@ def _every_message() -> list[str]:
                         (run,),
                         dispatch(
                             end=end,
-                            delivered_kwh=0.5,
+                            objective_realized_kwh=0.5,
                             running=False,
                             stop_reason=reason,
                         ),
@@ -782,7 +790,7 @@ def test_every_lifecycle_line_carries_its_plan_id() -> None:
             (run,),
             dispatch(
                 end=end,
-                delivered_kwh=2.22,
+                objective_realized_kwh=2.22,
                 running=False,
                 stop_reason=EXECUTION_STOP_TARGET_REACHED,
             ),
@@ -961,7 +969,7 @@ def test_a_dispatch_nobody_announced_is_adopted_rather_than_dropped() -> None:
                 (),
                 dispatch(
                     end=end,
-                    delivered_kwh=2.22,
+                    objective_realized_kwh=2.22,
                     running=False,
                     stop_reason=EXECUTION_STOP_TARGET_REACHED,
                 ),
@@ -1232,7 +1240,9 @@ def test_a_superseded_campaign_quotes_the_target_it_announced() -> None:
         previous=state,
         runs=(replacement,),
         now=NOW + 2 * QUARTER,
-        execution=dispatch(end=end, target_kwh=1.11, delivered_kwh=0.90),
+        execution=dispatch(
+            end=end, objective_target_kwh=1.11, objective_realized_kwh=0.90
+        ),
     )
 
     assert entry is not None
@@ -1246,8 +1256,8 @@ def test_a_superseded_campaign_quotes_the_target_it_announced() -> None:
         now=NOW + 2 * QUARTER,
         execution=dispatch(
             end=end,
-            target_kwh=2.22,
-            delivered_kwh=0.90,
+            objective_target_kwh=2.22,
+            objective_realized_kwh=0.90,
             running=False,
             stop_reason=EXECUTION_STOP_OWNERSHIP_CONFLICT,
         ),
@@ -1266,7 +1276,7 @@ def test_a_plan_that_never_started_is_cancelled_without_figures() -> None:
         previous=state,
         runs=(),
         now=NOW + QUARTER,
-        execution=dispatch(end=end, delivered_kwh=0.0),
+        execution=dispatch(end=end, objective_realized_kwh=0.0),
     )
 
     assert entry is not None

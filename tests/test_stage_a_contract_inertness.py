@@ -98,16 +98,22 @@ def test_the_terminal_behaviour_is_unchanged() -> None:
     assert first.terminal_plan_cost_eur is None
 
 
-def test_the_solve_count_is_unchanged_at_three() -> None:
+def test_the_solve_count_is_pinned_and_every_solve_is_accounted_for() -> None:
     """**The failure mode a projection could plausibly cause.**
 
     A field that needed one more solve to compute would be a performance
     regression dressed as reporting, and would be easy to miss: the plan would be
     identical and every figure correct.
 
-    Four appear in the source since beta.31, and the fourth is behind
-    ``compare_legacy`` -- requested in Shadow alone and documented as temporary. An
-    unconditional fifth would be exactly the regression this test exists to catch.
+    Six appear in the source since beta.32. **Three are unconditional** -- desired,
+    capability and reserve-relaxed -- and three are conditional: the ungated pass
+    the export permission is built from, which runs only when there is measured
+    evidence to build one; the audit baseline re-solve, which runs only when the
+    anti-churn head bump has moved the enforced head; and the ``compare_legacy``
+    comparison that only Shadow requests. The ungated pass is *not* reporting:
+    without it the permission has no non-circular definition of the refill the plan
+    expects to use. An unconditional fourth would be exactly the regression this
+    test catches.
     """
     source = pathlib.Path(economic_module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -122,8 +128,40 @@ def test_the_solve_count_is_unchanged_at_three() -> None:
                 ):
                     calls += 1
 
-    # The fourth is conditional; see ``compare_legacy``.
-    assert calls == 4
+    # Three of the six are conditional; see the docstring for each.
+    assert calls == 6
+
+    # **Both conditional solves must actually be conditional.** Counting is not
+    # enough -- the fault this test guards against is an *unconditional* solve, and
+    # a count alone cannot tell the difference. Decided by ancestry: a solve is
+    # conditional exactly when an ``if`` stands between it and the function body.
+    build_outcome = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "build_outcome"
+    )
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(build_outcome):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+
+    def _is_conditional(node: ast.AST) -> bool:
+        while (parent := parents.get(id(node))) is not None:
+            if isinstance(parent, ast.If):
+                return True
+            node = parent
+        return False
+
+    solves = [
+        node
+        for node in ast.walk(build_outcome)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "solve"
+    ]
+    conditional = [node for node in solves if _is_conditional(node)]
+    assert len(conditional) == 3, "exactly three solves may be conditional"
+    assert len(solves) - len(conditional) == 3, "three solves run every refresh"
 
 
 def test_the_balance_helper_cannot_reach_the_solver() -> None:

@@ -75,6 +75,7 @@ from .const import (
     EXECUTION_QUALITY_PARTIAL,
     EXECUTION_QUALITY_RECONSTRUCTED,
     EXECUTION_QUALITY_UNAVAILABLE,
+    EXECUTION_REDUCTION_BATTERY_CEILING,
     EXECUTION_REDUCTION_BUDGET,
     EXECUTION_REDUCTION_HEADROOM,
     EXECUTION_REDUCTION_NONE,
@@ -87,8 +88,10 @@ from .const import (
     EXECUTION_STATE_RUNNING,
     EXECUTION_STATE_STOPPING,
     EXECUTION_STATE_UNPROVEN,
+    EXECUTION_STOP_BATTERY_CEILING,
     EXECUTION_STOP_GRID_CEILING,
     EXECUTION_STOP_HEADROOM_REACHED,
+    EXECUTION_STOP_OWNERSHIP_CONFLICT,
     EXECUTION_STOP_PLAN_REPLACED,
     EXECUTION_STOP_STAGE_A_HOLD,
     EXECUTION_STOP_STALE_PLAN,
@@ -850,6 +853,9 @@ class CarriedQuarter:
     #: than consulted live, so a run that later vanishes can neither enlarge this
     #: quarter nor reach back into it.
     frozen_remaining_at_admission_kwh: float | None = None
+    #: The campaign this quarter belongs to, frozen at admission with everything
+    #: else. ``None`` on a pre-beta.32 record; absent means run-level behaviour.
+    campaign_id: str | None = None
 
     def covers(self, moment: datetime) -> bool:
         """Return whether this quarter is the one in progress at ``moment``."""
@@ -952,6 +958,9 @@ class AdmittedPlan:
     #: than consulted live, so a run that later vanishes can neither enlarge this
     #: plan nor reach back into a row already open.
     frozen_remaining_at_admission_kwh: float | None = None
+    #: The economic campaign this plan belongs to, frozen at admission with
+    #: everything else. ``None`` on a pre-beta.32 publication.
+    campaign_id: str | None = None
 
     @property
     def starts_at(self) -> datetime:
@@ -1010,6 +1019,7 @@ class AdmittedPlan:
             revision=self.revision,
             admitted_at=self.admitted_at,
             frozen_remaining_at_admission_kwh=(self.frozen_remaining_at_admission_kwh),
+            campaign_id=self.campaign_id,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -1060,6 +1070,7 @@ def admit_plan(
         run_id=run.run_id if run is not None else target.plan_id,
         intent=target.intent,
         purpose=target.purpose,
+        campaign_id=target.campaign_id,
         admitted_at=now,
         rows=target.quarter_schedule,
         reserve_floor_kwh=target.reserve_floor_kwh,
@@ -1137,6 +1148,7 @@ def admit_quarter(
     revision: int,
     now: datetime,
     frozen_remaining_kwh: float | None,
+    campaign_id: str | None = None,
 ) -> CarriedQuarter:
     """Return the envelope for one published quarter row."""
     return CarriedQuarter(
@@ -1152,6 +1164,7 @@ def admit_quarter(
         revision=revision,
         admitted_at=now,
         frozen_remaining_at_admission_kwh=frozen_remaining_kwh,
+        campaign_id=campaign_id,
     )
 
 
@@ -1215,6 +1228,7 @@ def carry_quarter(
             revision=target.revision,
             now=now,
             frozen_remaining_kwh=frozen_remaining_kwh,
+            campaign_id=target.campaign_id,
         )
     return None
 
@@ -1269,6 +1283,13 @@ class Target:
     #: than fail: a record persisted before beta.27 carries no schedule, and a
     #: publication that could not be parsed must not take the control layer down.
     quarter_schedule: tuple[QuarterRow, ...] = ()
+    #: Which economic campaign this target belongs to, when the publisher could
+    #: say. **Optional with a ``None`` default**, the beta.27 ``quarter_schedule``
+    #: precedent: a beta.31 record carries none, and absent must degrade to
+    #: run-level behaviour rather than fail. Stage B never reads it -- it exists so
+    #: one lifecycle can span the several windows Stage B necessarily sees as
+    #: separate.
+    campaign_id: str | None = None
 
     @property
     def constrained(self) -> bool:
@@ -1375,6 +1396,9 @@ def parse_target(raw: dict[str, Any]) -> Target | None:
         required_headroom_kwh=_finite(raw.get("required_headroom_kwh")),
         max_end_energy_kwh=_finite(raw.get("max_end_energy_kwh")),
         headroom_until=instant_of(raw.get("headroom_until")),
+        campaign_id=(
+            raw.get("campaign_id") if isinstance(raw.get("campaign_id"), str) else None
+        ),
     )
 
 
@@ -2055,7 +2079,33 @@ def demand_for(
         remaining_kwh=remaining_kwh, remaining_minutes=remaining_minutes
     )
 
-    if remaining_kwh <= TARGET_TOLERANCE_KWH:
+    # **For an export, this machine may not assert completion at all.**
+    #
+    # Every figure above is battery-side: ``target.battery_target_kwh`` against
+    # ``progress.realized_kwh``. For a ``net_export`` run that pair is the
+    # *ceiling*, not the objective -- the objective is meter export, and the
+    # admitted quarter judges it against ``grid_remaining_kwh`` with its own
+    # 0.01 kWh tolerance. Through beta.31 there was no branch here, so an export
+    # run with a ceiling at or below ``TARGET_TOLERANCE_KWH`` satisfied
+    # ``remaining <= tolerance`` on its first evaluation and was stopped and reset
+    # as ``target_reached`` before delivering anything. The first real Live export
+    # carried a 0.25 kWh ceiling, exactly on that boundary.
+    #
+    # So: a bound reached is its own reason, tested at ``<= 0.0`` because
+    # forgiving a quarter of a kilowatt-hour of a *bound* would authorise energy
+    # Stage A never approved.
+    if target.intent == EXECUTION_INTENT_NET_EXPORT:
+        if remaining_kwh <= 0.0:
+            return Demand(
+                rolling_kw=rolling_kw,
+                ceiling_kw=None,
+                required_kw=0.0,
+                reduction=EXECUTION_REDUCTION_BATTERY_CEILING,
+                remaining_kwh=remaining_kwh,
+                remaining_minutes=remaining_minutes,
+                ahead_kwh=ahead_kwh,
+            )
+    elif remaining_kwh <= TARGET_TOLERANCE_KWH:
         return Demand(
             rolling_kw=rolling_kw,
             ceiling_kw=None,
@@ -2349,12 +2399,34 @@ def _decide(
 
     # 1. Somebody else is driving. This is the one case with no discretion at all.
     if ownership == OWNERSHIP_FOREIGN:
+        # **A run we were carrying and a dispatch we cannot prove is an ending**,
+        # and beta.31 reported it as a standing condition. The claim was abandoned
+        # with no ``stop_reason`` and no ``reset_required``, so the lifecycle
+        # `Ownership Lost` existed in the Activity vocabulary and nothing could
+        # ever produce it -- while the campaign's Planned line stayed standing as
+        # though the plan were still under way.
+        #
+        # No write is authorised by this, and none is wanted: a foreign dispatch is
+        # never touched. What changes is that the ending is *named*, so the campaign
+        # terminates on its own realised figures instead of going quiet.
+        lost = carried is not None or running_run_id is not None
         return Decision(
             state=EXECUTION_STATE_INHIBITED,
             ownership=ownership,
             progress=progress,
+            stop_reason=EXECUTION_STOP_OWNERSHIP_CONFLICT if lost else None,
             inhibit_reason="foreign_dispatch",
-            notes=("a dispatch is running that Alpha EMS did not arm",),
+            notes=(
+                "a dispatch is running that Alpha EMS did not arm",
+                *(
+                    (
+                        "a run we were carrying has been taken over; it is ended, "
+                        "and nothing is written to the foreign dispatch",
+                    )
+                    if lost
+                    else ()
+                ),
+            ),
         )
 
     # 2. It might be ours and we cannot show it. Same restraint, different report:
@@ -2538,6 +2610,24 @@ def _decide(
             progress=progress,
             stop_reason=EXECUTION_STOP_TARGET_REACHED,
             reset_required=owned,
+        )
+
+    if demand.reduction == EXECUTION_REDUCTION_BATTERY_CEILING:
+        # The export moved every kilowatt-hour its plan authorised the battery to
+        # move. Stop -- but say which bound bound, because "complete" would claim
+        # the meter objective was met and it was not.
+        return Decision(
+            state=EXECUTION_STATE_STOPPING if owned else EXECUTION_STATE_IDLE,
+            ownership=ownership,
+            target=target,
+            demand=demand,
+            progress=progress,
+            stop_reason=EXECUTION_STOP_BATTERY_CEILING,
+            reset_required=owned,
+            notes=(
+                "the authorised battery movement for this export is spent; the "
+                "meter objective is judged by the admitted quarter, not here",
+            ),
         )
 
     if demand.reduction == EXECUTION_REDUCTION_BUDGET:

@@ -1852,6 +1852,23 @@ ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL: Final = "no_primitive_curtail"
 #: compatibility with anything importing it; only the published text changed.
 ECONOMIC_BLOCKED_LIVE_CHARGE_ONLY: Final = "live_direction_not_executable"
 
+#: The plan's action has no actuator, or the user has withheld its permission.
+#:
+#: **beta.32, and it replaces two false ones.** ``no_primitive_export`` said no
+#: actuator existed for an export, while ``CONTROL_EXECUTABLE_ACTIONS_BY_INTENT``
+#: has authorised an admitted ``net_export`` since beta.27 and the hardware has
+#: performed one. ``live_direction_not_executable`` then stood in for every other
+#: case, including "the user disabled export", which is not a missing capability
+#: but a setting they can change.
+ECONOMIC_BLOCKED_ACTION_NOT_EXECUTABLE: Final = "action_not_executable"
+ECONOMIC_BLOCKED_EXPORT_NOT_PERMITTED: Final = "battery_export_not_permitted"
+
+#: Nothing is standing in the way. **A real answer, and beta.31 had none.**
+#: _economic_blocked_reason returned a blocking reason unconditionally, so a
+#: Live charge -- which this release does send -- published one too. A field named
+#: for why nothing is sent must be able to say that something is.
+ECONOMIC_BLOCKED_NONE: Final = "none"
+
 #: Why the capability plan differs from the desired one. Diagnostics only: the
 #: entity shows the two actions and lets them speak for themselves.
 ECONOMIC_GAP_NO_PRIMITIVE: Final = "no_primitive"
@@ -2755,7 +2772,26 @@ EXECUTION_REDUCTION_TARGET_MET: Final = "target_reached"
 #: buying.
 EXECUTION_REDUCTION_BUDGET: Final = "grid_energy_ceiling"
 
+#: An export run has moved all the battery energy its plan authorised.
+#:
+#: **beta.32, and it exists because a ceiling is not a completion test.** For a
+#: ``net_export`` run the objective is at the *meter* and ``battery_target_kwh`` is
+#: a ceiling on how much the pack may move to reach it. Through beta.31
+#: ``demand_for`` had no export branch, so it judged completion against that
+#: ceiling with a 0.25 kWh tolerance -- and an export run whose ceiling was
+#: 0.25 kWh or less satisfied ``remaining <= tolerance`` on its **first**
+#: evaluation, reporting ``target_reached`` before a single watt-hour had crossed
+#: the meter. With beta.31's label fragmentation, single-quarter export runs with
+#: sub-0.25 kWh ceilings were the normal shape rather than an edge case.
+#:
+#: Reaching the ceiling is a real reason to stop, so it keeps one -- but it is a
+#: *bound* being hit, not an objective being met, and the two must not share a
+#: token. Judged at ``<= 0.0`` rather than within a tolerance, because forgiving
+#: 0.25 kWh of a bound would authorise energy Stage A did not.
+EXECUTION_REDUCTION_BATTERY_CEILING: Final = "battery_ceiling"
+
 EXECUTION_REDUCTION_REASONS: Final = (
+    EXECUTION_REDUCTION_BATTERY_CEILING,
     EXECUTION_REDUCTION_BUDGET,
     EXECUTION_REDUCTION_NONE,
     EXECUTION_REDUCTION_PV_AHEAD,
@@ -2768,11 +2804,15 @@ EXECUTION_REDUCTION_REASONS: Final = (
 #: Why an owned run stopped. Published so a stop is never silent, and so the
 #: difference between "finished" and "gave up" is a recorded fact.
 EXECUTION_STOP_TARGET_REACHED: Final = "target_reached"
+#: An export run reached its authorised battery movement without meeting the meter
+#: objective. beta.32; the counterpart of ``EXECUTION_REDUCTION_BATTERY_CEILING``.
+#: Distinct from ``target_reached`` because the objective was *not* met, and a
+#: reader who is told "complete" about an under-delivered export has been misled.
+EXECUTION_STOP_BATTERY_CEILING: Final = "battery_ceiling"
 EXECUTION_STOP_WINDOW_ENDED: Final = "window_ended"
 EXECUTION_STOP_STAGE_A_HOLD: Final = "stage_a_hold"
 EXECUTION_STOP_PLAN_REPLACED: Final = "plan_replaced"
 EXECUTION_STOP_SAFETY: Final = "safety"
-EXECUTION_STOP_RESERVE_LIMIT: Final = "reserve_limit"
 EXECUTION_STOP_STALE_PLAN: Final = "stale_plan"
 EXECUTION_STOP_SWITCHED_TO_SHADOW: Final = "user_switched_to_shadow"
 EXECUTION_STOP_SWITCHED_OFF: Final = "user_switched_off"
@@ -2780,9 +2820,6 @@ EXECUTION_STOP_OWNERSHIP_CONFLICT: Final = "ownership_conflict"
 EXECUTION_STOP_EXECUTION_ERROR: Final = "execution_error"
 #: The approved grid energy for this run has all been bought.
 EXECUTION_STOP_GRID_CEILING: Final = "grid_energy_ceiling"
-#: No valid charge ceiling could be established, so the charge was refused
-#: rather than given a substituted bound. See ``CONTROL_CUTOFF_MIN_PERCENT``.
-EXECUTION_STOP_NO_CHARGE_CEILING: Final = "no_charge_ceiling"
 #: A sustaining re-arm did not demonstrably advance the device dead-man.
 #:
 #: The controller refreshes every fifteen minutes against a twenty-minute
@@ -2803,22 +2840,111 @@ EXECUTION_STOP_TIMER_NOT_REFRESHED: Final = "deadman_not_refreshed"
 EXECUTION_STOP_HEADROOM_REACHED: Final = "headroom_reached"
 
 EXECUTION_STOP_REASONS: Final = (
+    EXECUTION_STOP_BATTERY_CEILING,
     EXECUTION_STOP_TIMER_NOT_REFRESHED,
     EXECUTION_STOP_HEADROOM_REACHED,
     EXECUTION_STOP_GRID_CEILING,
-    EXECUTION_STOP_NO_CHARGE_CEILING,
     EXECUTION_STOP_TARGET_REACHED,
     EXECUTION_STOP_WINDOW_ENDED,
     EXECUTION_STOP_STAGE_A_HOLD,
     EXECUTION_STOP_PLAN_REPLACED,
     EXECUTION_STOP_SAFETY,
-    EXECUTION_STOP_RESERVE_LIMIT,
     EXECUTION_STOP_STALE_PLAN,
     EXECUTION_STOP_SWITCHED_TO_SHADOW,
     EXECUTION_STOP_SWITCHED_OFF,
     EXECUTION_STOP_OWNERSHIP_CONFLICT,
     EXECUTION_STOP_EXECUTION_ERROR,
+    # **beta.32: two reasons the controller has always produced and no vocabulary
+    # ever admitted.** Both are assigned in ``_build_control_report``; neither was
+    # in this tuple, so both fell through the Activity map to the fallback and
+    # printed "Canceled -- Plan Replaced", which is false in each case. A marker
+    # that vanished under a live dispatch and a restart that lost a quarter's
+    # progress are not the optimiser changing its mind.
+    EXECUTION_STOP_MARKER_LOST,
+    EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
 )
+
+#: Which stop reasons mean something went **wrong**, as against the optimiser
+#: changing its mind.
+#:
+#: The distinction a reader most needs, and until beta.32 it lived only in
+#: ``activity._ERROR_REASONS`` -- a presentation table, deciding a class. Moved
+#: here so the coordinator can compute the outcome where the energy was measured
+#: and Activity can render a decision it did not make.
+EXECUTION_FAILED_STOP_REASONS: Final = (
+    EXECUTION_STOP_EXECUTION_ERROR,
+    EXECUTION_STOP_TIMER_NOT_REFRESHED,
+    EXECUTION_STOP_MARKER_LOST,
+    EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
+)
+
+#: Which side of the plant a campaign's objective is stated at.
+#:
+#: **Two boundaries, one field, and the field says which.** Through beta.31 the
+#: Activity surface carried a battery pair and a meter pair and chose between them
+#: -- which is how "Tracking 0.25 kWh" (a battery ceiling) came to stand beside
+#: "Planned 0.11 kWh" (a meter objective) for one run. Choosing is the fault, so
+#: the choice is made where the objective is defined and published with it.
+CAMPAIGN_BOUNDARY_BATTERY: Final = "battery"
+CAMPAIGN_BOUNDARY_METER: Final = "meter"
+
+CAMPAIGN_BOUNDARIES: Final = (CAMPAIGN_BOUNDARY_BATTERY, CAMPAIGN_BOUNDARY_METER)
+
+#: How a campaign ended, decided once where the energy was measured.
+#:
+#: **The class, not the reason.** beta.31 asked Activity to derive this from a
+#: ``stop_reason`` string, which is how a 0.014 kWh shortfall became a cancellation
+#: and a successful export became "Plan Replaced". The reason is still published
+#: beside it; what changed is who decides what it *means*.
+OUTCOME_SUCCESS: Final = "success"
+OUTCOME_PARTIAL: Final = "partial"
+OUTCOME_CANCELED: Final = "canceled"
+OUTCOME_FAILED: Final = "failed"
+
+CAMPAIGN_OUTCOMES: Final = (
+    OUTCOME_SUCCESS,
+    OUTCOME_PARTIAL,
+    OUTCOME_CANCELED,
+    OUTCOME_FAILED,
+)
+
+#: Which vocabulary a published ``reason`` belongs to.
+#:
+#: **Added rather than substituted, and that is the whole design.** Five strings
+#: are shared across four vocabularies -- ``quarter_expired`` appears three times,
+#: ``quarter_target_reached`` and ``target_reached`` twice each -- and renaming any
+#: of them would break a user's automation for the sake of tidiness. So every
+#: published ending carries the name of the vocabulary its reason came from, and a
+#: reader can tell which of the five aliases they are looking at without inferring
+#: it from context. ``tests/test_const_vocabularies.py`` allows exactly those five
+#: collisions and fails the build on a sixth.
+REASON_VOCABULARY_QUARTER_COMPLETION: Final = "quarter_completion"
+REASON_VOCABULARY_BINDING_CLAMP: Final = "binding_clamp"
+REASON_VOCABULARY_RUN_STOP: Final = "run_stop"
+REASON_VOCABULARY_CAMPAIGN_END: Final = "campaign_end"
+
+REASON_VOCABULARIES: Final = (
+    REASON_VOCABULARY_QUARTER_COMPLETION,
+    REASON_VOCABULARY_BINDING_CLAMP,
+    REASON_VOCABULARY_RUN_STOP,
+    REASON_VOCABULARY_CAMPAIGN_END,
+)
+
+#: How much a campaign may under-deliver per admitted quarter and still be a
+#: Success, capped at the run-level completion tolerance.
+#:
+#: **A reporting tolerance, and it is not the control one.** Stage B keeps
+#: correcting to ``QUARTER_TARGET_TOLERANCE_KWH`` (0.01) while time remains, which
+#: is right for a controller and wrong for a verdict: the observed 0.014 kWh
+#: shortfall is 0.56 of one actuator step, so no command could have closed it and
+#: calling the campaign Partial would be blaming the plant for the lattice.
+#:
+#: **Scaled per admitted quarter, capped in total.** A long charge whose quarters
+#: each left an individually unclosable residue would otherwise report Partial for
+#: an arithmetic reason; the cap stops the same scaling from excusing a real
+#: shortfall on a twenty-quarter campaign. Serve-load gaps are not counted -- they
+#: had no objective and cannot fall short of one.
+CAMPAIGN_SUCCESS_TOLERANCE_PER_QUARTER_KWH: Final = MIN_EXECUTABLE_QUARTER_KWH
 
 #: How the realised battery figure was obtained, so a reader can weigh it.
 #:
@@ -3006,6 +3132,84 @@ ECONOMIC_EXECUTION_EVENT_KINDS: Final = (
 #: compelled/discretionary split :func:`economic.classify_purchase` publishes --
 #: so the category a user reads and the attribution a diagnostic reader audits
 #: cannot disagree.
+#: Why a campaign is not worth operating the battery for.
+#:
+#: One value today, and a vocabulary rather than a bare string so a second reason
+#: cannot arrive as free text. The test is the objective's own: a campaign must
+#: save more, against leaving the battery alone, than the switching fee the DP
+#: charged it. Immaterial campaigns stay in the plan and in diagnostics; only the
+#: Activity announcement is withheld.
+#: How the interval's idle counterfactual was computed, published so a reader can
+#: see which basis every marginal euro figure rests on.
+#:
+#: ``idle_import`` is beta.31's model: the house imports its whole residual load
+#: while the pack sits. ``ambient_self_consumption`` is beta.32's: the inverter
+#: covers the residual load from the battery, continuously and sub-bucket, which
+#: is what the hardware actually does when nothing is dispatched.
+#: How the survival window's far edge was chosen.
+#:
+#: ``plan_charge_campaign`` is the refill the optimiser itself selected -- the only
+#: definition that cannot drift from the plan. ``actionable_prefix`` is the
+#: fallback when the plan schedules no material charge: the reliably known horizon,
+#: which ends at the first unpriced or unforecast interval. Nothing is invented
+#: beyond it and no price is ever guessed.
+SURVIVAL_WINDOW_PLAN_CAMPAIGN: Final = "plan_charge_campaign"
+SURVIVAL_WINDOW_ACTIONABLE_PREFIX: Final = "actionable_prefix"
+
+SURVIVAL_WINDOW_BASES: Final = (
+    SURVIVAL_WINDOW_PLAN_CAMPAIGN,
+    SURVIVAL_WINDOW_ACTIONABLE_PREFIX,
+)
+
+#: How far today's measured consumption may raise the protective demand estimate.
+#:
+#: One-sided and clipped. ``adaptation_ratio`` is unstable early in the day, when
+#: expected-so-far is small, and beyond this point the evidence is better explained
+#: by a sensor fault than by occupancy. Protection only: the cost objective never
+#: sees it.
+ADAPT_PROTECTION_CEILING: Final = 1.5
+
+COUNTERFACTUAL_IDLE_IMPORT: Final = "idle_import"
+COUNTERFACTUAL_AMBIENT_SELF_CONSUMPTION: Final = "ambient_self_consumption"
+
+COUNTERFACTUAL_BASES: Final = (
+    COUNTERFACTUAL_IDLE_IMPORT,
+    COUNTERFACTUAL_AMBIENT_SELF_CONSUMPTION,
+)
+
+#: Why ambient battery self-consumption is or is not modelled.
+#:
+#: **Deliberately the surplus-absorption vocabulary, one direction over.** That
+#: layer answers "does the inverter store surplus production when nobody tells it
+#: to"; this one answers "does it serve residual house load from the battery when
+#: nobody tells it to". Same control surface, same evidence, same rule that an
+#: unreadable or feature-suppressed inverter is **not modelled** rather than
+#: assumed -- because the optimistic error here is a plan that believes the house
+#: is fed for free.
+AMBIENT_SELF_CONSUMPTION_NO_SUPPRESSING_FEATURE: Final = "no_suppressing_feature"
+AMBIENT_SELF_CONSUMPTION_SELF_CONSUMPTION: Final = "self_consumption"
+AMBIENT_SELF_CONSUMPTION_PEAK_SHAVING: Final = "peak_shaving"
+AMBIENT_SELF_CONSUMPTION_STATE_UNREADABLE: Final = "state_unreadable"
+
+AMBIENT_SELF_CONSUMPTION_REASONS: Final = (
+    AMBIENT_SELF_CONSUMPTION_NO_SUPPRESSING_FEATURE,
+    AMBIENT_SELF_CONSUMPTION_SELF_CONSUMPTION,
+    AMBIENT_SELF_CONSUMPTION_PEAK_SHAVING,
+    AMBIENT_SELF_CONSUMPTION_STATE_UNREADABLE,
+)
+
+ECONOMIC_IMMATERIAL_BELOW_TRADE_GAIN: Final = "below_trade_gain"
+
+#: A charge campaign with no objective the actuator could deliver. Distinct from
+#: ``below_trade_gain`` because it is a *physical* verdict, not an economic one --
+#: the optimiser remains the authority for whether a Buy was worth making.
+ECONOMIC_IMMATERIAL_NOT_EXECUTABLE: Final = "not_executable"
+
+ECONOMIC_IMMATERIAL_REASONS: Final = (
+    ECONOMIC_IMMATERIAL_BELOW_TRADE_GAIN,
+    ECONOMIC_IMMATERIAL_NOT_EXECUTABLE,
+)
+
 ACTIVITY_CATEGORY_SAFETY_BUY: Final = "safety_buy"
 ACTIVITY_CATEGORY_ECONOMIC_BUY: Final = "economic_buy"
 ACTIVITY_CATEGORY_MIXED_BUY: Final = "mixed_buy"

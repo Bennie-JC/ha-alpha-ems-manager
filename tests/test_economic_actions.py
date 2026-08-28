@@ -121,12 +121,37 @@ def test_the_desired_plan_uses_every_action_the_physics_allows() -> None:
     assert ECONOMIC_ACTION_EXPORT in outcome.desired.permitted
 
 
-def test_the_capability_plan_is_solved_separately_not_degraded() -> None:
-    """Different intervals, not the same plan with the export crossed out.
+def curtailment_horizon(table: PhysicsTable) -> EconomicHorizon:
+    """Return a horizon whose best action is one no actuator can perform.
 
-    The capability plan charges later and discharges into the house; the desired
-    plan charges for four intervals and sells. If the capability plan were a
-    filtered copy it would have the desired plan's charge window, and it does not.
+    A full pack, three kilowatt-hours of production against a quarter of a
+    kilowatt-hour of load, and a **negative** export price -- so the money says
+    decline the production, and no release commands the inverter to do that.
+    Curtailment is the one action still outside :data:`IMPLEMENTED_ACTIONS`, which
+    makes this the only horizon that can still demonstrate a capability gap.
+    """
+    return horizon_for(
+        table,
+        demands=flat_demands(2, load_kwh=0.25, pv_kwh=3.0),
+        prices=[IntervalPrice(import_eur_kwh=0.30, export_eur_kwh=-0.10)] * 2,
+    )
+
+
+def test_the_capability_plan_is_solved_separately_not_degraded() -> None:
+    """A different plan, not the desired one with an action crossed out.
+
+    **The demonstration moved horizons in beta.32, and why is the point.** This
+    used to run on the eight-interval sell horizon: the desired plan charged for
+    four intervals and exported, and the capability plan -- forbidden to export --
+    charged later and discharged into the house instead. Different windows, so
+    provably not a filtered copy.
+
+    ``export`` is in :data:`IMPLEMENTED_ACTIONS` since beta.32, because
+    ``CONTROL_EXECUTABLE_ACTIONS_BY_INTENT`` has authorised an admitted
+    ``net_export`` since beta.27 and the hardware has performed one. So on that
+    horizon the two plans now **agree**, which is asserted below as the release's
+    own change, and the separate-solve property is demonstrated on the one action
+    still without an actuator: curtailment.
     """
     table = reference_table()
     outcome = outcome_for(table, eight_interval_horizon(table), start_kwh=START_KWH)
@@ -139,25 +164,45 @@ def test_the_capability_plan_is_solved_separately_not_degraded() -> None:
     ]
 
     assert desired == [(ECONOMIC_ACTION_CHARGE, 0, 3), (ECONOMIC_ACTION_EXPORT, 4, 7)]
-    assert capability == [
-        (ECONOMIC_ACTION_CHARGE, 2, 3),
-        (ECONOMIC_ACTION_DISCHARGE, 4, 7),
-    ]
+    # No gap: the plant can do what the plan wants, and beta.31 said otherwise.
+    assert capability == desired
     assert outcome.capability.permitted == frozenset(
         outcome.desired.permitted & IMPLEMENTED_ACTIONS
     )
 
+    # And the property itself, where a gap still exists.
+    gapped = outcome_for(
+        table, curtailment_horizon(table), start_kwh=22.0, terminal_kwh=22.0
+    )
+    assert gapped.action == ECONOMIC_ACTION_CURTAIL
+    assert gapped.capability_action != ECONOMIC_ACTION_CURTAIL
+    assert ECONOMIC_ACTION_CURTAIL not in gapped.capability.permitted
+
 
 def test_the_value_forgone_is_the_gap_between_the_two_plans() -> None:
-    """What the missing primitives cost, in euros, recomputed from both plans."""
+    """What the missing primitives cost, in euros, recomputed from both plans.
+
+    **Measured on a curtailment horizon since beta.32.** On the sell horizon the
+    figure is now zero, and correctly so: the plant can perform the export, so
+    nothing is forgone. That drop is one of the intended consequences of widening
+    :data:`IMPLEMENTED_ACTIONS`, and it is asserted separately below.
+    """
     table = reference_table()
-    outcome = outcome_for(table, eight_interval_horizon(table), start_kwh=START_KWH)
+    outcome = outcome_for(
+        table, curtailment_horizon(table), start_kwh=22.0, terminal_kwh=22.0
+    )
 
     assert outcome.economic_value_forgone_eur == pytest.approx(
         outcome.desired.expected_net_value_eur
         - outcome.capability.expected_net_value_eur
     )
     assert outcome.economic_value_forgone_eur > 0.0
+
+    # The identity still holds where there is no gap, and there the figure is zero
+    # rather than absent -- an export day no longer reports value the plant cannot
+    # capture, because it can.
+    selling = outcome_for(table, eight_interval_horizon(table), start_kwh=START_KWH)
+    assert selling.economic_value_forgone_eur == pytest.approx(0.0)
 
 
 def test_the_value_forgone_is_zero_when_every_wanted_action_has_an_actuator() -> None:
@@ -415,15 +460,23 @@ def test_a_reserve_above_the_pack_is_carried_as_its_own_figure() -> None:
 # -- D. the capability gap ---------------------------------------------------
 
 
-def test_a_wanted_export_with_no_actuator_reports_no_primitive() -> None:
-    """The gap that justifies building something, named as such."""
+def test_a_wanted_export_has_an_actuator_and_reports_no_gap() -> None:
+    """The gap that beta.27 closed and beta.31 was still reporting.
+
+    ``CONTROL_EXECUTABLE_ACTIONS_BY_INTENT`` has authorised an admitted
+    ``net_export`` since beta.27; ``CONTROL_LIVE_DISPATCH_INTENTS`` contains it;
+    the hardware has performed one. :data:`IMPLEMENTED_ACTIONS` said no actuator
+    existed, and that was not a label -- it bounded the capability solve, so every
+    export day reported euros the plant supposedly could not capture, and it put an
+    ``Advisory`` marker on Live export lines a command was about to be sent for.
+    """
     table = reference_table()
     outcome = outcome_for(table, eight_interval_horizon(table), start_kwh=START_KWH)
 
-    assert ECONOMIC_ACTION_EXPORT not in IMPLEMENTED_ACTIONS
+    assert ECONOMIC_ACTION_EXPORT in IMPLEMENTED_ACTIONS
     assert outcome.desired.runs[1].action == ECONOMIC_ACTION_EXPORT
-    # The published action is the *first* run, which both plans agree on here.
     assert outcome.capability_gap_reason == ECONOMIC_GAP_NONE
+    assert outcome.economic_value_forgone_eur == pytest.approx(0.0)
 
 
 def test_a_wanted_curtailment_with_no_actuator_reports_no_primitive() -> None:
@@ -438,7 +491,12 @@ def test_a_wanted_curtailment_with_no_actuator_reports_no_primitive() -> None:
 
     assert ECONOMIC_ACTION_CURTAIL not in IMPLEMENTED_ACTIONS
     assert outcome.action == ECONOMIC_ACTION_CURTAIL
-    assert outcome.capability_action == ECONOMIC_ACTION_HOLD
+    # **Not ``hold`` any more, and the change is honest.** A full pack with three
+    # kilowatt-hours of surplus physically exports it whatever the label says; with
+    # ``export`` implemented the capability plan names what actually happens
+    # instead of calling it a hold. The gap is unchanged: curtailment is still the
+    # thing no actuator can do.
+    assert outcome.capability_action == ECONOMIC_ACTION_EXPORT
     assert outcome.capability_gap_reason == ECONOMIC_GAP_NO_PRIMITIVE
 
 

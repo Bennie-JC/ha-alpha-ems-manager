@@ -592,6 +592,18 @@ def _economic_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any
             else plan.reserve_projection.floor_energy_kwh
         ),
         bridge_requirement_kwh=bridge,
+        # **The two inputs the surplus figures need**, carried from the same plan
+        # the decision was made against rather than re-read here. See
+        # surplus_rule: the floor is contained in reachability_now already, and
+        # a second reading of the pack could disagree with the plan beside it.
+        stored_dc_kwh=(
+            None if plan is None or plan.state is None else plan.state.energy_kwh
+        ),
+        discharge_efficiency=(
+            1.0
+            if plan is None or plan.state is None
+            else plan.state.limits.discharge_efficiency
+        ),
         pack_ceiling_kwh=(
             None
             if plan is None or plan.reserve_projection is None

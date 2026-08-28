@@ -262,8 +262,12 @@ def test_the_reason_is_a_report_and_not_an_instruction() -> None:
     # The old gate is gone from every branch.
     assert any("stop_reason=" in row for row in code)
     assert not [row for row in code if "if owned else None" in row]
-    # And the reset gate is not.
-    assert sum(row.count("reset_required=owned") for row in code) == 7
+    # And the reset gate is not. **Eight since beta.32**, not seven: the export
+    # branch added to ``demand_for`` gives ``battery_ceiling`` its own stop, and like
+    # every other stop it resets only what it owns. The number is asserted rather
+    # than bounded because a *new unguarded* reset is what this catches, and a new
+    # guarded one should have to declare itself here.
+    assert sum(row.count("reset_required=owned") for row in code) == 8
 
 
 # ===========================================================================
@@ -496,8 +500,8 @@ def _dispatch(**overrides) -> activity_module.ExecutionView:
             direction=ECONOMIC_DIRECTION_CHARGE, start_utc=LIFECYCLE_START
         ),
         "end_utc": LIFECYCLE_END,
-        "target_kwh": TARGET_KWH,
-        "delivered_kwh": REALIZED_KWH,
+        "objective_target_kwh": TARGET_KWH,
+        "objective_realized_kwh": REALIZED_KWH,
         "intent": EXECUTION_INTENT_GRID_CHARGE,
         "run_id": "incident",
         "executed": True,
@@ -578,18 +582,28 @@ def test_the_reasons_a_reader_must_tell_apart_read_differently() -> None:
 
 
 def test_a_reached_target_quotes_the_pair_and_says_when_they_agree() -> None:
-    """Inside the completion tolerance the two figures are the same number twice.
+    """A run-level ``target_reached`` reads the same whatever the pair says.
 
-    Both are still printed -- the format is one line and one shape -- and "Target
-    Reached" tells the reader that the numbers beside it are not a discrepancy
-    they should be hunting for.
+    **The tolerance has left this module, and its absence is the assertion.**
+    Through beta.31 Activity held ``TARGET_TOLERANCE_KWH`` and decided from it
+    whether to print "Target Reached" -- a presentation layer ruling on whether
+    0.014 kWh of residue was a success, which is 0.56 of one actuator step and
+    therefore not a question a renderer can answer. Since beta.32 the outcome
+    class is computed where the energy was measured, and this path renders Stage
+    B's own ``target_reached`` verdict without second-guessing it.
+
+    Both figures are still printed. The format is one line and one shape.
     """
-    met = terminal(EXECUTION_STOP_TARGET_REACHED, delivered_kwh=8.02)[1]
+    met = terminal(EXECUTION_STOP_TARGET_REACHED, objective_realized_kwh=8.02)[1]
     short = terminal(EXECUTION_STOP_TARGET_REACHED)[1]
 
     assert "Success — Target Reached — 8.02 / 8.06 kWh" in met
-    assert "Target Reached" not in short
-    assert "1.76 / 8.06 kWh" in short
+    # The same phrase on a pair that disagrees, because Stage B said the target was
+    # reached and this layer no longer holds a tolerance to disagree with it.
+    assert "Success — Target Reached — 1.76 / 8.06 kWh" in short
+    assert not hasattr(activity_module, "TARGET_TOLERANCE_KWH"), (
+        "the completion tolerance must not return to the Activity surface"
+    )
 
 
 def test_no_reason_reaches_a_person_as_an_identifier() -> None:

@@ -404,12 +404,28 @@ class WindowSummary:
     #: never as a zero standing in for "no comparison happened".
     predicted_kwh: float | None = None
     actual_kwh: float | None = None
+    #: How much of a day's forecast error points the *same way*, averaged over the
+    #: window. ``1.0`` when a day's errors are entirely one-directional and
+    #: ``~1/sqrt(n)`` when they cancel.
+    #:
+    #: **beta.32, and it exists to answer a question no assumption could.** An
+    #: allowance for cumulative forecast error over ``n`` intervals grows as
+    #: ``mae * sqrt(n)`` if the errors are independent and as ``mae * n`` if they
+    #: are perfectly persistent. Neither is defensible as an assumption, and
+    #: beta.31's implicit ``sqrt(n)`` is why its statistical term was inert -- on
+    #: the live installation 0.06 x sqrt(48) is 0.42 kWh against a pack of 21.6.
+    #:
+    #: The window's own rows already hold the answer: ``|predicted - actual|``
+    #: against the summed absolute error is exactly the cancellation. So the factor
+    #: is **measured**, and no free statistical constant is introduced.
+    error_persistence: float | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Return a plain mapping for the diagnostics payload."""
         return {
             "days_compared": self.days_compared,
             "intervals_compared": self.intervals_compared,
+            "error_persistence": _round(self.error_persistence, 4),
             "mae_kwh_per_interval": _round(self.mae_kwh, 5),
             "bias_kwh_per_interval": _round(self.bias_kwh, 5),
             "wape_percent": _round(self.wape_percent, 2),
@@ -445,6 +461,11 @@ def window_from_summaries(rows: Iterable[dict[str, object]]) -> WindowSummary:
     abs_error = 0.0
     predicted = 0.0
     actual = 0.0
+    # One ratio per usable day, averaged at the end. Per day rather than pooled,
+    # because persistence is a property of a day's shape: pooling first would let
+    # a day that over-predicted cancel a day that under-predicted and report
+    # errors as self-cancelling when neither day's were.
+    persistence: list[float] = []
 
     for row in rows:
         flags = row.get("fg")
@@ -463,6 +484,10 @@ def window_from_summaries(rows: Iterable[dict[str, object]]) -> WindowSummary:
         abs_error += row_error
         predicted += row_predicted
         actual += row_actual
+        if row_error > 0.0:
+            # Bounded at 1.0: the signed error can never exceed the absolute one,
+            # and floating point should not be allowed to say otherwise.
+            persistence.append(min(1.0, abs(row_predicted - row_actual) / row_error))
 
     if not compared:
         return WindowSummary()
@@ -470,6 +495,9 @@ def window_from_summaries(rows: Iterable[dict[str, object]]) -> WindowSummary:
         days_compared=days,
         intervals_compared=compared,
         mae_kwh=abs_error / compared,
+        error_persistence=(
+            sum(persistence) / len(persistence) if persistence else None
+        ),
         bias_kwh=(predicted - actual) / compared,
         # ``actual > 0`` rather than ``!= 0``: a window in which the house
         # measurably consumed nothing has no denominator, and a percentage

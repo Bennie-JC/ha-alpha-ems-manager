@@ -720,8 +720,8 @@ def view(**overrides):
         "end_utc": LIFECYCLE_END,
         "intent": EXECUTION_INTENT_GRID_CHARGE,
         "run_id": "run-1",
-        "target_kwh": TARGET_KWH,
-        "delivered_kwh": 0.0,
+        "objective_target_kwh": TARGET_KWH,
+        "objective_realized_kwh": 0.0,
         "executed": True,
     }
     params.update(overrides)
@@ -763,7 +763,7 @@ def test_the_three_lines_read_as_the_approved_wording() -> None:
         view(running=True, activation_confirmed=True),
         view(
             running=False,
-            delivered_kwh=TARGET_KWH,
+            objective_realized_kwh=TARGET_KWH,
             stop_reason=EXECUTION_STOP_TARGET_REACHED,
         ),
     ):
@@ -859,11 +859,11 @@ def test_a_plan_says_planned_started_and_finished_and_nothing_else() -> None:
     # decision, and Activity is not even told what the power is.
     for delivered in (1.0, 2.0, 3.0, 4.0):
         for _ in range(4):
-            step(view(running=True, delivered_kwh=delivered))
+            step(view(running=True, objective_realized_kwh=delivered))
     step(
         view(
             running=False,
-            delivered_kwh=TARGET_KWH,
+            objective_realized_kwh=TARGET_KWH,
             stop_reason=EXECUTION_STOP_TARGET_REACHED,
         )
     )
@@ -913,7 +913,7 @@ def test_a_second_campaign_announces_itself() -> None:
         view(
             run_id="run-2",
             end_utc=second_end,
-            target_kwh=4.0,
+            objective_target_kwh=4.0,
             running=True,
             activation_confirmed=True,
         ),
@@ -1636,7 +1636,9 @@ def test_the_headroom_branch_reports_the_headroom_reason() -> None:
     state = entry_for(state, view(running=True, activation_confirmed=True)).state
     ended = entry_for(
         state,
-        view(running=False, delivered_kwh=6.2, stop_reason=decision.stop_reason),
+        view(
+            running=False, objective_realized_kwh=6.2, stop_reason=decision.stop_reason
+        ),
     )
     assert ended is not None
     assert ended.kind == ECONOMIC_EVENT_CANCELLED
@@ -1754,7 +1756,7 @@ def test_a_supersession_of_the_same_intent_still_announces_the_new_run() -> None
         view(
             run_id="run-2",
             end_utc=second_end,
-            target_kwh=4.0,
+            objective_target_kwh=4.0,
             running=True,
             activation_confirmed=True,
         ),

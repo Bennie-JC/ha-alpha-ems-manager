@@ -76,10 +76,17 @@ from .battery import INTERVAL_HOURS, BatteryLimits, sanitize_soc_percent
 from .confidence import ConfidenceBreakdown, compute_confidence
 from .const import (
     ACTION_DISCHARGE,
+    AMBIENT_SELF_CONSUMPTION_NO_SUPPRESSING_FEATURE,
+    AMBIENT_SELF_CONSUMPTION_PEAK_SHAVING,
+    AMBIENT_SELF_CONSUMPTION_SELF_CONSUMPTION,
+    AMBIENT_SELF_CONSUMPTION_STATE_UNREADABLE,
     BALANCE_MAX_SOURCE_AGE_SECONDS,
     BATTERY_MAX_SOC_PERCENT,
     CADENCE_PHYSICAL_TICK,
     CADENCE_QUARTER_REFRESH,
+    CAMPAIGN_BOUNDARY_BATTERY,
+    CAMPAIGN_BOUNDARY_METER,
+    CAMPAIGN_SUCCESS_TOLERANCE_PER_QUARTER_KWH,
     CAP_NONE,
     CLAIM_SCHEMA_VERSION,
     CONF_ALLOW_BATTERY_EXPORT,
@@ -142,8 +149,10 @@ from .const import (
     DISPATCH_POWER_DEADBAND_KW,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     EV_ABSENCE_GRACE_REFRESHES,
+    EXECUTION_FAILED_STOP_REASONS,
     EXECUTION_INTENT_NET_EXPORT,
     EXECUTION_STOP_COHERENCE_LOST,
+    EXECUTION_STOP_EXECUTION_ERROR,
     EXECUTION_STOP_MARKER_LOST,
     EXECUTION_STOP_QUARTER_EXPIRED,
     EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
@@ -168,6 +177,10 @@ from .const import (
     MAX_SAMPLE_GAP_SECONDS,
     MIN_EXECUTABLE_QUARTER_KWH,
     MIN_QUARTER_COVERAGE,
+    OUTCOME_CANCELED,
+    OUTCOME_FAILED,
+    OUTCOME_PARTIAL,
+    OUTCOME_SUCCESS,
     OWNERSHIP_DEGRADED,
     OWNERSHIP_NONE,
     OWNERSHIP_OWNED,
@@ -207,6 +220,8 @@ from .const import (
     QUARTER_END_TARGET_REACHED,
     QUARTER_MINUTES,
     QUARTER_TARGET_TOLERANCE_KWH,
+    REASON_VOCABULARY_QUARTER_COMPLETION,
+    REASON_VOCABULARY_RUN_STOP,
     REFUSE_MODE_NOT_ACTIVE,
     SAFETY_SAMPLE_SECONDS,
     SELECT_INVERTER_AC_LIMIT,
@@ -240,6 +255,7 @@ from .dispatch import (
 from .dispatch import decide as decide_setpoint
 from .economic import (
     EconomicOutcome,
+    ForecastRisk,
     IntervalPrice,
     actionable_intervals,
     build_economic_snapshot,
@@ -266,6 +282,7 @@ from .energy_balance import (
     measure_coherence,
 )
 from .execution import (
+    TARGET_TOLERANCE_KWH,
     AdmittedPlan,
     CarriedQuarter,
     CarriedRun,
@@ -777,6 +794,14 @@ class PlanningInputs:
     #: money. Never in Live, where the plan is executing and the payload is not
     #: being read.
     compare_legacy: bool = False
+    #: The measured forecast-quality evidence the export permission may use, or
+    #: ``None`` to leave the permission off -- which is what every pre-beta.32 test
+    #: gets, so each still describes the behaviour it was written for.
+    forecast_risk: Any = None
+    #: Whether the inverter covers residual house load from the battery when
+    #: nothing is dispatched. **Unknown means not modelled**, so the default is the
+    #: pre-beta.32 counterfactual: an idle interval imports at full price.
+    ambient_self_consumption: bool = False
 
 
 def _solve_economic(
@@ -866,6 +891,10 @@ def _solve_economic(
         uncertainty=None if planning is None else planning.uncertainty,
         actionable_interval_count=(
             0 if planning is None else planning.actionable_intervals
+        ),
+        forecast_risk=None if planning is None else planning.forecast_risk,
+        ambient_self_consumption=(
+            False if planning is None else planning.ambient_self_consumption
         ),
     )
 
@@ -1354,6 +1383,36 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._quarter_pv_helped: bool = False
         self._quarter_target_reached_at: datetime | None = None
         self._quarter_clamps: set[str] = set()
+        # ---------------------------------------------------------------- campaign
+        #
+        # **One economic campaign, one lifecycle, and the state lives here.**
+        #
+        # It has to live here for a structural reason rather than a tidiness one:
+        # every stop funnel wipes ``_carried``, ``_quarter`` and ``_plan``, and the
+        # 60-second tick that ends a campaign publishes no coordinator data at all.
+        # Through beta.31 the Activity terminal was derived from those carriers, so
+        # a campaign that ended on a tick had nothing left to speak from -- and the
+        # measured 17:30-17:45 export terminated in silence while its Planned line
+        # stayed standing as though still true. Held apart from the carriers, the
+        # campaign's own record survives every one of those paths.
+        #
+        # **Immutable once started** (beta.32 invariant B12): the objective is
+        # frozen at the first confirmed activation, the realised figure only ever
+        # accumulates, and a later Stage-A replan can add information but can
+        # neither shrink the target nor reset the progress.
+        self._campaign_id: str | None = None
+        self._campaign_run_id: str | None = None
+        self._campaign_end_utc: datetime | None = None
+        self._campaign_boundary: str | None = None
+        self._campaign_started_at: datetime | None = None
+        self._campaign_frozen_target_kwh: float | None = None
+        self._campaign_realized_kwh: float = 0.0
+        self._campaign_quarters_admitted: int = 0
+        self._campaign_measurable: bool = True
+        #: The finished campaign, latched. **Not consumed on read**: the surfaces
+        #: make it fire once through their own ``closed`` set, and a latch a reader
+        #: could exhaust would be a terminal that depends on who looked first.
+        self._closed_campaign: dict[str, Any] | None = None
         #: The claim the current quarter's progress belongs to. Progress keys on
         #: ``(claim_id, quarter_start)``, so neither a new arm nor a new row can
         #: inherit measurements taken under the other.
@@ -2752,6 +2811,122 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return (dt_util.now() + timedelta(days=1)).date()
 
     @callback
+    def _forecast_risk(
+        self, horizon_intervals: int, today_interval_count: int
+    ) -> ForecastRisk | None:
+        """Return the measured forecast-quality evidence, or ``None``.
+
+        **Every field is a quantity the learning stack already computed and, before
+        beta.32, published to nobody who could act on it**: the signed bias, the
+        absolute error split by provenance, the newly-measured error persistence,
+        and today's adaptation ratio. No distribution is invented and no price is
+        forecast.
+
+        ``None`` when there is no rolling window at all, which leaves the export
+        permission off and the plan exactly as beta.31 would have made it. That is
+        the same doctrine ``_forecast_mae_kwh_per_interval`` already follows: a
+        figure that cannot be established honestly is absent, never zero.
+        """
+        record = self.last_record
+        window = None if record is None else getattr(record, "window", None)
+        if window is None:
+            return None
+        # Adaptation is meaningless beyond the day it measured, and
+        # ``today_interval_count`` is already the count of leading horizon
+        # intervals belonging to today -- the same split ``_economic_prices`` uses
+        # to decide which calendar day an interval's price comes from.
+        adaptation = None
+        today = (self.data or {}).get("today")
+        if today is not None:
+            adaptation = getattr(today, "adaptation_ratio", None)
+        return ForecastRisk(
+            bias_kwh=getattr(window, "bias_kwh", None),
+            mae_kwh=getattr(window, "mae_kwh", None),
+            mae_modelled_kwh=getattr(window, "mae_modelled_kwh", None),
+            mae_filled_kwh=getattr(window, "mae_filled_kwh", None),
+            mae_by_band=getattr(window, "mae_by_band", None),
+            error_persistence=getattr(window, "error_persistence", None),
+            adaptation_ratio=adaptation,
+            today_interval_count=min(max(0, today_interval_count), horizon_intervals),
+        )
+
+    @callback
+    def _ambient_self_consumption(self) -> tuple[bool, str]:
+        """Return whether the inverter serves house load from the battery unbidden.
+
+        Wrapped for the same reason every layer added since Phase 2 is: this reads
+        the vendor control surface, and a fault there must cost one modelling
+        refinement rather than the whole refresh.
+
+        **Unknown means not modelled**, exactly as surplus absorption already
+        treats an unreadable entity. Guessing optimistically here would give the
+        plan a house fed for free, so the default is the pessimistic one -- an idle
+        interval imports, which is what every release before beta.32 assumed
+        unconditionally.
+        """
+        try:
+            return self._ambient_self_consumption_from_device()
+        except Exception:
+            self._log.warning(
+                _PV_LOG,
+                (
+                    "Whether the inverter serves house load from the battery could "
+                    "not be determined; the plan treats an idle interval as "
+                    "importing at full price, which is the conservative reading "
+                    "and is what earlier releases did unconditionally"
+                ),
+            )
+            _LOGGER.debug("Ambient self-consumption state unreadable", exc_info=True)
+            return False, AMBIENT_SELF_CONSUMPTION_STATE_UNREADABLE
+
+    @callback
+    def _ambient_self_consumption_from_device(self) -> tuple[bool, str]:
+        """Return the ambient-discharge verdict and how it was established.
+
+        **The surplus-absorption detector, one direction over**, and the parallel
+        is the argument for it: that layer stopped asserting "the inverter absorbs
+        surplus autonomously" and started reading the control surface, because the
+        vendor's own features contradict the assertion. The discharge direction has
+        carried the same unexamined assertion ever since --
+        ``docs/ARCHITECTURE.md`` says baseline self-consumption is real in the
+        default configuration, and until now nothing checked.
+
+        Two gates, and the two omissions matter more than the gates:
+
+        * **Peak Shaving** arms the vendor's own dispatch, which may hold the pack
+          against house load. Not modelled.
+        * An inverter whose feature flags are **present but unreadable**, or whose
+          required entities are unavailable, could be doing anything. Not modelled.
+
+        **Not gated on ``excess_export_active``**: that feature directs *production*
+        to load and feed-in, which is a statement about the charge direction. It
+        says nothing about whether stored energy answers a residual load.
+
+        **Not gated on ``dispatch_active``** -- and this is the one real departure.
+        Surplus absorption asks what the pack is doing *now*, so a live dispatch
+        makes the answer unknowable. This asks a **counterfactual**: what would
+        happen in an interval where nothing is dispatched. A command running right
+        now is no evidence about that, and gating on it would make the idle
+        counterfactual -- and therefore every published marginal euro figure --
+        flicker between two bases every time the optimiser dispatched anything.
+        """
+        capability = discover(self.hass)
+        if capability.peak_shaving_active:
+            return False, AMBIENT_SELF_CONSUMPTION_PEAK_SHAVING
+        # Before the rest, because a feature boolean that cannot be read could be
+        # hiding a feature that is on.
+        if capability.feature_flags_present and not capability.feature_flags_readable:
+            return False, AMBIENT_SELF_CONSUMPTION_STATE_UNREADABLE
+        if capability.unavailable:
+            return False, AMBIENT_SELF_CONSUMPTION_STATE_UNREADABLE
+        if capability.missing or not capability.feature_flags_present:
+            # Nothing on this installation could suppress it, which is different
+            # evidence from "we checked and nothing is" -- named separately for the
+            # same reason the absorption vocabulary names both.
+            return True, AMBIENT_SELF_CONSUMPTION_NO_SUPPRESSING_FEATURE
+        return True, AMBIENT_SELF_CONSUMPTION_SELF_CONSUMPTION
+
+    @callback
     def _forecast_mae_kwh_per_interval(self) -> float | None:
         """Return the load forecast's mean absolute error, or ``None``.
 
@@ -3041,6 +3216,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not self._quarter_power_samples
             else self._quarter_power_sum / self._quarter_power_samples
         )
+        # **The campaign's own accumulator, advanced from the same measurement.**
+        # One source, so the campaign total and the quarter rows can never
+        # disagree -- and it accrues across ``serve_load`` gaps and segment
+        # boundaries, because a campaign that pauses to feed the house has not
+        # stopped selling.
+        self._accrue_campaign_progress(quarter, realised)
         self._completed_quarters.append(
             {
                 "quarter_start": quarter.quarter_start.isoformat(),
@@ -3051,10 +3232,35 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "planned_grid_kwh": round(planned_grid, 3),
                 "realized_grid_kwh": round(realised_grid, 3),
                 "shortfall_kwh": round(shortfall, 3),
+                # **Null below one actuator step, since beta.32.** The observed row
+                # published ``140 %`` against a 0.01 kWh objective -- arithmetically
+                # correct and useless: a percentage of a figure smaller than
+                # anything a command could move is noise wearing a decimal point.
+                # Withheld rather than clipped, because "no meaningful percentage"
+                # and "0 %" are different statements.
                 "shortfall_percent": (
-                    None if planned <= 0.0 else round(100.0 * shortfall / planned, 1)
+                    None
+                    if planned < MIN_EXECUTABLE_QUARTER_KWH
+                    else round(100.0 * shortfall / planned, 1)
                 ),
+                # **Signed, and at the objective's boundary.** ``shortfall_kwh`` is
+                # clamped at zero, so a quarter that *over*-delivered looked
+                # identical to one that landed exactly. The sign is what separates
+                # meter-side tracking lag -- which scales with the target and would
+                # defeat a fixed tolerance at larger objectives -- from noise, and a
+                # week of real export quarters settles which the 13 % was.
+                "objective_tracking_error_kwh": round(realised - planned, 4),
+                "objective_tracking_error_fraction": (
+                    None
+                    if planned < MIN_EXECUTABLE_QUARTER_KWH
+                    else round((realised - planned) / planned, 4)
+                ),
+                "objective_boundary": (
+                    CAMPAIGN_BOUNDARY_METER if export else CAMPAIGN_BOUNDARY_BATTERY
+                ),
+                "campaign_id": quarter.campaign_id,
                 "completion_reason": reason,
+                "reason_vocabulary": REASON_VOCABULARY_QUARTER_COMPLETION,
                 "max_dispatch_kw": round(self._quarter_peak_kw, 3),
                 "mean_dispatch_kw": round(mean_kw, 3),
                 "pv_helped": self._quarter_pv_helped,
@@ -3070,6 +3276,241 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ),
             }
         )
+
+    @callback
+    def _accrue_campaign_progress(
+        self, quarter: CarriedQuarter | None, realised_kwh: float
+    ) -> None:
+        """Add one completed quarter's realised objective to its campaign.
+
+        Only for the campaign currently open, and only from the objective boundary
+        the quarter was judged at -- the meter for an export, the battery for a
+        charge. A quarter belonging to some other campaign contributes nothing,
+        which is what stops a replan from crediting one campaign with another's
+        energy.
+        """
+        if quarter is None or quarter.campaign_id is None:
+            return
+        if quarter.campaign_id != self._campaign_id:
+            return
+        self._campaign_realized_kwh += max(0.0, realised_kwh)
+        self._campaign_quarters_admitted += 1
+        if self._quarter_progress_unknown:
+            # A restart lost a quarter of this campaign. The total is no longer a
+            # measurement, and saying so is the honesty guard that outranks even a
+            # met objective in the outcome precedence.
+            self._campaign_measurable = False
+
+    @callback
+    def _open_quarter_objective_kwh(self) -> float:
+        """Return the open quarter's realised objective, at its own boundary."""
+        quarter = self._quarter
+        if quarter is None or quarter.campaign_id != self._campaign_id:
+            return 0.0
+        if quarter.intent == EXECUTION_INTENT_NET_EXPORT:
+            return self._quarter_grid_export_kwh
+        return self._quarter_battery_kwh
+
+    @callback
+    def _campaign_realized_now(self) -> float:
+        """Return the campaign's realised objective including the open quarter."""
+        return self._campaign_realized_kwh + self._open_quarter_objective_kwh()
+
+    @callback
+    def _campaign_objective_kwh(self, campaign_id: str) -> float | None:
+        """Return what the published plan means this campaign to achieve.
+
+        Summed over the campaign's targets at each one's own objective boundary --
+        the meter for an export segment, the battery for a charge. A discharge
+        campaign whose segments are all ``serve_load`` therefore sums to nothing,
+        which is correct: it sells nothing, so it is not a sell.
+
+        ``None`` when no published target names this campaign, which is how a
+        pre-beta.32 record and an unplaceable target both degrade to run-level
+        behaviour rather than to a zero.
+        """
+        total = 0.0
+        seen = False
+        for target in self.execution_targets:
+            if target.get("campaign_id") != campaign_id:
+                continue
+            seen = True
+            if target.get("intent") == EXECUTION_INTENT_NET_EXPORT:
+                total += float(target.get("grid_target_kwh") or 0.0)
+            else:
+                total += float(target.get("battery_target_kwh") or 0.0)
+        return total if seen else None
+
+    @callback
+    def _note_campaign_progress(self, now: datetime, stop_reason: str | None) -> None:
+        """Open, advance and close the campaign lifecycle. Once per refresh.
+
+        **This is the layer beta.31 did not have, and its absence is R10/R11.**
+        Since beta.29 the hardware is armed from the admitted quarter and stopped
+        from the 60-second tick; ``Decision`` stopped being the executor two
+        releases ago, and the Activity terminal was still wired to it. So the
+        terminal is derived here instead -- from the carrier that actually admits
+        the energy, in the layer that measured it.
+
+        Three transitions, and nothing else:
+
+        * a quarter appears whose campaign is not the open one -- **open** it, and
+          close whatever was open first, because one campaign at a time is the
+          whole point of the unit;
+        * a write carrying an activation succeeds while a campaign is open --
+          **freeze** its objective, once, for ever;
+        * no quarter and no admissible target names the open campaign any more --
+          **close** it, latching the outcome computed below.
+        """
+        quarter = self._quarter
+        current = None if quarter is None else quarter.campaign_id
+        if current is not None and current != self._campaign_id:
+            self._close_campaign(now, stop_reason)
+            self._campaign_id = current
+            self._campaign_run_id = quarter.run_id
+            self._campaign_end_utc = quarter.quarter_end
+            self._campaign_boundary = (
+                CAMPAIGN_BOUNDARY_METER
+                if quarter.intent == EXECUTION_INTENT_NET_EXPORT
+                else CAMPAIGN_BOUNDARY_BATTERY
+            )
+            self._campaign_started_at = None
+            self._campaign_frozen_target_kwh = None
+            self._campaign_realized_kwh = 0.0
+            self._campaign_quarters_admitted = 0
+            self._campaign_measurable = True
+
+        if self._campaign_id is None:
+            return
+
+        # **The end instant tracks the furthest quarter this campaign reaches**, so
+        # a campaign whose later segments are still ahead of us does not look
+        # finished the moment its first one ends.
+        if (
+            quarter is not None
+            and quarter.campaign_id == self._campaign_id
+            and (
+                self._campaign_end_utc is None
+                or quarter.quarter_end > self._campaign_end_utc
+            )
+        ):
+            self._campaign_end_utc = quarter.quarter_end
+
+        if self._campaign_started_at is None and self.activation_confirmed:
+            # **Frozen here and nowhere else.** Success is judged against what was
+            # promised when execution began: a campaign that promised 2.65 kWh and
+            # delivered 1.80 because Stage A changed its mind is Partial, not a
+            # retroactively successful 1.80 / 1.80.
+            self._campaign_started_at = now
+            self._campaign_frozen_target_kwh = self._campaign_objective_kwh(
+                self._campaign_id
+            )
+
+        still_planned = any(
+            target.get("campaign_id") == self._campaign_id
+            for target in self.execution_targets
+        )
+        if quarter is None and not still_planned:
+            self._close_campaign(now, stop_reason)
+
+    @callback
+    def _close_campaign(self, now: datetime, stop_reason: str | None) -> None:
+        """Latch the open campaign's outcome, from the measurements taken here.
+
+        **The precedence is computed once, in this order, and the order is
+        argued:**
+
+        1. an untrustworthy measurement is **Failed** -- the honesty guard, because
+           publishing a verdict on a figure we do not believe is worse than
+           publishing no verdict;
+        2. the objective met within the reporting tolerance is **Success** -- above
+           Cancelled deliberately: *the money made outranks the reason the plan
+           then changed*, and beta.31 filed a real 0.10 / 0.11 kWh export as
+           "Canceled -- Plan Replaced";
+        3. a reason in the failed set is **Failed**;
+        4. a reason in the cancelled set is **Canceled**;
+        5. anything else is **Partial**.
+
+        A campaign that never started produces no terminal at all: nothing
+        physical happened, so there is nothing to have finished.
+        """
+        campaign_id = self._campaign_id
+        self._campaign_id = None
+        if campaign_id is None or self._campaign_started_at is None:
+            return
+        target_kwh = self._campaign_frozen_target_kwh
+        # **Including whatever the open quarter had moved.** A campaign cut short
+        # mid-quarter delivered that energy, and dropping it would report a
+        # shortfall the plant did not have.
+        realized = self._campaign_realized_now()
+        quarters = self._campaign_quarters_admitted
+        tolerance = min(
+            TARGET_TOLERANCE_KWH,
+            CAMPAIGN_SUCCESS_TOLERANCE_PER_QUARTER_KWH * max(1, quarters),
+        )
+        measurable = self._campaign_measurable and target_kwh is not None
+        shortfall = None if target_kwh is None else target_kwh - realized
+        if not measurable:
+            outcome = OUTCOME_FAILED
+        elif shortfall is not None and shortfall <= tolerance:
+            outcome = OUTCOME_SUCCESS
+        elif stop_reason in EXECUTION_FAILED_STOP_REASONS:
+            outcome = OUTCOME_FAILED
+        elif stop_reason:
+            outcome = OUTCOME_CANCELED
+        else:
+            outcome = OUTCOME_PARTIAL
+        self._closed_campaign = {
+            "campaign_id": campaign_id,
+            "run_id": self._campaign_run_id,
+            "window_end": (
+                None
+                if self._campaign_end_utc is None
+                else self._campaign_end_utc.isoformat()
+            ),
+            "started": True,
+            "started_at": self._campaign_started_at.isoformat(),
+            "ended_at": now.isoformat(),
+            "objective_boundary": self._campaign_boundary,
+            "objective_target_kwh": (
+                None if target_kwh is None else round(target_kwh, 3)
+            ),
+            "objective_realized_kwh": round(realized, 3),
+            "objective_measurable": measurable,
+            # **Signed, and null below the actuator quantum.** A 13 % shortfall on
+            # a 0.11 kWh objective and a 13 % shortfall on a 5 kWh one are
+            # different problems, and a percentage of a figure smaller than one
+            # actuator step is noise wearing a decimal point. beta.31 published
+            # 140 % on a 0.01 kWh target.
+            "objective_tracking_error_kwh": (
+                None if shortfall is None else round(-shortfall, 4)
+            ),
+            "objective_tracking_error_fraction": (
+                None
+                if target_kwh is None or target_kwh < MIN_EXECUTABLE_QUARTER_KWH
+                else round(-shortfall / target_kwh, 4)
+            ),
+            "quarters_admitted": quarters,
+            "success_tolerance_kwh": round(tolerance, 4),
+            "outcome": outcome,
+            "reason": stop_reason,
+            "reason_vocabulary": REASON_VOCABULARY_RUN_STOP,
+            "rule": (
+                "the outcome is decided here, where the energy was measured, and "
+                "the reason is published beside it rather than standing in for it. "
+                "the target is frozen at the first confirmed activation and may "
+                "never shrink; the realised figure accumulates across segments and "
+                "across serve_load gaps and is reset only when the campaign closes"
+            ),
+        }
+        self._campaign_run_id = None
+        self._campaign_end_utc = None
+        self._campaign_boundary = None
+        self._campaign_started_at = None
+        self._campaign_frozen_target_kwh = None
+        self._campaign_realized_kwh = 0.0
+        self._campaign_quarters_admitted = 0
+        self._campaign_measurable = True
 
     @callback
     def _live_kw(self) -> tuple[float, float, float] | None:
@@ -4260,6 +4701,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         absorb_surplus, absorption_reason = self._surplus_absorption()
+        # The same control surface, read for the other direction. Read here beside
+        # its sibling and passed down, so the whole refresh describes one inverter
+        # rather than two reads that could disagree mid-refresh.
+        ambient_modelled, ambient_reason = self._ambient_self_consumption()
 
         plan = self._build_battery_plan(
             today=today,
@@ -4290,6 +4735,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             tz=tz,
             today_interval_count=baseline_today.interval_count,
             price_forecasts=price_forecasts,
+            ambient_self_consumption=ambient_modelled,
         )
 
         await self._async_record_economic_evidence_safely(
@@ -4358,6 +4804,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "modelled": absorb_surplus,
                 "reason": absorption_reason,
             },
+            # **What an idle interval actually costs.** Published beside its
+            # sibling because a reader comparing two marginal euro figures across
+            # installations needs to know which counterfactual each was measured
+            # against -- see ``counterfactual_basis`` on the plan.
+            "ambient_self_consumption": {
+                "modelled": ambient_modelled,
+                "reason": ambient_reason,
+            },
             "price_today": price_forecasts.get(today),
             "price_tomorrow": price_forecasts.get(tomorrow),
         }
@@ -4371,6 +4825,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         tz: tzinfo,
         today_interval_count: int,
         price_forecasts: dict[date, PriceForecast],
+        ambient_self_consumption: bool = False,
     ) -> EconomicOutcome | None:
         """Solve the economic plan, or say nothing and keep the refresh.
 
@@ -4387,6 +4842,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 tz=tz,
                 today_interval_count=today_interval_count,
                 price_forecasts=price_forecasts,
+                ambient_self_consumption=ambient_self_consumption,
             )
         except Exception:
             self._log.warning(
@@ -4409,6 +4865,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         tz: tzinfo,
         today_interval_count: int,
         price_forecasts: dict[date, PriceForecast],
+        ambient_self_consumption: bool = False,
     ) -> EconomicOutcome | None:
         """Return this refresh's economic plan, or ``None``.
 
@@ -4484,6 +4941,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             reachability=reachability,
             uncertainty=margin,
             actionable_intervals=actionable,
+            forecast_risk=self._forecast_risk(len(demands), today_interval_count),
+            ambient_self_consumption=ambient_self_consumption,
             edge_value_eur_per_kwh=edge_value_eur_per_kwh(
                 prices[:actionable],
                 discharge_efficiency=limits.discharge_efficiency,
@@ -7238,6 +7697,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         dispatch_active = bool(snapshot is not None and snapshot.dispatch_active)
         result = stage_b.get("result") or {}
         stop_reason = result.get("stop_reason")
+        # **A failed command is a stop reason, and beta.31 recorded it as a note.**
+        # ``_mark_execution_error`` has always written ``execution_error`` into this
+        # block, and nothing has ever read it -- so ``Command Failed`` was in the
+        # Activity vocabulary and structurally unreachable, which is R10. Read here,
+        # and only where no more specific reason already stands.
+        if not stop_reason and result.get("execution_error"):
+            stop_reason = EXECUTION_STOP_EXECUTION_ERROR
         unsafe_while_owned = owned and dispatch_active and not verdict.safe
         if unsafe_while_owned and not stop_reason:
             stop_reason = EXECUTION_STOP_SAFETY
@@ -7429,6 +7895,53 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "ownership factor and must not become one again"
             ),
         }
+        # **The reason is written back into ``result``, which is the field every
+        # reader consults.** Three reasons were computed above -- safety turning
+        # unsafe under our own dispatch, a restart that lost the quarter's progress,
+        # and a marker that vanished -- and all three were published only to
+        # ``write_boundary``. So the surfaces saw ``None`` and printed
+        # "Plan Replaced" for a safety stop, which is R10's false claim rather than
+        # a wording problem.
+        if stop_reason:
+            existing = stage_b.get("result")
+            if not isinstance(existing, dict):
+                existing = {}
+                stage_b["result"] = existing
+            existing["stop_reason"] = stop_reason
+            existing.setdefault("reason_vocabulary", REASON_VOCABULARY_RUN_STOP)
+
+        # **The campaign lifecycle, advanced once per refresh, after the reason is
+        # known and before anything is published.** This is the ordering that lets
+        # the incident's 17:45 refresh speak at all.
+        self._note_campaign_progress(now, stop_reason)
+        stage_b["completed_campaign"] = self._closed_campaign
+        stage_b["open_campaign"] = (
+            None
+            if self._campaign_id is None
+            else {
+                "campaign_id": self._campaign_id,
+                "objective_boundary": self._campaign_boundary,
+                "started": self._campaign_started_at is not None,
+                "frozen_target_kwh": (
+                    None
+                    if self._campaign_frozen_target_kwh is None
+                    else round(self._campaign_frozen_target_kwh, 3)
+                ),
+                # **Committed plus the quarter in flight.** The committed sum
+                # advances only on a completed quarter, so quoting it alone would
+                # show a campaign frozen at its last boundary while energy was
+                # visibly moving.
+                "campaign_realized_kwh": round(self._campaign_realized_now(), 3),
+                "campaign_committed_kwh": round(self._campaign_realized_kwh, 3),
+                "quarters_admitted": self._campaign_quarters_admitted,
+                "rule": (
+                    "the realised figure accumulates across segments and holds "
+                    "across serve_load gaps; it is reset only when the campaign "
+                    "closes. the target is frozen at the first confirmed "
+                    "activation and may never shrink"
+                ),
+            }
+        )
         stage_b["admitted_plan"] = None if self._plan is None else self._plan.as_dict()
         stage_b["physical_decisions"] = list(self._physical_decisions)
         stage_b["write_boundary"] = {

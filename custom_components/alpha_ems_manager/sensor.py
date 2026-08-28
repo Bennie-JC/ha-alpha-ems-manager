@@ -67,6 +67,7 @@ from .activity import (
     PlannedRun,
     RunContent,
     RunIdentity,
+    TerminalView,
     category_of,
     direction_of,
     logbook_payload,
@@ -77,22 +78,27 @@ from .const import (
     BATTERY_KW_PRECISION,
     BATTERY_KWH_PRECISION,
     BATTERY_SOC_PRECISION,
+    CAMPAIGN_OUTCOMES,
     CONTROL_EXECUTABLE_ACTIONS,
     CONTROL_EXECUTION_AVAILABLE,
     CONTROL_MODE_ACTIVE,
     CONTROL_STATE_OPTIONS,
     DOMAIN,
+    ECONOMIC_ACTION_CHARGE,
     ECONOMIC_ACTION_CURTAIL,
     ECONOMIC_ACTION_EXPORT,
     ECONOMIC_ACTION_OPTIONS,
     ECONOMIC_ACTION_SAFETY_BUY,
+    ECONOMIC_BLOCKED_ACTION_NOT_EXECUTABLE,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
-    ECONOMIC_BLOCKED_LIVE_CHARGE_ONLY,
+    ECONOMIC_BLOCKED_EXPORT_NOT_PERMITTED,
     ECONOMIC_BLOCKED_MODE_NOT_ACTIVE,
     ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL,
-    ECONOMIC_BLOCKED_NO_PRIMITIVE_EXPORT,
+    ECONOMIC_BLOCKED_NONE,
     ECONOMIC_BLOCKED_NOT_ENABLED,
+    ECONOMIC_DIRECTION_CHARGE,
     ECONOMIC_EUR_PRECISION,
+    EXECUTION_INTENT_NET_EXPORT,
     EXECUTION_STATE_ARMED,
     EXECUTION_STATE_PREPARED,
     EXECUTION_STATE_RUNNING,
@@ -606,16 +612,33 @@ def _planned_runs(coordinator: AlphaEmsCoordinator) -> tuple[PlannedRun, ...]:
     # well was labelled refused by a comparison it was never part of. A run whose
     # own direction has an actuator is not refused, whatever the plan-level
     # comparison concluded about some other run.
+    # **Campaigns, not label slices, since beta.32.** ``runs_from`` splits on the
+    # action label, and the label flips between ``discharge`` and ``export`` as
+    # house load rises and falls beneath one physical discharge -- so on the live
+    # 17:45 horizon the DP charged three switching fees and this loop produced
+    # fifteen announcements. Fifteen Planned lines, fifteen cancellations, for
+    # three decisions. Grouping on the DP's own run state reproduces exactly the
+    # transitions the fee was charged against.
+    #
+    # The economic runs are still published in diagnostics: the label slices remain
+    # the honest per-interval record. What changed is what gets *announced*.
     runs: list[PlannedRun] = []
-    for run in outcome.desired.runs:
+    for run in outcome.desired.campaigns:
         start = _economic_instant(plan.target_day, run.start_index, count, tz)
         end = _economic_instant(plan.target_day, run.end_index + 1, count, tz)
         if start is None or end is None:
             continue
+        # **A campaign that sells nothing is not a Sell**, and the objective is
+        # what says so: a discharge campaign whose segments are all ``serve_load``
+        # has a meter objective of zero. It is self-consumption, which is inverter
+        # behaviour and not an event.
+        objective = run.objective_kwh
+        if not run.sell_announcement_material:
+            continue
         action = (
             ECONOMIC_ACTION_SAFETY_BUY
             if run.start_index in outcome.safety_buy_runs
-            else run.action
+            else _campaign_action(run)
         )
         # **beta.31: the category comes from the attribution, not from the label.**
         # ``safety_buy_runs`` is a set of indices, so it can only ever say yes or
@@ -624,12 +647,16 @@ def _planned_runs(coordinator: AlphaEmsCoordinator) -> tuple[PlannedRun, ...]:
         # reserve-relaxed counterfactual, so the word a user reads and the figures
         # a diagnostic reader audits cannot drift apart.
         category = category_of(
-            action, outcome.safety_buy_attribution.get(run.start_index)
+            action,
+            outcome.safety_buy_attribution.get(run.start_index),
+            # One category per campaign, decided by whether it sells. Derived from
+            # the label, this flipped mid-campaign and split one lifecycle in two.
+            sells=objective > 0.0,
         )
-        # ``run.action`` rather than the display label: a safety buy *is* a charge,
-        # and an actuator exists for it. Testing the label would mark every
-        # reserve-driven buy as impossible.
-        executable = run.action in IMPLEMENTED_ACTIONS
+        # The campaign's own action rather than the display label: a safety buy
+        # *is* a charge, and an actuator exists for it. Testing the label would
+        # mark every reserve-driven buy as impossible.
+        executable = _campaign_action(run) in IMPLEMENTED_ACTIONS
         runs.append(
             PlannedRun(
                 identity=RunIdentity(
@@ -638,7 +665,10 @@ def _planned_runs(coordinator: AlphaEmsCoordinator) -> tuple[PlannedRun, ...]:
                 ),
                 content=RunContent(
                     category=category,
-                    energy_kwh=run.energy_kwh,
+                    # **The campaign's objective, at the boundary it is paid at**:
+                    # the meter for a sale, the battery for a purchase. beta.31
+                    # announced a battery figure and then tracked a meter one.
+                    energy_kwh=objective,
                     end_utc=dt_util.as_utc(end),
                     window=f"{start:%H:%M}-{end:%H:%M}",
                     executable=executable,
@@ -646,6 +676,19 @@ def _planned_runs(coordinator: AlphaEmsCoordinator) -> tuple[PlannedRun, ...]:
             )
         )
     return tuple(runs)
+
+
+def _campaign_action(campaign: Any) -> str:
+    """Return the action label one campaign's direction implies.
+
+    A campaign is a *direction*, which is the DP's own unit; the action labels are
+    the slices inside it. A discharge campaign is labelled ``export`` because that
+    is the action an actuator would have to perform for the part of it that has an
+    objective -- the ``serve_load`` part needs no actuator and emits nothing.
+    """
+    if campaign.direction == ECONOMIC_DIRECTION_CHARGE:
+        return ECONOMIC_ACTION_CHARGE
+    return ECONOMIC_ACTION_EXPORT
 
 
 def _economic_activity(
@@ -690,9 +733,49 @@ def _execution_view(coordinator: AlphaEmsCoordinator) -> ExecutionView | None:
     target = report.get("target") or {}
     progress = report.get("progress") or {}
     power = report.get("power") or {}
+    # **The terminal is built before anything else, and the ordering is the fix.**
+    # A campaign ends on the 60-second tick, which wipes the carriers and publishes
+    # no plan; every beta.31 path returned ``None`` there for want of a live
+    # ``intent``, so the ending was never described and the Planned line stayed
+    # standing as though still true. That is R10, and this is why the incident's
+    # 17:45 refresh could not speak.
+    terminal = _terminal_view(report)
     intent = report.get("intent")
     if not isinstance(intent, str):
-        return None
+        # A terminal-only view: there is an ending to describe and nothing running.
+        if terminal is None:
+            return None
+        return ExecutionView(executed=True, terminal=terminal)
+
+    # **One objective pair, chosen where the objective is defined.** A charge aims
+    # at the battery figure and an export at the meter figure; the other one is a
+    # ceiling, and a ceiling in a sentence about an objective is what published
+    # ``Tracking 0.25 kWh`` beside ``Planned ... 0.11 kWh``.
+    # **The campaign figure is the public quantity, per the beta.32 lifecycle.**
+    # Stage B necessarily sees a campaign as several separate windows, and quoting
+    # whichever it currently holds is how one sale came to be announced at
+    # 2.65 kWh and tracked at a segment's share of it. Frozen at Started, so it
+    # cannot shrink under a replan either.
+    campaign = report.get("open_campaign")
+    if isinstance(campaign, dict) and campaign.get("frozen_target_kwh") is not None:
+        objective_target = float(campaign["frozen_target_kwh"])
+        objective_realized = float(campaign.get("campaign_realized_kwh") or 0.0)
+    elif intent == EXECUTION_INTENT_NET_EXPORT:
+        objective = target.get("grid_target_kwh")
+        if objective is None:
+            # **A fault, not a zero.** An export target with no meter figure cannot
+            # be tracked, and announcing 0.00 kWh for it would invite a reader to
+            # look for a shortfall where there is a missing field.
+            return (
+                None
+                if terminal is None
+                else ExecutionView(executed=True, terminal=terminal)
+            )
+        objective_target = float(objective)
+        objective_realized = float(progress.get("grid_export_realized_kwh") or 0.0)
+    else:
+        objective_target = float(target.get("battery_target_kwh") or 0.0)
+        objective_realized = float(progress.get("battery_realized_kwh") or 0.0)
     opens = report.get("window_start")
     closes = report.get("window_end")
     identity = None
@@ -720,8 +803,8 @@ def _execution_view(coordinator: AlphaEmsCoordinator) -> ExecutionView | None:
         # wording is decided by ``executed``, not by this.
         running=report.get("state") in (EXECUTION_STATE_ARMED, EXECUTION_STATE_RUNNING),
         executed=bool(power.get("executed")),
-        target_kwh=float(target.get("battery_target_kwh") or 0.0),
-        delivered_kwh=float(progress.get("battery_realized_kwh") or 0.0),
+        objective_target_kwh=objective_target,
+        objective_realized_kwh=objective_realized,
         intent=intent,
         stop_reason=(report.get("result") or {}).get("stop_reason"),
         inhibit_reason=(report.get("result") or {}).get("inhibit_reason"),
@@ -735,6 +818,37 @@ def _execution_view(coordinator: AlphaEmsCoordinator) -> ExecutionView | None:
         # Set for exactly one refresh, and only after a write carrying an
         # activation actually succeeded.
         activation_confirmed=bool(coordinator.activation_confirmed),
+        terminal=terminal,
+        campaign_open=isinstance(campaign, dict) and bool(campaign.get("started")),
+    )
+
+
+def _terminal_view(report: dict[str, Any]) -> TerminalView | None:
+    """Return the latched campaign outcome, or ``None``.
+
+    A thin reading of ``control.execution.completed_campaign``, which the
+    coordinator writes when a campaign closes -- outcome already decided, from the
+    measurements taken where the energy moved. Nothing is computed here: this
+    function contains no tolerance and no reason-to-outcome mapping, because both
+    belong to the layer that measured the energy and neither belongs to a sensor.
+    """
+    latched = report.get("completed_campaign")
+    if not isinstance(latched, dict):
+        return None
+    campaign_id = latched.get("campaign_id")
+    outcome = latched.get("outcome")
+    if not isinstance(campaign_id, str) or outcome not in CAMPAIGN_OUTCOMES:
+        return None
+    target = latched.get("objective_target_kwh")
+    return TerminalView(
+        campaign_id=campaign_id,
+        outcome=outcome,
+        objective_target_kwh=None if target is None else float(target),
+        objective_realized_kwh=float(latched.get("objective_realized_kwh") or 0.0),
+        objective_boundary=latched.get("objective_boundary"),
+        reason=latched.get("reason"),
+        measurable=bool(latched.get("objective_measurable", True)),
+        started=bool(latched.get("started")),
     )
 
 
@@ -750,6 +864,13 @@ def _economic_blocked_reason(coordinator: AlphaEmsCoordinator) -> str:
     controls -- the enable and the mode -- and below them the direction: an action
     outside :data:`CONTROL_EXECUTABLE_ACTIONS` is blocked for being that action, not
     for lacking an actuator.
+
+    **Two of beta.31's answers were false, and beta.32 removes both.** An export
+    returned ``no_primitive_export`` while ``CONTROL_EXECUTABLE_ACTIONS_BY_INTENT``
+    has authorised an admitted ``net_export`` since beta.27 and the hardware has
+    performed one; and everything else fell through to
+    ``live_direction_not_executable``, which described a user who had switched
+    battery export off as a missing capability rather than as a setting.
     """
     if not CONTROL_EXECUTION_AVAILABLE:
         return ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE
@@ -759,15 +880,21 @@ def _economic_blocked_reason(coordinator: AlphaEmsCoordinator) -> str:
         return ECONOMIC_BLOCKED_MODE_NOT_ACTIVE
     outcome = _economic_outcome(coordinator)
     if outcome is not None:
-        # A missing actuator is a different fact from a direction this release does
-        # not execute, and they must not be reported as the same thing.
         if outcome.action == ECONOMIC_ACTION_EXPORT:
-            return ECONOMIC_BLOCKED_NO_PRIMITIVE_EXPORT
+            # Executable since beta.27, so the only thing that can stand in the
+            # way is the user's own permission -- which is theirs to change, and
+            # says so.
+            if not coordinator.config.allow_battery_export:
+                return ECONOMIC_BLOCKED_EXPORT_NOT_PERMITTED
+            return ECONOMIC_BLOCKED_NONE
         if outcome.action == ECONOMIC_ACTION_CURTAIL:
+            # Genuinely absent: no release commands the inverter to decline
+            # production, and the plan reports ``hold`` while saying what it wanted.
             return ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL
-        if outcome.action not in CONTROL_EXECUTABLE_ACTIONS:
-            return ECONOMIC_BLOCKED_LIVE_CHARGE_ONLY
-    return ECONOMIC_BLOCKED_LIVE_CHARGE_ONLY
+        if outcome.action in CONTROL_EXECUTABLE_ACTIONS:
+            return ECONOMIC_BLOCKED_NONE
+        return ECONOMIC_BLOCKED_ACTION_NOT_EXECUTABLE
+    return ECONOMIC_BLOCKED_ACTION_NOT_EXECUTABLE
 
 
 def _economic_window(coordinator: AlphaEmsCoordinator, run: Any) -> str | None:

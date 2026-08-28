@@ -52,7 +52,7 @@ from custom_components.alpha_ems_manager.battery import (
 )
 from custom_components.alpha_ems_manager.const import (
     ECONOMIC_ACTION_CHARGE,
-    ECONOMIC_ACTION_DISCHARGE,
+    ECONOMIC_ACTION_CURTAIL,
     ECONOMIC_ACTION_EXPORT,
     ECONOMIC_ACTION_HOLD,
     ECONOMIC_BUCKET_BAND_KWH,
@@ -533,18 +533,27 @@ def test_producing_the_capability_plan_by_filtering_is_caught() -> None:
     longer happens -- so it reports a capability the actuators do not have.
     """
     table = reference_table()
-    outcome = outcome_for(table, eight_interval_horizon(table), start_kwh=START_KWH)
+    # **Curtailment since beta.32**, because it is the only action left without an
+    # actuator: ``export`` joined :data:`IMPLEMENTED_ACTIONS` once it was admitted
+    # that ``CONTROL_EXECUTABLE_ACTIONS_BY_INTENT`` had authorised it since
+    # beta.27. A horizon with no gap cannot demonstrate anything about how the gap
+    # is computed.
+    horizon = horizon_for(
+        table,
+        demands=flat_demands(2, load_kwh=0.25, pv_kwh=3.0),
+        prices=[IntervalPrice(import_eur_kwh=0.30, export_eur_kwh=-0.10)] * 2,
+    )
+    outcome = outcome_for(table, horizon, start_kwh=22.0, terminal_kwh=22.0)
 
-    desired = [(run.action, run.start_index) for run in outcome.desired.runs]
-    capability = [(run.action, run.start_index) for run in outcome.capability.runs]
+    desired = [run.action for run in outcome.desired.runs]
+    capability = [run.action for run in outcome.capability.runs]
 
-    assert desired == [(ECONOMIC_ACTION_CHARGE, 0), (ECONOMIC_ACTION_EXPORT, 4)]
-    assert capability == [
-        (ECONOMIC_ACTION_CHARGE, 2),
-        (ECONOMIC_ACTION_DISCHARGE, 4),
-    ]
-    # A filtered copy would have kept the four-interval charge window.
-    assert capability[0][1] != desired[0][1]
+    assert ECONOMIC_ACTION_CURTAIL in desired
+    # A filtered copy would have dropped the curtailment and published nothing in
+    # its place. A separate solve answers "what would the plant do instead", and
+    # the answer is a different action rather than an absence.
+    assert ECONOMIC_ACTION_CURTAIL not in capability
+    assert capability, "a filtered plan would be empty where the desired one acts"
 
 
 def test_measuring_caused_export_against_zero_is_caught() -> None:
@@ -2191,6 +2200,15 @@ def test_running_a_fourth_solve_to_price_nothing_is_caught() -> None:
     against live data before it is trusted with money. Three things keep it from
     becoming the fault beta.18 removed -- it is gated behind ``compare_legacy``, it
     is requested in Shadow alone, and it is documented as temporary.
+
+    beta.32 adds two more on the same terms, and both are conditional. The ungated
+    pass establishes which refill the export permission is protecting, and runs only
+    when there is measured evidence to build a permission from -- without that
+    guard it would be a byte-identical re-solve, which is precisely the fault this
+    test was written for. And when the anti-churn head bump moves the enforced head,
+    the ungated pass is re-solved on that head, so the published export-gate cost
+    prices the permission rather than the buffer; that runs only on a refresh where
+    a Safety Buy is already compelled.
     """
     source = pathlib.Path(economic_module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -2205,15 +2223,58 @@ def test_running_a_fourth_solve_to_price_nothing_is_caught() -> None:
                 ):
                     calls += 1
 
-    # Three unconditional, plus one that only runs when a caller asks for the
-    # architecture comparison. Asserted as an exact count so a fifth is a visible
+    # **Three unconditional since beta.32, plus three that only run when something
+    # asks for them.** Asserted as an exact count so a seventh is a visible
     # decision rather than a quiet cost.
-    assert calls == 4
+    #
+    # The ungated probe is the opposite of the fault this test was written for: it
+    # does not price a constraint that no longer exists, it *establishes* one. The
+    # export permission needs to know which refill the plan expects to use, and no
+    # non-circular definition of that exists without solving once without the
+    # permission. Its cost difference is then the audit figure.
+    #
+    # And it is **conditional**, for exactly the reason this test exists: with no
+    # measured evidence the permission is off, so an ungated pass would be
+    # byte-identical to the desired one -- a solve whose difference from another is
+    # identically zero by construction, which is the fault beta.18 deleted.
+    assert calls == 6
 
-    # And the fourth is genuinely conditional: it cannot run unless asked.
+    # And both extras are genuinely conditional: neither can run unless asked.
     guarded = [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.If) and "compare_legacy" in ast.dump(node.test)
     ]
     assert guarded, "the legacy comparison solve must be behind compare_legacy"
+
+    # **Both conditional solves must actually be conditional.** Counting is not
+    # enough -- the fault this test guards against is an *unconditional* solve, and
+    # a count alone cannot tell the difference. Decided by ancestry: a solve is
+    # conditional exactly when an ``if`` stands between it and the function body.
+    build_outcome = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "build_outcome"
+    )
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(build_outcome):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+
+    def _is_conditional(node: ast.AST) -> bool:
+        while (parent := parents.get(id(node))) is not None:
+            if isinstance(parent, ast.If):
+                return True
+            node = parent
+        return False
+
+    solves = [
+        node
+        for node in ast.walk(build_outcome)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "solve"
+    ]
+    conditional = [node for node in solves if _is_conditional(node)]
+    assert len(conditional) == 3, "exactly three solves may be conditional"
+    assert len(solves) - len(conditional) == 3, "three solves run every refresh"

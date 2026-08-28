@@ -510,7 +510,7 @@ async def test_the_economic_surface_writes_nothing_in_active_mode(
     frank,
     economic_service_calls: list,
 ) -> None:
-    """Eight quarter-hours, in the most permissive mode the release can reach.
+    """A day of quarter-hours, in the most permissive mode the release can reach.
 
     The static proofs above show that no Phase-8 module *names* a service. This
     is the other half: the integration actually running, with real prices so the
@@ -520,8 +520,22 @@ async def test_the_economic_surface_writes_nothing_in_active_mode(
     Asserted positively as well as negatively. Silence while the plan was
     unavailable and the logbook empty would prove nothing, so the plan must be
     available with runs in it and at least one Activity line must have been filed
-    before the zero below is worth anything.
+    before the zero below is worth anything -- and at least one of them must be a
+    **sale**, since a sale is the line whose marker beta.32 changed.
+
+    **The sweep is a full day since beta.32, and that is the point of the change.**
+    Through beta.31 eight quarters sufficed because the plan put a discharge run in
+    the near term and slid it forward one interval per refresh -- three
+    ``Plan Replaced`` cancellations in two hours, which is the churn this release
+    exists to remove. With the idle counterfactual corrected, an interval in which
+    the inverter already serves the house from the battery no longer looks like a
+    reason to pay a switching fee, so the sale concentrates at the single best
+    price of the day and stops moving. The sweep therefore has to run until it
+    *reaches* that sale, rather than relying on a run that was never going to
+    happen where the old plan said it would.
     """
+    from datetime import timedelta
+
     from homeassistant.const import EVENT_LOGBOOK_ENTRY
 
     from custom_components.alpha_ems_manager.const import (
@@ -546,16 +560,23 @@ async def test_the_economic_surface_writes_nothing_in_active_mode(
     # half of the economic surface is made of.
     from .test_beta24_live_charge import sell_now_price
 
-    frank.publish(today=synthetic_day(NORMAL, price_at=sell_now_price), tomorrow=None)
+    day = synthetic_day(NORMAL, price_at=sell_now_price)
+    # Tomorrow as well, so the horizon does not collapse late in the sweep: the
+    # optimiser must stay *available* for the whole day, or the silence below is
+    # silence from a plan that had nothing to say.
+    frank.publish(today=day, tomorrow=day)
     # Both opt-ins on: the state that gives the optimizer something to advise,
     # and therefore the state in which a write would actually be tempting.
     allow_trading(coordinator, allow_grid_charging=True, allow_battery_export=True)
     await set_mode(hass, CONTROL_MODE_ACTIVE)
 
     outcomes = []
-    for quarter in range(8):
-        hour, minute = 10 + quarter // 4, 15 * (quarter % 4)
-        await refresh_at(coordinator, local(NORMAL, hour, minute))
+    started = local(NORMAL, 10, 15)
+    # Stops at 23:30: the refresh after that crosses midnight, and a horizon whose
+    # first interval belongs to a different day is a separate question from this
+    # one.
+    for quarter in range(54):
+        await refresh_at(coordinator, started + timedelta(minutes=15 * quarter))
         outcomes.append(coordinator.data["economic"])
 
     # The surface was live, or the zero below means nothing.
@@ -568,21 +589,29 @@ async def test_the_economic_surface_writes_nothing_in_active_mode(
     assert economic_service_calls == []
     assert_charge_only_capability()
     assert (coordinator.control_report or {}).get("last_write") is None
+    sells = 0
     for entry in logbook:
         assert entry["name"] == activity_module.ACTIVITY_NAME
-        # **Every line disclaims execution, in one word since beta.31.** Through
-        # beta.30 it was a whole sentence -- "Advisory only: no command is sent for
-        # this action." -- repeated on line after line until a reader stopped
-        # seeing it, which is worse than a short marker they do read.
-        assert entry["message"].endswith(("— Advisory", "— Shadow")), entry["message"]
-        # And the stronger claim, which the disclaimer was only ever a proxy for:
-        # no line says the battery did anything. A start, a success and an error
-        # are execution kinds and are unreachable for an action with no actuator.
+        # **No line is advisory in Active mode, and that inversion is the beta.32
+        # correction.** Through beta.31 a Live sell carried ``— Advisory`` because
+        # :data:`IMPLEMENTED_ACTIONS` said no actuator existed for an export --
+        # while ``CONTROL_EXECUTABLE_ACTIONS_BY_INTENT`` had authorised an admitted
+        # ``net_export`` since beta.27 and the hardware had performed one. So the
+        # marker was appended to lines a command was about to be sent for, which is
+        # the one claim a writing release must not get wrong.
+        assert not entry["message"].endswith("— Advisory"), entry["message"]
+        assert not entry["message"].endswith("— Shadow"), entry["message"]
+        if " Sell " in entry["message"]:
+            sells += 1
+        # And the claim the disclaimer was only ever a proxy for: no line says the
+        # battery did anything. A start, a success and an error are execution
+        # kinds, and this whole test is the proof that nothing was sent.
         assert " Started " not in entry["message"]
         assert not entry["message"].startswith("Finished ")
+    assert sells, "no sale was announced, so the marker rule proves nothing"
 
     # And it did not repeat itself. The live symptom was a near-identical line
-    # every quarter of an hour about a run already under way, so eight refreshes
-    # producing eight variations of one sentence is the failure this catches.
+    # every quarter of an hour about a run already under way, so a day of refreshes
+    # producing a day of variations on one sentence is the failure this catches.
     messages = [entry["message"] for entry in logbook]
     assert len(messages) == len(set(messages)), messages

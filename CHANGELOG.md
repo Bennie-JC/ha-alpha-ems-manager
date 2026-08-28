@@ -9,6 +9,294 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.32] - 2026-08-28
+
+**The calm optimiser.** `beta.31` shipped the right economic architecture. `beta.32`
+fixes what sits *around* it — the surfaces that describe the plan, the layer that
+groups it, and the one thing standing between a discretionary export and the 20 %
+floor. Every root cause was found by reading the code against a live diagnostic, and
+four of the design's own formulas were wrong and were corrected by working the
+numbers.
+
+The objective is unchanged in every case where measured evidence is absent. An
+installation with no rolling forecast window plans exactly as `beta.31` did.
+
+### Fixed: a discretionary export could sell the household into a compelled purchase
+
+The only protection between a sale and the hard floor was the **uncertainty margin**,
+and on this installation that is a constant 0.42 kWh on a reachability curve that is
+a flat line at `floor + margin` on every refresh. Its statistical half was
+`mae × √n` with `n ≡ 0`, because `grid_credit_allowed` is `position < actionable` and
+actionable is at least 1 whenever prices exist — so the term was structurally inert.
+
+Measured: a quiet forecast exported 3.950 kWh at 0.29 €/kWh and took the pack to
+**22.0 %**; reality arrived at 3.4× the forecast load and the next refresh was
+compelled to buy **0.833 kWh** at whatever the market asked.
+
+`beta.32` prices the export instead of raising the floor. An export delta that
+crosses the meter beyond what the site would have spilled anyway is refused when its
+price does not beat the **demand-weighted mean import price** across the window to
+the refill the plan itself expects to use — and only when the pack would land below
+what it needs to reach that refill. On the invariant scenario the compelled purchase
+goes **0.833 → 0.000 kWh** while the minimum state of charge stays at **25.6 %**: the
+pack is still spent on the house, which is the half a raised floor would have broken
+(it stranded the pack at 35.4 % and cost €0.547, against €0.031 for the price).
+
+The window is **the plan's own charge campaign**, not the first tolerable price. Every
+price-only rule fails the same counter-example: with `[0.30 now, 0.24 tonight,
+0.35 × n, 0.12 tomorrow]` a relative test picks tonight's mediocre 0.24, and the
+household would be far better off surviving to 0.12. The circularity is cut by two
+fixed passes, and the difference between them is published as
+`export_gate_cost_eur` — so a protection that ever costs real money says so.
+
+### Fixed: an export run could report success before delivering anything
+
+**The highest-severity defect in the set.** `demand_for` compared the **battery**
+remainder against `TARGET_TOLERANCE_KWH` for every intent. An export run whose
+battery ceiling was at or below 0.25 kWh therefore satisfied
+`remaining <= tolerance` on its *first* evaluation — before a single kilowatt-hour
+crossed the meter — and reported `target_reached`, stopped and reset. Reachable on any
+mid-quarter refresh while owned: a reload, a restart, a user action. The observed
+run's ceiling was exactly 0.25.
+
+The objective is at the meter; the controller's progress is battery-side, so it
+cannot judge completion for an export at all. The battery figure is a **ceiling**, and
+a ceiling is never a completion test.
+
+### Fixed: three lines per label slice, for one decision
+
+`runs_from` splits on the action *label*, and the label flips between `discharge` and
+`export` whenever house load crosses the smallest representable discharge. Measured on
+a realistic today+tomorrow horizon: the objective flagged **three** run-state
+transitions and charged three switching fees, while the published plan carried
+**fifteen** runs — with `charged_switching_fee` false on every artefact split, because
+the objective never saw them.
+
+`beta.32` adds the **campaign**: a maximal contiguous stretch of one objective run
+state, which reproduces exactly the transitions the fee was charged against. Fifteen
+label slices become three campaigns, and `len(campaigns) == direction_changes` by
+construction — the proof that this layer changed no decision. The label slices are
+still published; what changed is what gets *announced*.
+
+Inside a campaign, three further layers are now named rather than conflated:
+`segments` (contiguous same-intent, which is what the controller can be handed),
+the per-quarter frozen objective, and the campaign's own meter objective. On the live
+discharge campaign that means 8.750 kWh of battery, 2.648 kWh sold at the meter and
+**6.102 kWh AC fed to the house** — the largest quantity in the campaign, and
+previously invisible.
+
+### Fixed: a finished export terminated in silence
+
+Since `beta.29` the hardware is armed from the admitted quarter and stopped from the
+60-second tick. **`Decision` stopped being the executor two releases ago, and the
+Activity surface was still wired to it** — so the ending happened on a tick that wipes
+the carriers and publishes no coordinator data, the next refresh had no intent, and
+the view returned nothing. The measured 17:30–17:45 export therefore ended with no
+line at all, its `Planned` announcement left standing as though still true.
+
+The campaign outcome is now computed **where the energy was measured**, latched before
+anything can be wiped, and rendered by a surface that decides nothing. Consequences:
+
+- `Finished — Partial` exists. `beta.31` had only Success and Cancelled, so a campaign
+  that delivered most of what it promised was filed as a cancellation.
+- `Failed Plan ID:` replaces `Finished … — Error`, which was self-contradictory in
+  four words. The event **kind** is unchanged, so nothing a consumer subscribes to
+  moved.
+- The observed 0.096 / 0.11 kWh export is a **Success**. The shortfall was 0.56 of one
+  actuator step; no command could have closed it, and the completion tolerance has
+  left the presentation layer entirely.
+- Success outranks Cancelled deliberately: *the money made outranks the reason the
+  plan then changed*. Failed outranks Success, as the honesty guard.
+- The target is **frozen at the first confirmed activation** and may never shrink. A
+  vanishing later segment yields `Partial` against what was promised, not a
+  retroactively satisfied smaller number.
+- Four reasons the controller has always produced — safety, marker lost, progress
+  unknown after a restart, and a failed command — reached the surface as
+  "Canceled — Plan Replaced", which was false in each case. All four are now named,
+  and `execution_error` is read for the first time since it was written.
+- Two reasons the surface named and nothing could produce (`reserve_limit`,
+  `no_charge_ceiling`) are deleted. A new test forbids the next one.
+
+### Fixed: `export` claimed to have no actuator
+
+`CONTROL_EXECUTABLE_ACTIONS_BY_INTENT` has authorised an admitted `net_export` since
+`beta.27`, `CONTROL_LIVE_DISPATCH_INTENTS` contains it, and the hardware has performed
+one — while `IMPLEMENTED_ACTIONS` said no actuator existed. Not a label: it bounded the
+**capability solve**, so every export day reported euros the plant supposedly could not
+capture, and it put an `Advisory` marker on Live export lines a command was about to be
+sent for.
+
+`export` is now in the set. Export remains gated by your `allow_battery_export`
+setting at every decision — an actuator existing and a user permitting its use are
+different questions.
+
+### Fixed: an idle interval was charged full import price
+
+`docs/ARCHITECTURE.md` has asserted since Phase 2 that baseline self-consumption is
+real in the default configuration, and nothing checked: the only measurement in the
+codebase detects the **charge** direction. `beta.32` adds the missing detection,
+mirroring the surplus-absorption detector's shape exactly — wrapped, never raises, and
+**unknown means not modelled**, because the optimistic error would be a plan that
+believes the house is fed for free.
+
+It matters beyond reporting. `unavoidable_import` feeds `grid_charge_kwh`, which is the
+basis for the grid-charge margin, so an overstated unavoidable import *understates* the
+margin and biases the plan toward charging too readily. And an idle interval whose real
+import is near zero was being priced as a full purchase, which biased the objective
+toward paying a switching fee to start a discharge that idling already achieves.
+
+With ambient self-consumption unmodelled, every published euro figure is byte-identical
+to `beta.31`. The state *transition* is deliberately not corrected, and the reason is
+recorded: 0.105 kWh DC of ambient discharge against a 0.264 kWh lattice bucket is not
+representable.
+
+### Fixed: four formulas in the design, corrected by arithmetic
+
+Each of these was wrong in a reviewed draft and was caught by working the numbers.
+
+- **The exportable surplus double-counted the hard floor.** `reserve.py` computes
+  `required = floor + deficit`, and production calls it twice — a probe at the bare
+  floor to size the margin, then the real projection at `floor + margin` — so
+  `reachability_now` already contains both. On the live figures the surplus is
+  `14.77 − 5.13 = 9.64` kWh DC, not 5.32.
+- **The hold-versus-export comparison had one conversion too many.** One DC kWh held
+  to serve the house avoids `p_import × η_d`; the same kWh exported earns
+  `p_export × η_d`. Same energy, same single conversion — **it cancels**, and the
+  comparison is prices directly. Dividing by the round trip made the gate ~11 % too
+  strict, enough to refuse genuinely good trades.
+- **The anti-churn buffer's decay was inverted**, so it was largest when the refill
+  was *closest*. There is no decay constant now: the distance lives in the quantity.
+- **The export-gate audit was measured on the wrong objective.** `cost_eur` is the
+  metered cash flow alone; the recursion also charges the switching fee, the
+  grid-charge margin and the throughput cost. On the live horizon `cost_eur` fell
+  €0.022 while the fee rose €0.20, so the audit published **−0.022** for a protection
+  that had cost €0.178. `EconomicPlan.objective_eur` now names the scalar the
+  recursion minimises, and comparisons use it.
+
+### Added: the forecast quality that was measured and read by nobody
+
+Every input is an existing computed quantity. No price forecasting, no new user
+setting, no learning redesign.
+
+- **`error_persistence`** — new in `metrics.py`, and it answers a question no
+  assumption could settle. An allowance for cumulative error over `n` intervals grows
+  as `mae × √n` if the errors are independent and as `mae × n` if they are perfectly
+  persistent; neither is defensible, and `beta.31`'s implicit `√n` is why its
+  statistical term was inert. The window's own rows hold the answer:
+  `|predicted − actual| / Σ|error|`, per day, averaged. **Measured, with no free
+  statistical constant.**
+- **The signed bias, one-sided.** `bias_kwh` is positive when the model
+  over-predicts, so only a measured *under*-prediction widens the allowance: only that
+  direction can strand the pack.
+- **Today's adaptation, protection only and capped at 1.5.** Today's measured
+  consumption is the best evidence about today's remaining consumption, so it is used
+  — for protection, never for the cost objective, and never for tomorrow. A structural
+  test asserts the adapted estimate reaches no priced quantity.
+- **Sparse history yields *more* protection, never zero.** A missing persistence ratio
+  means `rho = 1`, the conservative end. An earlier draft would have removed all
+  protection at 11 learned days, which is exactly when it is most needed.
+
+### Added: the anti-churn extension, and why it is not a reserve
+
+A compelled Safety Buy that buys the bare minimum is compelled again on the next
+refresh. So while a bridge exists, the enforced requirement at the **head interval
+only** is raised by one lattice bucket plus the smaller of the expected load and the
+measured error over the window to the refill.
+
+Four properties make it structurally incapable of becoming a second autonomy reserve:
+it is gated on a condition its own action destroys, so it cannot survive two
+consecutive refreshes after being satisfied; it touches interval 0 and nothing else;
+it never raises the physical curve, so the compulsory/discretionary split stays
+measured against pure physics; and **it cannot initiate a purchase** — no bridge, no
+bump.
+
+Purchase attribution is therefore three-way, not two: the physical requirement, the
+triggered extension, and ordinary discretionary energy. Each publishes **two**
+booleans, because initiating a purchase and enlarging an already-triggered one are
+different powers, and only physical reachability carries the first.
+
+### Unchanged, deliberately
+
+- **The 20 % physical floor** remains the only hard inventory bound.
+- **`reserve.py` is still price-blind.** A draft proposed narrowing its grid credit to
+  economically attractive intervals via a boolean mask; it was **withdrawn**, because
+  even as a boolean a price-derived mask makes the lexicographic physical reserve
+  depend on economics. The physical curve therefore stays flat at `floor + margin` on
+  this installation, and that is correct physics — with a 10 kW connection the grid
+  genuinely can refill the pack next quarter. The defect was never the flatness; it
+  was using that flat line as the only protection for a discretionary export.
+- **Self-consumption is never gated**, so the pack can always reach its floor feeding
+  the house. The export permission refuses a caused-export delta and nothing else.
+- **With `allow_battery_export` off, nothing broadens permitted export** — and the
+  battery is nonetheless usable again at low load. A draft proposed permitting a
+  bounded spill so that a house load below one discharge bucket could still be served
+  from the pack; implementation measured the production lattice and found the assumed
+  bound wrong by an order of magnitude. The smallest non-zero discharge is
+  **0.250 kWh AC**, not the 0.025 kWh actuator step, so serving a 0.19 kWh load would
+  spill 0.060 kWh every quarter — approaching several kWh a day of metered export
+  against an explicit instruction. That proposal was withdrawn.
+
+  The fault it was trying to fix was real, and severe: with export disabled, every
+  representable discharge overshot a sub-bucket load, tripped `caused_export` and was
+  refused, so **the pack sat idle while the house imported**. Measured at
+  0.19 kWh/quarter in a dear 0.35 window: 0.000 kWh discharged, 4.560 kWh imported,
+  **€2.143** for a day the battery could have covered outright.
+
+  It is fixed by the idle-counterfactual correction instead, and no export is
+  involved. When the inverter is known to serve residual load from the battery
+  unbidden, an idle interval is *modelled as* doing so — continuously, outside the
+  bucket grid, clamped at the floor and at discharge power — so the plan stops
+  believing it must choose between a 0.250 kWh dispatch and a full-price import.
+  Measured after the fix, at 0.05 / 0.10 / 0.19 / 0.22 / 0.24 kWh per quarter: the
+  house is served in full with **zero export and zero import**, and the cost is zero.
+  Nothing about the no-export instruction was weakened — the spill is not permitted;
+  it is no longer necessary.
+- **Stage-B safety is untouched.** The fail-closed gates, the ownership protection, the
+  dead-man failsafe, the foreign-dispatch protection and the non-executable
+  `serve_load` intent are all unchanged.
+- **No published `quarter_expired`-family value strings change.** Five strings are
+  shared across four vocabularies; renaming them would break a user automation for
+  tidiness. Disambiguation is *added* — every published ending carries
+  `reason_vocabulary` — and a new test allows exactly those five collisions and fails
+  the build on a sixth.
+
+### Changed: figures and text a reader may notice
+
+- `shortfall_percent` can now be **null**. It published `140 %` against a 0.01 kWh
+  objective — arithmetically correct and useless, since a percentage of a figure
+  smaller than one actuator step is noise. A signed
+  `objective_tracking_error_kwh` is published instead, which is the figure that can
+  distinguish meter-side tracking lag from noise.
+- `economic_value_forgone_eur` drops to ~0 on export days, because the plant can now
+  do what the plan wants.
+- `capability_gap_reason` no longer returns `no_primitive` for an export; curtailment
+  is the only action left without an actuator.
+- `execution_blocked_reason` can now say `none`. It returned a blocking reason
+  unconditionally, including on a Live charge this release does send.
+- Activity message text changes: `Partial`, `Failed Plan ID:`, and no `Advisory`
+  marker on a Live sale. A filter on the literal `"Error"` stops matching.
+- Execution plan ids change, because identity is now anchored on the campaign. Run
+  ownership is unaffected — it keys on the minted `run_id` — and `execution_revision`
+  restarts at 1 once. A pre-`beta.32` in-flight claim that cannot be matched **fails
+  closed**.
+- `campaign_id` is optional with a `None` default everywhere it appears; absent means
+  fall back to run-level behaviour, never an error.
+- No entity id, unique id or state value changes. `STORAGE_MINOR_VERSION` unchanged.
+
+### Verification
+
+4020 tests pass, 1 skipped. `ruff check`, `ruff format --check` and
+`git diff --check` clean. New suites: the export permission and its measured evidence,
+the campaign lifecycle, multi-quarter export execution (the release's real new risk
+surface, which nothing covered before), the published diagnostics and their
+arithmetic, the four-quantity architectural gate, and the vocabulary guard.
+
+Live `net_export` has been executed on this hardware, and the multi-quarter export
+campaign this release creates has **not** — it is new behaviour, tested but not yet
+observed on the inverter across a boundary. `objective_tracking_error_kwh` is
+published so a week of real export quarters can settle whether the observed 13 %
+shortfall was meter-side lag or noise.
+
 ## [1.0.0-beta.31] - 2026-08-28
 
 **The economic correctness release.** `beta.30` fixed the controller's hands;
@@ -4459,7 +4747,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.31...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.32...HEAD
+[1.0.0-beta.32]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.31...v1.0.0-beta.32
 [1.0.0-beta.31]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.30...v1.0.0-beta.31
 [1.0.0-beta.30]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.29...v1.0.0-beta.30
 [1.0.0-beta.29]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.28...v1.0.0-beta.29

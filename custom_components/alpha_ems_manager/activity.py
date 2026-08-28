@@ -104,13 +104,14 @@ from .const import (
     ECONOMIC_EVENT_PLANNED,
     ECONOMIC_EVENT_STARTED,
     ECONOMIC_EXECUTION_EVENT_KINDS,
+    EXECUTION_STOP_BATTERY_CEILING,
     EXECUTION_STOP_EXECUTION_ERROR,
     EXECUTION_STOP_GRID_CEILING,
     EXECUTION_STOP_HEADROOM_REACHED,
-    EXECUTION_STOP_NO_CHARGE_CEILING,
+    EXECUTION_STOP_MARKER_LOST,
     EXECUTION_STOP_OWNERSHIP_CONFLICT,
     EXECUTION_STOP_PLAN_REPLACED,
-    EXECUTION_STOP_RESERVE_LIMIT,
+    EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
     EXECUTION_STOP_SAFETY,
     EXECUTION_STOP_STAGE_A_HOLD,
     EXECUTION_STOP_STALE_PLAN,
@@ -120,8 +121,10 @@ from .const import (
     EXECUTION_STOP_TIMER_NOT_REFRESHED,
     EXECUTION_STOP_WINDOW_ENDED,
     MAX_ECONOMIC_RUNS_TRACKED,
+    OUTCOME_FAILED,
+    OUTCOME_PARTIAL,
+    OUTCOME_SUCCESS,
 )
-from .execution import TARGET_TOLERANCE_KWH
 
 #: The name every entry is filed under.
 #:
@@ -179,6 +182,7 @@ _CATEGORY_DIRECTIONS = {
 #: no snake_case. A reader is told what happened to their battery, not which
 #: branch fired -- the branch is in diagnostics, where it belongs.
 _CANCEL_REASONS: dict[str, str] = {
+    EXECUTION_STOP_BATTERY_CEILING: "Battery Limit Reached",
     EXECUTION_STOP_PLAN_REPLACED: "Plan Replaced",
     EXECUTION_STOP_WINDOW_ENDED: "Window Expired",
     EXECUTION_STOP_STALE_PLAN: "Plan Expired",
@@ -189,7 +193,6 @@ _CANCEL_REASONS: dict[str, str] = {
     EXECUTION_STOP_SAFETY: "Safety Stop",
     EXECUTION_STOP_HEADROOM_REACHED: "Headroom Reached",
     EXECUTION_STOP_GRID_CEILING: "Grid Limit Reached",
-    EXECUTION_STOP_RESERVE_LIMIT: "Reserve Limit Reached",
 }
 
 #: Why a lifecycle ended in a failure. Separate from the map above because the
@@ -198,7 +201,16 @@ _CANCEL_REASONS: dict[str, str] = {
 _ERROR_REASONS: dict[str, str] = {
     EXECUTION_STOP_EXECUTION_ERROR: "Command Failed",
     EXECUTION_STOP_TIMER_NOT_REFRESHED: "Timer Not Refreshed",
-    EXECUTION_STOP_NO_CHARGE_CEILING: "No Charge Limit",
+    # **Two reasons the controller has always produced and no map ever named.**
+    # Both fell through to "Plan Replaced", which described a marker vanishing
+    # under a live dispatch and a restart losing a quarter's measurement as the
+    # optimiser changing its mind. ``No Charge Limit`` and ``Reserve Limit
+    # Reached`` went the other way: named here, and assigned nowhere in
+    # production. Green tests on inputs the pipeline could not produce, which is
+    # what ``test_every_activity_reason_is_reachable_from_production_code``
+    # now forbids.
+    EXECUTION_STOP_MARKER_LOST: "Ownership Marker Lost",
+    EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN: "Progress Unknown After Restart",
 }
 
 #: What to say when a plan is withdrawn and no stop reason was recorded, which is
@@ -301,6 +313,40 @@ class PlannedRun:
 
 
 @dataclass(frozen=True, slots=True)
+class TerminalView:
+    """A campaign that has ended, as the layer that measured it reported it.
+
+    **Activity decides nothing here, and that is the point of the class.**
+    Through beta.31 the terminal was inferred from ``Decision.stop_reason``: a
+    0.014 kWh residue became a cancellation because a tolerance lived in this
+    module, and a real 0.10 / 0.11 kWh export was filed "Canceled -- Plan
+    Replaced" because the reason was read as the outcome. Since beta.29 the
+    hardware is armed from the admitted quarter and stopped from the 60-second
+    tick, so ``Decision`` had not been the executor for two releases and this
+    surface was still wired to it.
+
+    Now the coordinator computes the class where the energy was measured, latches
+    it before anything can be wiped, and this module renders four shapes.
+
+    **One energy pair, at the objective's own boundary.** Not a battery pair
+    beside a meter pair for a renderer to choose between -- choosing is what put
+    a battery ceiling in a sentence about a meter objective.
+    """
+
+    campaign_id: str
+    outcome: str
+    objective_target_kwh: float | None = None
+    objective_realized_kwh: float = 0.0
+    objective_boundary: str | None = None
+    reason: str | None = None
+    #: Whether the realised figure is a measurement at all. False outranks a met
+    #: objective in the outcome precedence, and the coordinator has already
+    #: applied that -- this is carried so the line can say so.
+    measurable: bool = True
+    started: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionView:
     """What Stage B is doing, in the few terms Activity needs.
 
@@ -324,8 +370,13 @@ class ExecutionView:
     running: bool = False
     #: Whether a command physically went out.
     executed: bool = False
-    target_kwh: float = 0.0
-    delivered_kwh: float = 0.0
+    #: The campaign objective and what was realised against it, **both at the
+    #: boundary the objective is stated at**. Replaces beta.31's ``target_kwh`` /
+    #: ``delivered_kwh``, which were battery-side whatever the plan was aiming at:
+    #: for an export run that published ``Tracking 0.25 kWh`` -- the battery
+    #: ceiling -- beside ``Planned ... 0.11 kWh``, the meter objective.
+    objective_target_kwh: float = 0.0
+    objective_realized_kwh: float = 0.0
     intent: str = ""
     stop_reason: str | None = None
     inhibit_reason: str | None = None
@@ -342,11 +393,25 @@ class ExecutionView:
     #: decision -- computed, sent nothing -- which on a release that writes is the
     #: one claim that must not be wrong.
     activation_confirmed: bool = False
+    #: The campaign that has just ended, if one has. **Read first**, before any
+    #: live intent: a campaign ends on a tick that publishes no plan at all, and
+    #: requiring a live intent is why the incident's 17:45 refresh said nothing.
+    terminal: TerminalView | None = None
+    #: Whether a campaign is still open. **While this is true the campaign owns its
+    #: own ending** and no run-level terminal may fire.
+    #:
+    #: Without it, a ``serve_load`` gap inside a discharge campaign terminates the
+    #: lifecycle: the run is not running, no stop reason was recorded, and beta.31's
+    #: fall-through reads that as ``Canceled -- Plan Replaced``. Harmless while an
+    #: export run was one quarter wide; on the multi-quarter campaigns beta.32
+    #: creates it would file a cancellation every time the house ate a quarter's
+    #: worth of discharge, and then a second lifecycle when selling resumed.
+    campaign_open: bool = False
 
     @property
     def deviation_kwh(self) -> float:
-        """Return how far delivery landed from the target."""
-        return self.delivered_kwh - self.target_kwh
+        """Return how far delivery landed from the objective. Signed."""
+        return self.objective_realized_kwh - self.objective_target_kwh
 
 
 @dataclass(frozen=True, slots=True)
@@ -519,7 +584,7 @@ def next_activity(
         # announced. Stage B's target has already been revised by the refresh that
         # replaced the plan, so quoting it would put the new plan's figure beside
         # the old plan's progress.
-        delivered = None if execution is None else execution.delivered_kwh
+        delivered = None if execution is None else execution.objective_realized_kwh
         return _cancelled(state, lifecycle, reason, delivered_kwh=delivered)
 
     # Something new is imminent. Once per plan id, ever.
@@ -584,7 +649,21 @@ def _terminal_entry(
     returned with the line, and a closed plan id matches nothing afterwards -- so
     a hundred further refreshes carrying the same ``stop_reason`` produce nothing.
     """
+    # **The latched campaign outcome comes first, and it needs no live intent.**
+    # This single reordering is what lets a campaign that ended on the 60-second
+    # tick speak at all: that tick wipes the carriers and publishes no plan, so
+    # every beta.31 path into this function had already lost its subject.
+    if execution.terminal is not None:
+        entry = _campaign_terminal(state, execution, execution.terminal)
+        if entry is not None:
+            return entry
+
     if not execution.executed:
+        return None
+    if execution.campaign_open:
+        # **The campaign has not closed, so it has not ended.** A gap between two
+        # export segments is a refresh with nothing running and no stop reason, and
+        # the run-level fall-through below would call that a cancellation.
         return None
     lifecycle = _lifecycle_for(state, execution)
     if lifecycle is None or not lifecycle.started:
@@ -596,20 +675,102 @@ def _terminal_entry(
     if reason == EXECUTION_STOP_TARGET_REACHED:
         return _finished(state, lifecycle, execution)
     if reason in _ERROR_REASONS:
-        return ActivityEntry(
-            kind=ECONOMIC_EVENT_ERROR,
-            message=(
-                f"Finished Plan ID: {lifecycle.plan_id} — Error — "
-                f"{_ERROR_REASONS[reason]}"
-            ),
-            state=state.with_closed(lifecycle.plan_id),
-            plan_id=lifecycle.plan_id,
-        )
+        return _failed(state, lifecycle, _ERROR_REASONS[reason])
     return _cancelled(
         state,
         lifecycle,
         _CANCEL_REASONS.get(reason, _CANCEL_REPLACED),
         execution=execution,
+    )
+
+
+def _campaign_terminal(
+    state: ActivityState, execution: ExecutionView, terminal: TerminalView
+) -> ActivityEntry | None:
+    """Render the campaign outcome the coordinator computed. Four shapes.
+
+    **Renders, never decides.** The class arrives already settled -- computed
+    where the energy was measured, under a precedence stated once in
+    ``_close_campaign`` -- so this function contains no tolerance, no comparison
+    and no reason-to-outcome mapping. Everything beta.31 got wrong here was a
+    decision this layer had no business making.
+
+    ``None`` when there is no lifecycle to attach the ending to, or when it has
+    already been closed: a terminal for a campaign nobody announced would be a
+    line about a plan the history has never seen.
+    """
+    lifecycle = _lifecycle_for(state, execution)
+    if lifecycle is None or not lifecycle.started:
+        return None
+    if not terminal.started:
+        return None
+    figures = f"{terminal.objective_realized_kwh:.2f}"
+    if terminal.objective_target_kwh is not None:
+        figures += f" / {terminal.objective_target_kwh:.2f}"
+    figures += " kWh"
+
+    if terminal.outcome == OUTCOME_SUCCESS:
+        return ActivityEntry(
+            kind=ECONOMIC_EVENT_FINISHED,
+            message=(
+                f"Finished Plan ID: {lifecycle.plan_id} — Success — "
+                f"Target Reached — {figures}"
+            ),
+            state=state.with_closed(lifecycle.plan_id),
+            plan_id=lifecycle.plan_id,
+        )
+    if terminal.outcome == OUTCOME_PARTIAL:
+        # **Partial is its own word, and it is the honest one.** beta.31 had only
+        # Success and Canceled, so a campaign that delivered most of what it
+        # promised had to be filed as one or the other -- and it was filed as a
+        # cancellation, which reads as though nothing happened.
+        return ActivityEntry(
+            kind=ECONOMIC_EVENT_FINISHED,
+            message=(f"Finished Plan ID: {lifecycle.plan_id} — Partial — {figures}"),
+            state=state.with_closed(lifecycle.plan_id),
+            plan_id=lifecycle.plan_id,
+        )
+    if terminal.outcome == OUTCOME_FAILED:
+        detail = (
+            "Measurement Unavailable"
+            if not terminal.measurable
+            else _ERROR_REASONS.get(
+                terminal.reason or "", _humanise(terminal.reason) or "Command Failed"
+            )
+        )
+        return _failed(state, lifecycle, detail, figures=figures)
+    detail = _CANCEL_REASONS.get(terminal.reason or "", _CANCEL_REPLACED)
+    line = f"Canceled Plan ID: {lifecycle.plan_id} — {detail} — {figures}"
+    return ActivityEntry(
+        kind=ECONOMIC_EVENT_CANCELLED,
+        message=_marked(line, lifecycle),
+        state=state.with_closed(lifecycle.plan_id),
+        plan_id=lifecycle.plan_id,
+    )
+
+
+def _failed(
+    state: ActivityState,
+    lifecycle: Lifecycle,
+    detail: str,
+    *,
+    figures: str | None = None,
+) -> ActivityEntry:
+    """Return the failure line for a campaign that ended badly.
+
+    ``Failed Plan ID:`` rather than beta.31's ``Finished ... — Error``, which was
+    self-contradictory in four words. The event **kind** is unchanged, so
+    ``logbook_payload``'s refusal guard and every enum option are untouched: what
+    changed is the sentence, not the vocabulary a consumer subscribes to.
+    """
+    line = f"Failed Plan ID: {lifecycle.plan_id} — {detail}"
+    if figures is not None:
+        line += f" — {figures}"
+    return ActivityEntry(
+        kind=ECONOMIC_EVENT_ERROR,
+        message=line,
+        state=state.with_closed(lifecycle.plan_id),
+        plan_id=lifecycle.plan_id,
     )
 
 
@@ -673,7 +834,7 @@ def _started_entry(
         kind=ECONOMIC_EVENT_STARTED,
         message=(
             f"Plan ID: {started.plan_id} — {verb} Started — "
-            f"Tracking {execution.target_kwh:.2f} kWh"
+            f"Tracking {execution.objective_target_kwh:.2f} kWh"
         ),
         state=state.with_open(started),
         plan_id=started.plan_id,
@@ -706,20 +867,22 @@ def _inhibit_entry(
 def _finished(
     state: ActivityState, lifecycle: Lifecycle, execution: ExecutionView
 ) -> ActivityEntry:
-    """Return the success line for a plan that met its target.
+    """Return the success line for a run Stage B reported as complete.
 
-    Two shapes, and the difference is worth the branch: naming "Target Reached"
-    when delivery landed inside the completion tolerance tells a reader the two
-    figures beside it are the same number twice rather than a discrepancy they
-    should be hunting for.
+    **The tolerance has gone from this module**, and its absence is the fix. It
+    lived here as ``TARGET_TOLERANCE_KWH``, so a presentation layer decided
+    whether a 0.014 kWh residue was a success -- 0.56 of one actuator step, which
+    no command could have closed. The outcome class now arrives already decided
+    from where the energy was measured (see :class:`TerminalView`), and this path
+    remains only for a run-level stop with no campaign behind it, where Stage B's
+    own ``target_reached`` *is* the verdict.
     """
-    short_by = execution.target_kwh - execution.delivered_kwh
-    exact = " — Target Reached" if short_by <= TARGET_TOLERANCE_KWH else ""
     return ActivityEntry(
         kind=ECONOMIC_EVENT_FINISHED,
         message=(
-            f"Finished Plan ID: {lifecycle.plan_id} — Success{exact} — "
-            f"{execution.delivered_kwh:.2f} / {execution.target_kwh:.2f} kWh"
+            f"Finished Plan ID: {lifecycle.plan_id} — Success — Target Reached — "
+            f"{execution.objective_realized_kwh:.2f} / "
+            f"{execution.objective_target_kwh:.2f} kWh"
         ),
         state=state.with_closed(lifecycle.plan_id),
         plan_id=lifecycle.plan_id,
@@ -748,7 +911,10 @@ def _cancelled(
     """
     line = f"Canceled Plan ID: {lifecycle.plan_id} — {reason}"
     if lifecycle.started and execution is not None:
-        line += f" — {execution.delivered_kwh:.2f} / {execution.target_kwh:.2f} kWh"
+        line += (
+            f" — {execution.objective_realized_kwh:.2f}"
+            f" / {execution.objective_target_kwh:.2f} kWh"
+        )
     elif lifecycle.started and delivered_kwh is not None:
         line += f" — {delivered_kwh:.2f} / {lifecycle.energy_kwh:.2f} kWh"
     return ActivityEntry(
@@ -855,7 +1021,7 @@ def _adopted(execution: ExecutionView) -> Lifecycle | None:
         plan_id=plan_id_for(identity),
         identity=identity,
         direction=execution.identity.direction,
-        energy_kwh=execution.target_kwh,
+        energy_kwh=execution.objective_target_kwh,
         window="",
         run_id=execution.run_id,
     )
@@ -984,7 +1150,12 @@ def direction_of(action: str) -> str:
     return action
 
 
-def category_of(action: str, attribution: tuple[float, float] | None) -> str:
+def category_of(
+    action: str,
+    attribution: tuple[float, float] | None,
+    *,
+    sells: bool | None = None,
+) -> str:
     """Return the plan category for one run.
 
     The buy categories come from the **purchase attribution**, which is the
@@ -997,6 +1168,14 @@ def category_of(action: str, attribution: tuple[float, float] | None) -> str:
     A charge with no attribution at all is an economic buy: the counterfactual
     declined to buy anything, which is precisely what "nothing was compulsory"
     means.
+
+    **``sells`` settles the discharge side, and it is a campaign question.** The
+    label alternates between ``discharge`` and ``export`` under a varying house
+    load, so deriving the category from the label alone gave one physical campaign
+    two categories -- and therefore two lifecycles, two Planned lines and two
+    terminals. A campaign either has a material meter objective or it does not, and
+    that is what the caller passes here. ``None`` keeps the label-derived answer,
+    so a pre-campaign caller still describes the behaviour it was written for.
     """
     if action in (ECONOMIC_ACTION_CHARGE, ECONOMIC_ACTION_SAFETY_BUY):
         compelled, discretionary = attribution or (0.0, 0.0)
@@ -1008,6 +1187,8 @@ def category_of(action: str, attribution: tuple[float, float] | None) -> str:
     if action == ECONOMIC_ACTION_EXPORT:
         return ACTIVITY_CATEGORY_ECONOMIC_SELL
     if action == ECONOMIC_ACTION_DISCHARGE:
+        if sells:
+            return ACTIVITY_CATEGORY_ECONOMIC_SELL
         return ACTIVITY_CATEGORY_ECONOMIC_DISCHARGE
     if action == ECONOMIC_ACTION_CURTAIL:
         return ACTIVITY_CATEGORY_CURTAILMENT
@@ -1024,6 +1205,7 @@ __all__ = [
     "PlannedRun",
     "RunContent",
     "RunIdentity",
+    "TerminalView",
     "category_of",
     "direction_of",
     "logbook_payload",

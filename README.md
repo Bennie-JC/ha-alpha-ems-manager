@@ -19,12 +19,12 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.31` — a public beta.**
+> **Current release: `1.0.0-beta.32` — a public beta.**
 >
 > Stage A is feature-complete. Stage B — the physical execution controller — is
 > wired end to end and, from beta.24, **can charge your battery**. From beta.27 it
 > executes each 15-minute plan interval as an explicit energy target, and can also
-> **export to the grid** when the plan says so. Covered by 3913 automated tests.
+> **export to the grid** when the plan says so. Covered by 4020 automated tests.
 >
 > **Two actions are executable: buying energy into the battery, and selling it back
 > out.** Serving the house from the battery, and curtailing production, are
@@ -55,21 +55,39 @@ switched off.
 > you enable *Live* on this release, watch your grid meter during the first planned
 > export quarter.
 >
-> **`beta.31` changes how the battery decides to spend money.** Until now the
+> **`beta.32` fixes what sits around the optimiser.** `beta.31` shipped the right
+> economics; the layers that describe, group and protect the plan had not caught up.
+> Three things a user will notice. A sale is now refused when its price does not beat
+> what that energy is worth to the house before the next cheap window — selling at
+> 0.29 to buy the same energy back at 0.30 is a loss whatever the headline price
+> says, and on the measured scenario that turns 0.833 kWh of compelled purchase into
+> zero while still spending the pack down to 25.6 %. One decision now reads as one
+> story: fifteen log lines for three decisions become three, and a finished export
+> reports what it delivered instead of ending in silence. And an export run can no
+> longer report success before delivering anything — it compared a *battery ceiling*
+> against a completion tolerance, so a run whose ceiling was 0.25 kWh stopped on its
+> first evaluation and called it done.
+>
+> **`beta.31` changed how the battery decides to spend money.** Until then the
 > planner held whatever inventory would have covered the whole forecast *with no
 > further grid purchase ever* — a figure that reached 73 % SoC against a 20 % floor
 > and immobilised 97 % of the usable pack. It credited future sun and refused to
 > credit the future grid, so it paid real money to hold energy it did not need.
-> `beta.31` makes the hard constraint physical reachability, prices the inventory
-> left at the end of the priced horizon instead of bounding it, and puts every
-> discretionary purchase through the economic gates. The pack is now working
-> inventory: buy low, displace expensive import, let the charge fall, refill at the
-> next attractive feasible window.
+> `beta.31` made the hard constraint physical reachability, priced the inventory
+> left at the end of the priced horizon instead of bounding it, and put every
+> discretionary purchase through the economic gates. The pack is working inventory:
+> buy low, displace expensive import, let the charge fall, refill at the next
+> attractive feasible window. `beta.32` keeps every one of those properties and adds
+> the one thing that architecture was missing — a *price* standing between a
+> discretionary export and the 20 % floor, where before there was only a constant
+> 0.42 kWh margin.
 >
 > **`beta.30` was the release whose controller could finally hold the wheel** —
 > ownership proven from evidence Alpha EMS writes itself, and the boundary fault
 > that skipped every second quarter of a multi-quarter run. All of that Stage-B
-> behaviour is carried into `beta.31` unchanged, byte for byte.
+> behaviour is carried into `beta.32` unchanged. `execution.py` gains exactly one
+> fix — the export completion test above — and `safety.py`, `dispatch.py`,
+> `control.py`, `quarter.py` and both AlphaESS modules are untouched.
 > **If you are running anything earlier, upgrade.**
 >
 > **This integration is not in the HACS default repository.** Install it as a
@@ -103,7 +121,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.31` is not offered.
+     dialog if `1.0.0-beta.32` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -742,7 +760,9 @@ before its window opens, or its window passes, it says that once too. Earlier
 releases re-announced whatever the plan currently said on every refresh, which
 buried the log in near-identical lines for a run already under way.
 
-Nothing reads those lines back, and every one of them says it is advisory.
+Nothing reads those lines back. Since `beta.32` a line carries the `Advisory`
+marker only when the action genuinely has no actuator — a Live sale is executed, and
+marking it advisory was a false claim on a line a command was about to be sent for.
 
 ### Export safety, and why a discharge gets smaller (changed in beta.15)
 
@@ -786,22 +806,35 @@ safe as asked". A reduced command reads `eligible`, and the `export_check` block
 of a diagnostics download says by how much: `requested_power_kw`,
 `safe_capacity_kw`, `safety_limited` and `final_command_power_kw`.
 
-None of this makes a *discharge* executable. beta.24 executes a charge and nothing
-else, and the Phase-8 `export` action — which deliberately *wants* grid export —
-remains advisory with no actuator at all. The clamp exists so export does not
-happen; it cannot be the thing that performs one.
+**This text described beta.24 and was left standing for six releases.** The clamp
+still governs every charge, every hold and every reserve-guard discharge, and
+`INHIBIT_WOULD_EXPORT` still fires on them — there, energy reaching the meter is an
+accident. But an **admitted `net_export` quarter** has taken a separate authorisation
+path since `beta.27`, because for it the meter *is* the objective and the same
+question has the opposite answer. `beta.32` finished the correction: `export` is in
+`IMPLEMENTED_ACTIONS`, so the capability plan no longer reports value the plant can
+actually capture, and a Live sale no longer carries an `Advisory` marker.
+
+Serving the house from the battery (`serve_load`) and photovoltaic curtailment remain
+non-executable, and the clamp is still what keeps an *unintended* export from
+happening.
 
 ## What it does **not** do yet
 
-- ❌ No discharging, exporting or curtailment. Those are calculated and
-  explained, and refused at three independent boundaries before anything reaches
-  the inverter.
-- ✅ Charging *is* carried out since beta.24, in *Live* mode with command sending
-  enabled — and only that. A reserve is calculated (Phase 7) and the charge plan
-  is subject to it.
-- ❌ **No selling.** Phase 8 Stage A computes a full plan including selling and
-  curtailment and executes only the buying half of it; export and photovoltaic
-  curtailment have no actuator at all.
+- ✅ **Charging is carried out** since beta.24, and **selling to the grid** since
+  beta.27 — both in *Live* mode with command sending enabled, and both subject to the
+  calculated reserve. The two entries below this used to deny the second one; they
+  described beta.24 and were left standing.
+- ❌ **No load-serving discharge, and no curtailment.** Both are calculated,
+  published and explained, and refused at three independent boundaries before
+  anything reaches the inverter. `serve_load` is deliberately not an executable
+  intent: a discharge into the house is ordinary inverter behaviour and needs no
+  command from this integration.
+- ⚠️ **Multi-quarter export campaigns are new in beta.32 and unobserved on
+  hardware.** Live `net_export` has been executed on this installation; a sale that
+  spans several quarter boundaries as one continuous campaign has been tested but not
+  yet watched on the inverter. If you enable *Live*, watch your grid meter during the
+  first long planned export.
 - ❌ No EV charge scheduling. Phase 1 only *separates* EV consumption from the
   baseline; it never starts, stops or plans charging.
 - ❌ No Solcast-driven *optimisation*. The forecast reduces what the battery is

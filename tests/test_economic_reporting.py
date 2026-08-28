@@ -567,14 +567,30 @@ def test_the_terminal_comparison_is_absent_rather_than_zero() -> None:
     assert outcome.terminal_near_field_cost_eur is None
 
 
-def test_the_solver_runs_three_solves_not_four() -> None:
-    """Three unconditional solves, plus one that must be asked for.
+def test_the_solver_runs_four_solves_not_five() -> None:
+    """Three unconditional solves, plus three that must be asked for.
 
     Desired, capability and the reserve-relaxed label solve run every refresh. The
-    fourth beta.18 deleted priced a constraint that no longer existed, so its
-    difference was identically zero; the fourth beta.31 adds solves the same inputs
-    under the *previous* architecture, which is a different number and a temporary
-    one. It runs only when ``compare_legacy`` is set, which only Shadow does.
+    three conditional ones:
+
+    * the **ungated pass**, when there is measured forecast evidence to build the
+      export permission from. It is not a diagnostic -- the permission has to know
+      which refill the plan expects to use, and the only definition of that which
+      cannot drift from the plan is the plan's own choice, so the circle is cut by
+      solving once without the permission. Its cost difference is then what makes
+      the permission auditable, as ``export_gate_cost_eur``. **Conditional for the
+      reason this test exists**: with no evidence the permission is off, so the pass
+      would be byte-identical to the desired one;
+    * the **audit baseline re-solve**, when the anti-churn head bump has moved the
+      enforced head -- an audit measured against a different head would price the
+      buffer as though the permission had cost it;
+    * the beta.31 **legacy comparison**, behind ``compare_legacy``, which only
+      Shadow requests.
+
+    An unconditional fourth would be the regression this test exists to catch.
+
+    The one beta.18 deleted was different in kind: it priced a constraint that no
+    longer existed, so its difference was identically zero.
     """
     tree = ast.parse(pathlib.Path(economic_module.__file__).read_text(encoding="utf-8"))
     calls = 0
@@ -588,8 +604,40 @@ def test_the_solver_runs_three_solves_not_four() -> None:
                 ):
                     calls += 1
 
-    # The fourth is conditional; see ``compare_legacy``.
-    assert calls == 4
+    # Three of the six are conditional; see the docstring for each.
+    assert calls == 6
+
+    # **Both conditional solves must actually be conditional.** Counting is not
+    # enough -- the fault this test guards against is an *unconditional* solve, and
+    # a count alone cannot tell the difference. Decided by ancestry: a solve is
+    # conditional exactly when an ``if`` stands between it and the function body.
+    build_outcome = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "build_outcome"
+    )
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(build_outcome):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+
+    def _is_conditional(node: ast.AST) -> bool:
+        while (parent := parents.get(id(node))) is not None:
+            if isinstance(parent, ast.If):
+                return True
+            node = parent
+        return False
+
+    solves = [
+        node
+        for node in ast.walk(build_outcome)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "solve"
+    ]
+    conditional = [node for node in solves if _is_conditional(node)]
+    assert len(conditional) == 3, "exactly three solves may be conditional"
+    assert len(solves) - len(conditional) == 3, "three solves run every refresh"
 
 
 def test_the_published_plan_is_the_only_plan() -> None:
