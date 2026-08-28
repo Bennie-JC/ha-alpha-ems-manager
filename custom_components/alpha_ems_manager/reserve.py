@@ -238,6 +238,33 @@ class ReserveProjection:
         return self.grid_credit_intervals > 0
 
     @property
+    def peak_required_dc_kwh(self) -> float | None:
+        """Return the largest requirement anywhere in the horizon, and where.
+
+        Unlike the autonomy projection's ``peak_required_reserve_kwh`` -- which is
+        a diagnostic precisely because substituting it for the pointwise figure
+        would demand energy be present before it is needed -- this is published to
+        show a reader **where the curve binds**, which is rarely at the head.
+        """
+        values = [
+            entry.required_dc_kwh
+            for entry in self.intervals
+            if entry.required_dc_kwh is not None
+        ]
+        return max(values) if values else None
+
+    @property
+    def peak_required_interval(self) -> int | None:
+        """Return the index of the interval carrying the peak requirement."""
+        best: tuple[float, int] | None = None
+        for entry in self.intervals:
+            if entry.required_dc_kwh is None:
+                continue
+            if best is None or entry.required_dc_kwh > best[0]:
+                best = (entry.required_dc_kwh, entry.index)
+        return None if best is None else best[1]
+
+    @property
     def semantics(self) -> str:
         """Return which requirement this is, for a reader who has only the JSON."""
         return (
@@ -247,16 +274,22 @@ class ReserveProjection:
         )
 
     def bridge_kwh(self, stored_dc_kwh: float | None) -> float | None:
-        """Return the only grid energy this projection makes *compulsory*.
+        """Return the grid energy compulsory **at this interval**.
 
-        ``max(0, required_now - stored)``. Everything above it is discretionary
-        and must clear the economic gates; nothing below it can be declined,
-        because declining it means crossing the floor the clamp enforces anyway.
+        ``max(0, required_now - stored)``.
 
-        **The invariant this exists to make checkable:** a bridge of zero means
-        no purchase is compulsory. Before beta.31 there was no such quantity, so
-        "why this much" had no answer in the code -- ``safety_buy`` was a label
-        applied by diffing two solves after the fact.
+        **This is the immediate deficit, not the whole compulsory amount, and the
+        distinction is load bearing.** The requirement is a *curve*, and it
+        typically peaks some intervals ahead -- wherever demand has just outrun
+        what the connection can replenish. Measured on a winter shape: the head
+        asked for 9.59 kWh while the curve peaked at 10.855 kWh four quarters
+        later, so a pack at 10.80 kWh had a head bridge of **zero** and 0.56 kWh
+        of genuinely compulsory purchasing ahead of it.
+
+        So a zero here means "nothing must be bought *this* interval", never
+        "nothing must be bought". :attr:`peak_required_dc_kwh` is the figure that
+        says where the curve actually binds, and the exact compulsory quantity per
+        run is the one the reserve-relaxed counterfactual declines to buy.
         """
         required = self.required_now_dc_kwh
         if required is None or stored_dc_kwh is None:

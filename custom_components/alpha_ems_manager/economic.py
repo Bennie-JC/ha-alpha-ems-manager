@@ -2617,16 +2617,29 @@ def classify_purchase(
     uncertainty_dc_kwh: float | None,
     edge_value_eur_per_kwh: float,
     survives_to_edge_kwh: float,
+    attribution: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Return why this charge run exists, and how much of it was unavoidable.
 
     **Derived, never asserted.** The rule is the split between energy the physics
     compelled and energy an economic gate let through:
 
-    * ``bridge_kwh_now`` is the *only* compulsory quantity -- what the pack needs
-      right now to stay reachable. Zero means nothing at all was compulsory.
-    * Whatever the run buys beyond it is discretionary, and had to clear the trade
+    * the compulsory share is what the **reserve-relaxed counterfactual declines
+      to buy** over the same intervals -- the same solve, the same prices, with the
+      reserve relaxed to the hard floor. That is a statement about *why* the
+      energy is there, which no price threshold could make.
+    * whatever the run buys beyond it is discretionary, and had to clear the trade
       gain, the grid-charge margin and the throughput cost to be here.
+
+    **``bridge_kwh_now`` is supporting evidence, not the measure**, and an earlier
+    draft of this function used it as the measure and was wrong. The requirement is
+    a curve that usually peaks *ahead* of the head, so a head deficit of zero is
+    entirely compatible with compulsory purchasing: on a winter shape the head
+    asked 9.59 kWh while the curve peaked at 10.855 four quarters later, and a pack
+    at 10.80 had a zero head bridge and 0.56 kWh it could not decline. Reporting
+    that as discretionary would have been the mirror of the fault this release
+    exists to fix -- and it is the reason the counterfactual, not the head figure,
+    decides.
 
     The discretionary half is then attributed by where its value comes from:
     arbitrage if the run's own marginal cost is negative -- it pays for itself
@@ -2653,7 +2666,10 @@ def classify_purchase(
             "why_now": "reachability was not computed for this refresh",
         }
 
-    compelled = min(energy, max(0.0, bridge_kwh_now))
+    if attribution is not None:
+        compelled = min(energy, max(0.0, attribution[0]))
+    else:
+        compelled = min(energy, max(0.0, bridge_kwh_now))
     discretionary = max(0.0, energy - compelled)
     pays_for_itself = run.marginal_cost_eur < 0.0
 
@@ -2677,12 +2693,22 @@ def classify_purchase(
     return {
         "classification": label,
         "bridge_kwh_now": _round_kwh(bridge_kwh_now),
+        "compulsory_basis": (
+            "reserve_relaxed_counterfactual"
+            if attribution is not None
+            else "head_bridge"
+        ),
         "compulsory_kwh": _round_kwh(compelled),
         "economic_extra_kwh": _round_kwh(discretionary),
         "why_now": (
             "the pack cannot stay above its floor without this energy"
             if compelled > 0.0
             else "no energy was compulsory; this run cleared the economic gates"
+        ),
+        "why_not_earlier": (
+            "the requirement binds ahead of this interval, not at it"
+            if compelled > 0.0 and not (bridge_kwh_now or 0.0) > 0.0
+            else None
         ),
         "why_this_much": (
             f"{_round_kwh(compelled)} kWh compelled by reachability, "
@@ -2704,10 +2730,13 @@ def classify_purchase(
             None if uncertainty_dc_kwh is None else _round_kwh(uncertainty_dc_kwh)
         ),
         "rule": (
-            "bridge_kwh_now is the only compulsory purchase. everything above it "
-            "is discretionary and had to clear the trade gain, the grid-charge "
-            "margin and the throughput cost. a figure that cannot be derived "
-            "honestly is null rather than guessed"
+            "the compulsory share is what the reserve-relaxed solve declines to "
+            "buy over the same intervals; everything above it is discretionary and "
+            "had to clear the trade gain, the grid-charge margin and the "
+            "throughput cost. bridge_kwh_now is the deficit at *this* interval and "
+            "is supporting evidence only -- the requirement is a curve and usually "
+            "binds ahead of the head, so a zero there does not mean nothing was "
+            "compulsory. a figure that cannot be derived honestly is null"
         ),
     }
 
@@ -2897,6 +2926,7 @@ def _runs_as_dicts(
                 omitted=omitted,
                 purchase=classify_purchase(
                     run,
+                    attribution=outcome.safety_buy_attribution.get(run.start_index),
                     bridge_kwh_now=outcome.bridge_kwh_now,
                     uncertainty_dc_kwh=(
                         None
@@ -3453,6 +3483,17 @@ def economic_as_dict(
                 None
                 if reachability is None
                 else _round_kwh(reachability.required_now_dc_kwh)
+            ),
+            # **Where the curve actually binds**, which is rarely the head. A
+            # reader who sees only the head figure will conclude that a purchase
+            # was discretionary when it was not.
+            "reachability_peak_dc_kwh": (
+                None
+                if reachability is None
+                else _round_kwh(reachability.peak_required_dc_kwh)
+            ),
+            "reachability_peak_interval": (
+                None if reachability is None else reachability.peak_required_interval
             ),
             "hard_floor_dc_kwh": (
                 None if reachability is None else _round_kwh(floor_energy_kwh)
