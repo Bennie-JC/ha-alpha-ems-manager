@@ -115,6 +115,11 @@ async def test_a_stale_reason_cannot_survive_beside_a_later_write(
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
 
     # First a refusal: no carrier at all.
+    # **The schedule too, since beta.30.** The executing quarter is derived at
+    # the top of every tick and refresh, so clearing the derived value alone
+    # would be undone immediately -- which is exactly the property that makes a
+    # skipped boundary impossible.
+    coordinator._plan = None
     coordinator._quarter = None
     coordinator._carried = None
     await coordinator._async_physical_tick(local(NORMAL, 10, 46))
@@ -155,6 +160,11 @@ async def test_no_carrier_at_all_reports_no_admitted_quarter(
 ) -> None:
     """Cause one of the three beta.26 conflated."""
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
+    # **The schedule too, since beta.30.** The executing quarter is derived at
+    # the top of every tick and refresh, so clearing the derived value alone
+    # would be undone immediately -- which is exactly the property that makes a
+    # skipped boundary impossible.
+    coordinator._plan = None
     coordinator._quarter = None
     coordinator._carried = None
 
@@ -291,6 +301,11 @@ async def test_the_block_is_published_with_nothing_admitted(
 ) -> None:
     """``None`` rather than absent, so a dashboard reads the same shape always."""
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
+    # **The schedule too, since beta.30.** The executing quarter is derived at
+    # the top of every tick and refresh, so clearing the derived value alone
+    # would be undone immediately -- which is exactly the property that makes a
+    # skipped boundary impossible.
+    coordinator._plan = None
     coordinator._quarter = None
     coordinator._reset_quarter_progress(None)
 

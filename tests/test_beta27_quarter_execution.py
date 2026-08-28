@@ -31,7 +31,11 @@ from custom_components.alpha_ems_manager.const import (
     TICK_STOPPED_QUARTER_EXPIRED,
     TICK_STOPPED_TARGET_REACHED,
 )
-from custom_components.alpha_ems_manager.execution import CarriedQuarter
+from custom_components.alpha_ems_manager.execution import (
+    AdmittedPlan,
+    CarriedQuarter,
+    QuarterRow,
+)
 
 from .forecast_helpers import NORMAL, local
 from .test_beta24_live_charge import LiveSurface, owned_live_charge, step_once
@@ -80,6 +84,36 @@ def install(coordinator, quarter: CarriedQuarter) -> None:
     counted rows would be counting the fixture's history as well as its own. This
     helper defines the whole starting state, not just the current quarter.
     """
+    # **A plan, not a bare row.** Since beta.30 the executing quarter is *derived*
+    # from a frozen schedule at the top of every tick and refresh, so assigning
+    # ``_quarter`` alone would be overwritten immediately. That is the point of the
+    # change: a quarter cannot exist without a schedule behind it, which is what
+    # made the skipped-boundary defect unrepresentable.
+    #
+    # The plan id is taken from the live claim when there is one, because ownership
+    # compares the claim against the admitted plan.
+    record = coordinator.store.execution_record or {}
+    claimed_plan = record.get("admitted_plan_id")
+    coordinator._plan = AdmittedPlan(
+        plan_id=claimed_plan if isinstance(claimed_plan, str) else quarter.plan_id,
+        revision=quarter.revision,
+        run_id=quarter.run_id,
+        intent=quarter.intent,
+        purpose=quarter.intent,
+        admitted_at=quarter.admitted_at,
+        rows=(
+            QuarterRow(
+                start=quarter.quarter_start,
+                end=quarter.quarter_end,
+                battery_kwh=quarter.battery_target_kwh,
+                grid_authorised_kwh=quarter.grid_authorised_kwh,
+                grid_export_target_kwh=quarter.grid_export_target_kwh,
+                grid_export_caused_kwh=0.0,
+                desired_grid_kw=quarter.initial_desired_grid_kw,
+            ),
+        ),
+        frozen_remaining_at_admission_kwh=(quarter.frozen_remaining_at_admission_kwh),
+    )
     coordinator._quarter = quarter
     coordinator._reset_quarter_progress(quarter)
     coordinator._completed_quarters.clear()
@@ -108,6 +142,11 @@ async def test_a_quarter_with_nothing_admitted_writes_nothing(
 ) -> None:
     """No carrier at all is a refusal, named as such, with no write."""
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
+    # **The schedule too, since beta.30.** The executing quarter is derived at
+    # the top of every tick and refresh, so clearing the derived value alone
+    # would be undone immediately -- which is exactly the property that makes a
+    # skipped boundary impossible.
+    coordinator._plan = None
     coordinator._quarter = None
     coordinator._carried = None
     live_surface.calls.clear()

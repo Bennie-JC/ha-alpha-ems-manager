@@ -79,12 +79,22 @@ def _give_the_quarter_headroom(coordinator) -> None:
     """
     from dataclasses import replace
 
-    quarter = coordinator._quarter
-    assert quarter is not None, "the fixture should admit a quarter since beta.27.1"
-    coordinator._quarter = replace(
-        quarter,
-        battery_target_kwh=quarter.battery_target_kwh / 2.0,
-        grid_authorised_kwh=quarter.grid_authorised_kwh / 2.0,
+    # **The schedule, not the derived quarter.** Since beta.30 the executing quarter
+    # is derived from the frozen plan at the top of every tick, so halving the
+    # derived value alone would be recomputed away on the next call. Halving the row
+    # it comes from is the equivalent, and it keeps the plan the single source.
+    plan = coordinator._plan
+    assert plan is not None, "the fixture should admit a plan since beta.30"
+    coordinator._plan = replace(
+        plan,
+        rows=tuple(
+            replace(
+                row,
+                battery_kwh=row.battery_kwh / 2.0,
+                grid_authorised_kwh=row.grid_authorised_kwh / 2.0,
+            )
+            for row in plan.rows
+        ),
     )
 
 
@@ -486,6 +496,13 @@ async def test_the_tick_writes_nothing_for_a_sub_deadband_wobble(
     # The same headroom as the test above, and for the same reason: a saturated
     # setpoint cannot move, so a deadband test on it would prove nothing.
     _give_the_quarter_headroom(coordinator)
+    # **Let the setpoint settle on the new target first.** Giving the quarter
+    # headroom moves the required rate away from the one the arm wrote, so the very
+    # next tick legitimately corrects. A deadband test has to start from a settled
+    # setpoint or it measures that correction instead of the wobble.
+    settle = local(NORMAL, 10, 45, 30)
+    live_surface.at(settle)
+    await coordinator._async_physical_tick(settle)
     live_surface.calls.clear()
 
     # Well inside the 0.2 kW band, and expressed from it so the two cannot drift.

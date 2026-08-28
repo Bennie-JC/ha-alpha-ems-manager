@@ -155,9 +155,12 @@ from .const import (
     EXECUTION_INTENT_SERVE_LOAD,
     MAX_ECONOMIC_RUN_INTERVALS_REPORTED,
     MAX_ECONOMIC_RUNS_REPORTED,
+    MIN_EXECUTABLE_QUARTER_KWH,
     MODE_CHARGE,
     MODE_DISCHARGE,
     MODE_IDLE,
+    QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE,
+    QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION,
 )
 from .simulation import IntervalDemand
 
@@ -2233,10 +2236,34 @@ def quarter_schedule_for(
             if intent == EXECUTION_INTENT_NET_EXPORT
             else entry.battery_charge_ac_kwh
         )
+        # **Whether this row is physically deliverable, decided here.**
+        #
+        # The objective is the battery figure for a charge and the actual meter
+        # export for an export -- the contract's asymmetry. Below the actuator's
+        # resolution there is no command that realises it: the Dispatch power helper
+        # quantises to 0.1 kW, so the smallest non-zero energy a quarter can deliver
+        # is 0.025 kWh. beta.29 published export rows of 0.01 and 0.02 kWh, which the
+        # actuator can only answer with 0.025 -- a 150 % overshoot -- or with nothing.
+        #
+        # Decided in Stage A because "is this run worth forming" is an economic
+        # question, and because the row must stay **visible** either way: the
+        # economics are still true, and a reader has to be able to see what was
+        # planned and why it was not armed. Stage B carries its own backstop.
+        objective_kwh = (
+            entry.grid_export_kwh
+            if intent == EXECUTION_INTENT_NET_EXPORT
+            else battery_kwh
+        )
+        not_executable: str | None = None
+        if objective_kwh <= 0.0:
+            not_executable = QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE
+        elif objective_kwh < MIN_EXECUTABLE_QUARTER_KWH:
+            not_executable = QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION
         rows.append(
             {
                 "start": start.isoformat(),
                 "end": end.isoformat(),
+                "not_executable": not_executable,
                 "battery_kwh": _round_kwh(battery_kwh),
                 "grid_authorised_kwh": _round_kwh(
                     max(0.0, entry.marginal_grid_import_kwh)
@@ -2678,7 +2705,10 @@ def execution_target(
             "grid_authorised_kwh is the marginal import ceiling for a charge; "
             "grid_export_target_kwh is the ACTUAL meter export objective for an "
             "export and is what the run-level grid_target_kwh is summed from. "
-            "grid_export_caused_kwh is attribution only"
+            "grid_export_caused_kwh is attribution only. not_executable names why "
+            "a row cannot be armed and is null when it can: an objective below the "
+            "actuator's 0.025 kWh resolution is economically real and physically "
+            "meaningless, so it stays visible here and is never sent"
         ),
         "buy_attribution_rule": (
             "reserve-attributable and economic energy within this run window, "

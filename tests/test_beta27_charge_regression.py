@@ -175,6 +175,11 @@ async def test_a_charge_still_runs_without_any_quarter_schedule(
     executes the beta.26 arithmetic unchanged.
     """
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
+    # **The schedule too, since beta.30.** The executing quarter is derived at
+    # the top of every tick and refresh, so clearing the derived value alone
+    # would be undone immediately -- which is exactly the property that makes a
+    # skipped boundary impossible.
+    coordinator._plan = None
     coordinator._quarter = None
     assert coordinator._carried is not None
     coordinator._applied_setpoint_kw = 0.0

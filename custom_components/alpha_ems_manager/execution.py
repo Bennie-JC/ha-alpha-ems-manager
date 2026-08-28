@@ -99,12 +99,23 @@ from .const import (
     EXECUTION_STOP_WINDOW_ENDED,
     EXECUTION_TARGET_STALE_MINUTES,
     OWNERSHIP_DEGRADED,
+    OWNERSHIP_FACTOR_CLAIM,
+    OWNERSHIP_FACTOR_CUTOFF,
+    OWNERSHIP_FACTOR_DISPATCH,
+    OWNERSHIP_FACTOR_DURATION,
+    OWNERSHIP_FACTOR_MARKER,
+    OWNERSHIP_FACTOR_MODE,
+    OWNERSHIP_FACTOR_NONE,
+    OWNERSHIP_FACTOR_PLAN,
+    OWNERSHIP_FACTOR_RUN,
     OWNERSHIP_FOREIGN,
     OWNERSHIP_NONE,
     OWNERSHIP_OWNED,
     OWNERSHIP_PROVENANCE_EXACT,
+    OWNERSHIP_PROVENANCE_PARAMETERS,
     OWNERSHIP_PROVENANCE_SETTLING,
     OWNERSHIP_UNPROVEN,
+    PLAN_ADMISSION_LOOKBACK_SECONDS,
 )
 from .control import ControlIntent
 
@@ -247,6 +258,18 @@ class OwnershipEvidence:
     #: number, so "is this ours" cannot be answered by which entity is on. A
     #: caller with no readback passes ``False`` and gets the conservative answer.
     readback_compatible: bool = False
+    #: The admitted plan Stage B is executing right now, when the caller knows it.
+    #: ``None`` leaves ``record_names_this_plan`` permissive -- see there.
+    executing_plan_id: str | None = None
+    #: The helper values Alpha EMS itself wrote, read back. Signed power, whole
+    #: percent, whole minutes. ``None`` for anything unreadable, which fails closed.
+    readback_power_kw: float | None = None
+    readback_cutoff_percent: float | None = None
+    readback_duration_minutes: float | None = None
+    #: Whether the live duration is one Alpha EMS is willing to command. Supplied by
+    #: the coordinator, which owns the permitted dead-man set; ``None`` means not
+    #: supplied, and then the duration is reported rather than judged.
+    readback_duration_permitted: bool | None = None
 
     @property
     def record_present(self) -> bool:
@@ -266,6 +289,148 @@ class OwnershipEvidence:
         if not isinstance(recorded_run, str) or not recorded_run:
             return False
         return self.run_id is None or recorded_run == self.run_id
+
+    @property
+    def record_names_this_plan(self) -> bool:
+        """Return whether the claim records which plan armed the dispatch.
+
+        **Reported, and deliberately not a gate.** An earlier draft compared this
+        against the plan Stage B is *currently* executing, and that conflates two
+        different questions: what we intend to do next, and what is physically
+        running now. They legitimately differ -- a run ends, a fresh plan is
+        admitted, and the dispatch from the previous plan still has to be stopped.
+        Gating on it made the stop unprovable at exactly the moment the stop was
+        needed, which is the opposite of what an ownership check is for.
+
+        There is no observable that says which plan a *running* dispatch belongs to,
+        other than the claim itself; a check that pretends otherwise is inferring
+        from evidence that does not exist. What actually keeps a claim untransferable
+        is that arming writes a **fresh** claim: a stale one can authorise nothing,
+        because the act of arming replaces it.
+
+        Kept as a published field because a reader tracing a dispatch needs to know
+        which plan armed it.
+        """
+        if not self.record_present:
+            return False
+        # A claim written before beta.30 records no plan. Reported, not refused:
+        # see the docstring -- this is not a gate.
+        recorded = (self.record or {}).get("admitted_plan_id")
+        return isinstance(recorded, str) and bool(recorded)
+
+    @property
+    def readback_reflects_claim(self) -> bool:
+        """Return whether the device reflects the parameters this claim wrote.
+
+        **The third factor, and the one that needs no vendor register.** Alpha EMS
+        wrote these helpers itself, so reading them back is reading its own
+        handwriting -- not the parameter matching this project rejects, because that
+        was *parameters alone*. Here they are the third of three conjoined factors:
+        a foreign dispatch would have to be running while our marker is on -- which
+        we only leave on while we hold a live claim -- **and** match the exact power,
+        cutoff and duration a claim written before the write recorded.
+
+        Power is compared within one helper step, because that is the resolution it
+        was written at. The cutoff and duration are whole numbers written and read
+        back as whole numbers, so any difference is a different command.
+
+        Fails closed on anything unreadable: no evidence is not agreement.
+        """
+        return self.readback_factor_failure is None
+
+    @property
+    def readback_factor_failure(self) -> str | None:
+        """Return the first readback factor that failed, or ``None``.
+
+        Split from the boolean so a refusal can name the factor. Ordered so the
+        most fundamental disagreement is the one reported.
+        """
+        if not self.readback_compatible:
+            # Mode and sign, from the shared helper. Kept as one factor because the
+            # caller computes them together and a split here could disagree with it.
+            return OWNERSHIP_FACTOR_MODE
+        record = self.record or {}
+        # **The power is reported, never judged**, and the reason is the same one
+        # that disqualified the dead-man duration: it is a value Alpha EMS
+        # deliberately varies. The sixty-second controller rewrites it whenever the
+        # world moves -- that is the entire purpose of the controller -- so a factor
+        # comparing the live power against the power the claim recorded at the arm
+        # would deny ownership the moment the first correction landed. Measured:
+        # claim 4.3 kW, live -5.5 kW, one minute later.
+        #
+        # A factor may only test something invariant under our *own* control. What
+        # remains is still a conjunction a foreign dispatch cannot satisfy by
+        # accident: our marker on, our claim naming this admitted plan, mode 2, the
+        # sign this intent permits, the cutoff we wrote, and a duration we are
+        # willing to command.
+        claimed_cutoff = _finite(record.get("cutoff_soc_percent"))
+        if claimed_cutoff is not None:
+            if self.readback_cutoff_percent is None:
+                return OWNERSHIP_FACTOR_CUTOFF
+            if round(self.readback_cutoff_percent) != round(claimed_cutoff):
+                return OWNERSHIP_FACTOR_CUTOFF
+        # **The duration is checked against the permitted dead-man values, not
+        # against the claim.** The dead-man deliberately alternates 20/25 minutes so
+        # the vendor automation fires at all, so the live duration legitimately
+        # differs from the one the claim recorded the moment the first re-arm lands.
+        # Comparing the two would make ownership fail every fifteen minutes -- the
+        # exact class of periodic failure beta.30 exists to end.
+        #
+        # So the factor asks the question that is actually invariant: is the running
+        # dispatch on *a duration Alpha EMS is willing to command*. A foreign
+        # dispatch on some other duration still fails it. The verdict is supplied by
+        # the caller, which owns the device layer's permitted set; ``None`` means the
+        # caller did not say, and then duration is reported rather than judged.
+        if self.readback_duration_permitted is False:
+            return OWNERSHIP_FACTOR_DURATION
+        return None
+
+    @property
+    def failed_factor(self) -> str:
+        """Return the single factor that denied ownership, or ``none``.
+
+        **The field that would have ended the beta.29 investigation in one look.**
+        Sixteen consecutive ticks reported ``ownership_not_owned`` and nothing said
+        which of six conditions had failed.
+        """
+        if not self.dispatch_active:
+            return OWNERSHIP_FACTOR_DISPATCH
+        if not self.marker_on:
+            return OWNERSHIP_FACTOR_MARKER
+        if not self.record_present:
+            return OWNERSHIP_FACTOR_CLAIM
+        if not self.record_names_this_run:
+            return OWNERSHIP_FACTOR_RUN
+        readback = self.readback_factor_failure
+        if readback is not None:
+            return readback
+        return OWNERSHIP_FACTOR_NONE
+
+    def factor_results(self) -> dict[str, Any]:
+        """Return every factor's own verdict, for diagnostics.
+
+        Published whole rather than as a single reason, so a reader can see which
+        factors held as well as which one failed.
+        """
+        return {
+            OWNERSHIP_FACTOR_DISPATCH: self.dispatch_active,
+            OWNERSHIP_FACTOR_MARKER: self.marker_on,
+            OWNERSHIP_FACTOR_CLAIM: self.record_present,
+            OWNERSHIP_FACTOR_RUN: self.record_names_this_run,
+            OWNERSHIP_FACTOR_PLAN: self.record_names_this_plan,
+            OWNERSHIP_FACTOR_MODE: self.readback_compatible,
+            "readback_power_kw": self.readback_power_kw,
+            "claimed_power_kw": _finite((self.record or {}).get("power_kw")),
+            OWNERSHIP_FACTOR_CUTOFF: self.readback_factor_failure
+            != OWNERSHIP_FACTOR_CUTOFF,
+            OWNERSHIP_FACTOR_DURATION: self.readback_duration_permitted,
+            "readback_duration_minutes": self.readback_duration_minutes,
+            "claimed_duration_minutes": _finite(
+                (self.record or {}).get("duration_minutes")
+            ),
+            "failed_factor": self.failed_factor,
+            "provenance": self.record_provenance,
+        }
 
     @property
     def record_provenance(self) -> str | None:
@@ -308,23 +473,35 @@ class OwnershipEvidence:
             return None
         if not self.record_names_this_run:
             return None
+        # **The factor that grants causation, and it needs no vendor register.**
+        # See ``readback_reflects_claim``. Until beta.30 this function required the
+        # dispatch-start register, whose meaning has never been measured on the
+        # hardware -- and on the real installation neither branch below could ever
+        # be satisfied, so ownership was permanently ``unproven``: no correction
+        # landed on a thirty-minute run, the EMS could not stop its own dispatch at
+        # the target or at the quarter end, and the dead-man had to finish the job.
+        if not self.readback_reflects_claim:
+            return None
+
         record = self.record or {}
+        # **The register is corroborating from here on.** It may *upgrade* the label
+        # a reader sees; it can no longer withhold ownership. Everything below is
+        # diagnostics-grade provenance strength.
         observed = instant_of(record.get("dispatch_start"))
         if observed is not None and self.dispatch_start is not None:
             delta = abs((self.dispatch_start - observed).total_seconds())
             if delta <= OWNERSHIP_START_TOLERANCE_SECONDS:
                 return OWNERSHIP_PROVENANCE_EXACT
-        # The settle path. It requires the running dispatch to have *begun* when we
-        # wrote, so it cannot adopt one that merely happens to be running now.
         written = instant_of(record.get("written_at"))
-        if written is None or self.dispatch_start is None:
-            return None
-        lag = (self.dispatch_start - written).total_seconds()
-        # A small negative lag is allowed: the register resolves to whole seconds
-        # and the surface can report a start a moment before our write completes.
-        if -OWNERSHIP_START_TOLERANCE_SECONDS <= lag <= OWNERSHIP_CLAIM_WINDOW_SECONDS:
-            return OWNERSHIP_PROVENANCE_SETTLING
-        return None
+        if written is not None and self.dispatch_start is not None:
+            lag = (self.dispatch_start - written).total_seconds()
+            if (
+                -OWNERSHIP_START_TOLERANCE_SECONDS
+                <= lag
+                <= OWNERSHIP_CLAIM_WINDOW_SECONDS
+            ):
+                return OWNERSHIP_PROVENANCE_SETTLING
+        return OWNERSHIP_PROVENANCE_PARAMETERS
 
     @property
     def record_causation_holds(self) -> bool:
@@ -524,6 +701,29 @@ class QuarterRow:
     grid_export_target_kwh: float
     grid_export_caused_kwh: float
     desired_grid_kw: float
+    #: Why this row cannot be physically executed, or ``None`` if it can.
+    #:
+    #: **Stage A's answer, carried rather than recomputed.** A row whose objective is
+    #: below what one quarter can deliver at the 0.1 kW helper step is economically
+    #: real and physically meaningless: beta.29 published meter targets of 0.01 kWh
+    #: against a 0.025 kWh minimum delivery. Such a row stays visible in the
+    #: economics and is never armed.
+    not_executable: str | None = None
+
+    def objective_kwh(self, intent: str) -> float:
+        """Return the figure this row is trying to realise, per intent.
+
+        The asymmetry the contract states: a charge aims at the battery figure and
+        an export at the actual meter figure. The other one is a ceiling.
+        """
+        if intent == EXECUTION_INTENT_NET_EXPORT:
+            return max(0.0, self.grid_export_target_kwh)
+        return max(0.0, self.battery_kwh)
+
+    @property
+    def executable(self) -> bool:
+        """Return whether Stage B may arm this row."""
+        return self.not_executable is None
 
     def covers(self, moment: datetime) -> bool:
         """Return whether ``moment`` falls inside this quarter. End exclusive."""
@@ -539,6 +739,8 @@ class QuarterRow:
             "grid_export_target_kwh": round(self.grid_export_target_kwh, 3),
             "grid_export_caused_kwh": round(self.grid_export_caused_kwh, 3),
             "desired_grid_kw": round(self.desired_grid_kw, 3),
+            "executable": self.executable,
+            "not_executable": self.not_executable,
         }
 
 
@@ -574,6 +776,14 @@ def _quarter_rows(raw: Any) -> tuple[QuarterRow, ...]:
                     0.0, _finite(entry.get("grid_export_caused_kwh")) or 0.0
                 ),
                 desired_grid_kw=_finite(entry.get("desired_grid_kw")) or 0.0,
+                # Stage A's own verdict, carried rather than recomputed here: what
+                # is executable is a property of the actuator, and the actuator's
+                # resolution is not a fact this parser should own.
+                not_executable=(
+                    reason
+                    if isinstance(reason := entry.get("not_executable"), str) and reason
+                    else None
+                ),
             )
         )
     # **Not sorted, and deliberately.** ``quarter_schedule_for`` emits one row
@@ -653,6 +863,16 @@ class CarriedQuarter:
         """Return the seconds left in this quarter, never negative."""
         return max(0.0, (self.quarter_end - moment).total_seconds())
 
+    def objective_kwh(self) -> float:
+        """Return the figure this quarter is trying to realise, per intent.
+
+        The contract's asymmetry in one place: a charge aims at the battery figure
+        and an export at the actual meter figure; the other one is a ceiling.
+        """
+        if self.intent == EXECUTION_INTENT_NET_EXPORT:
+            return max(0.0, self.grid_export_target_kwh)
+        return max(0.0, self.battery_allowance_kwh())
+
     def battery_allowance_kwh(self) -> float:
         """Return the battery energy this quarter may move.
 
@@ -688,6 +908,224 @@ class CarriedQuarter:
                 "cannot describe this quarter"
             ),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class AdmittedPlan:
+    """The whole solved quarter schedule of one run, frozen at admission.
+
+    **The object that replaces the single carried quarter, and the reason the
+    skipped-boundary defect becomes unrepresentable.**
+
+    beta.27 carried one ``CarriedQuarter`` at a time and admitted "the quarter
+    opening next". Those two rules cannot both hold with one slot: while a quarter is
+    open the slot is occupied, so nothing is admitted for the boundary after it --
+    and when the slot frees, the selection rule looks strictly forward and picks the
+    quarter *after* the one that just opened. Measured on the real installation: the
+    executing quarter jumped from ``22:15-22:30Z`` to ``22:45-23:00Z`` and the
+    quarter between them was never executed at all. That is the same fault beta.27
+    diagnosed on ``CarriedRun``; adding a second single slot moved it rather than
+    removing it.
+
+    Here the *schedule* is the carried object and the executing quarter is
+    **derived** -- :meth:`row_covering`. Crossing a boundary is an ordinary lookup,
+    not a hand-off, so there is no slot to occupy and no race to lose.
+
+    Immutability is stronger than before rather than weaker: the whole schedule is
+    frozen at admission, so no later publication can alter any row. Withdrawal is
+    still never inferred from a horizon that structurally cannot describe an open
+    quarter.
+    """
+
+    plan_id: str
+    revision: int
+    run_id: str
+    intent: str
+    purpose: str
+    admitted_at: datetime
+    rows: tuple[QuarterRow, ...]
+    #: Stage-A physical limits Stage B must honour, frozen with the schedule.
+    reserve_floor_kwh: float = 0.0
+    max_end_energy_kwh: float | None = None
+    headroom_until: datetime | None = None
+    #: The run-level frozen remainder at the instant of admission. Captured rather
+    #: than consulted live, so a run that later vanishes can neither enlarge this
+    #: plan nor reach back into a row already open.
+    frozen_remaining_at_admission_kwh: float | None = None
+
+    @property
+    def starts_at(self) -> datetime:
+        """Return the first row's start."""
+        return self.rows[0].start
+
+    @property
+    def ends_at(self) -> datetime:
+        """Return the last row's end."""
+        return self.rows[-1].end
+
+    def has_opened(self, moment: datetime) -> bool:
+        """Return whether the first row has begun.
+
+        The line between *revisable* and *immutable*. Before it, a fresher
+        publication may replace this plan -- nothing physical has happened. After
+        it, the plan is economically frozen for the rest of its span.
+        """
+        return moment >= self.starts_at
+
+    def spans(self, moment: datetime) -> bool:
+        """Return whether ``moment`` falls anywhere inside this plan."""
+        return self.starts_at <= moment < self.ends_at
+
+    def row_covering(self, moment: datetime) -> QuarterRow | None:
+        """Return the row containing ``moment``, or ``None``.
+
+        The whole of the boundary fix. No ordering operation and no "next" lookup:
+        the row that contains this instant either exists or does not.
+        """
+        for row in self.rows:
+            if row.covers(moment):
+                return row
+        return None
+
+    def executing_quarter(self, moment: datetime) -> CarriedQuarter | None:
+        """Return the executable envelope for ``moment``, or ``None``.
+
+        ``None`` for three different situations, and the caller can tell them apart
+        through :meth:`row_covering`: the plan has not opened, the plan has finished,
+        or the row covering now is not executable at this actuator's resolution.
+        """
+        row = self.row_covering(moment)
+        if row is None or not row.executable:
+            return None
+        return CarriedQuarter(
+            quarter_start=row.start,
+            quarter_end=row.end,
+            intent=self.intent,
+            battery_target_kwh=row.battery_kwh,
+            grid_authorised_kwh=row.grid_authorised_kwh,
+            grid_export_target_kwh=row.grid_export_target_kwh,
+            initial_desired_grid_kw=row.desired_grid_kw,
+            run_id=self.run_id,
+            plan_id=self.plan_id,
+            revision=self.revision,
+            admitted_at=self.admitted_at,
+            frozen_remaining_at_admission_kwh=(self.frozen_remaining_at_admission_kwh),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the bounded diagnostics form."""
+        return {
+            "plan_id": self.plan_id,
+            "revision": self.revision,
+            "run_id": self.run_id,
+            "intent": self.intent,
+            "purpose": self.purpose,
+            "admitted_at": self.admitted_at.isoformat(),
+            "starts_at": self.starts_at.isoformat(),
+            "ends_at": self.ends_at.isoformat(),
+            "row_count": len(self.rows),
+            "executable_row_count": sum(1 for row in self.rows if row.executable),
+            "reserve_floor_kwh": round(self.reserve_floor_kwh, 3),
+            "max_end_energy_kwh": self.max_end_energy_kwh,
+            "headroom_until": (
+                None if self.headroom_until is None else self.headroom_until.isoformat()
+            ),
+            "frozen_remaining_at_admission_kwh": (
+                self.frozen_remaining_at_admission_kwh
+            ),
+            "rows": [row.as_dict() for row in self.rows],
+            "authority_rule": (
+                "the whole schedule is frozen at admission and the executing "
+                "quarter is derived from it, so a boundary is a lookup rather than "
+                "a hand-off and no quarter can be skipped. revisable until the "
+                "first row opens; economically immutable afterwards. withdrawal is "
+                "never inferred from a horizon that cannot describe an open quarter"
+            ),
+        }
+
+
+def admit_plan(
+    target: Target,
+    *,
+    run: CarriedRun | None,
+    now: datetime,
+    frozen_remaining_kwh: float | None = None,
+) -> AdmittedPlan | None:
+    """Return the plan a publication supports, or ``None`` if it supports none."""
+    if not target.quarter_schedule:
+        return None
+    return AdmittedPlan(
+        plan_id=target.plan_id,
+        revision=target.revision,
+        run_id=run.run_id if run is not None else target.plan_id,
+        intent=target.intent,
+        purpose=target.purpose,
+        admitted_at=now,
+        rows=target.quarter_schedule,
+        reserve_floor_kwh=target.reserve_floor_kwh,
+        max_end_energy_kwh=target.max_end_energy_kwh,
+        headroom_until=target.headroom_until,
+        frozen_remaining_at_admission_kwh=frozen_remaining_kwh,
+    )
+
+
+def carry_plan(
+    current: AdmittedPlan | None,
+    targets: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    now: datetime,
+    *,
+    run: CarriedRun | None,
+    frozen_remaining_kwh: float | None = None,
+    executable_intents: frozenset[str] = frozenset({EXECUTION_INTENT_GRID_CHARGE}),
+) -> AdmittedPlan | None:
+    """Return the admitted plan after this refresh. Pure, and priority-ordered.
+
+    **An opened plan is returned unchanged** -- not re-derived, not re-priced, not
+    compared against the horizon, because Stage A's horizon head is ``elapsed + 1``
+    and no publication issued after a row opened can describe it. That is the whole
+    of the beta.27 authority rule, now applied to the schedule rather than to one
+    row, which is what makes a skipped boundary unrepresentable.
+
+    A plan that has not opened yet *may* be replaced: nothing physical has happened,
+    so a fresher publication is simply better information.
+
+    **The schedule comes from the run that was admitted**, never from a scan of the
+    horizon. An earlier draft picked the earliest admissible publication and stamped
+    the carried run's identity onto it -- so on a refresh where the horizon held a
+    different run first, the plan and the run described different publications, the
+    claim stopped matching, and the campaign stopped and restarted itself. Run
+    admission already answers "which publication is Stage B executing"; asking it
+    twice, differently, is how the two answers drift apart.
+    """
+    if current is not None:
+        if current.has_opened(now) and now < current.ends_at:
+            return current
+        if now >= current.ends_at:
+            current = None
+
+    if run is None:
+        return current
+    if run.target.intent not in executable_intents:
+        return current
+    candidate = admit_plan(
+        run.target, run=run, now=now, frozen_remaining_kwh=frozen_remaining_kwh
+    )
+    if candidate is None or now >= candidate.ends_at:
+        return current
+    # **Opening now or next, within the refresh jitter.** A strictly-future rule can
+    # never admit the row that opens *at* this refresh, which is the second half of
+    # the skipped-boundary defect: the refresh lands a few seconds after the boundary
+    # it is meant to open. A row that opened minutes ago is refused, because its
+    # elapsed delivery was never measured.
+    if (now - candidate.starts_at).total_seconds() > PLAN_ADMISSION_LOOKBACK_SECONDS:
+        return current
+    if not any(row.executable for row in candidate.rows):
+        # Nothing in it Stage B could arm. Reported by the caller, not admitted.
+        return current
+    if current is not None and candidate.plan_id == current.plan_id:
+        # The same publication, re-derived. Keep the admitted instant.
+        return current
+    return candidate
 
 
 def admit_quarter(

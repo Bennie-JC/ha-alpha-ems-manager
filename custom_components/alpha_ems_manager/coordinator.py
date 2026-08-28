@@ -12,6 +12,7 @@ registry, so this integration adds no API traffic of its own.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 import time
@@ -48,11 +49,13 @@ from .alphaess_adapter import (
 )
 from .alphaess_device import (
     BOOLEAN_EXECUTION_OWNER,
+    DISPATCH_DEADMAN_MINUTES,
     DISPATCH_DURATION,
     DISPATCH_ENABLE,
     DISPATCH_MODE_SOC_CONTROL,
     DISPATCH_POWER,
     FAMILIES,
+    SENSOR_DISPATCH_START,
     action_refusal,
     build_command,
     device_power_kw,
@@ -78,6 +81,7 @@ from .const import (
     CADENCE_PHYSICAL_TICK,
     CADENCE_QUARTER_REFRESH,
     CAP_NONE,
+    CLAIM_SCHEMA_VERSION,
     CONF_ALLOW_BATTERY_EXPORT,
     CONF_ALLOW_GRID_CHARGING,
     CONF_BATTERY_CAPACITY_KWH,
@@ -150,16 +154,18 @@ from .const import (
     INHIBIT_NO_DECISION,
     INHIBIT_NO_PLAN,
     INHIBIT_PLAN_UNAVAILABLE,
+    LIFECYCLE_IDLE,
     LOG_THROTTLE_SECONDS,
     MAX_COMPLETED_QUARTERS_REPORTED,
     MAX_CONTROL_EVENTS_REPORTED,
+    MAX_DISPATCH_START_SAMPLES_REPORTED,
     MAX_PHYSICAL_DECISIONS_REPORTED,
     MAX_SAMPLE_GAP_SECONDS,
+    MIN_EXECUTABLE_QUARTER_KWH,
     MIN_QUARTER_COVERAGE,
     OWNERSHIP_DEGRADED,
     OWNERSHIP_NONE,
     OWNERSHIP_OWNED,
-    OWNERSHIP_PROVENANCE_SETTLING,
     OWNERSHIP_UNPROVEN,
     PRICE_CROSS_CHECK_DISAGREES,
     PRICE_FLAG_EXPORT_CROSS_CHECK_FAILED,
@@ -167,6 +173,12 @@ from .const import (
     PRICE_UNAVAILABLE_NOT_CONFIGURED,
     PRICE_UNAVAILABLE_OPTIONS_UNREADABLE,
     PRICE_UNAVAILABLE_SOURCE_UNAVAILABLE,
+    PROBE_PHASE_AFTER_REARM,
+    PROBE_PHASE_AFTER_START,
+    PROBE_PHASE_AFTER_STOP,
+    PROBE_PHASE_BEFORE_START,
+    PROBE_PHASE_IDLE,
+    PROBE_PHASE_STEADY,
     PV_ABSORPTION_DISPATCH_ACTIVE,
     PV_ABSORPTION_EXCESS_EXPORT,
     PV_ABSORPTION_NO_SUPPRESSING_FEATURE,
@@ -206,6 +218,7 @@ from .const import (
     TICK_SKIPPED_NOT_LIVE,
     TICK_SKIPPED_OWNERSHIP,
     TICK_SKIPPED_STALE_TARGET,
+    TICK_SKIPPED_SUB_RESOLUTION,
     TICK_STOPPED_QUARTER_EXPIRED,
     TICK_STOPPED_TARGET_REACHED,
 )
@@ -245,6 +258,7 @@ from .energy_balance import (
     measure_coherence,
 )
 from .execution import (
+    AdmittedPlan,
     CarriedQuarter,
     CarriedRun,
     ForwardAuthorisation,
@@ -254,10 +268,11 @@ from .execution import (
     affirms,
     carried_from_record,
     carry_forward,
-    carry_quarter,
+    carry_plan,
     control_intent_for,
     decide,
     forward_authorisation,
+    instant_of,
     measure_progress,
     ownership_of,
     parse_target,
@@ -812,6 +827,21 @@ def _mark_execution_applied(
     power["executed"] = True
 
 
+def _claim_id(run_id: str, now: datetime) -> str:
+    """Return a stable identity for one physical claim.
+
+    **One arm, one identity.** A run id names an economic run and legitimately
+    outlives several arms -- a run stopped and restarted inside its window keeps it.
+    Progress and ownership need to distinguish the *arms*, because delivered energy
+    belongs to the arm that delivered it.
+
+    Derived from the run and the instant of the write, so it is reproducible from the
+    record and needs no counter to persist.
+    """
+    seed = f"{run_id}:{now.isoformat()}".encode()
+    return hashlib.blake2s(seed, digest_size=8).hexdigest()
+
+
 def _dispatch_start_instant(snapshot: Any, now: datetime) -> datetime | None:
     """Return the device's dispatch start as an instant, or ``None``.
 
@@ -1193,6 +1223,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: The quarter currently authorised for execution. Carried in its own
         #: right, because a run that ends at a boundary used to leave the quarter
         #: after it with no carrier at all -- which is the whole of R1.
+        #: The frozen quarter schedule of the admitted run. **The carried object
+        #: since beta.30**; the executing quarter is derived from it rather than held
+        #: in a slot of its own, which is what makes a skipped boundary impossible.
+        self._plan: AdmittedPlan | None = None
+        #: The row covering this instant, derived from ``_plan`` at the top of every
+        #: tick and every refresh. A cache, never an authority.
         self._quarter: CarriedQuarter | None = None
         #: Measured progress inside the current quarter, keyed on its start so a
         #: new quarter can never inherit the last one's accumulators.
@@ -1207,6 +1243,18 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._quarter_pv_helped: bool = False
         self._quarter_target_reached_at: datetime | None = None
         self._quarter_clamps: set[str] = set()
+        #: The claim the current quarter's progress belongs to. Progress keys on
+        #: ``(claim_id, quarter_start)``, so neither a new arm nor a new row can
+        #: inherit measurements taken under the other.
+        self._quarter_claim: str | None = None
+        #: The read-only dispatch-start probe. Diagnostics only; no decision reads it.
+        self._dispatch_start_samples: deque[dict[str, Any]] = deque(
+            maxlen=MAX_DISPATCH_START_SAMPLES_REPORTED
+        )
+        #: Where the execution lifecycle is, and when it got there.
+        self._lifecycle: str = LIFECYCLE_IDLE
+        self._lifecycle_at: datetime | None = None
+        self._lifecycle_previous: str | None = None
         #: The bounded history of finished execution quarters.
         self._completed_quarters: deque[dict[str, Any]] = deque(
             maxlen=MAX_COMPLETED_QUARTERS_REPORTED
@@ -1611,10 +1659,24 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         would lose energy from the quarter's totals on exactly the ticks a reader
         most wants explained.
         """
+        # **Derive before measuring.** The row covering this instant decides which
+        # accumulators the sample belongs to, so it must be resolved first -- and the
+        # derivation is also what notices a row ending, because a derived quarter
+        # cannot be found expired: it stops being returned.
+        ended = self._refresh_executing_quarter(now)
         self._accrue_quarter_progress(now)
         quarter = self._quarter
         run = self._carried
         snapshot = read_snapshot(self.hass)
+        self._record_dispatch_start_sample(snapshot, now, cadence=CADENCE_PHYSICAL_TICK)
+
+        if ended is not None:
+            # The row that was being executed has finished. Close it whatever
+            # follows: the shortfall belongs to the row it happened in.
+            await self._async_end_row(ended, now, snapshot, stop=self._quarter is None)
+            if self._quarter is None:
+                self._note_tick(now, TICK_STOPPED_QUARTER_EXPIRED, wrote=True)
+                return
 
         # **Three reasons where beta.26 published one.** ``no_owned_run`` covered
         # "nothing is admitted", "nothing is armed" and "we cannot prove this is
@@ -1642,11 +1704,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # and asking the run whether the tick may proceed is what made a whole
         # quarter unexecutable.
         if quarter is not None:
-            if now >= quarter.quarter_end:
-                await self._async_end_quarter(
-                    now, snapshot, QUARTER_END_EXPIRED, SHORTFALL_QUARTER_EXPIRED
-                )
-                self._note_tick(now, TICK_STOPPED_QUARTER_EXPIRED, wrote=True)
+            # **No expiry test here any more.** A derived row cannot be found
+            # expired: the derivation above stops returning it, and that is where
+            # the end is noticed. A test here would be unreachable code pretending
+            # to be a safety check.
+            if quarter.objective_kwh() < MIN_EXECUTABLE_QUARTER_KWH:
+                # Stage A marks such a row non-executable and never publishes it as
+                # armable; this is Stage B's own backstop, because arming it would
+                # overshoot the objective by construction.
+                self._note_tick(now, TICK_SKIPPED_SUB_RESOLUTION)
                 return
         elif run.stale_at(now) or not run.actionable_at(now):
             # The beta.26 window test, reached only on the run-only fallback.
@@ -1702,6 +1768,65 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._applied_setpoint_kw = decision.applied_kw
         self._note_tick(now, TICK_APPLIED, wrote=True)
+
+    async def _async_end_row(
+        self,
+        row: CarriedQuarter,
+        now: datetime,
+        snapshot: Any,
+        *,
+        stop: bool,
+    ) -> None:
+        """Close a finished row, stopping the dispatch only when nothing follows.
+
+        **Two different situations, and conflating them is how a boundary loses a
+        quarter.** A row that ends inside a multi-quarter plan hands over to the next
+        row: the dispatch keeps running, the claim stays, and only the measurements
+        reset. A row that ends with nothing after it is the end of the plan, and the
+        dispatch must stop -- immediately, whatever the dead-man lease still says.
+
+        The shortfall is recorded against the row it happened in either way, and is
+        **never** carried forward.
+        """
+        measured = self._capture_quarter_progress()
+        self._note_quarter_clamp(SHORTFALL_QUARTER_EXPIRED)
+        clamps = set(self._quarter_clamps)
+        if stop:
+            await self._async_stop_owned_run(
+                now, snapshot, EXECUTION_STOP_QUARTER_EXPIRED
+            )
+        self._restore_quarter_progress(measured)
+        self._quarter_clamps = clamps
+        self._record_completed_quarter(row, QUARTER_END_EXPIRED)
+        self._reset_quarter_progress(self._quarter)
+
+    @callback
+    def _capture_quarter_progress(self) -> tuple[Any, ...]:
+        """Return the measured totals, so a stop cannot erase them before use."""
+        return (
+            self._quarter_battery_kwh,
+            self._quarter_grid_import_kwh,
+            self._quarter_grid_export_kwh,
+            self._quarter_peak_kw,
+            self._quarter_power_sum,
+            self._quarter_power_samples,
+            self._quarter_pv_helped,
+            self._quarter_target_reached_at,
+        )
+
+    @callback
+    def _restore_quarter_progress(self, measured: tuple[Any, ...]) -> None:
+        """Put the captured totals back, for exactly as long as recording takes."""
+        (
+            self._quarter_battery_kwh,
+            self._quarter_grid_import_kwh,
+            self._quarter_grid_export_kwh,
+            self._quarter_peak_kw,
+            self._quarter_power_sum,
+            self._quarter_power_samples,
+            self._quarter_pv_helped,
+            self._quarter_target_reached_at,
+        ) = measured
 
     async def _async_end_quarter(
         self,
@@ -1763,8 +1888,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ) = measured
         self._quarter_clamps = clamps
         self._record_completed_quarter(finished, completion)
-        self._quarter = None
-        self._reset_quarter_progress(None)
+        # **The row ends; the plan does not.** A finished row inside a multi-quarter
+        # plan must leave the rest of the schedule admitted, or the next boundary
+        # would have nothing to derive from -- which is the defect this release
+        # removes. The plan is dropped only by ``carry_plan``, when it is spent.
+        self._refresh_executing_quarter(now)
+        self._reset_quarter_progress(self._quarter)
 
     @callback
     def _controller_block(self, setpoint: Any, now: datetime) -> dict[str, Any]:
@@ -2080,20 +2209,311 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     @callback
+    def _record_dispatch_start_sample(
+        self, snapshot: Any, now: datetime, *, cadence: str
+    ) -> None:
+        """Record one read-only sample of the vendor dispatch-start register.
+
+        **P0: a measurement, not a decision.** The ownership model this release ships
+        does not read this register at all -- see
+        :data:`OWNERSHIP_PROVENANCE_PARAMETERS`. It is sampled because its meaning
+        has never been established on the hardware, and because every ownership
+        model up to beta.29 rested on an *assumption* about it that the test double
+        then asserted rather than tested:
+
+            # tests/test_beta24_live_charge.py
+            # "The same reconstruction the ownership layer performs, from the same
+            #  instant: seconds since the refresh day's midnight."
+
+        A double defined as the inverse of the function under test cannot fail, which
+        is why roughly two hundred ownership assertions passed while Live execution
+        was impossible on the real inverter.
+
+        **Nothing decides on this.** The samples are appended to a bounded ring and
+        read by diagnostics alone. No service is called, no entity is written, and no
+        new cadence is introduced: the snapshot is the one the caller already read.
+
+        Candidate interpretations are published **side by side and unlabelled as to
+        which is correct**. Deciding here would repeat the original mistake.
+        """
+        state = self.hass.states.get(SENSOR_DISPATCH_START)
+        raw = None if snapshot is None else snapshot.dispatch_start
+        record = (
+            self.store.execution_record
+            if isinstance(self.store.execution_record, dict)
+            else {}
+        )
+        written = instant_of(record.get("written_at"))
+        previous = (
+            self._dispatch_start_samples[-1] if self._dispatch_start_samples else None
+        )
+        active = bool(snapshot is not None and snapshot.dispatch_active)
+        duration = None if snapshot is None else snapshot.dispatch_duration_minutes
+
+        # --- phase, from observable transitions only ---------------------------
+        was_active = bool(previous.get("dispatch_active")) if previous else False
+        previous_duration = (
+            previous.get("dispatch_duration_minutes") if previous else None
+        )
+        if active and not was_active:
+            phase = PROBE_PHASE_AFTER_START
+        elif not active and was_active:
+            phase = PROBE_PHASE_AFTER_STOP
+        elif active and previous is not None and previous_duration != duration:
+            phase = PROBE_PHASE_AFTER_REARM
+        elif active:
+            phase = PROBE_PHASE_STEADY
+        elif record:
+            phase = PROBE_PHASE_IDLE
+        else:
+            phase = PROBE_PHASE_BEFORE_START
+
+        # --- candidate interpretations, none preferred -------------------------
+        candidates: dict[str, str | None] = {}
+        numeric = raw if isinstance(raw, (int, float)) and raw == raw else None
+        if numeric is not None and numeric > 0:
+            local_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            utc_now = dt_util.as_utc(now)
+            utc_midnight = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            candidates["local_midnight_seconds"] = (
+                local_midnight + timedelta(seconds=numeric)
+            ).isoformat()
+            candidates["utc_midnight_seconds"] = (
+                utc_midnight + timedelta(seconds=numeric)
+            ).isoformat()
+            if 1e9 <= numeric <= 4e9:
+                candidates["unix_epoch_seconds"] = datetime.fromtimestamp(
+                    numeric, tz=UTC
+                ).isoformat()
+            if 1e12 <= numeric <= 4e12:
+                candidates["unix_epoch_millis"] = datetime.fromtimestamp(
+                    numeric / 1000.0, tz=UTC
+                ).isoformat()
+            if numeric <= 86400:
+                candidates["elapsed_seconds_before_now"] = (
+                    now - timedelta(seconds=numeric)
+                ).isoformat()
+                candidates["countdown_seconds_after_now"] = (
+                    now + timedelta(seconds=numeric)
+                ).isoformat()
+
+        deltas = {
+            name: (
+                None
+                if written is None or value is None
+                else round((instant_of(value) - written).total_seconds(), 1)
+            )
+            for name, value in candidates.items()
+        }
+
+        previous_raw = previous.get("raw_numeric") if previous else None
+        self._dispatch_start_samples.append(
+            {
+                "at_local": now.isoformat(),
+                "at_utc": dt_util.as_utc(now).isoformat(),
+                "cadence": cadence,
+                "phase": phase,
+                # The string exactly as the state machine holds it: ``parse_numeric``
+                # discards it, and a timestamp device class or a unit suffix would
+                # answer the semantics question outright.
+                "raw_state": None if state is None else state.state,
+                "raw_numeric": numeric,
+                "raw_device_class": (
+                    None if state is None else state.attributes.get("device_class")
+                ),
+                "raw_unit": (
+                    None
+                    if state is None
+                    else state.attributes.get("unit_of_measurement")
+                ),
+                "raw_state_class": (
+                    None if state is None else state.attributes.get("state_class")
+                ),
+                "raw_last_changed": (
+                    None if state is None else state.last_changed.isoformat()
+                ),
+                "raw_last_updated": (
+                    None if state is None else state.last_updated.isoformat()
+                ),
+                # What the production reconstruction makes of it. Reported so the
+                # measurement can be compared against the belief it replaces.
+                "reconstructed_local_midnight": (
+                    None
+                    if (reconstructed := _dispatch_start_instant(snapshot, now)) is None
+                    else reconstructed.isoformat()
+                ),
+                "dispatch_active": active,
+                "dispatch_selected_mode": (
+                    None if snapshot is None else snapshot.dispatch_selected_mode
+                ),
+                "register_mode": None if snapshot is None else snapshot.dispatch_mode,
+                "helper_setpoint_kw": (
+                    None if snapshot is None else snapshot.dispatch_setpoint_kw
+                ),
+                "register_power_w": (
+                    None if snapshot is None else snapshot.dispatch_power_w
+                ),
+                "dispatch_cutoff_percent": (
+                    None if snapshot is None else snapshot.dispatch_cutoff_percent
+                ),
+                "dispatch_duration_minutes": duration,
+                "dispatch_timer_active": (
+                    None if snapshot is None else snapshot.dispatch_timer_active
+                ),
+                "dispatch_timer_finishes_at": (
+                    None
+                    if snapshot is None or snapshot.dispatch_timer_finishes_at is None
+                    else snapshot.dispatch_timer_finishes_at.isoformat()
+                ),
+                "owner_marker": None if snapshot is None else snapshot.owner_marker,
+                "claim_written_at": record.get("written_at"),
+                "claim_dispatch_start": record.get("dispatch_start"),
+                "claim_id": record.get("claim_id"),
+                "ownership_state": self._ownership_now(snapshot, now),
+                "seconds_since_claim_written": (
+                    None
+                    if written is None
+                    else round((now - written).total_seconds(), 1)
+                ),
+                "raw_changed_since_previous": (
+                    None if previous is None else previous_raw != numeric
+                ),
+                "raw_delta_since_previous": (
+                    None
+                    if previous is None or previous_raw is None or numeric is None
+                    else round(numeric - previous_raw, 3)
+                ),
+                "raw_vs_register_time_s": (
+                    None
+                    if numeric is None
+                    or snapshot is None
+                    or snapshot.dispatch_time_s is None
+                    else round(numeric - snapshot.dispatch_time_s, 3)
+                ),
+                "raw_vs_duration_seconds": (
+                    None
+                    if numeric is None or duration is None
+                    else round(numeric - duration * 60.0, 3)
+                ),
+                "candidates": candidates,
+                "deltas_to_claim_written_s": deltas,
+                "rule": (
+                    "read-only. no decision path reads this ring. candidate "
+                    "interpretations are published side by side and none is "
+                    "selected: the correct one is whichever delta to "
+                    "claim_written_at stays small across a whole run. "
+                    "raw_delta_since_previous alone separates a fixed start instant "
+                    "from elapsed seconds from a countdown, and a jump at "
+                    "after_rearm would show the re-arm re-anchoring it"
+                ),
+            }
+        )
+
+    @callback
+    def _refresh_executing_quarter(self, now: datetime) -> CarriedQuarter | None:
+        """Derive the executing quarter from the frozen plan. **The boundary fix.**
+
+        Called at the top of every tick and every refresh. Until beta.30 the
+        executing quarter was *carried* in a slot and admitted one refresh ahead --
+        two rules that cannot both hold with one slot, because while a quarter is
+        open the slot is occupied and nothing can be admitted for the boundary after
+        it. On the real installation the executing quarter jumped from ``22:15Z`` to
+        ``22:45Z`` and the quarter between was never executed.
+
+        Deriving it removes the slot, and with it the race: the row covering this
+        instant either exists in the frozen schedule or does not.
+
+        Returns the row that **just ended**, when this call is the one that noticed,
+        so the caller can close it. ``None`` when nothing ended.
+        """
+        plan = self._plan
+        previous = self._quarter
+        self._quarter = None if plan is None else plan.executing_quarter(now)
+        if previous is None:
+            return None
+        if (
+            self._quarter is not None
+            and self._quarter.quarter_start == previous.quarter_start
+        ):
+            return None
+        # **The row that was current no longer is, so it has ended.** With a derived
+        # quarter, expiry is not observable as ``now >= quarter_end`` any more -- the
+        # row simply stops being returned. Handing the finished row back is what lets
+        # the caller close it: record the shortfall, and stop the dispatch if nothing
+        # follows it. Without this a multi-quarter plan would roll silently and a
+        # single-row plan would leave a dispatch running with nothing aiming it.
+        return previous
+
+    @callback
+    def _quarter_progress_key(self) -> tuple[str | None, datetime | None]:
+        """Return the identity this quarter's measurements belong to.
+
+        ``(claim_id, quarter_start)``. Both halves are needed: a new row under the
+        same claim is new progress, and a new claim for the same row -- a stop and a
+        restart inside one quarter -- is new progress too.
+        """
+        record = self.store.execution_record
+        claim = None
+        if isinstance(record, dict):
+            raw = record.get("claim_id")
+            claim = raw if isinstance(raw, str) and raw else None
+        return (
+            claim,
+            None if self._quarter is None else self._quarter.quarter_start,
+        )
+
+    @callback
+    def _note_lifecycle(self, state: str, now: datetime) -> None:
+        """Record a lifecycle transition. One field, one question."""
+        if state == self._lifecycle:
+            return
+        self._lifecycle_previous = self._lifecycle
+        self._lifecycle = state
+        self._lifecycle_at = now
+
+    @callback
+    def _lifecycle_block(self) -> dict[str, Any]:
+        """Return where the execution lifecycle is, and when it got there."""
+        return {
+            "state": self._lifecycle,
+            "entered_at": (
+                None if self._lifecycle_at is None else self._lifecycle_at.isoformat()
+            ),
+            "previous_state": self._lifecycle_previous,
+            "rule": (
+                "one field for one question. before beta.30 a reader had to infer "
+                "the state from four others computed at different instants"
+            ),
+        }
+
+    @callback
     def _executing_intent(self) -> str | None:
         """Return the intent currently being executed, or ``None``.
 
         **The quarter first**, because it is the narrower and more current
-        authority and it freezes its intent at admission; the carried run only as a
-        fallback, so a stop remains provable after the quarter has gone.
+        authority and it freezes its intent at admission; then the carried run; then
+        **the claim**, which is what makes a stop provable after both have gone.
 
-        ``None`` is a real answer and fails closed everywhere it is consumed: the
-        sign gate refuses an unknown intent rather than guessing a direction.
+        That last fallback is not a convenience. Since beta.30 the readback is an
+        ownership factor, and the readback checks the *sign this intent permits* --
+        so an unknown intent means an unprovable dispatch. On the Off path and after
+        a restart neither the plan nor the run survives, and without the claim's own
+        intent the EMS would be unable to prove ownership of the very dispatch it is
+        trying to stop. The claim recorded what it armed; that is the authoritative
+        answer to "what is running", and it outlives everything else by design.
+
+        ``None`` is still a real answer and fails closed everywhere it is consumed:
+        the sign gate refuses an unknown intent rather than guessing a direction.
         """
         if self._quarter is not None:
             return self._quarter.intent
         if self._carried is not None:
             return self._carried.intent
+        record = self.store.execution_record
+        if isinstance(record, dict):
+            intent = record.get("intent")
+            if isinstance(intent, str) and intent:
+                return intent
         return None
 
     @callback
@@ -2120,6 +2540,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @callback
     def _reset_quarter_progress(self, quarter: CarriedQuarter | None) -> None:
         """Begin measuring ``quarter``, discarding any previous one's totals."""
+        self._quarter_claim = self._quarter_progress_key()[0]
         self._quarter_key = None if quarter is None else quarter.quarter_start
         self._quarter_battery_kwh = 0.0
         self._quarter_grid_import_kwh = 0.0
@@ -2159,7 +2580,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if quarter is None:
             self._quarter_sampled_at = None
             return
-        if self._quarter_key != quarter.quarter_start:
+        # **Keyed on the claim as well as the row.** A stop and a restart inside one
+        # quarter is a new arm, and energy delivered by the previous arm is not
+        # progress against this one.
+        claim, row_start = self._quarter_progress_key()
+        if self._quarter_key != row_start or self._quarter_claim != claim:
             self._reset_quarter_progress(quarter)
 
         previous = self._quarter_sampled_at
@@ -2612,6 +3037,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._clear_execution_record()
         self._carried = None
         self._quarter = None
+        self._plan = None
         self._reset_quarter_progress(None)
         self._quarter_progress_unknown = False
         self._applied_setpoint_kw = None
@@ -2659,6 +3085,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._clear_execution_record()
         self._carried = None
         self._quarter = None
+        self._plan = None
         self._reset_quarter_progress(None)
         self._quarter_progress_unknown = False
         self._applied_setpoint_kw = None
@@ -2750,6 +3177,20 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ``None`` and the readback is treated as incompatible, which is the
         # conservative direction.
         expected_sign = permitted_sign(self._executing_intent())
+        # **The readback of our own handwriting, which is what beta.30 rests
+        # ownership on.** These four helpers were written by Alpha EMS itself, so
+        # comparing them against the claim is a causal check rather than the
+        # parameter matching this project rejects -- that was parameters *alone*, and
+        # these are the third of three conjoined factors.
+        #
+        # The duration verdict is computed here because the permitted dead-man set
+        # belongs to the device layer. It asks whether the live duration is one Alpha
+        # EMS is willing to command -- not whether it equals the claim's, which the
+        # 20/25-minute alternation makes false at every re-arm.
+        duration = None if snapshot is None else snapshot.dispatch_duration_minutes
+        duration_permitted = (
+            None if duration is None else round(duration) in DISPATCH_DEADMAN_MINUTES
+        )
         return OwnershipEvidence(
             dispatch_active=bool(snapshot is not None and snapshot.dispatch_active),
             marker_on=bool(snapshot is not None and snapshot.owner_marker),
@@ -2766,6 +3207,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     expected_sign=expected_sign,
                 )
             ),
+            executing_plan_id=None if self._plan is None else self._plan.plan_id,
+            readback_power_kw=None
+            if snapshot is None
+            else snapshot.dispatch_setpoint_kw,
+            readback_cutoff_percent=(
+                None if snapshot is None else snapshot.dispatch_cutoff_percent
+            ),
+            readback_duration_minutes=duration,
+            readback_duration_permitted=duration_permitted,
         )
 
     @callback
@@ -4064,6 +4514,24 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "duration_minutes": None if command is None else command.duration_minutes,
             "written_at": now.isoformat(),
             "dispatch_start": None,
+            # **The quarter this claim is for**, so a claim can never be reused to
+            # justify a dispatch belonging to a different one. Ownership compares it
+            # against the row Stage B is actually executing.
+            "quarter_start": (
+                None
+                if self._quarter is None
+                else self._quarter.quarter_start.isoformat()
+            ),
+            # **A stable identity for the physical claim itself.** The run id names
+            # an economic run and legitimately outlives several arms; this names one
+            # arm, so progress can be keyed to it and a later claim cannot inherit an
+            # earlier one's measurements.
+            "claim_id": _claim_id(run.run_id, now),
+            # **The admitted plan this claim belongs to.** Ownership compares this,
+            # not the row: one dispatch session spans every row of its plan, so a
+            # row comparison would break ownership at each boundary.
+            "admitted_plan_id": None if self._plan is None else self._plan.plan_id,
+            "schema": CLAIM_SCHEMA_VERSION,
         }
         self.store.schedule_save()
 
@@ -4203,7 +4671,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # of that test is one too many, and the copy that drifted would be this one.
         if observed is None:
             return False
-        if evidence.record_provenance != OWNERSHIP_PROVENANCE_SETTLING:
+        # **Any provenance will do, not only the settle path.** Until beta.30 this
+        # required ``settling``, and ``settling`` required the dispatch-start
+        # register -- so one unvalidated assumption about that register foreclosed
+        # the *stronger* ``exact`` proof as well, permanently. The two factors must
+        # be independently reachable, which is what this restores.
+        if evidence.record_provenance is None:
             return False
         record["dispatch_start"] = observed.isoformat()
         record["stamped_at"] = now.isoformat()
@@ -4410,15 +4883,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # and any rule claiming to re-describe it would be inferring from evidence
         # that structurally cannot exist.
         previous_quarter = self._quarter
-        self._quarter = carry_quarter(
-            previous_quarter,
+        # **The whole schedule is carried; the row is derived.** See
+        # ``_refresh_executing_quarter`` for why a carried row could not work.
+        self._plan = carry_plan(
+            self._plan,
             self.execution_targets,
             now,
             run=self._carried,
             frozen_remaining_kwh=self._frozen_remaining_kwh(now),
             executable_intents=CONTROL_LIVE_DISPATCH_INTENTS,
         )
-        if previous_quarter is not None and self._quarter is not previous_quarter:
+        self._refresh_executing_quarter(now)
+        if previous_quarter is not None and (
+            self._quarter is None
+            or self._quarter.quarter_start != previous_quarter.quarter_start
+        ):
             # It ended between ticks rather than on one -- record it before the
             # accumulators are rebased, or the history loses the quarter entirely.
             self._record_completed_quarter(
@@ -6573,7 +7052,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # download taken later has to be able to reconstruct the quarter rather
         # than only describe the instant it was taken.
         stage_b["controller"] = self._controller_block(setpoint, now)
+        self._record_dispatch_start_sample(
+            snapshot, now, cadence=CADENCE_QUARTER_REFRESH
+        )
         stage_b["quarter"] = self._quarter_block(now)
+        stage_b["lifecycle"] = self._lifecycle_block()
+        stage_b["dispatch_start_probe"] = list(self._dispatch_start_samples)
+        stage_b["admitted_plan"] = None if self._plan is None else self._plan.as_dict()
         stage_b["physical_decisions"] = list(self._physical_decisions)
         stage_b["write_boundary"] = {
             "refusal": refusal,

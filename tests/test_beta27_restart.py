@@ -52,6 +52,11 @@ def simulate_restart(coordinator) -> None:
     total do not.
     """
     coordinator._carried = None
+    # **The schedule too, since beta.30.** The executing quarter is derived at
+    # the top of every tick and refresh, so clearing the derived value alone
+    # would be undone immediately -- which is exactly the property that makes a
+    # skipped boundary impossible.
+    coordinator._plan = None
     coordinator._quarter = None
     coordinator._reset_quarter_progress(None)
     coordinator._quarter_progress_unknown = False

@@ -86,6 +86,12 @@ def evidence_for(run_id: str) -> OwnershipEvidence:
         record=matching_record(run_id=run_id),
         dispatch_start=DISPATCH_START,
         run_id=run_id,
+        # **beta.30: the readback is the third ownership factor.** Evidence for a
+        # run of ours must now say the device reflects the command this claim
+        # wrote -- mode and sign. The power is reported rather than judged, because
+        # the sixty-second controller varies it by design, and the duration is
+        # judged against the permitted dead-man set for the same reason.
+        readback_compatible=True,
     )
 
 

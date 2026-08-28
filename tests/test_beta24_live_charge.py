@@ -79,6 +79,7 @@ from custom_components.alpha_ems_manager.const import (
     EXECUTION_STOP_TIMER_NOT_REFRESHED,
     OWNERSHIP_OWNED,
     OWNERSHIP_PROVENANCE_EXACT,
+    OWNERSHIP_PROVENANCE_PARAMETERS,
     OWNERSHIP_PROVENANCE_SETTLING,
     OWNERSHIP_UNPROVEN,
     REFUSE_LIVE_ACTION_NOT_PERMITTED,
@@ -282,6 +283,12 @@ def evidence_at(now: datetime, **overrides) -> OwnershipEvidence:
             "written_at": (now - timedelta(seconds=30)).isoformat(),
             "dispatch_start": None,
         },
+        # **beta.30: the readback is the third ownership factor.** Evidence for a
+        # run of ours must now say the device reflects the command this claim
+        # wrote -- mode and sign. The power is reported rather than judged, because
+        # the sixty-second controller varies it by design, and the duration is
+        # judged against the permitted dead-man set for the same reason.
+        "readback_compatible": True,
     }
     params.update(overrides)
     return OwnershipEvidence(**params)
@@ -301,19 +308,39 @@ def test_a_fresh_claim_is_owned_while_it_settles() -> None:
     assert evidence.record_matches is True
 
 
-def test_a_stale_claim_is_not_owned() -> None:
-    """Outside the window a record proves nothing, and that is the whole bound."""
+def test_an_old_claim_is_still_owned_when_the_readback_agrees() -> None:
+    """**The beta.30 model change, stated where the old rule used to be.**
+
+    Until beta.30 a claim older than the settle window proved nothing, because both
+    provenance paths needed the vendor dispatch-start register. On the real inverter
+    neither could ever be satisfied, so ownership was permanently ``unproven``: no
+    correction landed on a thirty-minute run, the EMS could not stop its own
+    dispatch, and the dead-man had to finish every run.
+
+    Age is no longer the question. The question is whether the device reflects the
+    command this claim wrote -- and it does, so this is ours however long ago it was
+    armed. That is what makes a long run controllable at all.
+    """
     old = (NOW - timedelta(seconds=OWNERSHIP_CLAIM_WINDOW_SECONDS + 60)).isoformat()
     evidence = evidence_at(
         NOW, record={"run_id": "run-1", "written_at": old, "dispatch_start": None}
     )
 
-    assert evidence.record_provenance is None
-    assert evidence.record_matches is False
+    assert evidence.record_provenance == OWNERSHIP_PROVENANCE_PARAMETERS
+    assert evidence.record_matches is True
 
 
-def test_a_completed_record_is_matched_exactly() -> None:
-    """After stamping the comparison is exact, so a moved register stops matching."""
+def test_the_register_may_strengthen_a_claim_but_never_withhold_one() -> None:
+    """**The register is corroborating-only**, which is the whole of the beta.30 fix.
+
+    A register that agrees upgrades the label a reader sees to ``exact``. A register
+    that disagrees -- or reads zero, or is in some other epoch entirely, which is
+    what the hardware may well be doing -- leaves ownership intact and merely stops
+    corroborating it.
+
+    This is the property that makes the release safe to ship before P0 reports: no
+    outcome of that measurement can take ownership away.
+    """
     stamped = {
         "run_id": "run-1",
         "written_at": (NOW - timedelta(hours=2)).isoformat(),
@@ -321,9 +348,21 @@ def test_a_completed_record_is_matched_exactly() -> None:
     }
     exact = evidence_at(NOW, record=stamped)
     moved = evidence_at(NOW, record=stamped, dispatch_start=NOW + timedelta(hours=1))
+    absent = evidence_at(NOW, record=stamped, dispatch_start=None)
 
     assert exact.record_provenance == OWNERSHIP_PROVENANCE_EXACT
-    assert moved.record_provenance is None
+    # Disagreeing, and still ours.
+    assert moved.record_provenance == OWNERSHIP_PROVENANCE_PARAMETERS
+    assert moved.record_matches is True
+    # Absent, and still ours.
+    assert absent.record_provenance == OWNERSHIP_PROVENANCE_PARAMETERS
+    assert absent.record_matches is True
+
+
+def test_a_disagreeing_readback_is_never_owned() -> None:
+    """And the factor that replaced it does refuse. Fail-closed is unchanged."""
+    assert evidence_at(NOW, readback_compatible=False).record_matches is False
+    assert evidence_at(NOW, readback_compatible=False).failed_factor == "readback_mode"
 
 
 def test_the_settle_window_needs_the_marker_and_a_running_dispatch() -> None:
@@ -1640,7 +1679,13 @@ async def test_live_to_shadow_stops_the_charge(
 
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
     await set_mode(hass, CONTROL_MODE_SHADOW)
-    report = await step_once(hass, coordinator, live_surface)
+    # **The stop happens on the mode-change refresh itself, since beta.30.**
+    # Selecting Shadow *is* the stop request, as this test's own name says, and
+    # ownership is now provable on that refresh -- so the reset completes there
+    # rather than one refresh later. Asserting the report from the refresh that
+    # performed it is the stronger statement: it pins that no dispatch of ours
+    # survives the mode change even for a single cycle.
+    report = coordinator.control_report or {}
 
     assert report["mode"] == CONTROL_MODE_SHADOW
     assert_full_charge_reset(
@@ -1671,7 +1716,12 @@ async def test_live_to_off_stops_the_charge_then_goes_quiet(
 
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
     await set_mode(hass, CONTROL_MODE_OFF)
-    report = await step_once(hass, coordinator, live_surface)
+    # **The stop happens on the mode-change refresh itself, since beta.30.**
+    # Selecting Off while a charge of ours is running means stop, and ownership is
+    # now provable on that refresh -- so the cleanup completes there rather than one
+    # refresh later. Asserting the report from the refresh that performed it pins
+    # that no dispatch of ours survives the mode change even for a single cycle.
+    report = coordinator.control_report or {}
 
     # ``state`` is relabelled by the send site once a write lands, so the boundary
     # is what says which operation ran.
@@ -1721,6 +1771,11 @@ async def test_stage_a_withdrawal_stops_the_charge(
         type(coordinator), "_execution_targets", lambda self, **kwargs: ()
     )
     # And no quarter is open, so there is genuinely no intent anywhere.
+    # **The schedule too, since beta.30.** The executing quarter is derived at
+    # the top of every tick and refresh, so clearing the derived value alone
+    # would be undone immediately -- which is exactly the property that makes a
+    # skipped boundary impossible.
+    coordinator._plan = None
     coordinator._quarter = None
     coordinator._reset_quarter_progress(None)
     report = await step_once(hass, coordinator, live_surface)

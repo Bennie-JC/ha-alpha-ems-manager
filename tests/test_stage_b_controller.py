@@ -622,24 +622,29 @@ DISPATCH_START = datetime(2026, 8, 24, 10, 46, tzinfo=UTC)
 
 
 @pytest.mark.parametrize(
-    ("active", "marker", "record", "expected"),
+    ("active", "marker", "record", "readback", "expected"),
     [
-        (False, False, None, OWNERSHIP_NONE),
-        (False, True, None, OWNERSHIP_NONE),
-        (True, False, None, OWNERSHIP_FOREIGN),
-        (True, False, matching_record(), OWNERSHIP_FOREIGN),
-        (True, True, None, OWNERSHIP_UNPROVEN),
-        (True, True, {}, OWNERSHIP_UNPROVEN),
-        (True, True, {"run_id": "other"}, OWNERSHIP_UNPROVEN),
-        (True, True, matching_record(), OWNERSHIP_OWNED),
+        (False, False, None, False, OWNERSHIP_NONE),
+        (False, True, None, False, OWNERSHIP_NONE),
+        (True, False, None, False, OWNERSHIP_FOREIGN),
+        (True, False, matching_record(), False, OWNERSHIP_FOREIGN),
+        (True, True, None, True, OWNERSHIP_UNPROVEN),
+        (True, True, {}, True, OWNERSHIP_UNPROVEN),
+        (True, True, {"run_id": "other"}, True, OWNERSHIP_UNPROVEN),
+        # **The third factor, since beta.30.** Marker and record without a readback
+        # that reflects the command this claim wrote is no longer ownership: it is
+        # two factors, and the third is what tells our dispatch from someone else's.
+        (True, True, matching_record(), False, OWNERSHIP_UNPROVEN),
+        (True, True, matching_record(), True, OWNERSHIP_OWNED),
     ],
 )
-def test_the_ownership_matrix(active, marker, record, expected) -> None:
-    """Every combination of dispatch, marker and record, stated once.
+def test_the_ownership_matrix(active, marker, record, readback, expected) -> None:
+    """Every combination of dispatch, marker, record and readback, stated once.
 
-    The two that matter most: a marker alone is ``unproven``, and a record alone
-    is ``foreign``. Neither is ``owned``, because either on its own is exactly the
-    inference the control surface makes untrustworthy.
+    The three that matter most: a marker alone is ``unproven``, a record alone is
+    ``foreign``, and marker-plus-record without a matching readback is ``unproven``
+    too. None of them is ``owned``, because each on its own is exactly the inference
+    the control surface makes untrustworthy.
     """
     evidence = OwnershipEvidence(
         dispatch_active=active,
@@ -647,6 +652,7 @@ def test_the_ownership_matrix(active, marker, record, expected) -> None:
         record=record,
         dispatch_start=DISPATCH_START if active else None,
         run_id="abc123",
+        readback_compatible=readback,
     )
 
     assert ownership_of(evidence) == expected
@@ -814,6 +820,7 @@ def test_an_owned_run_reports_running() -> None:
             record=matching_record(),
             dispatch_start=DISPATCH_START,
             run_id="abc123",
+            readback_compatible=True,
         ),
     )
 
@@ -829,6 +836,12 @@ def owned_evidence() -> OwnershipEvidence:
         record=matching_record(),
         dispatch_start=DISPATCH_START,
         run_id="abc123",
+        # **beta.30: the readback is the third ownership factor.** Evidence that
+        # establishes ownership must now say the device reflects the command this
+        # claim wrote -- mode and sign. The power is reported rather than judged,
+        # because the sixty-second controller varies it by design, and the duration
+        # is judged against the permitted dead-man set for the same reason.
+        readback_compatible=True,
     )
 
 

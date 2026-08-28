@@ -2040,6 +2040,37 @@ OWNERSHIP_NONE: Final = "none"
 #: would hide which evidence carried the decision.
 OWNERSHIP_PROVENANCE_EXACT: Final = "exact"
 OWNERSHIP_PROVENANCE_SETTLING: Final = "settling"
+#: Causation shown by the device reflecting **the parameters this claim wrote**.
+#:
+#: **The provenance beta.30 rests ownership on**, and the reason Live execution
+#: works at all. The two labels above both need the vendor's dispatch-start
+#: register, whose semantics have never been measured on the hardware -- and on the
+#: real installation neither could ever be satisfied, so ownership was permanently
+#: ``unproven``, no correction ever landed, and the dead-man had to stop every run.
+#:
+#: This label needs no vendor register. It is granted when the marker is on, a claim
+#: written *before* the writes names this run and this quarter, and the device
+#: reflects the mode, sign, power, cutoff and duration that claim recorded. The
+#: register may still *upgrade* the label to ``exact`` or ``settling``; it can no
+#: longer withhold ownership.
+OWNERSHIP_PROVENANCE_PARAMETERS: Final = "parameters"
+
+#: The named factors an ownership verdict is composed from, so a refusal can say
+#: **which one** failed rather than only that the verdict was negative. Reading
+#: ``ownership_not_owned`` on sixteen consecutive ticks cost a day of hardware
+#: debugging that one of these names would have ended.
+OWNERSHIP_FACTOR_MARKER: Final = "marker"
+OWNERSHIP_FACTOR_CLAIM: Final = "claim"
+OWNERSHIP_FACTOR_RUN: Final = "claim_names_run"
+OWNERSHIP_FACTOR_PLAN: Final = "claim_names_plan"
+OWNERSHIP_FACTOR_MODE: Final = "readback_mode"
+OWNERSHIP_FACTOR_SIGN: Final = "readback_sign"
+OWNERSHIP_FACTOR_POWER: Final = "readback_power"
+OWNERSHIP_FACTOR_CUTOFF: Final = "readback_cutoff"
+OWNERSHIP_FACTOR_DURATION: Final = "readback_duration"
+OWNERSHIP_FACTOR_DISPATCH: Final = "dispatch_active"
+OWNERSHIP_FACTOR_NONE: Final = "none"
+
 OWNERSHIP_OWNED: Final = "owned"
 OWNERSHIP_FOREIGN: Final = "foreign"
 OWNERSHIP_UNPROVEN: Final = "unproven"
@@ -2116,6 +2147,36 @@ DISPATCH_POWER_DEADBAND_KW: Final = 0.2
 
 #: The device power resolution, in kW. Every commanded figure is a multiple of it.
 DISPATCH_POWER_STEP_KW: Final = 0.1
+
+#: The smallest non-zero energy one quarter can physically deliver.
+#:
+#: ``0.1 kW`` for a quarter of an hour. **A published objective below this is not
+#: executable**, and beta.29 published many: an export plan with meter targets of
+#: ``0.01`` and ``0.02`` kWh, which the actuator can only answer with ``0.025`` --
+#: a 150 % overshoot, or nothing at all. Neither is what Stage A asked for.
+#:
+#: Derived rather than written down, so it cannot drift from the step it comes from.
+MIN_EXECUTABLE_QUARTER_KWH: Final = DISPATCH_POWER_STEP_KW * 0.25
+
+#: Why a published row cannot be executed. Reported, never silent: the economics
+#: stay visible so a reader can see what was planned and why it was not armed.
+QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION: Final = "below_actuator_resolution"
+QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE: Final = "no_objective"
+
+#: How stale an opening row may be and still be admitted, in seconds.
+#:
+#: **The fix for the skipped-quarter defect's second half.** A refresh lands a few
+#: seconds *after* the boundary it is meant to open, so a rule of "strictly in the
+#: future" can never admit the row that has just opened. This tolerates the jitter
+#: and nothing more: a row that opened two minutes ago carries unmeasured delivery
+#: and is refused.
+PLAN_ADMISSION_LOOKBACK_SECONDS: Final = 120.0
+#: How far a readback figure may sit from the claim and still be the same command.
+#:
+#: One helper step for power, because that is the resolution the value was written
+#: at. Exact for the cutoff and the duration: both are written as whole numbers and
+#: read back as the same whole numbers, so a difference is a different command.
+OWNERSHIP_POWER_TOLERANCE_KW: Final = DISPATCH_POWER_STEP_KW + 1e-9
 
 #: How fresh a measurement must be to actuate on, in seconds.
 #:
@@ -2354,6 +2415,10 @@ DISPATCH_EXPORT_CLAMP_ORDER: Final = (
 #: distinct conditions, so a reader could not tell "no authority" from "authority
 #: but nothing armed".
 TICK_SKIPPED_NO_QUARTER: Final = "no_admitted_quarter"
+#: The open row's objective is below what one quarter can physically deliver.
+#: Stage A marks such a row non-executable; this is Stage B's own backstop, because
+#: a caller that armed one anyway would overshoot it by construction.
+TICK_SKIPPED_SUB_RESOLUTION: Final = "objective_below_actuator_resolution"
 TICK_SKIPPED_DISPATCH_INACTIVE: Final = "dispatch_not_active"
 TICK_SKIPPED_OWNERSHIP: Final = "ownership_not_owned"
 TICK_STOPPED_TARGET_REACHED: Final = "stopped_target_reached"
@@ -2365,9 +2430,50 @@ TICK_ERROR: Final = "controller_error"
 #: described one event.
 CADENCE_PHYSICAL_TICK: Final = "physical_tick"
 CADENCE_QUARTER_REFRESH: Final = "quarter_refresh"
+CADENCE_OFF_REFRESH: Final = "off_refresh"
 
 #: The bounded history of completed execution quarters.
 MAX_COMPLETED_QUARTERS_REPORTED: Final = 12
+
+#: How many dispatch-start probe samples to keep.
+#:
+#: A twenty-minute run is ~20 sixty-second ticks plus two refreshes, so this holds
+#: one whole run including the arm and the samples after the stop.
+MAX_DISPATCH_START_SAMPLES_REPORTED: Final = 32
+
+#: The causal-claim schema this release writes and will accept.
+#:
+#: **A claim written before beta.30 carries no quarter and no claim id**, so it
+#: cannot be checked against the row Stage B is executing. Such a claim is refused
+#: rather than adopted: an upgrade must not take over a dispatch armed under rules
+#: this release no longer applies. The dead-man finishes any run in flight, which is
+#: exactly what it is for.
+CLAIM_SCHEMA_VERSION: Final = 2
+
+#: Where the execution lifecycle currently is. One field, one question, so a reader
+#: never has to infer the state from four others that were computed at different
+#: instants.
+LIFECYCLE_IDLE: Final = "idle"
+LIFECYCLE_ADMITTED: Final = "admitted"
+LIFECYCLE_STARTING: Final = "starting"
+LIFECYCLE_EXECUTING: Final = "executing"
+LIFECYCLE_UPDATING: Final = "updating"
+LIFECYCLE_STOPPING: Final = "stopping"
+LIFECYCLE_STOPPED: Final = "stopped"
+LIFECYCLE_DEADMAN_EXPIRED: Final = "deadman_expired"
+LIFECYCLE_CLEANUP_COMPLETE: Final = "cleanup_complete"
+LIFECYCLE_FOREIGN: Final = "foreign"
+LIFECYCLE_UNPROVEN: Final = "unproven"
+LIFECYCLE_DEGRADED: Final = "degraded"
+
+#: Where a probe sample sits in the physical lifecycle, derived from observable
+#: transitions only. Diagnostics; nothing decides on it.
+PROBE_PHASE_BEFORE_START: Final = "before_start"
+PROBE_PHASE_AFTER_START: Final = "after_start"
+PROBE_PHASE_STEADY: Final = "steady_active"
+PROBE_PHASE_AFTER_REARM: Final = "after_rearm"
+PROBE_PHASE_AFTER_STOP: Final = "after_stop"
+PROBE_PHASE_IDLE: Final = "idle"
 
 #: Which of the two authorisation caps produced the effective remainder.
 CAP_FROZEN: Final = "frozen"

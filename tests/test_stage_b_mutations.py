@@ -70,6 +70,11 @@ def owned() -> OwnershipEvidence:
         record=matching_record(),
         dispatch_start=DISPATCH_START,
         run_id="abc123",
+        # **beta.30: the readback is the third ownership factor.** Evidence that
+        # establishes ownership must say the device reflects the command this claim
+        # wrote -- mode and sign. The power is reported rather than judged, because
+        # the controller varies it by design.
+        readback_compatible=True,
     )
 
 

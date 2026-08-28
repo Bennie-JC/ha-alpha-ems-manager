@@ -381,7 +381,14 @@ async def test_an_unverified_stop_withholds_cleanup_and_keeps_the_evidence(
     report = await step_once(hass, coordinator, deaf_surface)
 
     written = sent_entities(deaf_surface)
-    assert written == [DISPATCH_ENABLE], written
+    # **The deactivation, and nothing beyond it.** Since beta.30 the sixty-second
+    # tick also notices a row ending and attempts the stop, so the enable may be
+    # written more than once against a surface that is ignoring it -- retrying a
+    # deactivation that did not take is the correct response, and it is why the
+    # cleanup is withheld. What must not appear is any *other* entity: the resting
+    # values and the marker stay untouched until the stop is verified.
+    assert written, written
+    assert set(written) == {DISPATCH_ENABLE}, written
     assert hass.states.get(BOOLEAN_EXECUTION_OWNER).state == "on"
     assert coordinator.store.execution_record is not None
 

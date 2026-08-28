@@ -473,12 +473,14 @@ async def test_target_reached_stops_the_quarter_with_no_carried_run(
     A start gate and a stop gate that disagree about a direction is the worst of the
     two: it strands a running dispatch on the device dead-man.
     """
+    # **A charge quarter, not an export one.** Since beta.30 the readback is an
+    # ownership factor and it checks the sign the intent permits -- so fabricating an
+    # export claim over the fixture's *running charge* is an incoherent world that
+    # the model correctly refuses to own. The property under test is the STOP, which
+    # is direction-independent; the export stop has its own test beside this one.
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
-    orphan_the_quarter(
-        coordinator,
-        quarter_at(10, 45, intent=EXECUTION_INTENT_NET_EXPORT, battery=1.0, export=0.5),
-    )
-    coordinator._quarter_grid_export_kwh = 0.5
+    orphan_the_quarter(coordinator, quarter_at(10, 45, battery=1.0, authorised=1.0))
+    coordinator._quarter_battery_kwh = 1.0
     live_surface.calls.clear()
 
     await coordinator._async_physical_tick(local(NORMAL, 10, 46))
@@ -557,6 +559,13 @@ async def test_a_quarter_at_the_run_level_tolerance_still_executes(
 
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
     await after_dark(hass)
+    if intent == EXECUTION_INTENT_NET_EXPORT:
+        # The fixture leaves a *charge* running, and since beta.30 the readback is an
+        # ownership factor that checks the sign the intent permits. An export claim
+        # over a negative setpoint is an incoherent world, so the device is put into
+        # the shape an export would actually have left it in.
+        hass.states.async_set(DISPATCH_POWER, "0.7")
+        await hass.async_block_till_done()
     orphan_the_quarter(
         coordinator,
         quarter_at(
