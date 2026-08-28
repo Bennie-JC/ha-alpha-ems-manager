@@ -9,6 +9,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.30] - 2026-08-28
+
+**The structural execution fix.** A full-night hardware run of `beta.29` produced
+enough evidence to stop patching one defect per release and repair the architecture
+instead. Four defects, three of them structural, and one systemic lesson about how
+they stayed hidden.
+
+Anyone on any earlier release should upgrade. Before `beta.30` the controller could
+*start* a Live charge and then neither correct it, stop it, nor clean up after it.
+
+### Fixed: ownership could never be proven on the real inverter
+
+Every provenance path since `beta.24` required the vendor's dispatch-start register.
+`_dispatch_start_instant` invents a calendar for it — the register is a bare number,
+and the code assumed "seconds since local midnight" — and the settle path then
+subtracts a real wall-clock `written_at` from that synthetic instant. If the register
+is in UTC-midnight seconds, that is out by two hours against a 180-second window; if
+it is a Unix epoch, by decades. And because the `exact` path needs a stamp only the
+settle path can write, one unvalidated assumption disabled **both** factors
+permanently.
+
+Measured on the installation: sixteen consecutive ticks reporting
+`ownership_not_owned`, `last_successful_write` still sitting at the arm thirty
+minutes later, the EMS classifying **its own dispatch** as untouchable at the next
+boundary, and the hardware dead-man stopping the run.
+
+Ownership now rests on three factors Alpha EMS controls: **the marker**, **a claim
+written before the writes**, and **a readback of the helpers it wrote itself** — mode
+and the sign the intent permits. The register is corroborating-only: it may upgrade
+provenance to `exact` or `settling`, and it can no longer withhold ownership. That is
+what makes this release safe to run before the register is measured, and it is
+asserted directly: no reading of it — zero, an epoch, a two-hour offset, a moving
+counter — can take ownership away.
+
+**Three candidate factors were tried and rejected during implementation**, each for
+the same reason: a factor may not judge a value we deliberately vary.
+
+- the **dead-man duration** alternates 20/25 minutes so the vendor automation fires
+  at all, so it is judged against the permitted set rather than against the claim;
+- the **quarter** — a dispatch session spans every row of its plan, and binding the
+  claim to the row broke ownership at the first boundary (claim `08:15`, row `08:30`,
+  same dispatch);
+- the **commanded power** — the sixty-second controller rewrites it by design (claim
+  4.3 kW, live −5.5 kW one minute later), so it is reported and never judged.
+
+### Fixed: every second quarter of a multi-quarter run was skipped
+
+One slot cannot hold both "the quarter that is open" and "the quarter admitted next".
+While a quarter was open the slot was occupied, so nothing was admitted for the
+boundary after it — and when the slot freed, the selection rule looked strictly
+forward and picked the quarter *after* the one that had just opened. Visible in the
+hardware ring: the executing quarter jumped from `22:15Z` to `22:45Z` and the quarter
+between them never ran.
+
+`AdmittedPlan` freezes the **whole schedule** at admission and the executing row is
+**derived** from it, so a boundary is a lookup rather than a hand-off. There is no
+slot to occupy and no race to lose. Immutability is stronger than before: the entire
+schedule is frozen, so no later publication can alter any row, and withdrawal is
+still never inferred from a horizon that structurally cannot describe an open row.
+
+A row that stops being current has *ended*: it is closed and its shortfall recorded,
+and the dispatch stops only when nothing follows it.
+
+### Fixed: an ended run's progress reached a fresh publication
+
+The hardware reported `remaining_battery_kwh: 0` and `target_reached` against a
+1.11 kWh target while the battery was physically charging at 5.7 kW — the previous
+run's 2.531 kWh being compared against a publication it never executed. Quarter
+progress now keys on `(claim_id, quarter_start)`, so neither a new arm nor a new row
+can inherit the other's measurements.
+
+### Fixed: planned rows below the actuator's resolution
+
+The Dispatch power helper quantises to 0.1 kW, so the smallest energy a quarter can
+deliver is **0.025 kWh**. `beta.29` published export rows of 0.01 and 0.02 kWh, which
+the actuator can only answer with 0.025 — a 150 % overshoot — or with nothing. Stage A
+now marks such a row non-executable with a named reason; it stays fully visible in the
+economics, and Stage B refuses it as its own backstop.
+
+### New: the dispatch-start register probe (P0), read-only
+
+Because the register's meaning has never been established, `beta.30` measures it. On
+the cadences that already read the device — no new timer, no extra I/O — it records
+the raw state and its attributes, the entity's `last_changed` (which is the readback
+lag, measured rather than assumed), six candidate interpretations and each one's
+delta to the claim's `written_at`, the change since the previous sample, and a phase
+derived from observable transitions.
+
+**It chooses nothing.** Candidates are published side by side; the interpretation is a
+hardware measurement, not a code assumption. No decision path reads the ring.
+
+### Why the tests did not catch any of this
+
+`LiveSurface` set the register to *"the same reconstruction the ownership layer
+performs, from the same instant"*. **A double defined as the inverse of the function
+under test cannot fail** — roughly two hundred ownership assertions passed while Live
+execution was impossible in the field. `beta.30` adds an anti-tautology guard that
+fails if this test module ever derives a fixture value from the production code it
+then checks.
+
+### Not changed
+
+Verified byte-for-byte against `v1.0.0-beta.29`: `evaluate`, `absorbing_capacity_kw`,
+`safe_discharge_power_kw`, `limit_command`, `action_refusal`, `dispatch_refusal`,
+`demand_for`, `carry_forward`, `control_intent_for` and `ownership_of`. The run-level
+`TARGET_TOLERANCE_KWH` is still `0.25`.
+
+Stage A's economics are untouched: the optimiser still decides when to charge, when to
+export, the quarter targets, the reserve, headroom, prices, forecasts and switching
+cost. Stage B still only executes an already-authorised quarter. `serve_load` remains
+blocked, the reserve-guard discharge still cannot export, and the Force Charging and
+Force Discharging helper families are written for neither Live intent.
+
+**Physical PV curtailment is still not executed.** Stage A continues to model it for
+negative export prices; there is no actuator, and adding one needs a fail-safe that
+*restores* generation — the opposite of every other actuator here.
+
+### Upgrading
+
+A claim written before `beta.30` records no plan and no claim id, so it cannot be
+checked against what is running. Such a claim **fails closed**: the dispatch is left
+to the device dead-man rather than adopted under rules this release no longer applies.
+`STORAGE_MINOR_VERSION` is unchanged; there is nothing to migrate.
+
 ## [1.0.0-beta.29] - 2026-08-27
 
 **The open quarter becomes the execution authority, for both intents.** `beta.28`
@@ -4073,7 +4197,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.29...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.30...HEAD
+[1.0.0-beta.30]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.29...v1.0.0-beta.30
 [1.0.0-beta.29]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.28...v1.0.0-beta.29
 [1.0.0-beta.28]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.27...v1.0.0-beta.28
 [1.0.0-beta.27]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.26...v1.0.0-beta.27

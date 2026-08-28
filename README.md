@@ -19,12 +19,12 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.29` — a public beta.**
+> **Current release: `1.0.0-beta.30` — a public beta.**
 >
 > Stage A is feature-complete. Stage B — the physical execution controller — is
 > wired end to end and, from beta.24, **can charge your battery**. From beta.27 it
 > executes each 15-minute plan interval as an explicit energy target, and can also
-> **export to the grid** when the plan says so. Covered by 3780 automated tests.
+> **export to the grid** when the plan says so. Covered by 3827 automated tests.
 >
 > **Two actions are executable: buying energy into the battery, and selling it back
 > out.** Serving the house from the battery, and curtailing production, are
@@ -55,11 +55,14 @@ switched off.
 > you enable *Live* on this release, watch your grid meter during the first planned
 > export quarter.
 >
-> `beta.27` announced export but could not perform it, and `beta.28` still could
-> not: its export path refused every first write, because it asked for proof of
-> ownership that cannot exist until the first write has landed. `beta.29` fixes that
-> and makes the open 15-minute quarter the execution authority for charging too.
-> **If you are running `beta.27` or `beta.28`, upgrade.**
+> **`beta.30` is the first release whose controller can actually hold the wheel.**
+> Every release from `beta.24` proved ownership of a running dispatch against a
+> vendor register whose meaning had never been measured — and on the real inverter
+> that proof could never succeed. The controller could start a charge and then not
+> correct it, not stop it, and not clean up after it: the hardware dead-man ended
+> every run. `beta.30` proves ownership from evidence Alpha EMS writes itself, and
+> also fixes a boundary fault that skipped every second quarter of a multi-quarter
+> run. **If you are running anything earlier, upgrade.**
 >
 > **This integration is not in the HACS default repository.** Install it as a
 > HACS *custom repository* — see [Installation](#installation). A submission for
@@ -92,7 +95,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.29` is not offered.
+     dialog if `1.0.0-beta.30` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
