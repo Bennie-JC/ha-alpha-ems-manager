@@ -25,7 +25,6 @@ from .battery import INTERVAL_HOURS
 from .const import (
     BATTERY_KW_PRECISION,
     CONFIG_ENTRY_VERSION,
-    ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     ECONOMIC_MODEL_VERSION,
     ECONOMIC_TOMORROW_ABSENT,
     ECONOMIC_TOMORROW_PRESENT,
@@ -96,6 +95,7 @@ def _source_report(hass: HomeAssistant, entity_id: str | None) -> dict[str, Any]
     state = hass.states.get(entity_id)
     if state is None:
         return {"configured": True, "entity_id": entity_id, "exists": False}
+    now = dt_util.utcnow()
     return {
         "configured": True,
         "entity_id": entity_id,
@@ -104,6 +104,17 @@ def _source_report(hass: HomeAssistant, entity_id: str | None) -> dict[str, Any]
         "unit": state.attributes.get("unit_of_measurement"),
         "device_class": state.attributes.get("device_class"),
         "state_class": state.attributes.get("state_class"),
+        # **How old the reading is, since beta.33 (CFG-008).** The control path
+        # refuses a stale source -- ``INHIBIT_SOC_STALE`` and its family -- and a
+        # download that published the value but not its age could not tell a reader
+        # *which* source was the stale one. Both timestamps are published because
+        # they answer different questions: ``last_changed`` is when the figure last
+        # moved, and ``last_updated`` is when the source last said anything at all,
+        # which is the one the staleness gates read.
+        "last_changed": state.last_changed.isoformat(),
+        "last_updated": state.last_updated.isoformat(),
+        "age_seconds": round((now - state.last_updated).total_seconds(), 1),
+        "unchanged_for_seconds": round((now - state.last_changed).total_seconds(), 1),
     }
 
 
@@ -555,7 +566,12 @@ def _economic_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any
     bridge, basis = _economic_bridge(coordinator, plan)
     return economic_as_dict(
         outcome,
-        execution_blocked_reason=ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+        # **The real runtime reason, not a constant.** Through beta.32 this was
+        # hardcoded to ``execution_unavailable`` -- a release-level claim that no
+        # command reaches the battery, untrue since beta.24. A user downloading
+        # diagnostics during a Live charge was told execution was unavailable while
+        # the same download showed the dispatch running.
+        execution_blocked_reason=coordinator.economic_blocked_reason,
         table_max_power_kw=outcome.max_representable_power_kw,
         table_max_charge_kw=outcome.max_representable_charge_kw,
         table_max_discharge_kw=outcome.max_representable_discharge_kw,

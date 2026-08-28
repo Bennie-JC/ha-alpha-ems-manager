@@ -46,9 +46,9 @@ from .const import (
     CONF_BATTERY_POWER_SIGN,
     CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_SOC_ENTITY,
+    CONF_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
     CONF_CONTROL_EXECUTION_ENABLED,
     CONF_CONTROL_EXPORT_MARGIN_PERCENT,
-    CONF_CONTROL_HORIZON_MINUTES,
     CONF_DAILY_HOUSE_LOAD_ENTITY,
     CONF_EV_POWER_ENTITY,
     CONF_FRANK_ENTRY_ID,
@@ -65,14 +65,14 @@ from .const import (
     CONF_SOLCAST_ENTRY_ID,
     CONF_USE_PV_FORECAST,
     CONFIG_ENTRY_VERSION,
-    CONTROL_DURATION_STEP_MINUTES,
     DEFAULT_ALLOW_BATTERY_EXPORT,
     DEFAULT_ALLOW_GRID_CHARGING,
     DEFAULT_BATTERY_MIN_SOC_PERCENT,
     DEFAULT_BATTERY_POWER_SIGN,
     DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+    DEFAULT_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
+    DEFAULT_CONTROL_EXECUTION_ENABLED,
     DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
-    DEFAULT_CONTROL_HORIZON_MINUTES,
     DEFAULT_GRID_CHARGE_BUDGET_KWH,
     DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     DEFAULT_GRID_POWER_SIGN,
@@ -85,16 +85,16 @@ from .const import (
     MAX_BATTERY_CAPACITY_KWH,
     MAX_BATTERY_POWER_KW,
     MAX_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+    MAX_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
     MAX_CONTROL_EXPORT_MARGIN_PERCENT,
-    MAX_CONTROL_HORIZON_MINUTES,
     MAX_GRID_CHARGE_BUDGET_KWH,
     MAX_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     MAX_MINIMUM_TRADE_GAIN_EUR,
     MIN_BATTERY_CAPACITY_KWH,
     MIN_BATTERY_POWER_KW,
     MIN_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+    MIN_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
     MIN_CONTROL_EXPORT_MARGIN_PERCENT,
-    MIN_CONTROL_HORIZON_MINUTES,
     MIN_GRID_CHARGE_BUDGET_KWH,
     MIN_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     MIN_MINIMUM_TRADE_GAIN_EUR,
@@ -207,13 +207,6 @@ _GRID_BUDGET_SELECTOR = _number_selector(
     unit="kWh",
 )
 
-_HORIZON_SELECTOR = _number_selector(
-    minimum=MIN_CONTROL_HORIZON_MINUTES,
-    maximum=MAX_CONTROL_HORIZON_MINUTES,
-    step=CONTROL_DURATION_STEP_MINUTES,
-    unit="min",
-)
-
 _EXPORT_MARGIN_SELECTOR = _number_selector(
     minimum=MIN_CONTROL_EXPORT_MARGIN_PERCENT,
     maximum=MAX_CONTROL_EXPORT_MARGIN_PERCENT,
@@ -228,28 +221,25 @@ def _control_schema(
     """Return the control-settings schema.
 
     Every field is ``Required`` with a default, because every one always has a
-    usable value. The lower bound on the horizon is the load-bearing part: a
-    command shorter than one planning interval would lapse before the next
-    refresh could renew it, so the selector cannot express one. The safety gate
-    checks the same bound independently -- a single guard at either layer alone
-    would be a guard with a hole in it.
+    usable value.
 
-    **The execution enable is offered from beta.20 on**, and the reason it was
-    withheld before no longer holds in the same way. It still cannot make a command
-    reach the inverter on its own -- the release barrier is a source constant and
-    turning this on does not move it -- but it is now one of two independent
-    consents rather than a switch with nothing behind it, and the description says
-    so rather than implying otherwise. Withholding it would mean the first Live run
-    had to enable execution and open the barrier in the same step.
+    **Three fields since beta.33, not four.** The withdrawn one was shown here as
+    "Command duration" and never reached the Live Dispatch duration
+    register: that register is written only by the internal dead-man, which
+    alternates twenty and twenty-five because the vendor automation triggers on the
+    helper changing state. A setting that cannot change what the battery does is
+    worse than no setting, so it was withdrawn rather than relabelled -- and the
+    dead-man is deliberately **not** offered in its place under any name. Its value
+    and its re-arm cadence are safety mechanics, not preferences. A stored value
+    from an earlier release stays where it is and is never read.
+
+    **The execution enable is offered from beta.20 on.** It was withheld before
+    because it had nothing behind it; since beta.24 it is the switch that decides
+    whether a command reaches the inverter at all, alongside the Control Mode
+    select. Two independent consents, and neither implies the other.
     """
     return vol.Schema(
         {
-            vol.Required(
-                CONF_CONTROL_HORIZON_MINUTES,
-                default=current(
-                    CONF_CONTROL_HORIZON_MINUTES, DEFAULT_CONTROL_HORIZON_MINUTES
-                ),
-            ): _HORIZON_SELECTOR,
             vol.Required(
                 CONF_CONTROL_EXPORT_MARGIN_PERCENT,
                 default=current(
@@ -265,7 +255,12 @@ def _control_schema(
             ): _GRID_BUDGET_SELECTOR,
             vol.Required(
                 CONF_CONTROL_EXECUTION_ENABLED,
-                default=bool(current(CONF_CONTROL_EXECUTION_ENABLED, False)),
+                default=bool(
+                    current(
+                        CONF_CONTROL_EXECUTION_ENABLED,
+                        DEFAULT_CONTROL_EXECUTION_ENABLED,
+                    )
+                ),
             ): selector.BooleanSelector(),
         }
     )
@@ -288,16 +283,35 @@ _GRID_CHARGE_MARGIN_SELECTOR = _number_selector(
     unit="EUR/kWh",
 )
 
+#: CFG-004. The throughput cost, offered for the first time in beta.33.
+#:
+#: It was fully wired into every solve pass, the diagnostics and the settings
+#: fingerprint, and reachable only by hand-editing ``.storage`` -- so its declared
+#: bounds went unenforced too (CFG-005). Both are used here.
+_THROUGHPUT_COST_SELECTOR = _number_selector(
+    minimum=MIN_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
+    maximum=MAX_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
+    step=0.001,
+    unit="EUR/kWh",
+)
+
 
 def _economics_schema(
     current: Callable[[str, Any], Any],
 ) -> vol.Schema:
     """Return the economic-settings schema.
 
-    Three fields, all ``Required`` with a default, because all three always have a
-    usable value. Zero gain is allowed and means "take every trade the prices
+    Five fields, all ``Required`` with a default, because all of them always have
+    a usable value. Zero gain is allowed and means "take every trade the prices
     justify" -- refusing it would be a policy this integration has no business
     imposing, and the reserve keeps its lexicographic priority either way.
+
+    **The throughput cost joins them in beta.33 (CFG-004).** It was implemented,
+    solved on, published in diagnostics and included in the settings fingerprint,
+    and had no field: the only way to set it was to hand-edit ``.storage``. The
+    three economic terms have deliberately disjoint bases -- per run, per
+    grid-caused charged kWh, per kWh of throughput -- and offering two of the three
+    invited a user to express wear in the one place that does not mean it.
 
     The two opt-ins default to **off** and both are offered, unlike the execution
     enable. They earn their place because they change the *published* plan: a user
@@ -319,6 +333,13 @@ def _economics_schema(
                     DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH,
                 ),
             ): _GRID_CHARGE_MARGIN_SELECTOR,
+            vol.Required(
+                CONF_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
+                default=current(
+                    CONF_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
+                    DEFAULT_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
+                ),
+            ): _THROUGHPUT_COST_SELECTOR,
             vol.Required(
                 CONF_ALLOW_GRID_CHARGING,
                 default=current(CONF_ALLOW_GRID_CHARGING, DEFAULT_ALLOW_GRID_CHARGING),

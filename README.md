@@ -19,12 +19,12 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.32` — a public beta.**
+> **Current release: `1.0.0-beta.33` — a public beta.**
 >
 > Stage A is feature-complete. Stage B — the physical execution controller — is
 > wired end to end and, from beta.24, **can charge your battery**. From beta.27 it
 > executes each 15-minute plan interval as an explicit energy target, and can also
-> **export to the grid** when the plan says so. Covered by 4020 automated tests.
+> **export to the grid** when the plan says so. Covered by 4084 automated tests.
 >
 > **Two actions are executable: buying energy into the battery, and selling it back
 > out.** Serving the house from the battery, and curtailing production, are
@@ -55,7 +55,28 @@ switched off.
 > you enable *Live* on this release, watch your grid meter during the first planned
 > export quarter.
 >
-> **`beta.32` fixes what sits around the optimiser.** `beta.31` shipped the right
+> **`beta.33` connects the campaign layer `beta.32` shipped unwired.** Every
+> published execution target carried `campaign_id: null`, so no campaign ever
+> opened: the realised accumulator never advanced, the objective was never frozen
+> and no campaign terminal was ever filed. It was found in a live diagnostics
+> download rather than by a test, because the campaign tests all constructed their
+> own identities by hand. A multi-segment sale — an export, a quarter where the
+> house eats everything the pack gives it, then the rest of the export — is now one
+> campaign with one lifecycle rather than three unrelated runs.
+>
+> **`beta.33` also closes an audit of all thirty settings you can change.** A
+> minimum state of charge at or above 50 % produced no economic plan at all, silently
+> — that is fixed. *Command duration* has been **removed**: it never reached the Live
+> Dispatch duration register, which is driven by an internal safety dead-man that
+> alternates on its own and is not a preference. A stored value stays where it is,
+> does nothing, and needs no migration. The battery wear cost per kWh has been
+> implemented since `beta.18` and reachable only by hand-editing storage; it now has
+> a field, still defaulting to zero. And several published fields that had quietly
+> become untrue — a `serve_load` row claiming it was armable, a blocked reason that
+> always read `execution_unavailable`, and the package docstring's claim that no
+> command reaches the battery — now report what is actually the case.
+>
+> **`beta.32` fixed what sits around the optimiser.** `beta.31` shipped the right
 > economics; the layers that describe, group and protect the plan had not caught up.
 > Three things a user will notice. A sale is now refused when its price does not beat
 > what that energy is worth to the house before the next cheap window — selling at
@@ -121,7 +142,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.32` is not offered.
+     dialog if `1.0.0-beta.33` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -830,11 +851,13 @@ happening.
   anything reaches the inverter. `serve_load` is deliberately not an executable
   intent: a discharge into the house is ordinary inverter behaviour and needs no
   command from this integration.
-- ⚠️ **Multi-quarter export campaigns are new in beta.32 and unobserved on
-  hardware.** Live `net_export` has been executed on this installation; a sale that
-  spans several quarter boundaries as one continuous campaign has been tested but not
-  yet watched on the inverter. If you enable *Live*, watch your grid meter during the
-  first long planned export.
+- ⚠️ **Multi-quarter export campaigns have never run on hardware, and could not
+  have.** The campaign layer shipped unwired in `beta.32` and is connected for the
+  first time in `beta.33`, so every campaign lifecycle — the accumulator, the frozen
+  objective, the single terminal — is executing for the first time on this release.
+  Live `net_export` itself has been performed on this installation. If you enable
+  *Live*, watch your grid meter during the first long planned export, and check that
+  the campaign files exactly one terminal when it ends.
 - ❌ No EV charge scheduling. Phase 1 only *separates* EV consumption from the
   baseline; it never starts, stops or plans charging.
 - ❌ No Solcast-driven *optimisation*. The forecast reduces what the battery is

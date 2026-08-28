@@ -79,23 +79,14 @@ from .const import (
     BATTERY_KWH_PRECISION,
     BATTERY_SOC_PRECISION,
     CAMPAIGN_OUTCOMES,
-    CONTROL_EXECUTABLE_ACTIONS,
-    CONTROL_EXECUTION_AVAILABLE,
     CONTROL_MODE_ACTIVE,
     CONTROL_STATE_OPTIONS,
     DOMAIN,
     ECONOMIC_ACTION_CHARGE,
-    ECONOMIC_ACTION_CURTAIL,
     ECONOMIC_ACTION_EXPORT,
     ECONOMIC_ACTION_OPTIONS,
     ECONOMIC_ACTION_SAFETY_BUY,
-    ECONOMIC_BLOCKED_ACTION_NOT_EXECUTABLE,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
-    ECONOMIC_BLOCKED_EXPORT_NOT_PERMITTED,
-    ECONOMIC_BLOCKED_MODE_NOT_ACTIVE,
-    ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL,
-    ECONOMIC_BLOCKED_NONE,
-    ECONOMIC_BLOCKED_NOT_ENABLED,
     ECONOMIC_DIRECTION_CHARGE,
     ECONOMIC_EUR_PRECISION,
     EXECUTION_INTENT_NET_EXPORT,
@@ -855,46 +846,14 @@ def _terminal_view(report: dict[str, Any]) -> TerminalView | None:
 def _economic_blocked_reason(coordinator: AlphaEmsCoordinator) -> str:
     """Return why nothing is sent, most fundamental reason first.
 
-    Ordered so a reader is told the deepest reason rather than the first one this
-    refresh happened to hit. A release that sends nothing at all must say so before
-    it starts naming per-action reasons, or "no primitive for export" would read as
-    the only thing standing in the way.
-
-    Since beta.24 a charge *is* sent, so the deepest reasons are the ones the user
-    controls -- the enable and the mode -- and below them the direction: an action
-    outside :data:`CONTROL_EXECUTABLE_ACTIONS` is blocked for being that action, not
-    for lacking an actuator.
-
-    **Two of beta.31's answers were false, and beta.32 removes both.** An export
-    returned ``no_primitive_export`` while ``CONTROL_EXECUTABLE_ACTIONS_BY_INTENT``
-    has authorised an admitted ``net_export`` since beta.27 and the hardware has
-    performed one; and everything else fell through to
-    ``live_direction_not_executable``, which described a user who had switched
-    battery export off as a missing capability rather than as a setting.
+    **One implementation, on the coordinator, since beta.33.** The logic lived here
+    while diagnostics and the stored evidence snapshot each hardcoded
+    ``execution_unavailable`` instead, so the three surfaces disagreed about the
+    same fact. They now read
+    :attr:`~custom_components.alpha_ems_manager.coordinator.AlphaEmsCoordinator.economic_blocked_reason`,
+    which is where the ordering and its argument live.
     """
-    if not CONTROL_EXECUTION_AVAILABLE:
-        return ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE
-    if not coordinator.config.control_execution_enabled:
-        return ECONOMIC_BLOCKED_NOT_ENABLED
-    if coordinator.control_mode != CONTROL_MODE_ACTIVE:
-        return ECONOMIC_BLOCKED_MODE_NOT_ACTIVE
-    outcome = _economic_outcome(coordinator)
-    if outcome is not None:
-        if outcome.action == ECONOMIC_ACTION_EXPORT:
-            # Executable since beta.27, so the only thing that can stand in the
-            # way is the user's own permission -- which is theirs to change, and
-            # says so.
-            if not coordinator.config.allow_battery_export:
-                return ECONOMIC_BLOCKED_EXPORT_NOT_PERMITTED
-            return ECONOMIC_BLOCKED_NONE
-        if outcome.action == ECONOMIC_ACTION_CURTAIL:
-            # Genuinely absent: no release commands the inverter to decline
-            # production, and the plan reports ``hold`` while saying what it wanted.
-            return ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL
-        if outcome.action in CONTROL_EXECUTABLE_ACTIONS:
-            return ECONOMIC_BLOCKED_NONE
-        return ECONOMIC_BLOCKED_ACTION_NOT_EXECUTABLE
-    return ECONOMIC_BLOCKED_ACTION_NOT_EXECUTABLE
+    return coordinator.economic_blocked_reason
 
 
 def _economic_window(coordinator: AlphaEmsCoordinator, run: Any) -> str | None:

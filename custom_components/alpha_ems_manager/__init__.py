@@ -1,12 +1,21 @@
 """The Alpha EMS Manager integration.
 
 Source fusion, household-load learning, forecasting, a battery recommendation,
-and the full control pipeline that would execute it -- translation, safety gate,
+and the full control pipeline that executes it -- translation, safety gate,
 command planning and authorization.
 
-**No command reaches the battery.** The pipeline is complete and validated end to
-end, and its final step is unreachable rather than merely disabled: see
-``CONTROL_EXECUTION_AVAILABLE``. No trading decision is made anywhere.
+**Commands do reach the battery, under three independent gates.** This docstring
+said the opposite until beta.33: it was written when the final step was genuinely
+unreachable, and stayed unchanged through beta.24, which shipped the Live charge,
+and beta.27, which shipped the Live export. A safety claim that has quietly become
+false is worse than none, because it is exactly the sentence a reader auditing the
+integration stops at.
+
+What actually holds: nothing is sent unless the user has enabled sending commands,
+the control mode is Active, and the safety gate authorises the specific action --
+and every command carries a vendor dead-man that expires on its own if this
+integration stops talking. See ``CONTROL_EXECUTION_AVAILABLE`` for what the
+release can perform at all.
 """
 
 from __future__ import annotations

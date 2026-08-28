@@ -42,8 +42,8 @@ from custom_components.alpha_ems_manager.const import (
     COHERENCE_HOLDING,
     COHERENCE_OK,
     CONTROL_COHERENCE_GRACE_TICKS,
+    CONTROL_HORIZON_MINUTES,
     CONTROL_MAX_SOURCE_AGE_SECONDS,
-    DEFAULT_CONTROL_HORIZON_MINUTES,
     EMERGENCY_STOP_MAX_ATTEMPTS,
     REFUSE_EMERGENCY_ATTEMPTS_SPENT,
     REFUSE_EMERGENCY_NOT_AUTHORIZED,
@@ -229,7 +229,7 @@ def test_the_grace_period_is_materially_shorter_than_the_dead_man() -> None:
     controller decided to. Three physical ticks is 180 seconds.
     """
     grace = CONTROL_COHERENCE_GRACE_TICKS * SAFETY_SAMPLE_SECONDS
-    deadman = DEFAULT_CONTROL_HORIZON_MINUTES * 60
+    deadman = CONTROL_HORIZON_MINUTES * 60
 
     assert grace == 180
     assert grace < deadman / 4, (grace, deadman)

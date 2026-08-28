@@ -23,6 +23,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.alpha_ems_manager.activity import ACTIVITY_NAME
 from custom_components.alpha_ems_manager.const import (
+    CONTROL_EXECUTION_AVAILABLE,
     ECONOMIC_ACTION_OPTIONS,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     ECONOMIC_BLOCKED_NOT_ENABLED,
@@ -273,7 +274,16 @@ async def test_diagnostics_carries_the_economic_plan_section(
 
     assert section["model_version"] == ECONOMIC_MODEL_VERSION
     assert "decides_nothing" in section
-    assert "no service call reaches the inverter" in section["decides_nothing"]
+    # **Scoped to the module in beta.33.** It claimed "no service call reaches the
+    # inverter" -- true of the whole integration when written, false from beta.24
+    # on, and published where a user auditing safety would read it as a live
+    # guarantee. What the field is actually for is still asserted: Stage A itself
+    # actuates nothing, and the boundary tests check that at the syntax level.
+    assert (
+        "this module calls no service and names no helper" in section["decides_nothing"]
+    )
+    assert "never executes one" in section["decides_nothing"]
+    assert "no service call reaches the inverter" not in section["decides_nothing"]
 
 
 async def test_the_diagnostics_section_reports_both_plans_and_the_gap(
@@ -293,10 +303,19 @@ async def test_the_diagnostics_section_reports_both_plans_and_the_gap(
         "price_eur_kwh",
         "totals",
     }
-    assert section["capability"]["execution_available"] is False
+    # **Both of these were literals and both were false.** Alpha EMS has sent real
+    # commands since beta.24, so a capability block asserting execution was
+    # unavailable contradicted the control section of the same download. They now
+    # read the runtime, and on this fixture the barrier is the user's own switch.
+    assert section["capability"]["execution_available"] is CONTROL_EXECUTION_AVAILABLE
+    assert section["capability"]["execution_available"] is True
     assert (
         section["capability"]["execution_blocked_reason"]
-        == ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE
+        == setup_integration.runtime_data.economic_blocked_reason
+    )
+    assert (
+        section["capability"]["execution_blocked_reason"]
+        != ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE
     )
     assert "economic_value_forgone_eur" in section["forgone"]
 

@@ -83,8 +83,13 @@ EXPECTED_OPTIONS_FIELDS: dict[str, list[str]] = {
     # Phase 4. Two fields, both with defaults. The execution-enable key is
     # deliberately absent: while the release barrier makes it unable to change
     # anything, offering it would promise a capability that does not exist.
+    # MIGRATE-006. ``control_horizon_minutes`` was withdrawn in beta.33: it was
+    # shown as "Command duration" and governed nothing a Live run did, because the
+    # Dispatch dead-man is the internal alternating twenty/twenty-five. Its
+    # absence from this list is what keeps the schema and both translation files
+    # from drifting apart -- an orphaned label is exactly how a withdrawn setting
+    # comes back looking configurable.
     "control": [
-        "control_horizon_minutes",
         "control_export_margin_percent",
         # beta.20. The commissioning tightener, and the user's half of the two
         # consents a Live write needs. The other half is a release constant, and
@@ -102,6 +107,12 @@ EXPECTED_OPTIONS_FIELDS: dict[str, list[str]] = {
         # charging. Listed beside the fixed per-run gain deliberately -- the two
         # are different quantities and the form has to show both.
         "grid_charge_margin_eur_per_kwh",
+        # CFG-004, beta.33: the throughput cost was implemented, solved on and
+        # published from beta.18 and had no field at all -- reachable only by
+        # hand-editing ``.storage``. Listed third because its basis is the third
+        # of the three, and the three must stay visibly distinct: per run, per
+        # grid-caused charged kWh, per kWh of throughput.
+        "battery_throughput_cost_eur_per_kwh",
         "allow_grid_charging",
         "allow_battery_export",
     ],

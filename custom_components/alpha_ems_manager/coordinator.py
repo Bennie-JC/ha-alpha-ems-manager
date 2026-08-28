@@ -102,7 +102,6 @@ from .const import (
     CONF_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
     CONF_CONTROL_EXECUTION_ENABLED,
     CONF_CONTROL_EXPORT_MARGIN_PERCENT,
-    CONF_CONTROL_HORIZON_MINUTES,
     CONF_DAILY_HOUSE_LOAD_ENTITY,
     CONF_EV_POWER_ENTITY,
     CONF_FRANK_ENTRY_ID,
@@ -117,7 +116,9 @@ from .const import (
     CONF_SELECTED_SOLCAST_SITE_IDS,
     CONF_SOLCAST_ENTRY_ID,
     CONF_USE_PV_FORECAST,
+    CONTROL_EXECUTABLE_ACTIONS,
     CONTROL_EXECUTION_AVAILABLE,
+    CONTROL_HORIZON_MINUTES,
     CONTROL_LIVE_DISPATCH_INTENTS,
     CONTROL_MIN_POWER_KW,
     CONTROL_MODE_ACTIVE,
@@ -140,16 +141,24 @@ from .const import (
     DEFAULT_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
     DEFAULT_CONTROL_EXECUTION_ENABLED,
     DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
-    DEFAULT_CONTROL_HORIZON_MINUTES,
     DEFAULT_GRID_CHARGE_BUDGET_KWH,
     DEFAULT_GRID_CHARGE_MARGIN_EUR_PER_KWH,
     DEFAULT_GRID_POWER_SIGN,
     DEFAULT_MINIMUM_TRADE_GAIN_EUR,
     DISPATCH_LIMIT_NONE,
     DISPATCH_POWER_DEADBAND_KW,
+    ECONOMIC_ACTION_CURTAIL,
+    ECONOMIC_ACTION_EXPORT,
+    ECONOMIC_BLOCKED_ACTION_NOT_EXECUTABLE,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+    ECONOMIC_BLOCKED_EXPORT_NOT_PERMITTED,
+    ECONOMIC_BLOCKED_MODE_NOT_ACTIVE,
+    ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL,
+    ECONOMIC_BLOCKED_NONE,
+    ECONOMIC_BLOCKED_NOT_ENABLED,
     EV_ABSENCE_GRACE_REFRESHES,
     EXECUTION_FAILED_STOP_REASONS,
+    EXECUTION_INTENT_GRID_CHARGE,
     EXECUTION_INTENT_NET_EXPORT,
     EXECUTION_STOP_COHERENCE_LOST,
     EXECUTION_STOP_EXECUTION_ERROR,
@@ -262,6 +271,7 @@ from .economic import (
     build_horizon,
     build_outcome,
     build_physics_table,
+    campaign_identity,
     desired_grid_kw_at,
     edge_creditable_energy_kwh,
     edge_value_eur_per_kwh,
@@ -606,7 +616,6 @@ class SourceConfig:
     #: Phase-4 control settings. All three have defaults: unlike the battery
     #: hardware facts, none of them describes the installation, so a sensible
     #: value is a choice rather than a guess about someone's equipment.
-    control_horizon_minutes: int
     control_export_margin_percent: float
     #: Read, and deliberately absent from the options form while the release
     #: barrier makes it unable to change anything.
@@ -614,9 +623,11 @@ class SourceConfig:
     #: A ceiling, in kWh, on grid energy one Live charge run may buy. Zero means
     #: the commissioning tightener is off, never that charging is forbidden.
     grid_charge_budget_kwh: float
-    #: Phase-8 economic settings. One threshold and two opt-ins, and all three
-    #: are in the form because all three change the *published plan* -- unlike
-    #: the execution flag above, which cannot change anything in this release.
+    #: Phase-8 economic settings. A threshold, a per-kWh margin, a throughput cost
+    #: and two opt-ins, all in the form because every one of them changes the
+    #: *published plan* -- so a user can see what a setting did before any command
+    #: is sent. The execution flag above is the separate question of whether one
+    #: is, and since beta.24 it decides exactly that.
     minimum_trade_gain_eur: float
     grid_charge_margin_eur_per_kwh: float
     #: Wear per kWh of AC throughput in both directions. Off by default; see
@@ -670,12 +681,6 @@ class SourceConfig:
             battery_round_trip_efficiency_percent=_number(
                 value(CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT),
                 DEFAULT_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
-            ),
-            control_horizon_minutes=int(
-                _number(
-                    value(CONF_CONTROL_HORIZON_MINUTES),
-                    DEFAULT_CONTROL_HORIZON_MINUTES,
-                )
             ),
             control_export_margin_percent=_number(
                 value(CONF_CONTROL_EXPORT_MARGIN_PERCENT),
@@ -3320,10 +3325,24 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _campaign_objective_kwh(self, campaign_id: str) -> float | None:
         """Return what the published plan means this campaign to achieve.
 
-        Summed over the campaign's targets at each one's own objective boundary --
-        the meter for an export segment, the battery for a charge. A discharge
-        campaign whose segments are all ``serve_load`` therefore sums to nothing,
-        which is correct: it sells nothing, so it is not a sell.
+        Summed over the campaign's **executable** segments, at each one's own
+        objective boundary -- the meter for an export, the battery for a charge.
+
+        **A non-executable segment contributes nothing, and that is the whole
+        subtlety.** A ``serve_load`` segment is published with a battery figure,
+        because the plan really does move that energy; but it is a *ceiling* on
+        ambient inverter behaviour, not an objective anybody commanded, and no
+        actuator is asked for it. Adding it would inflate a sale's promise by the
+        energy the house happened to take during the gap -- measured on the
+        reference multi-segment shape, 2.64 kWh of genuine meter objective became
+        5.39. A discharge campaign whose segments are *all* ``serve_load``
+        therefore sums to zero, which is correct: it sells nothing, so it is not a
+        sell.
+
+        This mirrors :attr:`EconomicCampaign.objective_kwh` exactly, and it has to:
+        the frozen target and the announced figure are the same promise, and a
+        campaign that announced one number and was judged against another would be
+        the boundary confusion beta.32 set out to end.
 
         ``None`` when no published target names this campaign, which is how a
         pre-beta.32 record and an unplaceable target both degrade to run-level
@@ -3334,10 +3353,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for target in self.execution_targets:
             if target.get("campaign_id") != campaign_id:
                 continue
+            # Membership is what ``seen`` records, so a campaign made entirely of
+            # gaps still reports 0.0 rather than ``None`` -- "it sells nothing" and
+            # "nobody published it" are different answers.
             seen = True
-            if target.get("intent") == EXECUTION_INTENT_NET_EXPORT:
+            intent = target.get("intent")
+            if intent == EXECUTION_INTENT_NET_EXPORT:
                 total += float(target.get("grid_target_kwh") or 0.0)
-            else:
+            elif intent == EXECUTION_INTENT_GRID_CHARGE:
                 total += float(target.get("battery_target_kwh") or 0.0)
         return total if seen else None
 
@@ -3511,6 +3534,29 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._campaign_realized_kwh = 0.0
         self._campaign_quarters_admitted = 0
         self._campaign_measurable = True
+
+    @callback
+    def _duration_to_command(self, command: Any, snapshot: Any) -> int:
+        """Return the dead-man duration this refresh will actually write.
+
+        **The gate has to guard a real value, and the two paths write different
+        ones.** A live Dispatch arm or re-arm writes ``deadman_minutes()`` -- the
+        alternating twenty/twenty-five that makes the vendor automation fire at all
+        -- while the advisory helper-family command carries its own figure. Feeding
+        the safety gate the second while the first is what reaches the inverter
+        would leave ``INHIBIT_DURATION_OUT_OF_RANGE`` guarding a number nobody
+        sends.
+
+        That mattered more than it looks: beta.32's audit read the advisory figure
+        as though it were the Dispatch dead-man and concluded, wrongly, that a
+        configured horizon could break ownership. The two are separate, and this is
+        where the separation becomes explicit.
+        """
+        if self._executing_intent() in CONTROL_LIVE_DISPATCH_INTENTS:
+            return deadman_minutes(
+                None if snapshot is None else snapshot.dispatch_duration_minutes
+            )
+        return 0 if command is None else command.duration_minutes
 
     @callback
     def _live_kw(self) -> tuple[float, float, float] | None:
@@ -5067,7 +5113,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # for a charge and ignored for an export, because a charge cutoff is
                 # an upper state of charge and a discharge cutoff is a lower one.
                 ceiling_soc_percent=plan.state.limits.max_soc_percent,
-                horizon_minutes=self.config.control_horizon_minutes,
+                horizon_minutes=CONTROL_HORIZON_MINUTES,
                 target_day=day,
                 start_index=index,
                 built_at=now,
@@ -5079,7 +5125,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # be read the device layer refuses the charge rather than substituting
             # the discharge floor or a constant.
             ceiling_soc_percent=plan.state.limits.max_soc_percent,
-            horizon_minutes=self.config.control_horizon_minutes,
+            horizon_minutes=CONTROL_HORIZON_MINUTES,
             target_day=day,
             start_index=int(index),
             built_at=now,
@@ -5806,7 +5852,26 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "stale": (
                 None if decision.target is None else decision.target.stale_at(now)
             ),
-            "deadman_duration_minutes": self.config.control_horizon_minutes,
+            # **What this refresh will actually arm the dead-man to**, not a
+            # configured figure. Through beta.32 both duration fields published the
+            # user's "Command duration" setting -- which never reached the Dispatch
+            # register at all -- so a reader comparing them against the device saw
+            # two numbers that could not agree. That misreading is what sent the
+            # beta.32 configuration audit down a false trail.
+            "deadman_duration_minutes": self._duration_to_command(None, snapshot),
+            "deadman_duration_basis": (
+                "alternating_vendor_deadman"
+                if self._executing_intent() in CONTROL_LIVE_DISPATCH_INTENTS
+                else "advisory_helper_command"
+            ),
+            "deadman_alternation_minutes": list(DISPATCH_DEADMAN_MINUTES),
+            "deadman_rule": (
+                "the live Dispatch dead-man alternates between the two values "
+                "above because the vendor automation triggers on the helper "
+                "changing state -- writing the same duration twice re-arms "
+                "nothing. it is a safety mechanism, not a horizon, and it is not "
+                "user-configurable"
+            ),
             "ownership_marker_entity": BOOLEAN_EXECUTION_OWNER,
             "ownership_marker": None if snapshot is None else snapshot.owner_marker,
             "record_present": self.store.execution_record is not None,
@@ -5825,7 +5890,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "dispatch_mode": getattr(snapshot, "dispatch_mode", None),
             "dispatch_power_w": getattr(snapshot, "dispatch_power_w", None),
             "dispatch_time_s": getattr(snapshot, "dispatch_start", None),
-            "commanded_duration_minutes": self.config.control_horizon_minutes,
+            # The two halves a reader needs side by side: what we are about to
+            # write, and what the device currently holds. During a Live run these
+            # alternate 20 / 25 as each re-arm lands; between runs the readback
+            # rests at the helper's own minimum, which is not a stale value.
+            "commanded_duration_minutes": self._duration_to_command(None, snapshot),
+            "readback_duration_minutes": (
+                None if snapshot is None else snapshot.dispatch_duration_minutes
+            ),
             "owner_marker": None if snapshot is None else snapshot.owner_marker,
             "rule": (
                 "the raw dispatch surface reads signed: negative power is a "
@@ -6005,6 +6077,36 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return None, None, None
             return max(0.0, ceiling - end_energy), end_energy, absorbs_at
 
+        # **Which campaign each run belongs to, resolved to absolute time here.**
+        #
+        # This is the wiring beta.32 shipped without, and its absence starved the
+        # whole campaign layer: every published target carried ``campaign_id:
+        # null``, so ``_note_campaign_progress`` never opened a campaign, the
+        # realised accumulator never advanced, the target never froze and no
+        # campaign terminal ever fired. The machinery was all present and simply
+        # never fed.
+        #
+        # It has to be built *here* because the optimiser deliberately has no
+        # calendar: a campaign is a span of horizon indices, and only this layer
+        # knows which civil day each index falls in. See ``campaign_identity`` for
+        # why the identity is anchored on the **end** instant.
+        #
+        # Keyed by every index the campaign spans -- not just its first -- because
+        # a campaign's *runs* are label slices inside it and any of them may be the
+        # one being turned into a target. That is what gives a ``serve_load``
+        # segment the same identity as the export segments either side of it, which
+        # is what keeps one lifecycle open across the gap. It does not make
+        # ``serve_load`` executable: intent still decides that, and Stage B admits
+        # only the intents in ``executable_intents``.
+        campaign_of: dict[int, tuple[str, datetime]] = {}
+        for campaign in outcome.desired.campaigns:
+            closes_at = moment(campaign.end_index + 1)
+            if closes_at is None:
+                continue
+            identity = campaign_identity(campaign.direction, closes_at)
+            for index in range(campaign.start_index, campaign.end_index + 1):
+                campaign_of[index] = (identity, closes_at)
+
         targets: list[dict[str, Any]] = []
         # Diagnostics only, and from a solve that already happened.
         attribution = outcome.safety_buy_attribution
@@ -6056,6 +6158,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # have been in it.
                 intervals=outcome.desired.intervals,
                 moment=moment,
+                campaign_id=campaign_of.get(run.start_index, (None, None))[0],
+                campaign_end=campaign_of.get(run.start_index, (None, None))[1],
             )
             target["revision"] = execution_revision(
                 previous.get(target["plan_id"]), target
@@ -6214,7 +6318,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             issued_at=now,
             target_day=today,
             tz_key=str(tz),
-            execution_blocked_reason=ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+            execution_blocked_reason=self.economic_blocked_reason,
             config_fingerprint=fingerprint_battery_config(
                 capacity_kwh=self.config.battery_capacity_kwh,
                 min_soc_percent=self.config.battery_min_soc_percent,
@@ -7581,9 +7685,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             and self.store.execution_record is not None
         )
         if intent is None and not stage_b_holds_the_run:
-            intent = translate(
-                plan, now=now, horizon_minutes=self.config.control_horizon_minutes
-            )
+            intent = translate(plan, now=now, horizon_minutes=CONTROL_HORIZON_MINUTES)
         requested = build_command(intent) if intent is not None else None
 
         # One context, read once, describing the *requested* command. The export
@@ -8249,9 +8351,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             device_cutoff_percent=(
                 0 if command is None else command.cutoff_soc_percent
             ),
-            device_duration_minutes=(
-                0 if command is None else command.duration_minutes
-            ),
+            device_duration_minutes=self._duration_to_command(command, snapshot),
             export_margin_percent=self.config.control_export_margin_percent,
             seconds_since_last_write=(
                 None
@@ -8471,6 +8571,48 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def control_report(self) -> dict[str, Any] | None:
         """Return this refresh's control report, or ``None``."""
         return (self.data or {}).get("control")
+
+    @property
+    def economic_blocked_reason(self) -> str:
+        """Return why nothing is sent right now, most fundamental reason first.
+
+        **One answer, read by every surface.** The attribute, the diagnostics
+        payload and the stored evidence snapshot each carried this field, and two
+        of the three hardcoded ``execution_unavailable`` -- a release-level
+        statement that no command reaches the battery at all, which stopped being
+        true in beta.24. A user reading diagnostics while a Live charge was running
+        was told execution was unavailable.
+
+        The order is the point: the deepest reason first, so a reader is not told
+        "no primitive for export" when the real answer is that the mode is off.
+
+        1. the release genuinely ships no actuator;
+        2. the user has not enabled sending commands;
+        3. the mode is not Active;
+        4. then, and only then, per-action reasons.
+        """
+        if not CONTROL_EXECUTION_AVAILABLE:
+            return ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE
+        if not self.config.control_execution_enabled:
+            return ECONOMIC_BLOCKED_NOT_ENABLED
+        if self.control_mode != CONTROL_MODE_ACTIVE:
+            return ECONOMIC_BLOCKED_MODE_NOT_ACTIVE
+        outcome = (self.data or {}).get("economic")
+        if isinstance(outcome, EconomicOutcome):
+            if outcome.action == ECONOMIC_ACTION_EXPORT:
+                # Executable since beta.27, so the only thing that can stand in the
+                # way is the user's own permission -- which is theirs to change.
+                if not self.config.allow_battery_export:
+                    return ECONOMIC_BLOCKED_EXPORT_NOT_PERMITTED
+                return ECONOMIC_BLOCKED_NONE
+            if outcome.action == ECONOMIC_ACTION_CURTAIL:
+                # Genuinely absent: no release commands the inverter to decline
+                # production.
+                return ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL
+            if outcome.action in CONTROL_EXECUTABLE_ACTIONS:
+                return ECONOMIC_BLOCKED_NONE
+            return ECONOMIC_BLOCKED_ACTION_NOT_EXECUTABLE
+        return ECONOMIC_BLOCKED_ACTION_NOT_EXECUTABLE
 
     @property
     def current_soc_percent(self) -> float | None:

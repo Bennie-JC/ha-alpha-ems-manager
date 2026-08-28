@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -112,14 +113,23 @@ def test_the_blocked_reason_is_the_barrier_and_nothing_finer() -> None:
     sends nothing at all would tell a user the export was the only thing stopping
     them.
     """
+    from custom_components.alpha_ems_manager.coordinator import AlphaEmsCoordinator
     from custom_components.alpha_ems_manager.sensor import _economic_blocked_reason
 
-    source = inspect.getsource(_economic_blocked_reason)
-    tree = ast.parse(source.lstrip())
+    # **The ordering lives on the coordinator since beta.33.** Diagnostics and the
+    # stored evidence snapshot each hardcoded this field instead of asking, so the
+    # three surfaces could disagree about the same instant; there is now one
+    # implementation and the sensor delegates to it. The property is what this
+    # boundary has to hold, so it is the property that is read here.
+    source = inspect.getsource(AlphaEmsCoordinator.economic_blocked_reason.fget)
+    tree = ast.parse(textwrap.dedent(source))
     first = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
 
     assert "CONTROL_EXECUTION_AVAILABLE" in ast.dump(first.test)
     assert ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE == "execution_unavailable"
+
+    # And the sensor is a delegation, not a second copy of the ordering.
+    assert "economic_blocked_reason" in inspect.getsource(_economic_blocked_reason)
 
 
 def test_no_phase_eight_module_calls_a_service() -> None:

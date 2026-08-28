@@ -913,7 +913,6 @@ async def test_an_earlier_installation_gains_the_control_layer_switched_off(
         CONF_CONTROL_HORIZON_MINUTES,
         CONFIG_ENTRY_VERSION,
         DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT,
-        DEFAULT_CONTROL_HORIZON_MINUTES,
     )
 
     # An entry as an earlier release wrote it: no control keys at all, plus an
@@ -930,7 +929,10 @@ async def test_an_earlier_installation_gains_the_control_layer_switched_off(
     await hass.async_block_till_done()
 
     config = entry.runtime_data.config
-    assert config.control_horizon_minutes == DEFAULT_CONTROL_HORIZON_MINUTES
+    # ``control_horizon_minutes`` was withdrawn in beta.33 and is no longer a
+    # runtime field at all -- which is what makes a stale stored value inert
+    # rather than quietly honoured. See the migration suite.
+    assert not hasattr(config, "control_horizon_minutes")
     assert config.control_export_margin_percent == DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT
     assert config.control_execution_enabled is False
     assert entry.runtime_data.control_mode == CONTROL_MODE_OFF

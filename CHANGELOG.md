@@ -9,6 +9,205 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.33] - 2026-08-29
+
+**The release that connects what beta.32 built.** `beta.32` shipped a complete
+campaign layer — the accumulator, the frozen objective, the immutability rule and
+the single terminal — and shipped it **unwired**. Every published execution target
+carried `campaign_id: null`, so no campaign ever opened and none of that machinery
+ever ran. It was found in a live 00:02 diagnostics download, not by a test: the
+campaign tests all constructed their own identities by hand and stayed green.
+
+Alongside it, a full audit of all thirty user-configurable settings. Two were
+broken in ways only certain configurations could reach, one was reachable only by
+hand-editing storage, and one governed nothing at all while claiming to control the
+battery. All four are resolved here.
+
+Nothing in the optimiser's economics changed. An installation on the shipped
+defaults plans exactly as `beta.32` did.
+
+### Fixed: the campaign lifecycle was published but never connected
+
+`execution_target()` accepted `campaign_id` and `campaign_end` from `beta.32`
+onward, and `_execution_targets()` never passed them. The consequence was total
+rather than partial: `_note_campaign_progress` returned early on every refresh,
+no campaign was ever opened, the realised accumulator never advanced, the objective
+was never frozen and no campaign terminal was ever filed.
+
+`beta.33` resolves each run to the campaign that contains it and passes both fields
+through. The identity is **derived, never minted** — `sha256(direction|campaign
+end)`, truncated — and it is anchored on the campaign's **end** rather than its
+start, because the head of the horizon advances every refresh while the end does
+not. A restart recomputes the same identity from the same plan, so recovery needs
+no stored state.
+
+Everything the machinery was written to do now happens:
+
+- **A multi-segment Sell is one campaign.** The reference shape from the live
+  install is `net_export → serve_load → net_export`: a small export, a quarter
+  where the house eats everything the pack gives it, then the large export. Three
+  targets and three intents, one identity, one lifecycle held open across the gap.
+- **The realised accumulator advances across the gap** instead of resetting at each
+  segment boundary.
+- **The objective is frozen at the first confirmed activation**, so a campaign that
+  promised 2.65 kWh and delivered 1.80 because Stage A changed its mind is filed as
+  Partial rather than as a retroactively successful 1.80 of 1.80.
+- **A replacement plan may not shrink the frozen objective or reset progress.**
+- **Exactly one terminal is filed per campaign.**
+
+The test suite that proves this may not construct a campaign identity by hand.
+Every identity is read back from the production builder running over a real solved
+plan, and seven of the eight campaign tests fail against released `beta.32`.
+
+### Fixed: a minimum state of charge at or above 50 % produced no plan at all
+
+`build_physics_table` calibrated the charge and discharge ratios by probing the
+pack at a hardcoded 50 % state of charge. On the reference installation that is a
+fine probe. With a configured floor at or above 50 % the probe state *is* the
+floor, the clamp reduces the discharge reading to zero, and the function returns
+`None` — taking the entire optimiser with it, silently, with no diagnostics reason.
+Measured: a 49 % floor built a table and a 50 % floor did not.
+
+The probe now sits at the midpoint of floor and ceiling, which is the only point
+unclamped for every legal configuration, and its power is scaled to the width of
+the window so a narrow one still reads cleanly. The ratios are pure efficiency
+constants and therefore magnitude-independent — verified identical at every floor
+from 0 % to 99.5 % — so the scaling costs no accuracy. A floor at or above the
+ceiling is now a named early return rather than a case reached by accident.
+
+### Removed: "Command duration", because it did not control anything
+
+`control_horizon_minutes` was offered in the Control settings as *Command duration*
+/ *Duur van een opdracht*, 20 to 60 minutes. It never reached the Live Dispatch
+duration register. Every writer of that register is the internal dead-man, which
+alternates 20 and 25 minutes — the vendor automation triggers on the helper
+*changing state*, so writing the same duration twice re-arms nothing and the run
+would expire silently mid-charge. The setting only ever sized the advisory
+helper-family command and a range gate.
+
+A setting that cannot change what the battery does is worse than no setting, so it
+was withdrawn rather than relabelled. The dead-man is **not** offered in its place
+under any name: its value and its re-arm cadence are safety mechanics, not
+preferences, and they remain automatic and unchanged.
+
+For anyone upgrading:
+
+- **A stored value stays where it is.** Nothing rewrites or deletes it, and saving
+  the Control page carries it forward untouched.
+- **A stored value is inert.** The runtime field was deleted rather than hidden, so
+  an old 60 cannot be quietly honoured; an entry storing 60 and an entry that never
+  had the key produce identical control intents.
+- **`CONFIG_ENTRY_VERSION` does not move.** It stays at 2. The migration is a
+  deliberate refusal rather than a converter, so a bump would make every existing
+  entry fail to load — and withdrawing a field changes no key any entry depends on.
+
+### Fixed: the duration diagnostics reported a setting instead of a value
+
+Both duration fields in the download published the configured "Command duration",
+which never reached the device — so a reader comparing them against the inverter
+saw two numbers that could not agree. That misreading is what sent an earlier audit
+down a false trail and produced a high-severity finding that did not exist.
+
+They now report what this refresh will actually write and what the device currently
+holds, side by side, with the rule stated in the payload: `deadman_duration_minutes`,
+`deadman_duration_basis`, `deadman_alternation_minutes`, `deadman_rule`,
+`commanded_duration_minutes` and `readback_duration_minutes`. Between runs the
+readback rests at the helper's own five-minute minimum; that reading is correct and
+is not a stale dead-man.
+
+### Fixed: three published fields that stated something other than the truth
+
+None of these changed what the battery did. All three are what a user reads when
+they are trying to find out.
+
+- **`not_executable: null` on a `serve_load` quarter row.** In this contract that
+  is a positive claim — *Stage B may arm this row* — and Stage B never could:
+  `serve_load` unlocks no action and admission refuses it on intent long before it
+  reads a row. Those rows now name `intent_not_executable`. Rows of an intent that
+  *does* have an actuator are still judged on the energy they ask for, so
+  `below_actuator_resolution` is unaffected.
+- **`execution_blocked_reason: "execution_unavailable"`** in the diagnostics payload
+  and in every stored evidence snapshot. That is a release-level claim that no
+  command reaches the battery, which stopped being true in `beta.24`. Three
+  surfaces published this field and two of them hardcoded it, so they could
+  disagree about the same instant. There is now one implementation, on the
+  coordinator, and it reports the deepest real barrier first: the release, then the
+  user's own enable, then the mode, then the action.
+- **`execution_available: false`** in the capability block, one line away from it
+  and equally untrue.
+
+The package docstring made the same claim and has been corrected. It said "no
+command reaches the battery", which was written when that was so and stayed
+unchanged through `beta.24` and `beta.27`. What actually holds is stated instead:
+three independent gates and a vendor dead-man that expires on its own.
+
+### Added: battery wear cost per kWh, at last reachable
+
+`battery_throughput_cost_eur_per_kwh` has been wired into every solve pass, the
+diagnostics and the settings fingerprint since `beta.18`, and had no field — the
+only way to set it was to hand-edit `.storage`. Its declared bounds went unenforced
+for the same reason. Both are now used.
+
+It is the only one of the three economic terms whose basis is throughput: the
+minimum gain per trade is charged once per run, and the grid-charge margin only on
+energy a charge actually causes to be bought. Set above zero, a plan has to earn
+more than the cycling it asks for, which suppresses long shallow round trips that
+clear every other test on volume alone. It is charged linearly, which under-prices
+deep cycling and over-prices shallow cycling — real degradation is convex in depth
+— so it is a lever, not a wear model. The default stays 0.00, so upgrading changes
+nothing until it is set.
+
+### Added: how old each source reading is
+
+The control path refuses a source older than its window, and the diagnostics
+download published each source's value without its timestamp — so `INHIBIT_SOC_STALE`
+named a family without saying which member had gone quiet. Every source now carries
+`last_updated`, `last_changed`, `age_seconds` and `unchanged_for_seconds`.
+
+### Changed: internal
+
+- The "allow sending commands" field now defaults from `DEFAULT_CONTROL_EXECUTION_ENABLED`
+  rather than a literal beside it. Both read `False`; the desync would only have
+  appeared the day the constant changed.
+- A structural test now walks every published execution target and fails if any
+  contract field is null outside a short, argued allow-list — including a test that
+  fails if an allow-listed field turns out to be populated after all. This is the
+  guard that would have caught the campaign wiring before it shipped.
+- `_campaign_objective_kwh` counted `serve_load` battery targets into a sale's
+  objective. Found only because the wiring now works: a 2.64 kWh objective was
+  reported as 5.39.
+
+### Not changed
+
+No economics were redesigned. The objective, the reserve architecture, the
+ownership model, the dead-man values and their re-arm cadence, the storage versions
+and `CONFIG_ENTRY_VERSION` are all exactly as `beta.32` shipped them.
+
+### Not yet validated on hardware
+
+Everything below is proven in software and has never been watched on a real
+inverter. This list is the honest state of the release, not a disclaimer.
+
+- **The campaign lifecycle has never executed on hardware, and could not have.**
+  It was inert in `beta.32` — no campaign ever opened — so every accumulator
+  advance, every frozen objective, every immutability refusal and every campaign
+  terminal runs for the first time on this release.
+- **A multi-quarter export across a `serve_load` gap is not hardware-validated.**
+  Live `net_export` itself has been performed on the reference installation; a sale
+  held open as one campaign across a quarter where the house takes everything the
+  pack gives it has been tested and not yet observed.
+- **A minimum state of charge at or above 50 % is software-tested only.** The
+  calibration fix is proven across every floor from 0 % to 99 %, on the model. No
+  pack has been run at such a floor.
+- **The 20 / 25 dead-man alternation still needs observation across real
+  sustains.** The write sequence is pinned in tests and the vendor automation's
+  response to it — the reason the alternation exists at all — has not been watched
+  across several consecutive re-arms on the inverter.
+
+If you run this release in *Live*, watch the grid meter through the first long
+planned export, and check that the campaign files exactly one terminal when it
+ends.
+
 ## [1.0.0-beta.32] - 2026-08-28
 
 **The calm optimiser.** `beta.31` shipped the right economic architecture. `beta.32`
@@ -4747,7 +4946,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.32...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.33...HEAD
+[1.0.0-beta.33]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.32...v1.0.0-beta.33
 [1.0.0-beta.32]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.31...v1.0.0-beta.32
 [1.0.0-beta.31]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.30...v1.0.0-beta.31
 [1.0.0-beta.30]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.29...v1.0.0-beta.30

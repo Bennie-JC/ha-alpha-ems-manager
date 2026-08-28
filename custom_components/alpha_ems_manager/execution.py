@@ -2898,8 +2898,11 @@ def as_dict(decision: Decision, *, mode: str, executed: bool) -> dict[str, Any]:
 
     Bounded scalars only, and every Stage-A expectation sits beside what actually
     happened -- a deviation should be readable rather than something a reader has
-    to compute. ``applied_kw`` is zero and ``executed`` false in this release,
-    which is how the block says out loud that nothing was sent.
+    to compute. ``applied_kw`` and ``executed`` are what the caller reports for
+    *this* decision: zero and false when nothing was sent, which is every shadow
+    refresh and every Live refresh that commanded nothing. They stopped being
+    constants in beta.24 and this docstring described them as constants until
+    beta.33.
     """
     target = decision.target
     demand = decision.demand

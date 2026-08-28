@@ -52,9 +52,13 @@ once: the optimum is never bent to fit the actuator, and nothing is ever silentl
 substituted at execution time. Their difference is the value of the missing
 primitives, and it is published.
 
-In this release neither is executed. ``CONTROL_EXECUTION_AVAILABLE`` is false, so
-``execution_blocked_reason`` reads ``execution_unavailable`` on every action, and
-that is a fact about the release rather than a caveat in prose.
+**This module executes neither, and that is a fact about the module.** It reads
+no entity, calls no service and names no helper -- checked at the syntax level in
+``test_phase_eight_boundaries``. Whether anything downstream acts on the plan is a
+separate question with a separate answer: since beta.24 a charge is executed and
+since beta.27 an export is, so ``execution_blocked_reason`` reports the live
+barrier -- the user's enable, the mode, then the action -- rather than the constant
+``execution_unavailable`` it published through beta.32.
 
 Two ratified refinements of the approved plan
 ---------------------------------------------
@@ -122,6 +126,7 @@ from .const import (
     BUY_REASON_UNKNOWN,
     CAMPAIGN_BOUNDARY_BATTERY,
     CAMPAIGN_BOUNDARY_METER,
+    CONTROL_EXECUTION_AVAILABLE,
     CONTROL_LIVE_DISPATCH_INTENTS,
     COUNTERFACTUAL_AMBIENT_SELF_CONSUMPTION,
     COUNTERFACTUAL_IDLE_IMPORT,
@@ -163,6 +168,7 @@ from .const import (
     ECONOMIC_TOMORROW_ABSENT,
     ECONOMIC_UNAVAILABLE_HORIZON_EMPTY,
     ECONOMIC_UNAVAILABLE_TERMINAL_UNREACHABLE,
+    EXECUTION_INTENT_ACTIONS,
     EXECUTION_INTENT_GRID_CHARGE,
     EXECUTION_INTENT_HOLD,
     EXECUTION_INTENT_NET_EXPORT,
@@ -173,6 +179,7 @@ from .const import (
     MODE_CHARGE,
     MODE_DISCHARGE,
     MODE_IDLE,
+    QUARTER_NOT_EXECUTABLE_INTENT,
     QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE,
     QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION,
     SURVIVAL_WINDOW_ACTIONABLE_PREFIX,
@@ -551,11 +558,41 @@ def build_physics_table(
     floor_percent = limits.soc_for_energy(max(0.0, floor_energy_kwh))
     reserve = static_reserve(floor_percent)
 
-    calibration = build_state(soc_percent=50.0, limits=limits, reserve=reserve)
-    if calibration is None:  # pragma: no cover - build_limits precludes it
+    # **The probe sits inside the configured window, and it has to.** Until
+    # beta.32 this calibrated at a hardcoded ``soc_percent=50.0``, which is a
+    # perfectly good probe on the reference installation and silently fatal
+    # elsewhere: with a configured minimum state of charge at or above 50 % the
+    # probe state *is* the floor, so the clamp reduces the discharge reading to
+    # zero, ``discharge_ratio`` is 0, and this function returns ``None`` -- taking
+    # the whole optimiser with it, under a comment asserting ``build_limits``
+    # precluded the case. It did not. Measured on the reference pack: a 49 % floor
+    # built a table and a 50 % floor did not.
+    #
+    # The midpoint of floor and ceiling is the only probe that is unclamped for
+    # every legal configuration, and the power is scaled to the window so a narrow
+    # one still reads cleanly. The ratios are pure efficiency constants and are
+    # therefore magnitude-independent -- verified identical at 0.948683 and
+    # 1.054093 for every floor from 0 % to 99.5 % -- so scaling costs no accuracy.
+    window_kwh = ceiling - max(0.0, floor_energy_kwh)
+    if window_kwh <= 0.0:
+        # A floor at or above the ceiling. No charge and no discharge is possible,
+        # so there is genuinely no lattice to solve on. Named rather than reached
+        # by accident.
         return None
-    charge_ratio, discharge_ratio = _calibrate(calibration)
-    if charge_ratio <= 0.0 or discharge_ratio <= 0.0:  # pragma: no cover
+    probe_kw = min(
+        _CALIBRATION_PROBE_KW, window_kwh / INTERVAL_HOURS / _CALIBRATION_WINDOW_SHARE
+    )
+    calibration = build_state(
+        soc_percent=limits.soc_for_energy(
+            max(0.0, floor_energy_kwh) + window_kwh / 2.0
+        ),
+        limits=limits,
+        reserve=reserve,
+    )
+    if calibration is None:
+        return None
+    charge_ratio, discharge_ratio = _calibrate(calibration, probe_kw)
+    if charge_ratio <= 0.0 or discharge_ratio <= 0.0:
         return None
 
     def energy_of(bucket: int) -> float:
@@ -602,16 +639,34 @@ def build_physics_table(
     )
 
 
-def _calibrate(probe: Any) -> tuple[float, float]:
+#: The calibration probe's power, and how small a share of the usable window it
+#: must fit inside.
+#:
+#: One kilowatt over a quarter is 0.25 kWh AC, so the probe needs roughly 0.53 kWh
+#: of window to read cleanly in both directions. An eighth of the window is
+#: comfortably inside that for every window the full-power probe can use, and
+#: shrinks with the window when it cannot.
+_CALIBRATION_PROBE_KW: float = 1.0
+_CALIBRATION_WINDOW_SHARE: float = 8.0
+
+
+def _calibrate(
+    probe: Any, power_kw: float = _CALIBRATION_PROBE_KW
+) -> tuple[float, float]:
     """Return the measured DC-per-AC ratio in each direction.
 
     One clamp call per direction, at a power well inside every limit, so neither
     reading is taken through a clamp that bound. The ratios are what the inverse
     conversion needs, and taking them from the clamp rather than from the limits
     means a change to the conversion cannot leave the planner behind.
+
+    ``power_kw`` is scaled by the caller to the configured usable window. A
+    reading taken through a clamp is not a ratio, it is the clamp -- which is
+    exactly how a hardcoded probe silently disabled the optimiser for anyone with
+    a minimum state of charge at or above 50 %.
     """
-    charged = apply_request(probe, BatteryRequest.charge(1.0))
-    discharged = apply_request(probe, BatteryRequest.discharge(1.0))
+    charged = apply_request(probe, BatteryRequest.charge(power_kw))
+    discharged = apply_request(probe, BatteryRequest.discharge(power_kw))
     charge_ratio = (
         (charged.end_energy_kwh - probe.energy_kwh) / charged.charge_ac_kwh
         if charged.charge_ac_kwh > 0.0
@@ -3732,7 +3787,14 @@ def quarter_schedule_for(
             else battery_kwh
         )
         not_executable: str | None = None
-        if objective_kwh <= 0.0:
+        if intent not in EXECUTION_INTENT_ACTIONS:
+            # **No actuator exists for this intent**, so no magnitude makes the row
+            # armable. ``serve_load`` runs are published like every other run --
+            # they carry the campaign identity across the gap between two exports --
+            # and through beta.32 their rows reported ``not_executable: null``,
+            # which this contract reads as "Stage B may arm this". It never could.
+            not_executable = QUARTER_NOT_EXECUTABLE_INTENT
+        elif objective_kwh <= 0.0:
             not_executable = QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE
         elif objective_kwh < MIN_EXECUTABLE_QUARTER_KWH:
             not_executable = QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION
@@ -3804,10 +3866,18 @@ ECONOMIC_BASIS: str = (
 #: published number, which is worse than no basis string at all.
 TERMINAL_BASIS: str = "configured_floor_on_bucket_grid"
 
+#: **Scoped to this module, since beta.33.** It read "no service call reaches the
+#: inverter", which was true of the whole integration when it was written and false
+#: from beta.24 on -- and it is published in diagnostics, so a user auditing safety
+#: read it as a live guarantee. What is still true, and is what the field is for,
+#: is that Stage A itself actuates nothing: the plan beside it describes what an
+#: actuator could achieve, never what was done.
 ECONOMIC_DECIDES_NOTHING: str = (
-    "Phase 8 calculates a plan. It never executes one: no service call reaches "
-    "the inverter, and the capability plan beside the desired one describes what "
-    "implemented actuators could achieve rather than what was done"
+    "Phase 8 calculates a plan. It never executes one: this module calls no "
+    "service and names no helper, and the capability plan beside the desired one "
+    "describes what implemented actuators could achieve rather than what was "
+    "done. What is actually sent, and what is standing in the way, is reported "
+    "by the control section and by execution_blocked_reason"
 )
 
 
@@ -4876,7 +4946,13 @@ def economic_as_dict(
             "action": outcome.capability_action,
             "gap_reason": outcome.capability_gap_reason,
             "power_kw": _round_kw(outcome.capability.power_kw),
-            "execution_available": False,
+            # **Both read the runtime, since beta.33.** This pair was a literal
+            # ``False`` and a constant ``execution_unavailable`` -- correct in
+            # beta.18, when nothing was sent, and a plain untruth from beta.24 on.
+            # Publishing them side by side made the contradiction worse: the same
+            # download showed a running dispatch and a capability block saying
+            # execution was unavailable.
+            "execution_available": CONTROL_EXECUTION_AVAILABLE,
             "execution_blocked_reason": execution_blocked_reason,
             "permitted_actions": sorted(outcome.capability.permitted),
             "totals": _plan_totals(outcome.capability),

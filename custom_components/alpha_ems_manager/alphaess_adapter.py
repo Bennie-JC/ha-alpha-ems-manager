@@ -6,11 +6,16 @@ pure. This file only fetches values and, in some future release, calls services.
 Keeping the split means shadow mode and the real path share the whole mapping and
 differ solely in whether this shell is reached.
 
-Nothing here writes anything in this release. :func:`async_execute` exists,
-is imported, and is unit-tested, but it refuses to run: the release barrier is
-checked inside it as well as before it, so a caller that forgot to authorize
-cannot get through. That is the difference between execution being disabled and
-execution being unreachable.
+**This shell does write, and has since beta.24.** This paragraph said the
+opposite until beta.33 -- that :func:`async_execute` refused to run because the
+release barrier was checked inside it as well as before it. The check is still
+there and still refuses when the barrier is closed; what changed is that the
+barrier opened, so the sentence describing the release stopped being true while
+the sentence describing the guard stayed true.
+
+What still holds, and is the reason the guard is duplicated here: a caller that
+forgot to authorize cannot get through, and the entity subset test refuses a step
+list naming anything outside what this release may write, whatever built it.
 """
 
 from __future__ import annotations

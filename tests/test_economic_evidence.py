@@ -32,6 +32,7 @@ from custom_components.alpha_ems_manager.const import (
     ECONOMIC_ACTION_CHARGE,
     ECONOMIC_ACTION_HOLD,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+    ECONOMIC_BLOCKED_NOT_ENABLED,
     ECONOMIC_MODEL_VERSION,
     ECONOMIC_REASON_NO_ACTION,
     ECONOMIC_UNAVAILABLE_HORIZON_EMPTY,
@@ -368,7 +369,15 @@ async def test_a_refresh_records_the_plan_it_computed(
     assert recorded.reason == outcome.reason
     assert recorded.horizon_intervals == outcome.horizon.intervals
     assert recorded.horizon_limited_by == outcome.horizon.limited_by
-    assert recorded.execution_blocked_reason == (ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE)
+    # **The stored barrier is the live one.** Through beta.32 this field was
+    # hardcoded to ``execution_unavailable`` on every snapshot -- a release-level
+    # claim that no command reaches the battery, untrue since beta.24 -- so a later
+    # scoring pass reading these documents could not tell an install that sent
+    # nothing from one that was sending. It now records what actually stood in the
+    # way, and on this fixture that is the user's own execution switch.
+    assert recorded.execution_blocked_reason == coordinator.economic_blocked_reason
+    assert recorded.execution_blocked_reason == ECONOMIC_BLOCKED_NOT_ENABLED
+    assert recorded.execution_blocked_reason != ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE
 
 
 async def test_advancing_the_clock_alone_records_no_second_document(

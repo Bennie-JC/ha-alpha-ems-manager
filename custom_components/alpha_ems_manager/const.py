@@ -880,25 +880,43 @@ CONTROL_STATE_OPTIONS: Final = (
 
 # --- Phase 4: configuration keys ----------------------------------------------
 
-#: How long a command tells the device to hold, in minutes.
+#: **Retired in beta.33. Kept only to name the key, never to read it.**
 #:
-#: A dead-man margin, **not** a delivery window. The plan is rebuilt once per
-#: quarter-hour and each rebuild supersedes the last, so in normal operation
-#: this never expires; it exists so a stopped Alpha EMS cannot leave a dispatch
-#: running indefinitely. It must therefore exceed the planning cadence, which is
-#: why the accepted range starts above it rather than at the device minimum.
+#: It was offered as "Command duration" and never reached the Live Dispatch
+#: duration register: see :data:`CONTROL_HORIZON_MINUTES` below for why. The
+#: constant survives so the migration tests can name the stored key without
+#: spelling the string, and so a reader grepping for it lands on this note rather
+#: than on nothing. Nothing in the runtime reads a value under this key, and
+#: nothing deletes one either -- a stored value is left exactly where the user's
+#: last save put it.
 CONF_CONTROL_HORIZON_MINUTES: Final = "control_horizon_minutes"
 #: How far below the live house load a discharge command must stay, in percent.
 CONF_CONTROL_EXPORT_MARGIN_PERCENT: Final = "control_export_margin_percent"
 #: Whether the user has enabled real execution.
 #:
-#: Read but deliberately absent from the options form in this release: with
-#: ``CONTROL_EXECUTION_AVAILABLE`` false it cannot change behaviour, and an
-#: option that does nothing is worse than no option. The key exists so the
-#: plumbing is exercised by tests today.
+#: **Offered on the Control page since beta.20, and load-bearing since beta.24.**
+#: This note said the opposite until beta.33 -- that the field was deliberately
+#: absent because ``CONTROL_EXECUTION_AVAILABLE`` was false and an option that does
+#: nothing is worse than no option. Both halves stopped being true: the field is
+#: shown, and the switch is one of the two consents that decide whether a command
+#: reaches the inverter at all. The other is the Control Mode select, and neither
+#: implies the other.
 CONF_CONTROL_EXECUTION_ENABLED: Final = "control_execution_enabled"
 
-DEFAULT_CONTROL_HORIZON_MINUTES: Final = 20
+#: The Stage-B control horizon, in minutes. **Internal since beta.33.**
+#:
+#: It was a user setting through beta.32, shown as "Command duration" -- and it
+#: governed nothing a Live run did. Every writer of the Dispatch dead-man is
+#: ``dispatch.deadman_minutes()``, which alternates twenty and twenty-five so the
+#: vendor automation fires at all; this figure only ever sized the advisory
+#: helper-family command and a range gate. A setting that cannot change what the
+#: battery does is worse than no setting, so it was withdrawn rather than
+#: relabelled, and the dead-man stays internal: its value and its re-arm cadence
+#: are safety mechanics, not preferences.
+#:
+#: Kept as a constant because the advisory path still needs a figure. Twenty is
+#: what every install had, so withdrawing the field changed no behaviour.
+CONTROL_HORIZON_MINUTES: Final = 20
 DEFAULT_CONTROL_EXPORT_MARGIN_PERCENT: Final = 10
 DEFAULT_CONTROL_EXECUTION_ENABLED: Final = False
 
@@ -2298,6 +2316,23 @@ MIN_EXECUTABLE_QUARTER_KWH: Final = DISPATCH_POWER_STEP_KW * 0.25
 QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION: Final = "below_actuator_resolution"
 QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE: Final = "no_objective"
 
+#: The intent itself has no actuator. **Added in beta.33.**
+#:
+#: Every run is published as a target, ``serve_load`` runs included -- they carry
+#: the campaign identity that keeps one lifecycle open across a gap between two
+#: exports. Their quarter rows were stamped ``not_executable: null``, which in this
+#: contract is a positive claim: *Stage B may arm this row.* It may not, and never
+#: could: ``serve_load`` unlocks no action in
+#: :data:`CONTROL_EXECUTABLE_ACTIONS_BY_INTENT` and admission refuses it on intent
+#: long before it reads a row.
+#:
+#: So the row said the opposite of the truth to every reader of the published
+#: contract, on exactly the rows a reader is most likely to be puzzled by. The
+#: refusal is unchanged; only the reporting is. It is checked before the energy
+#: reasons because it is the more fundamental one: an intent with no actuator is
+#: not executable at any magnitude.
+QUARTER_NOT_EXECUTABLE_INTENT: Final = "intent_not_executable"
+
 #: How stale an opening row may be and still be admitted, in seconds.
 #:
 #: **The fix for the skipped-quarter defect's second half.** A refresh lands a few
@@ -3098,10 +3133,12 @@ ECONOMIC_ADVICE_EVENT_KINDS: Final = (
 )
 
 #: The kinds that describe *execution*: a command went out, and later stopped.
-#: Both unreachable while ``CONTROL_EXECUTION_AVAILABLE`` is false, and the emitter
-#: refuses them rather than trusting that no caller will ask -- an Activity line
-#: reading "started" while the integration sends nothing would be a lie about the
-#: battery, which is the one thing this surface must never say.
+#: Reachable since beta.24, when the first of them became true; the emitter still
+#: refuses them from any caller that has no execution to report, rather than
+#: trusting that none will ask -- an Activity line reading "started" when nothing
+#: was sent would be a lie about the battery, which is the one thing this surface
+#: must never say. The refusal is unchanged in strength; only its reason moved,
+#: from "no command is possible" to "this caller commanded nothing".
 #:
 #: beta.19 added ``stopped`` here rather than making ``started`` do both jobs, and
 #: added ``would_start``/``would_stop`` to the *advice* set for shadow. So the
