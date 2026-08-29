@@ -248,7 +248,8 @@
           "inhibited": "Inhibited",
           "eligible": "Planned",
           "idle": "Idle",
-          "executed": "Executing",
+          "executed": "Executed",
+          "executing": "Executing",
           "error": "Error"
         }
       },
@@ -268,7 +269,20 @@
           "discharge": "Discharge",
           "export": "Export",
           "safety_buy": "Safety Buy",
-          "curtail_pv": "Curtail"
+          "curtail_pv": "Curtail",
+          "idle": "Idle"
+        }
+      },
+      "next_planned_action": {
+        "name": "Next Planned Action",
+        "state": {
+          "hold": "Hold",
+          "charge": "Charge",
+          "discharge": "Discharge",
+          "export": "Export",
+          "safety_buy": "Safety Buy",
+          "curtail_pv": "Curtail",
+          "idle": "Idle"
         }
       }
     }

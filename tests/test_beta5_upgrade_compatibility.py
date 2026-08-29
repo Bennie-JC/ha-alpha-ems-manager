@@ -246,6 +246,7 @@ async def test_a_beta5_installation_keeps_every_entity_and_unique_id(
             f"{entry_id}_dynamic_battery_reserve"
         ),
         "sensor.alpha_ems_economic_action": f"{entry_id}_economic_action",
+        "sensor.alpha_ems_next_planned_action": (f"{entry_id}_next_planned_action"),
         "sensor.alpha_ems_control_state": f"{entry_id}_control_state",
         "select.alpha_ems_control_mode": f"{entry_id}_control_mode",
     }

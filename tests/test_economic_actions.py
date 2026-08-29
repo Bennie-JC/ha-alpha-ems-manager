@@ -23,6 +23,7 @@ from custom_components.alpha_ems_manager.const import (
     ECONOMIC_ACTION_DISCHARGE,
     ECONOMIC_ACTION_EXPORT,
     ECONOMIC_ACTION_HOLD,
+    ECONOMIC_ACTION_IDLE,
     ECONOMIC_ACTION_OPTIONS,
     ECONOMIC_ACTION_SAFETY_BUY,
     ECONOMIC_GAP_FORECAST_INFEASIBLE,
@@ -231,6 +232,11 @@ def test_every_published_action_is_in_the_declared_option_set() -> None:
         ECONOMIC_ACTION_EXPORT,
         ECONOMIC_ACTION_CURTAIL,
         ECONOMIC_ACTION_SAFETY_BUY,
+        # beta.34. Not a synonym for ``hold``: that is a verdict on the prices,
+        # and this says only that no run occupies the present interval. Published
+        # by ``Economic Action`` once it stopped reaching forward to a run that
+        # could be a day and a half away.
+        ECONOMIC_ACTION_IDLE,
     }
 
 

@@ -200,7 +200,7 @@ def test_the_survival_energy_is_dc_and_the_protect_price_carries_no_efficiency()
         for p in (0.20, 0.30, 0.40, 0.10)
     )
 
-    energy, protect = survival_curves(
+    raw, energy, protect = survival_curves(
         upper,
         prices,
         window_end=4,
@@ -210,6 +210,9 @@ def test_the_survival_energy_is_dc_and_the_protect_price_carries_no_efficiency()
 
     assert energy[0] == pytest.approx(4.32 + 4 * 0.4 / 0.9486832980505138)
     assert energy[0] == pytest.approx(6.006548, abs=1e-6)
+    # beta.34: with no ceiling supplied the two curves are the same object's
+    # value, so the clamp cannot change an existing caller's answer.
+    assert raw == energy
     # Demand-weighted, and with equal weights that is the arithmetic mean of the
     # four import prices -- the prices the source published, with no efficiency and
     # no guess.
@@ -231,7 +234,7 @@ def test_the_round_trip_form_would_refuse_a_trade_the_correct_one_permits() -> N
     """
     upper = (1.0,)
     prices = (IntervalPrice(import_eur_kwh=0.30, export_eur_kwh=0.285),)
-    _energy, protect = survival_curves(
+    _raw, _energy, protect = survival_curves(
         upper,
         prices,
         window_end=1,
@@ -252,7 +255,7 @@ def test_the_round_trip_form_would_refuse_a_trade_the_correct_one_permits() -> N
 
 def test_no_protection_exists_where_no_demand_is_spoken_for() -> None:
     """A zero denominator is no claim, not a zero price."""
-    _energy, protect = survival_curves(
+    _raw, _energy, protect = survival_curves(
         (0.0, 0.0),
         (IntervalPrice(import_eur_kwh=0.30, export_eur_kwh=0.17),) * 2,
         window_end=2,
@@ -406,15 +409,24 @@ def test_a_compelled_safety_buy_is_enlarged_and_the_head_says_so() -> None:
 
 
 def test_the_gate_cost_is_never_negative_on_any_shape() -> None:
-    """The audit figure, over 48 shapes. A restriction cannot save money.
+    """The audit figure over 48 shapes -- and **the claim is narrower than it was**.
 
-    ``export_gate_cost_eur`` is measured on ``EconomicPlan.objective_eur`` -- the
-    scalar the recursion minimises -- and not on ``cost_eur``, which is the metered
-    cash flow alone. Two earlier formulas here published a *negative* figure: one
-    omitted the switching fee (the live horizon: cost fell 0.022 while the fee rose
-    0.20), and one omitted the grid-charge margin (a 96-interval shape at
-    1.2 kWh/quarter imported 4.6 kWh more at 0.05/kWh). An audit figure that says a
-    protection paid for itself when it did not is worse than none.
+    Two earlier formulas here published a *negative* figure for reasons that were
+    plainly defects: one omitted the switching fee (the live horizon: cost fell
+    0.022 while the fee rose 0.20), and one omitted the grid-charge margin (a
+    96-interval shape at 1.2 kWh/quarter imported 4.6 kWh more at 0.05/kWh). Both
+    are still excluded, which is what this sweep is for.
+
+    **What this no longer claims is that a restriction cannot save money.** It
+    can, and beta.34 found two shapes where it does -- see
+    ``test_beta34_survival_window`` and the ``export_gate_cost_eur`` docstring.
+    Neither is in these 48, which is exactly why the old wording survived: a
+    universal claim pinned over a sample that happens not to contain a
+    counterexample is not a proof, and calling it one is how a false invariant
+    reaches a release.
+
+    So: on **these** shapes the figure is non-negative, and that is worth pinning
+    because a regression in the fee or margin terms would break it here first.
     """
     for load in (0.1, 0.3, 0.6, 1.2):
         for stored in (5.0, 10.0, 14.77, 20.0):

@@ -86,7 +86,11 @@ from .const import (
     CADENCE_QUARTER_REFRESH,
     CAMPAIGN_BOUNDARY_BATTERY,
     CAMPAIGN_BOUNDARY_METER,
+    CAMPAIGN_MEASUREMENT_RESOLUTION_PERCENT,
+    CAMPAIGN_ORPHAN_GRACE_MINUTES,
+    CAMPAIGN_SUCCESS_TOLERANCE_FRACTION,
     CAMPAIGN_SUCCESS_TOLERANCE_PER_QUARTER_KWH,
+    CAMPAIGN_TARGET_UNAVAILABLE,
     CAP_NONE,
     CLAIM_SCHEMA_VERSION,
     CONF_ALLOW_BATTERY_EXPORT,
@@ -126,10 +130,12 @@ from .const import (
     CONTROL_MODE_OPTIONS,
     CONTROL_MODE_SHADOW,
     CONTROL_REFUSE_MARKER_NOT_VERIFIED,
+    CONTROL_REFUSE_NO_CLAIMABLE_RUN,
     CONTROL_REFUSE_STOP_NOT_VERIFIED,
     CONTROL_STATE_ELIGIBLE,
     CONTROL_STATE_ERROR,
     CONTROL_STATE_EXECUTED,
+    CONTROL_STATE_EXECUTING,
     CONTROL_STATE_IDLE,
     CONTROL_STATE_INHIBITED,
     CONTROL_STATE_OFF,
@@ -157,6 +163,7 @@ from .const import (
     ECONOMIC_BLOCKED_NONE,
     ECONOMIC_BLOCKED_NOT_ENABLED,
     EV_ABSENCE_GRACE_REFRESHES,
+    EXECUTION_COMPLETION_STOP_REASONS,
     EXECUTION_FAILED_STOP_REASONS,
     EXECUTION_INTENT_GRID_CHARGE,
     EXECUTION_INTENT_NET_EXPORT,
@@ -168,6 +175,7 @@ from .const import (
     EXECUTION_STOP_QUARTER_TARGET_REACHED,
     EXECUTION_STOP_SAFETY,
     EXECUTION_STOP_SWITCHED_OFF,
+    EXECUTION_STOP_WINDOW_ENDED,
     EXECUTION_TARGET_STALE_MINUTES,
     EXECUTION_VERIFY_DISPATCH_INACTIVE,
     EXECUTION_VERIFY_DISPATCH_SETPOINT,
@@ -412,6 +420,49 @@ from .storage import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _PlanAuthority:
+    """An admitted plan, in the few terms the ownership claim needs.
+
+    **beta.34.** Not a ``CarriedRun`` and deliberately not pretending to be one:
+    it answers only the questions :meth:`AlphaEmsCoordinator._write_execution_record`
+    asks, so nothing else in the controller can start treating an admitted plan as
+    an economic run. Every field is copied from the plan or from the open row --
+    none is derived, defaulted or invented.
+    """
+
+    run_id: str
+    plan_id: str
+    revision: int
+    intent: str
+    target: Any
+    admitted_at: datetime
+    affirmed_at: datetime
+    stale_after: datetime
+
+
+#: How many horizon intervals of price and gate evidence a decision record keeps.
+#:
+#: **beta.34.** Eight quarters is two hours, which is where every gate decision
+#: that matters is made: an export is vetoed at the interval it would have
+#: happened in, and the veto that mattered on 2026-08-29 was at the head. The
+#: whole-horizon digest sits beside it, so a replay can still prove it holds the
+#: same series the decision saw. Bounded because these records are written every
+#: refresh and kept for a year.
+_RECORD_HEAD_INTERVALS = 8
+
+
+def _price_text(value: float | None) -> str:
+    """Return a price formatted for the fingerprint, ``none`` when absent."""
+    return "none" if value is None else f"{value:.6f}"
+
+
+def _rounded_price(value: float | None) -> float | None:
+    """Return a price rounded for the record, preserving ``None``."""
+    return None if value is None else round(value, 5)
+
 
 #: Seconds after each quarter boundary at which the bucket is closed. The small
 #: delay lets sources that publish exactly on the boundary land first.
@@ -952,6 +1003,41 @@ def _mark_execution_error(
     result["execution_error"] = reason
 
 
+def _mark_command_result(report: dict[str, Any] | None, result: str) -> None:
+    """Record whether the last staged write succeeded, as a command result.
+
+    Deliberately not the public state. "The write returned" and "the battery is
+    moving" are different facts, and beta.33 published the first under the name of
+    the second.
+    """
+    block = _execution_block(report)
+    if block is None:
+        return
+    outcome = block.get("result")
+    if not isinstance(outcome, dict):
+        outcome = {}
+        block["result"] = outcome
+    outcome["command_result"] = result
+
+
+def _mark_arm_refused(report: dict[str, Any] | None, reason: str) -> None:
+    """Record why an arming sequence was refused before anything was written.
+
+    Separate from ``execution_error`` because the two answer different questions:
+    that one says the refresh did not succeed, this one says *what the controller
+    declined to do and why*. A reader looking at a live dispatch that never
+    started needs the second.
+    """
+    block = _execution_block(report)
+    if block is None:
+        return
+    result = block.get("result")
+    if not isinstance(result, dict):
+        result = {}
+        block["result"] = result
+    result["arm_refused_reason"] = reason
+
+
 def _mark_execution_applied(
     report: dict[str, Any] | None, applied_kw: float | None
 ) -> None:
@@ -1411,6 +1497,16 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._campaign_boundary: str | None = None
         self._campaign_started_at: datetime | None = None
         self._campaign_frozen_target_kwh: float | None = None
+        #: The objective read while the campaign was still published, kept so the
+        #: freeze has something to freeze. **The freeze is structurally one refresh
+        #: late** -- ``_note_campaign_progress`` runs inside the control report,
+        #: which is built before ``_async_dispatch`` sets ``activation_confirmed``
+        #: -- so by the time the freeze fires, ``execution_targets`` has been
+        #: rebuilt from a solve whose head is ``elapsed + 1`` and which therefore
+        #: cannot contain the quarter just executed. A campaign of one quarter lost
+        #: its target to that every time. Updated on every refresh the campaign is
+        #: still named, so it tracks a growing objective right up to activation.
+        self._campaign_opening_target_kwh: float | None = None
         self._campaign_realized_kwh: float = 0.0
         self._campaign_quarters_admitted: int = 0
         self._campaign_measurable: bool = True
@@ -1467,6 +1563,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: the last *calculated* one: the deadband exists to compare against what
         #: is on the wire.
         self._applied_setpoint_kw: float | None = None
+        # **When the setpoint last moved, and by how much.** beta.34, for balance
+        # regime attribution only -- nothing in the control path reads either.
+        # Kept here rather than derived from ``_last_control_write`` because that
+        # timestamp advances on every successful write, including ones that send
+        # no power at all, and a marker release is not a command transition.
+        self._last_setpoint_write: datetime | None = None
+        self._setpoint_delta_kw: float | None = None
         #: Control-grade coherence, carried across physical ticks.
         self._coherence: ControlCoherence | None = None
         #: The forward authorisation cap, replaced on every affirmation.
@@ -2704,6 +2807,22 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         genuinely unrecoverable is the pack energy at the instant of the decision
         and the settings it was made under -- and both are here.
 
+        **beta.34 adds the export-permission head, because the rule above turned
+        out to have a hole in it.** On 2026-08-29 the plan collapsed at 13:00 --
+        five runs to none, cost_eur -0.546 to +0.544, 9.3 kWh of export gone -- and
+        the record of that refresh could not say why. The evidence layers do hold
+        the prices, but the *gate* is computed from them by a two-pass solve whose
+        intermediate quantities existed only for the length of one refresh: the
+        survival window, the protection price it implies, and which intervals were
+        free to export under it. Two adjacent records were therefore
+        indistinguishable across the largest single-refresh economic change the
+        installation has produced.
+
+        Bounded to the first ``_RECORD_HEAD_INTERVALS`` intervals and a digest.
+        The head is where every gate decision that matters is made -- an export is
+        vetoed at the interval it would happen in -- and the digest is what lets an
+        offline replay prove it is holding the same prices the decision saw.
+
         Nothing reads this except diagnostics and the offline replay harness. It is
         written after the plan exists, so a record can never describe a decision
         that was not made.
@@ -2789,8 +2908,76 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # the evidence layers that already keep them for a year.
                 "tomorrow_prices_available": self._tomorrow_prices_available(),
                 "tomorrow_prices_available_at": self._tomorrow_prices_available_at,
+                **self._price_evidence(outcome),
+                **self._gate_evidence(outcome),
             }
         )
+
+    @callback
+    def _price_evidence(self, outcome: Any) -> dict[str, Any]:
+        """Return the price head and its digest, for offline replay.
+
+        The digest covers the **whole** horizon while the head is truncated, so a
+        replay can prove it reconstructed the right series even though the record
+        only shows the start of it.
+        """
+        if outcome is None or not outcome.desired.available:
+            return {}
+        intervals = outcome.desired.intervals
+        if not intervals:
+            return {}
+        digest = hashlib.sha256(
+            "|".join(
+                f"{_price_text(row.import_price_eur_kwh)},"
+                f"{_price_text(row.export_price_eur_kwh)}"
+                for row in intervals
+            ).encode()
+        ).hexdigest()[:16]
+        head = intervals[:_RECORD_HEAD_INTERVALS]
+        return {
+            "price_fingerprint": digest,
+            "horizon_intervals": len(intervals),
+            "first_interval_index": intervals[0].index,
+            "import_price_head_eur_kwh": [
+                _rounded_price(row.import_price_eur_kwh) for row in head
+            ],
+            "export_price_head_eur_kwh": [
+                _rounded_price(row.export_price_eur_kwh) for row in head
+            ],
+        }
+
+    @callback
+    def _gate_evidence(self, outcome: Any) -> dict[str, Any]:
+        """Return the export-permission head, so a veto can be replayed.
+
+        Every field here is already computed each refresh and was already
+        published live; none of it was ever *recorded*, which is why the 13:00
+        collapse could be seen and not explained.
+        """
+        if outcome is None:
+            return {}
+        floor = outcome.export_floor_kwh
+        raw = outcome.export_floor_raw_kwh
+        protect = outcome.protect_price_eur_per_kwh
+        free = outcome.export_free
+        return {
+            "survival_window_quarters": outcome.survival_window_end,
+            "survival_window_basis": outcome.survival_window_basis,
+            "export_floor_head_dc_kwh": [
+                round(value, 3) for value in floor[:_RECORD_HEAD_INTERVALS]
+            ],
+            "export_floor_raw_head_dc_kwh": [
+                round(value, 3) for value in raw[:_RECORD_HEAD_INTERVALS]
+            ],
+            "protect_price_head_eur_kwh": [
+                None if value is None else round(value, 5)
+                for value in protect[:_RECORD_HEAD_INTERVALS]
+            ],
+            "export_free_head": list(free[:_RECORD_HEAD_INTERVALS]),
+            "export_gate_cost_eur": outcome.export_gate_cost_eur,
+            "export_gate_withheld_kwh": outcome.export_gate_withheld_kwh,
+            "export_gate_retained_kwh": outcome.export_gate_retained_kwh,
+        }
 
     @callback
     def _floor_energy_for_record(self, plan: Any) -> float | None:
@@ -3399,6 +3586,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             self._campaign_started_at = None
             self._campaign_frozen_target_kwh = None
+            self._campaign_opening_target_kwh = self._campaign_objective_kwh(current)
             self._campaign_realized_kwh = 0.0
             self._campaign_quarters_admitted = 0
             self._campaign_measurable = True
@@ -3419,14 +3607,27 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ):
             self._campaign_end_utc = quarter.quarter_end
 
+        # **Read while it is still there.** The objective is re-read on every
+        # refresh that still publishes this campaign, and only until the freeze --
+        # after which it is never consulted again, so a later publication cannot
+        # reach the frozen figure through this door.
+        if self._campaign_started_at is None:
+            live = self._campaign_objective_kwh(self._campaign_id)
+            if live is not None:
+                self._campaign_opening_target_kwh = live
+
         if self._campaign_started_at is None and self.activation_confirmed:
             # **Frozen here and nowhere else.** Success is judged against what was
             # promised when execution began: a campaign that promised 2.65 kWh and
             # delivered 1.80 because Stage A changed its mind is Partial, not a
             # retroactively successful 1.80 / 1.80.
             self._campaign_started_at = now
-            self._campaign_frozen_target_kwh = self._campaign_objective_kwh(
-                self._campaign_id
+            # The live figure where the campaign is still published, and the last
+            # one read while it was, where it is not. Never ``None`` because a
+            # target existed: that is the whole of the beta.34 correction.
+            self._campaign_frozen_target_kwh = (
+                self._campaign_objective_kwh(self._campaign_id)
+                or self._campaign_opening_target_kwh
             )
 
         still_planned = any(
@@ -3435,6 +3636,65 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         if quarter is None and not still_planned:
             self._close_campaign(now, stop_reason)
+            return
+
+        # **The orphan bound, beta.34.** The pair above is necessary and is not
+        # sufficient: a quarter carried from a frozen plan that Stage A has stopped
+        # affirming keeps ``quarter`` non-``None`` indefinitely, and the campaign
+        # then never reaches a terminal at all -- no verdict, no energy reported,
+        # and the next campaign's terminal is the first thing a reader sees. The
+        # admitted schedule is rebuilt every quarter, so an hour past the furthest
+        # instant this campaign ever claimed is far outside any legitimate carry.
+        if self._campaign_end_utc is None:
+            return
+        grace = timedelta(minutes=CAMPAIGN_ORPHAN_GRACE_MINUTES)
+        if now > self._campaign_end_utc + grace:
+            self._close_campaign(now, stop_reason or EXECUTION_STOP_WINDOW_ENDED)
+
+    @callback
+    def _completion_tolerance_kwh(
+        self, target_kwh: float | None, quarters: int
+    ) -> float:
+        """Return how far short a campaign may land and still be a success.
+
+        **Derived from the plant, then bounded by the promise.** Three quantities,
+        each measured rather than chosen:
+
+        * **Actuator quantisation.** Stage B floors the commanded power to the
+          0.1 kW helper step, so every quarter can under-deliver by up to
+          ``0.1 kW * 0.25 h`` -- and the flooring makes it *systematic*, always
+          downward. Twenty-two quarters accumulate 0.55 kWh of it.
+        * **Measurement resolution.** The objective is a state-of-charge delta and
+          the sensor reports a level. One percent of usable capacity is the worst
+          case a pack may report, 0.216 kWh here.
+        * **The promise.** The two above scale with duration and would, on a small
+          objective, excuse most of a miss. So they are capped at a fraction of
+          what was promised -- and that cap is floored at one actuator step, or a
+          0.3 kWh campaign would be failed by a single quantisation it could not
+          have avoided.
+
+        Worked, on figures from the live installation: a one-quarter Safety Buy
+        promising 1.11 kWh tolerates ``min(0.025 + 0.216, max(0.025, 0.056))`` =
+        **0.056**, and the observed 0.047 kWh shortfall is a success. A
+        twenty-two-quarter campaign promising 18.33 kWh tolerates
+        ``min(0.55 + 0.216, max(0.025, 0.917))`` = **0.766**, which is 4.2 % -- and
+        the same campaign delivering 12 kWh is Partial, as it should be.
+
+        The flat 0.025 kWh per quarter this replaces is the actuator resolution
+        alone. It is a real term and it is still here; it was never the whole of
+        the error, and used by itself it called a 4.3 % miss a failure.
+        """
+        quantisation = CAMPAIGN_SUCCESS_TOLERANCE_PER_QUARTER_KWH * max(1, quarters)
+        capacity = self.config.battery_capacity_kwh or 0.0
+        resolution = capacity * CAMPAIGN_MEASUREMENT_RESOLUTION_PERCENT / 100.0
+        physical = quantisation + resolution
+        if target_kwh is None or target_kwh <= 0.0:
+            return min(physical, TARGET_TOLERANCE_KWH)
+        proportional = max(
+            CAMPAIGN_SUCCESS_TOLERANCE_PER_QUARTER_KWH,
+            CAMPAIGN_SUCCESS_TOLERANCE_FRACTION * target_kwh,
+        )
+        return min(physical, proportional)
 
     @callback
     def _close_campaign(self, now: datetime, stop_reason: str | None) -> None:
@@ -3467,18 +3727,33 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # shortfall the plant did not have.
         realized = self._campaign_realized_now()
         quarters = self._campaign_quarters_admitted
-        tolerance = min(
-            TARGET_TOLERANCE_KWH,
-            CAMPAIGN_SUCCESS_TOLERANCE_PER_QUARTER_KWH * max(1, quarters),
-        )
-        measurable = self._campaign_measurable and target_kwh is not None
+        tolerance = self._completion_tolerance_kwh(target_kwh, quarters)
+        # **Two questions, and beta.33 answered them with one word.** Whether the
+        # measurement can be trusted is about the plant; whether an objective was
+        # ever published is about the plan. A campaign that delivered 1.063 kWh
+        # against a target nobody recorded was filed *Failed -- Measurement
+        # Unavailable* on the live installation, and the measurement was fine.
+        measurable = self._campaign_measurable
+        target_known = target_kwh is not None
         shortfall = None if target_kwh is None else target_kwh - realized
         if not measurable:
             outcome = OUTCOME_FAILED
+        elif not target_known:
+            # Energy moved and was measured; there is simply nothing to judge it
+            # against. Partial states exactly that, and the reason names why.
+            outcome = OUTCOME_PARTIAL
+            stop_reason = stop_reason or CAMPAIGN_TARGET_UNAVAILABLE
         elif shortfall is not None and shortfall <= tolerance:
             outcome = OUTCOME_SUCCESS
         elif stop_reason in EXECUTION_FAILED_STOP_REASONS:
             outcome = OUTCOME_FAILED
+        elif stop_reason in EXECUTION_COMPLETION_STOP_REASONS:
+            # **The ordinary way a campaign ends.** ``window_ended`` fires when the
+            # last planned quarter closes, on every campaign that runs to
+            # completion -- so reading it as a cancellation called every campaign
+            # that missed its tolerance *Canceled*, including a 4.3 % miss on a
+            # charge that physically worked.
+            outcome = OUTCOME_PARTIAL
         elif stop_reason:
             outcome = OUTCOME_CANCELED
         else:
@@ -3531,6 +3806,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._campaign_boundary = None
         self._campaign_started_at = None
         self._campaign_frozen_target_kwh = None
+        self._campaign_opening_target_kwh = None
         self._campaign_realized_kwh = 0.0
         self._campaign_quarters_admitted = 0
         self._campaign_measurable = True
@@ -4566,7 +4842,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         *coherent* failures does, because a single instantaneous mismatch is far
         more likely to be two sensors caught mid-transient than a real fault.
         """
-        sample = evaluate_balance(self.read_flows(), self._source_coherence())
+        # **The two attribution inputs, and they change no verdict.** The
+        # allowance and the pass test are exactly what they were; these only let a
+        # reader tell a meter caught mid-ramp from the installation's standing
+        # DC/AC boundary term. See ``BalanceSample.regime``.
+        elapsed: float | None = None
+        if self._last_setpoint_write is not None:
+            elapsed = max(
+                0.0, (dt_util.utcnow() - self._last_setpoint_write).total_seconds()
+            )
+        sample = evaluate_balance(
+            self.read_flows(),
+            self._source_coherence(),
+            seconds_since_dispatch_write=elapsed,
+            setpoint_delta_kw_since_previous=self._setpoint_delta_kw,
+        )
         if sample is None:
             unreadable = self._unreadable_balance_sources()
             self.balance.record_unavailable(unreadable)
@@ -5318,6 +5608,48 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return run_id if isinstance(run_id, str) and run_id else None
 
     @callback
+    def _claim_authority(self, run: Any) -> Any:
+        """Return whatever may write the ownership claim for this arm, or ``None``.
+
+        The carried run when there is one -- unchanged, and still the common case.
+        Otherwise the admitted plan, which since beta.29 is a Stage-A authority in
+        its own right: frozen at admission, immutable afterwards, and the thing the
+        open row was derived from.
+
+        ``None`` is the fail-closed answer and it means exactly one thing: this
+        command came from no surviving authority at all. The caller sends nothing,
+        not even stage one. Deliberately not "synthesise a run": an arm whose
+        authority has genuinely gone is an arm that must not happen, and inventing
+        an identity for it would be forging the record rather than writing it.
+        """
+        if run is not None:
+            return run
+        plan = self._plan
+        if plan is None:
+            return None
+        # The row this claim is being made for. Without one there is nothing open
+        # to execute and the plan is not an authority for anything right now.
+        quarter = self._quarter
+        if quarter is None:
+            return None
+        return _PlanAuthority(
+            run_id=plan.run_id,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            intent=plan.intent,
+            target=plan.target,
+            admitted_at=plan.admitted_at,
+            # **Never re-affirmed, and the record says so.** The publication that
+            # would have affirmed it is the one that structurally cannot describe
+            # an open row. Copying ``admitted_at`` here is the honest reading:
+            # this authority is exactly as old as its admission.
+            affirmed_at=plan.admitted_at,
+            # A claim may not outlive the row it was made for. The plan itself may
+            # run longer; this arm may not.
+            stale_after=quarter.quarter_end,
+        )
+
+    @callback
     def _write_execution_record(
         self, run: Any, command: Any, snapshot: Any, now: datetime
     ) -> None:
@@ -5348,7 +5680,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # stopped. Stored as the published payload so the reconstruction is a
             # round trip rather than a summary -- a serialiser that dropped the
             # headroom cap would restore a run allowed to charge past its ceiling.
-            "target": target_as_published(run.target),
+            # **Present whenever the authority has one.** A carried run always
+            # does. An admitted plan does too in production -- ``admit_plan``
+            # keeps the publication it was admitted from -- and ``None`` here is
+            # the defined answer ``carried_from_record`` already handles by
+            # declining to adopt after a restart. Live ownership does not consult
+            # it: that is ``run_id``, ``quarter_start``, ``admitted_plan_id`` and
+            # the ``dispatch_start`` readback.
+            "target": (None if run.target is None else target_as_published(run.target)),
             "admitted_at": run.admitted_at.isoformat(),
             "affirmed_at": run.affirmed_at.isoformat(),
             "stale_after": run.stale_after.isoformat(),
@@ -7393,12 +7732,55 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # refresh, ownership fell back to ``unproven`` on the second, and a charge
         # became unstoppable while still running. The claim is about the *arming*;
         # once stamped it is completed rather than replaced.
+        # **Whichever authority actually produced this command.** beta.34.
+        #
+        # Until now this read ``self._carried`` and nothing else, while the command
+        # was built from the admitted plan's open row -- and since beta.29 those
+        # two are routinely not the same thing. Stage A's horizon head is
+        # ``elapsed + 1``, so the publication made *at* 19:45 covers 20:00 onward
+        # and structurally cannot affirm the 19:45 run; the run ends, the row stays
+        # open, and the row is the execution authority. That is beta.29's whole
+        # design and it is correct.
+        #
+        # What was wrong is that the claim did not follow it. An arm from an open
+        # row wrote no causal record, so ownership had nothing to prove and the
+        # dispatch became untouchable -- the 13:30 incident of 2026-08-29, where
+        # every subsequent tick read ``ownership_not_owned`` and declined to write
+        # while the pack charged 3.1 kWh nobody had authorised.
+        #
+        # This grants nothing. The claim is still only a claim; ownership still
+        # requires the later ``dispatch_start`` readback to match, so a dispatch
+        # somebody else started still cannot be appropriated.
+        claim = self._claim_authority(run)
         claiming = (
-            run is not None and not self._pending_is_reset and self._pending_activates
+            claim is not None and not self._pending_is_reset and self._pending_activates
         )
+        # **An activation nobody can claim is never sent. beta.34.**
+        #
+        # The two conditions used to disagree: the claim required a carried run,
+        # the command list did not. A refresh could therefore arm the vendor
+        # helper from the admitted plan's frozen schedule after Stage A had
+        # withdrawn the run -- which it did, on 2026-08-29 at 13:30 -- and leave a
+        # real dispatch running that ownership could never prove was ours. Stage B
+        # then refused to touch it, correctly, for twenty minutes, and the vendor
+        # dead-man ended it.
+        #
+        # Fail-closed, and deliberately at the send site rather than earlier: this
+        # is the last point where the step list and the claim are both visible, so
+        # it is the only place the two can be held to the same condition. Nothing
+        # is written, not even stage one.
+        if self._pending_activates and not self._pending_is_reset and claim is None:
+            _mark_execution_error(report, CONTROL_REFUSE_NO_CLAIMABLE_RUN)
+            _mark_arm_refused(report, CONTROL_REFUSE_NO_CLAIMABLE_RUN)
+            _LOGGER.warning(
+                "A dispatch activation was refused because neither a carried run "
+                "nor an admitted plan could claim it. Nothing was written; the "
+                "helper was not armed"
+            )
+            return
         if claiming:
             self._write_execution_record(
-                run, self._pending_command, self._pending_snapshot, now
+                claim, self._pending_command, self._pending_snapshot, now
             )
         # **Two stages, and stage two is conditional.** This is the whole of
         # beta.25 at the send site: an activation may not be issued until the
@@ -7492,20 +7874,50 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     verify,
                 )
                 return
-            report["state"] = CONTROL_STATE_EXECUTED
+            # **What the EMS is doing, not whether the last write returned.**
+            #
+            # A write that carries an activation or a power setpoint, on a refresh
+            # that is not a stop, is the battery moving: that is ``executing``. A
+            # cleanup, a marker release and a stop are not, and they leave the
+            # eligibility state alone -- which for a stop is ``idle``, because
+            # after it nothing is running.
+            #
+            # ``executed`` is not lost; it moves to the execution result below,
+            # where "the last helper write succeeded" is exactly the question
+            # being asked.
+            _mark_command_result(report, CONTROL_STATE_EXECUTED)
+            if not self._pending_is_reset and (
+                self._pending_activates
+                or any(step.entity_id == DISPATCH_POWER for step in commands)
+            ):
+                report["state"] = CONTROL_STATE_EXECUTING
             # **One record of what is on the wire, whichever path wrote it.** The
             # quarter refresh and the sixty-second tick both command power, so a
             # deadband comparing against only one of them would compare against a
             # stale figure and either chatter or go deaf.
             for step in commands:
                 if step.entity_id == DISPATCH_POWER and step.value is not None:
+                    previous = self._applied_setpoint_kw
                     self._applied_setpoint_kw = step.value
+                    self._last_setpoint_write = now
+                    self._setpoint_delta_kw = (
+                        None if previous is None else step.value - previous
+                    )
             # **From the power actually written**, not from Stage B's request.
             # beta.19 copied ``requested_kw`` here, so the report would have
             # asserted one figure while a different one was on the wire -- and it
             # dereferenced a block that is ``None`` in every state reachable
             # today, which would have failed the whole refresh.
-            _mark_execution_applied(report, self._pending_power_kw)
+            #
+            # **And only when a power step was on the wire at all. beta.34.** Every
+            # successful staged write reached this line, including a stale-marker
+            # release whose entire command list is one ``input_boolean.turn_off``.
+            # The live installation published ``applied_kw: 0.9, executed: true``
+            # at 14:00 on 2026-08-29 while the dispatch was off and the only thing
+            # sent was the marker. A figure describing a command that was not
+            # issued is worse than no figure.
+            if any(step.entity_id == DISPATCH_POWER for step in commands):
+                _mark_execution_applied(report, self._pending_power_kw)
             self._last_control_write = now
             self._last_control_power_kw = self._pending_power_kw
             # **"Started" means a write carrying an activation succeeded**, and this
@@ -8185,7 +8597,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # A stop is not an eligibility question. Reporting ``inhibited`` because
             # the world is unsafe would describe the condition that *caused* the
             # stop as though it had prevented it.
-            state = CONTROL_STATE_ELIGIBLE if commands else CONTROL_STATE_IDLE
+            #
+            # **And it is not a plan either. beta.34.** ``eligible`` renders as
+            # "Planned", which is the opposite of what a stop or a stale-marker
+            # release means: after one of these, nothing is running and nothing is
+            # queued. ``idle`` is the honest present tense in both cases, and the
+            # steps that were sent are in ``commands`` for anyone who needs them.
+            state = CONTROL_STATE_IDLE
         elif verdict.safe:
             state = CONTROL_STATE_ELIGIBLE if commands else CONTROL_STATE_IDLE
 

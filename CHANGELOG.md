@@ -9,6 +9,273 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.34] - 2026-08-29
+
+**The release that read its own diagnostics.** `beta.33` ran a full supervised
+*Live* day on the reference installation, and two diagnostics captures from that
+day — 13:55:46 and 14:01:55 — are the evidence for everything below. The campaign
+machinery worked on hardware. Eleven distinct defects surfaced across four layers,
+one of them a control-safety defect and one an economic frame error that produced
+an **impossible export floor**. None was visible from the test suite, because in
+every case a test existed that pinned the behaviour under a condition production
+cannot produce.
+
+The pack was never in danger and no energy was lost. What was wrong is that the
+integration could not describe what it had done, and in one case could not stop
+what it had started.
+
+### Fixed: the export protection used an index where an offset was expected
+
+`survival_window_end()` returned `campaign.start_index` — a **civil-day index**,
+0–95 today and 96–191 tomorrow. `survival_curves()` consumes that value as a
+**relative position** into a curve indexed from the head of the horizon. The two
+branches of one function were returning quantities in different frames, and the
+other branch — `actionable_intervals` — was correctly a count.
+
+Invisible for three releases because every test horizon starts at index zero,
+where an index and an offset are the same number. On the live two-day horizon at
+14:00 the head was interval 57 and the next refill was interval 132: the correct
+offset is 75, the published figure was **132**. A 33-hour protection window
+instead of a 19-hour one.
+
+The floor that window produces was then never clamped to the battery's capacity.
+The live installation published **`export_floor_dc_kwh: 23.09` on a 21.6 kWh
+pack**, and the solver applies that as a hard test against `energies[move.target]`
+whose maximum *is* the ceiling. Every caused export was forbidden at every
+interval for every reachable bucket. `export_free` read `[false] × 12`: not a
+protection, a prohibition. The same fixture used by the minimum-SoC tests produces
+a raw requirement of **32.755 kWh**, 52 % above capacity, and had been green
+throughout.
+
+Three changes, and they are deliberately separate:
+
+- The window is **converted at the boundary**: the horizon head is passed in and
+  the campaign's absolute index becomes an offset, clamped at both ends.
+- The published floor is **clamped to usable capacity**, and the raw requirement
+  is published beside it as `export_floor_raw_dc_kwh` so an absurd number stays
+  visible as evidence without acting as a veto.
+- Where the requirement genuinely cannot be met, the energy test has stopped
+  discriminating — it is true for every reachable state — and the decision falls
+  back to the **price** comparison alone. This cannot loosen any case where the
+  floor is reachable, which the existing 48-shape sweep pins.
+
+With the frame fixed, a two-day horizon selects **two complete cycles** — buy,
+sell, buy, sell — and extending the horizon no longer changes what the plan does
+today. Both are asserted.
+
+### Fixed: a dispatch was armed that ownership could never prove was ours
+
+At 13:30:07 on 2026-08-29 the integration armed a full Mode 2 dispatch — marker
+on, mode 2, −10 kW, duration 20 — and wrote **no causal claim**. Every
+sixty-second tick from 13:31 to 13:44 then read `ownership_not_owned` and declined
+to write, correctly: an unproven dispatch must never be touched. The pack charged
+3.14 kWh nobody had authorised and the vendor dead-man ended it at 13:50:28.
+
+The arm path and the claim path disagreed about what an authority is. The command
+was built from the **admitted plan's open row**, which is exactly what `beta.29`
+designed — Stage A's head is `elapsed + 1`, so the publication made at 19:45
+structurally cannot affirm the 19:45 run, the run ends and the row stays open. The
+claim path required the carried run, which by then was gone.
+
+The claim now follows whichever authority produced the command, and the admitted
+plan keeps the publication it was admitted from so the claim is a full round trip.
+Where there is no authority at all the sequence is **refused before anything is
+written** — not even stage one — and publishes `arm_refused_reason`. Nothing about
+ownership is weakened: a claim is still only a claim, and ownership still requires
+the later `dispatch_start` readback to match.
+
+Found on the way: `target_as_published()` dropped `campaign_id`, so the round trip
+its own docstring asserts was false for the two fields the campaign lifecycle is
+keyed on. A restart mid-campaign adopted a run whose campaign was gone.
+
+### Fixed: a successful charge was recorded as a failure
+
+The reference installation performed a Safety Buy that delivered **1.063 kWh
+against 1.11 planned** — 4.3 % short, quarter expired normally — and Home
+Assistant recorded:
+
+> Failed Plan ID: 9d3c04 — Measurement Unavailable
+
+Three faults stacked to produce that sentence.
+
+**The freeze was structurally one refresh late.** `_note_campaign_progress` runs
+before `_async_dispatch` sets `_activation_confirmed`, so the freeze can only fire
+on the *next* refresh — by which time the published targets come from a solve
+whose head cannot contain the quarter just executed. A one-quarter campaign froze
+`None`. A multi-quarter one escaped, which is why 18.33 kWh froze correctly on the
+same day and 1.11 did not. The objective is now captured when the campaign opens
+and refreshed until it starts.
+
+**"No target was published" was filed under "the measurement is not
+trustworthy."** Those are different failures with different readers. A campaign
+whose target never got published is now **Partial** with an explicit
+`target_unavailable` reason, and *Measurement Unavailable* is reachable only from
+a genuinely untrustworthy measurement.
+
+**The completion tolerance was the actuator resolution.** 0.025 kWh — the smallest
+command that can be issued — used to decide whether an objective was met. The
+tolerance is now built from what the hardware cannot do better than (one actuator
+step per quarter, plus the pack's own 1 % state-of-charge reporting resolution)
+and **capped** by a proportional term, so a large campaign cannot miss materially
+and still claim success. On the reference pack a one-quarter 1.11 kWh campaign
+gets 0.056 kWh and a 22-quarter 18.33 kWh campaign gets 0.766 — 4.2 %, not 5 %.
+
+And `window_ended`, the ordinary terminal of a campaign that runs to the end of
+its window, was truthy and not in the failed set, so it fell through to
+**Canceled**. It is now a completion.
+
+A campaign can no longer stay open past its own end: an hour's grace after
+`campaign_end` closes it even if a stale quarter is still carried.
+
+### Fixed: the public entities described the wrong tense
+
+**Economic Action** published `current_run or next_run` with no bound on how far
+`next_run` may be. At 14:00, when tomorrow's prices arrived and the horizon grew
+from 40 intervals to 135, it announced `export` for a sale planned at 20:30 the
+**following** evening — and its `window` attribute renders `HH:MM–HH:MM` with no
+date, so nothing in the reading revealed it. It now reports the present interval
+only, and `idle` when no run occupies it. `idle` is not a synonym for `hold`:
+`hold` is a verdict on the prices, `idle` is an observation about now.
+
+**A new entity, `sensor.alpha_ems_next_planned_action`**, carries the plan that
+used to be hidden inside the other one — with full ISO instants, because the run
+it describes is routinely on another day, plus the energy, the price, the purpose
+and the campaign it belongs to.
+
+**Control State** was set to `executed` by the generic "the staged write did not
+raise" branch, which every successful write reaches — including a stale ownership
+marker release whose entire command list is one `input_boolean.turn_off`. The
+English label for that value is *Executing*. So at 14:00, with the dispatch off,
+the timer inactive and one boolean written, the dashboard read **Executing**. It
+now publishes `executing` only while a command that moves the battery is on the
+wire, and a stop or a marker release reads `idle`. `executed` keeps its place in
+the enum so no dashboard loses a value, and moves to
+`control.execution.result.command_result` where "did the last write succeed" is
+exactly the question being asked.
+
+`execution.power` published `applied_kw: 0.9, executed: true` on that same
+refresh. It is now written only when a power step was actually on the wire.
+
+### Fixed: the export gate reported a benefit where it cost the most
+
+`export_gate_cost_eur` was `desired.objective_eur − ungated.objective_eur`, and
+`objective_eur` subtracts the terminal edge credit. A gated plan cannot sell, so
+it ends holding more energy and earns a larger credit — and the figure came out
+**negative**, in contradiction of the invariant its own docstring asserted. The
+live installation published −0.1338 and −1.3259. Decomposed on a reconstruction:
+the gated plan spent **€1.46 more cash** and kept **7.93 kWh more**, credited
+€1.74, for a published −0.28.
+
+It is now measured on the cash the household actually moves, with the retained and
+withheld energy published beside it rather than netted into it. **And it is no
+longer claimed to be non-negative**: two shapes where it is negative are pinned as
+tests, because a universal claim proved over a sample that happens to contain no
+counterexample is not a proof.
+
+### Added: the evidence needed to replay a decision
+
+The 13:00 collapse of 2026-08-29 — five runs to none, €0.55 of value to −€0.54 —
+could be *seen* in the decision records and not explained by them, because the
+export gate's intermediate quantities lived only for the length of one refresh.
+Decision records now carry a whole-horizon price fingerprint, the first two hours
+of the priced series, and the survival window, floor, protection price and
+per-interval permission that the gate reached its verdict from.
+
+Alongside it, each campaign now publishes its buy cost, export revenue, avoided
+import, PV-versus-grid charge split and start and end state of charge; and the
+campaigns the export permission **withheld** are named, with `rejected_because`,
+rather than simply being absent.
+
+#### What the 13:00 collapse turned out to be
+
+Reproduced on the production solver and isolated to a single variable: the
+survival window has two branches, and it falls through from "protect until the
+next refill" to "protect until the end of the horizon" the moment the plan stops
+intending a refill. That is what happened when the morning's buy campaign
+completed with tomorrow's prices not yet published, and the floor jumps from
+4.32 kWh to 15.46.
+
+**The flip is not what cost the money.** At the live stored energy the protection
+withheld 0.56 kWh and cost **€0.136**. The remaining ~€0.78 is the cheap-buy
+opportunity itself passing out of the horizon — an economic fact about the day,
+not an artefact. The collapse was, in the main, correct, and `beta.34` does not
+make the sale reappear.
+
+### Added: energy-balance failures are attributed, not excused
+
+The residuals are two distinct populations and neither is a fault: samples caught
+mid-ramp while the setpoint moves by kilowatts in seconds, and a proportional
+DC/AC boundary term that grows with power (≈41 W of excess per failed sample in
+the 500–2000 W band against ≈412 W in the 2000–5000 W band). Reported as one
+number they look like one problem with a slightly tight tolerance.
+
+Each sample now carries `seconds_since_dispatch_write`,
+`setpoint_delta_kw_since_previous` and a derived `regime`, and the monitor
+publishes `failed_samples_by_regime` and `pass_rate_steady_state` beside the
+unchanged overall rate. **The three tolerance constants are unchanged and asserted
+so**, no verdict is altered, and balance remains an observation rather than a
+control gate.
+
+### Changed: the Activity vocabulary
+
+A Stage-A withdrawal rendered as *No Longer Economically Valid*, which reads as a
+verdict on the plan's worth; an ordinary re-solve is one plan replacing another,
+and it now reads **Plan Superseded**. A safety or ownership stop is filed as
+`stopped` rather than `cancelled`, so an ownership incident stops looking like a
+change of mind in a history view — the kind has been declared since `beta.19` and
+emitted by nothing.
+
+Every Activity event now carries a **structured payload** beside the sentence:
+`kind`, `outcome`, `purpose`, `campaign_id`, `run_id`, `plan_id`, `planned_kwh`,
+`realised_kwh`, `started_at`, `ended_at` and `reason`. The message text is
+unchanged, so automations that match on it keep working.
+
+Five event kinds that no production path ever constructed are retired: `changed`,
+`ended`, `refused`, `would_start` and `would_stop`. The last two had already been
+withdrawn in behaviour — Shadow shows planning and stops there — and the constants
+outlived the decision. A vocabulary a consumer subscribes to must not contain
+words nothing says.
+
+### Not changed
+
+The reserve stays price-blind, and no protection quantity enters the violation
+term. Run and campaign lifecycles stay decoupled — which is why 7.019 kWh of
+realised progress survived the 13:00 withdrawal. The admitted plan still outlives
+the carried run, because that is what makes a quarter boundary a lookup rather
+than a hand-off. Stage B still recomputes power every quarter. Safety Buy
+behaviour, the 20/25 dead-man and its re-arm cadence, `CONFIG_ENTRY_VERSION`, the
+storage versions and every shipped default are exactly as `beta.33` left them. No
+new setting was added; one new entity was, which needs no migration.
+
+---
+
+## Not yet validated on hardware
+
+Everything in this section is proven in software and has never been watched on a
+real inverter.
+
+- **A same-day economic Sell has never executed on hardware.** Charging was
+  validated in `beta.26`; every export to date has been a plan, not a meter
+  reading. This is the release's primary hardware question.
+- **The clamped export floor and the priced fallback have never been exercised
+  live.** The over-capacity requirement that motivated them was observed on
+  hardware; the fix for it was not.
+- **The two-cycle two-day plan is software-only.** Four campaigns across thirty
+  hours has been selected by the solver and never executed.
+- **The quarter-authority ownership claim has never been written on hardware.**
+  The condition that needs it — an open row whose parent run has ended — occurred
+  live on 2026-08-29 and produced no claim at all, which is the defect. The fix
+  runs for the first time on this release.
+- **An arm refused for want of any authority has never been observed**, and as the
+  pipeline currently stands cannot be: it is a guard against the two paths
+  disagreeing again, and its test says so plainly rather than implying otherwise.
+- **A campaign terminal with a frozen target on a one-quarter campaign** is
+  software-proven only. The live example is exactly the case that failed.
+- Carried forward and still outstanding: a multi-quarter export across a
+  `serve_load` gap; a configured minimum state of charge at or above 50 % on a
+  real pack; and the 20/25 dead-man alternation watched across four or more
+  consecutive sustains with the vendor timer observed advancing each time.
+
 ## [1.0.0-beta.33] - 2026-08-29
 
 **The release that connects what beta.32 built.** `beta.32` shipped a complete

@@ -1065,7 +1065,10 @@ def test_clearing_the_record_before_the_reset_lands_is_caught() -> None:
     with open(module.__file__, encoding="utf-8") as handle:
         text = handle.read()
 
-    marker = 'report["state"] = CONTROL_STATE_EXECUTED'
+    # beta.34 moved this line's *meaning* -- ``executed`` is now the command
+    # result rather than the public state -- but not its position, which is what
+    # this test is about: the success branch runs before the claim is released.
+    marker = "_mark_command_result(report, CONTROL_STATE_EXECUTED)"
     clear = "if self._pending_is_reset:\n                self._clear_execution_record()"
 
     assert marker in text

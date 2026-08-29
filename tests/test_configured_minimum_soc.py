@@ -271,18 +271,48 @@ def test_no_beta_32_protection_silently_keeps_the_old_floor() -> None:
     is ``floor + sum(upper_net_demand) / eta``. If the floor term were pinned, the
     protection would keep behaving as though the user had never lowered the
     setting, which is precisely the failure this test exists to exclude.
+
+    **Asserted on the raw curve since beta.34, and the reason is a number this
+    very fixture produces.** The requirement here is **32.755 kWh at the head of a
+    21.6 kWh pack** -- fifty-two per cent above the largest energy the battery can
+    ever hold. Through beta.33 that figure went straight into ``solve`` as a hard
+    energy test against ``energies[move.target]``, whose maximum *is* the ceiling,
+    so every caused export was forbidden at every interval for every reachable
+    bucket: not a protection but a permanent prohibition. beta.34 clamps the
+    published floor to capacity, so the clamped series saturates and two
+    configured floors are no longer distinguishable through it.
+
+    The raw series is where the floor term is still visible, and it is exactly the
+    reason the raw series is published: an impossible requirement stays *evidence*
+    without becoming a veto. Both facts are asserted below.
     """
     step = 21.6 * 0.10
     twenty = solve_at(20.0)
     ten = solve_at(10.0)
 
-    floors_twenty = twenty["outcome"].export_floor_kwh
-    floors_ten = ten["outcome"].export_floor_kwh
-    assert floors_twenty and floors_ten
-    assert len(floors_twenty) == len(floors_ten)
+    raw_twenty = twenty["outcome"].export_floor_raw_kwh
+    raw_ten = ten["outcome"].export_floor_raw_kwh
+    assert raw_twenty and raw_ten
+    assert len(raw_twenty) == len(raw_ten)
     # Every interval, not merely the head.
-    for index, (high, low) in enumerate(zip(floors_twenty, floors_ten, strict=True)):
+    for index, (high, low) in enumerate(zip(raw_twenty, raw_ten, strict=True)):
         assert high - low == pytest.approx(step), index
+
+    # And the clamp: never above capacity, never above the raw requirement, and
+    # never inventing a requirement the raw curve did not have.
+    capacity = 21.6
+    for solved in (twenty, ten):
+        outcome = solved["outcome"]
+        clamped = outcome.export_floor_kwh
+        raw = outcome.export_floor_raw_kwh
+        assert len(clamped) == len(raw)
+        for index, (value, source) in enumerate(zip(clamped, raw, strict=True)):
+            assert value <= capacity + 1e-9, index
+            assert value == pytest.approx(min(source, capacity)), index
+    # The head of this shape is genuinely unsatisfiable, which is what made the
+    # beta.33 veto unconditional. Pinned, so the fixture cannot drift away from
+    # the condition the clamp exists for.
+    assert max(raw_twenty) > capacity
 
     # The anti-churn extension is a bucket plus measured demand and carries no
     # floor term at all, so it is identical -- which is the correct answer, and is

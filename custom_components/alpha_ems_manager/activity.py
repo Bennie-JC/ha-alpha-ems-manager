@@ -74,9 +74,10 @@ looking for them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from hashlib import sha1
+from typing import Any
 
 from .const import (
     ACTIVITY_CATEGORY_CURTAILMENT,
@@ -85,6 +86,8 @@ from .const import (
     ACTIVITY_CATEGORY_ECONOMIC_SELL,
     ACTIVITY_CATEGORY_MIXED_BUY,
     ACTIVITY_CATEGORY_SAFETY_BUY,
+    ACTIVITY_PURPOSE_ECONOMIC,
+    ACTIVITY_PURPOSE_SAFETY,
     CONTROL_EXECUTION_AVAILABLE,
     ECONOMIC_ACTION_CHARGE,
     ECONOMIC_ACTION_CURTAIL,
@@ -103,6 +106,7 @@ from .const import (
     ECONOMIC_EVENT_INHIBITED,
     ECONOMIC_EVENT_PLANNED,
     ECONOMIC_EVENT_STARTED,
+    ECONOMIC_EVENT_STOPPED,
     ECONOMIC_EXECUTION_EVENT_KINDS,
     EXECUTION_STOP_BATTERY_CEILING,
     EXECUTION_STOP_EXECUTION_ERROR,
@@ -121,6 +125,7 @@ from .const import (
     EXECUTION_STOP_TIMER_NOT_REFRESHED,
     EXECUTION_STOP_WINDOW_ENDED,
     MAX_ECONOMIC_RUNS_TRACKED,
+    OUTCOME_CANCELED,
     OUTCOME_FAILED,
     OUTCOME_PARTIAL,
     OUTCOME_SUCCESS,
@@ -186,7 +191,12 @@ _CANCEL_REASONS: dict[str, str] = {
     EXECUTION_STOP_PLAN_REPLACED: "Plan Replaced",
     EXECUTION_STOP_WINDOW_ENDED: "Window Expired",
     EXECUTION_STOP_STALE_PLAN: "Plan Expired",
-    EXECUTION_STOP_STAGE_A_HOLD: "No Longer Economically Valid",
+    # **beta.34.** "No Longer Economically Valid" reads as a fault report on the
+    # plan, and a Stage-A withdrawal is nothing of the kind: prices moved, or a
+    # quarter elapsed, and the optimiser now prefers something else. The live
+    # 13:00 replan on 2026-08-29 filed exactly this line for an ordinary
+    # re-solve. What happened is that one plan replaced another.
+    EXECUTION_STOP_STAGE_A_HOLD: "Plan Superseded",
     EXECUTION_STOP_SWITCHED_TO_SHADOW: "Control Mode Changed",
     EXECUTION_STOP_SWITCHED_OFF: "Control Mode Changed",
     EXECUTION_STOP_OWNERSHIP_CONFLICT: "Ownership Lost",
@@ -194,6 +204,29 @@ _CANCEL_REASONS: dict[str, str] = {
     EXECUTION_STOP_HEADROOM_REACHED: "Headroom Reached",
     EXECUTION_STOP_GRID_CEILING: "Grid Limit Reached",
 }
+
+#: The stop reasons that make a terminal ``stopped`` rather than ``cancelled``.
+#:
+#: **beta.34, and the difference is who ended it.** Stage A withdrawing a plan is
+#: a cancellation: the optimiser changed its mind, and nothing happened to the
+#: battery. These two happened *to* a dispatch that was under way -- the safety
+#: gate intervened, or another owner took the register. Filing both kinds under
+#: ``cancelled`` is what made the 13:30 ownership incident of 2026-08-29
+#: indistinguishable from an ordinary replan in a history view, which is exactly
+#: the distinction a person needs to be able to make at a glance.
+#:
+#: A mode change is deliberately **not** here. Switching to Shadow or Off
+#: withdraws the plan's authority, which is Stage A's side of the line.
+#:
+#: ``stopped`` is execution-class, so it carries the same refusal ``started``
+#: does while nothing can be sent -- correctly: both assert a real dispatch
+#: existed. It has been declared since beta.19 and emitted by nothing until now.
+_STOPPED_REASONS: frozenset[str] = frozenset(
+    {
+        EXECUTION_STOP_OWNERSHIP_CONFLICT,
+        EXECUTION_STOP_SAFETY,
+    }
+)
 
 #: Why a lifecycle ended in a failure. Separate from the map above because the
 #: distinction is the one a reader most needs: a cancelled plan is the optimizer
@@ -386,6 +419,8 @@ class ExecutionView:
     run_id: str | None = None
     #: Whether a run is admitted and waiting for its window to open.
     prepared: bool = False
+    #: The open campaign's identity, carried so a line can name it.
+    campaign_id: str | None = None
     #: Whether a write carrying an activation actually succeeded this refresh.
     #:
     #: **This, and nothing else, is what "started" may be said about.** Derived
@@ -434,6 +469,13 @@ class Lifecycle:
     started: bool = False
     #: The Stage-B run this lifecycle was executed by, once one exists.
     run_id: str | None = None
+    #: The campaign this lifecycle belongs to, once one is open. beta.34: the
+    #: structured payload has to be able to tie a line to the campaign the
+    #: coordinator measured, and ``plan_id`` cannot do it -- it is derived from the
+    #: window, not from the campaign identity.
+    campaign_id: str | None = None
+    #: When execution actually began, as opposed to when the window opens.
+    started_at: datetime | None = None
     #: Whether the plan was only ever advice: Shadow, or an action with no
     #: actuator. Carried so the terminal line marks itself the same way the
     #: Planned line did.
@@ -516,6 +558,15 @@ class ActivityEntry:
     #: The lifecycle the line belongs to, so a reader of the event -- or a test --
     #: can group three lines without parsing the sentence.
     plan_id: str | None = None
+    #: The same line as machine-readable fields, for the bus.
+    #:
+    #: **beta.34, and the message is deliberately unchanged.** Until now the event
+    #: carried ``name``, ``message``, ``domain``, ``entity_id`` and ``plan_id``, so
+    #: an automation wanting to know whether a sale succeeded had to match on
+    #: English prose -- and ``plan_id`` is ``sha1(category|window-end-minute)``,
+    #: which ties to neither the run nor the campaign. Every consumer built on the
+    #: sentence keeps working; the structure is added beside it.
+    data: dict[str, Any] = field(default_factory=dict)
 
 
 def next_activity(
@@ -585,7 +636,16 @@ def next_activity(
         # replaced the plan, so quoting it would put the new plan's figure beside
         # the old plan's progress.
         delivered = None if execution is None else execution.objective_realized_kwh
-        return _cancelled(state, lifecycle, reason, delivered_kwh=delivered)
+        return _cancelled(
+            state,
+            lifecycle,
+            reason,
+            delivered_kwh=delivered,
+            now=now,
+            # The plan left the plan. No controller stop reason exists, and
+            # inventing one would put a fault token on an ordinary re-solve.
+            stop_reason=EXECUTION_STOP_STAGE_A_HOLD if not expired else None,
+        )
 
     # Something new is imminent. Once per plan id, ever.
     for run in runs:
@@ -612,6 +672,7 @@ def next_activity(
             message=_planned_message(lifecycle),
             state=state.with_open(lifecycle),
             plan_id=plan_id,
+            data=_structured(ECONOMIC_EVENT_PLANNED, lifecycle),
         )
 
     if execution is not None:
@@ -654,7 +715,7 @@ def _terminal_entry(
     # tick speak at all: that tick wipes the carriers and publishes no plan, so
     # every beta.31 path into this function had already lost its subject.
     if execution.terminal is not None:
-        entry = _campaign_terminal(state, execution, execution.terminal)
+        entry = _campaign_terminal(state, execution, execution.terminal, now=now)
         if entry is not None:
             return entry
 
@@ -673,19 +734,24 @@ def _terminal_entry(
     reason = execution.stop_reason or ""
 
     if reason == EXECUTION_STOP_TARGET_REACHED:
-        return _finished(state, lifecycle, execution)
+        return _finished(state, lifecycle, execution, now=now)
     if reason in _ERROR_REASONS:
-        return _failed(state, lifecycle, _ERROR_REASONS[reason])
+        return _failed(state, lifecycle, _ERROR_REASONS[reason], reason=reason)
     return _cancelled(
         state,
         lifecycle,
         _CANCEL_REASONS.get(reason, _CANCEL_REPLACED),
         execution=execution,
+        now=now,
     )
 
 
 def _campaign_terminal(
-    state: ActivityState, execution: ExecutionView, terminal: TerminalView
+    state: ActivityState,
+    execution: ExecutionView,
+    terminal: TerminalView,
+    *,
+    now: datetime,
 ) -> ActivityEntry | None:
     """Render the campaign outcome the coordinator computed. Four shapes.
 
@@ -709,6 +775,7 @@ def _campaign_terminal(
         figures += f" / {terminal.objective_target_kwh:.2f}"
     figures += " kWh"
 
+    campaign = _campaign_data(terminal, now=now)
     if terminal.outcome == OUTCOME_SUCCESS:
         return ActivityEntry(
             kind=ECONOMIC_EVENT_FINISHED,
@@ -718,6 +785,9 @@ def _campaign_terminal(
             ),
             state=state.with_closed(lifecycle.plan_id),
             plan_id=lifecycle.plan_id,
+            data=_structured(
+                ECONOMIC_EVENT_FINISHED, lifecycle, outcome=terminal.outcome, **campaign
+            ),
         )
     if terminal.outcome == OUTCOME_PARTIAL:
         # **Partial is its own word, and it is the honest one.** beta.31 had only
@@ -729,6 +799,9 @@ def _campaign_terminal(
             message=(f"Finished Plan ID: {lifecycle.plan_id} — Partial — {figures}"),
             state=state.with_closed(lifecycle.plan_id),
             plan_id=lifecycle.plan_id,
+            data=_structured(
+                ECONOMIC_EVENT_FINISHED, lifecycle, outcome=terminal.outcome, **campaign
+            ),
         )
     if terminal.outcome == OUTCOME_FAILED:
         detail = (
@@ -738,14 +811,31 @@ def _campaign_terminal(
                 terminal.reason or "", _humanise(terminal.reason) or "Command Failed"
             )
         )
-        return _failed(state, lifecycle, detail, figures=figures)
+        return _failed(
+            state,
+            lifecycle,
+            detail,
+            figures=figures,
+            outcome=terminal.outcome,
+            campaign=campaign,
+        )
     detail = _CANCEL_REASONS.get(terminal.reason or "", _CANCEL_REPLACED)
-    line = f"Canceled Plan ID: {lifecycle.plan_id} — {detail} — {figures}"
+    # **A stop the controller made for its own reasons is not a change of mind.**
+    # beta.34 gives ``stopped`` -- declared since beta.19 and emitted by nothing --
+    # the job it was declared for. An ownership loss and a safety stop are things
+    # that happened *to* the dispatch; ``cancelled`` is Stage A withdrawing a plan,
+    # and filing both under one kind is what made an ownership incident look like
+    # an ordinary replan in a history view.
+    stopped = (terminal.reason or "") in _STOPPED_REASONS
+    kind = ECONOMIC_EVENT_STOPPED if stopped else ECONOMIC_EVENT_CANCELLED
+    verb = "Stopped" if stopped else "Canceled"
+    line = f"{verb} Plan ID: {lifecycle.plan_id} — {detail} — {figures}"
     return ActivityEntry(
-        kind=ECONOMIC_EVENT_CANCELLED,
+        kind=kind,
         message=_marked(line, lifecycle),
         state=state.with_closed(lifecycle.plan_id),
         plan_id=lifecycle.plan_id,
+        data=_structured(kind, lifecycle, outcome=terminal.outcome, **campaign),
     )
 
 
@@ -755,6 +845,9 @@ def _failed(
     detail: str,
     *,
     figures: str | None = None,
+    outcome: str | None = None,
+    reason: str | None = None,
+    campaign: dict[str, Any] | None = None,
 ) -> ActivityEntry:
     """Return the failure line for a campaign that ended badly.
 
@@ -771,6 +864,12 @@ def _failed(
         message=line,
         state=state.with_closed(lifecycle.plan_id),
         plan_id=lifecycle.plan_id,
+        data=_structured(
+            ECONOMIC_EVENT_ERROR,
+            lifecycle,
+            outcome=outcome or OUTCOME_FAILED,
+            **({"reason": reason} if campaign is None else campaign),
+        ),
     )
 
 
@@ -826,6 +925,11 @@ def _started_entry(
         window=lifecycle.window,
         started=True,
         run_id=execution.run_id,
+        campaign_id=execution.campaign_id,
+        # The instant the dispatch was confirmed, carried so every later line of
+        # this lifecycle can say when it began without the reader reconstructing it
+        # from the logbook's own timestamps.
+        started_at=now,
         advisory=lifecycle.advisory,
         shadow=lifecycle.shadow,
     )
@@ -838,6 +942,12 @@ def _started_entry(
         ),
         state=state.with_open(started),
         plan_id=started.plan_id,
+        data=_structured(
+            ECONOMIC_EVENT_STARTED,
+            started,
+            planned_kwh=execution.objective_target_kwh,
+            realised_kwh=execution.objective_realized_kwh,
+        ),
     )
 
 
@@ -853,19 +963,28 @@ def _inhibit_entry(
     if execution.inhibit_reason == state.inhibit_reason:
         return None
     began = execution.inhibit_reason is not None
+    kind = ECONOMIC_EVENT_INHIBITED if began else ECONOMIC_EVENT_AVAILABLE
     return ActivityEntry(
-        kind=ECONOMIC_EVENT_INHIBITED if began else ECONOMIC_EVENT_AVAILABLE,
+        kind=kind,
         message=(
             f"Execution Inhibited — {_humanise(execution.inhibit_reason)}"
             if began
             else "Execution Available"
         ),
         state=state.with_inhibit(execution.inhibit_reason),
+        # No lifecycle: a standing condition belongs to the pipeline, not to a
+        # plan, and the payload says so by carrying nulls rather than by omitting
+        # the keys.
+        data=_structured(kind, None, reason=execution.inhibit_reason),
     )
 
 
 def _finished(
-    state: ActivityState, lifecycle: Lifecycle, execution: ExecutionView
+    state: ActivityState,
+    lifecycle: Lifecycle,
+    execution: ExecutionView,
+    *,
+    now: datetime,
 ) -> ActivityEntry:
     """Return the success line for a run Stage B reported as complete.
 
@@ -886,6 +1005,16 @@ def _finished(
         ),
         state=state.with_closed(lifecycle.plan_id),
         plan_id=lifecycle.plan_id,
+        data=_structured(
+            ECONOMIC_EVENT_FINISHED,
+            lifecycle,
+            outcome=OUTCOME_SUCCESS,
+            reason=execution.stop_reason,
+            planned_kwh=execution.objective_target_kwh,
+            realised_kwh=execution.objective_realized_kwh,
+            campaign_id=execution.campaign_id,
+            ended_at=now,
+        ),
     )
 
 
@@ -896,6 +1025,8 @@ def _cancelled(
     *,
     execution: ExecutionView | None = None,
     delivered_kwh: float | None = None,
+    now: datetime | None = None,
+    stop_reason: str | None = None,
 ) -> ActivityEntry:
     """Return the line for a plan that ended without succeeding.
 
@@ -917,11 +1048,30 @@ def _cancelled(
         )
     elif lifecycle.started and delivered_kwh is not None:
         line += f" — {delivered_kwh:.2f} / {lifecycle.energy_kwh:.2f} kWh"
+    realised = delivered_kwh
+    if lifecycle.started and execution is not None:
+        realised = execution.objective_realized_kwh
     return ActivityEntry(
         kind=ECONOMIC_EVENT_CANCELLED,
         message=_marked(line, lifecycle),
         state=state.with_closed(lifecycle.plan_id),
         plan_id=lifecycle.plan_id,
+        data=_structured(
+            ECONOMIC_EVENT_CANCELLED,
+            lifecycle,
+            outcome=OUTCOME_CANCELED,
+            reason=stop_reason
+            if stop_reason is not None
+            else (None if execution is None else execution.stop_reason),
+            planned_kwh=(
+                None
+                if execution is None or not lifecycle.started
+                else execution.objective_target_kwh
+            ),
+            realised_kwh=None if not lifecycle.started else realised,
+            campaign_id=None if execution is None else execution.campaign_id,
+            ended_at=now,
+        ),
     )
 
 
@@ -1135,7 +1285,97 @@ def logbook_payload(entry: ActivityEntry, *, domain: str, entity_id: str) -> dic
         # the sentence. Absent for the two standing conditions, which belong to no
         # plan.
         **({} if entry.plan_id is None else {"plan_id": entry.plan_id}),
+        # beta.34. Additive: every key above is untouched, and ``plan_id`` stays
+        # at the top level where beta.31 put it as well as inside the block.
+        **entry.data,
     }
+
+
+def _structured(
+    kind: str,
+    lifecycle: Lifecycle | None,
+    *,
+    outcome: str | None = None,
+    reason: str | None = None,
+    planned_kwh: float | None = None,
+    realised_kwh: float | None = None,
+    campaign_id: str | None = None,
+    ended_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Return the machine-readable half of one Activity line.
+
+    Every key is present on every line, ``None`` where it does not apply, so a
+    consumer can read ``data["outcome"]`` without first discovering which shape of
+    line it received. The one thing deliberately absent is any rewording of the
+    sentence: this is the same event described twice, in two registers, and if the
+    two could disagree there would be no point publishing both.
+
+    ``reason`` carries the **machine token** -- ``stage_a_hold``, ``safety`` --
+    while the message carries the phrase. That is the opposite way round from
+    every other rule in this module, and on purpose: the prose exists so a person
+    is not shown ``snake_case``, and the payload exists so an automation is not
+    made to parse prose.
+    """
+    if lifecycle is None:
+        return {
+            "kind": kind,
+            "outcome": outcome,
+            "purpose": None,
+            "campaign_id": campaign_id,
+            "run_id": None,
+            "plan_id": None,
+            "planned_kwh": None,
+            "realised_kwh": None,
+            "started_at": None,
+            "ended_at": None if ended_at is None else ended_at.isoformat(),
+            "reason": reason,
+        }
+    return {
+        "kind": kind,
+        "outcome": outcome,
+        "purpose": _purpose_for(lifecycle.identity.category),
+        "campaign_id": campaign_id or lifecycle.campaign_id,
+        "run_id": lifecycle.run_id,
+        "plan_id": lifecycle.plan_id,
+        "planned_kwh": lifecycle.energy_kwh if planned_kwh is None else planned_kwh,
+        "realised_kwh": realised_kwh,
+        "started_at": (
+            None if lifecycle.started_at is None else lifecycle.started_at.isoformat()
+        ),
+        "ended_at": None if ended_at is None else ended_at.isoformat(),
+        "reason": reason,
+    }
+
+
+def _campaign_data(terminal: TerminalView, *, now: datetime) -> dict[str, Any]:
+    """Return the structured fields a campaign terminal contributes.
+
+    Pulled out because four terminal shapes share them exactly, and a fifth shape
+    arriving with one field quietly missing is how a payload contract rots.
+    """
+    return {
+        "reason": terminal.reason,
+        "planned_kwh": terminal.objective_target_kwh,
+        "realised_kwh": terminal.objective_realized_kwh,
+        "campaign_id": terminal.campaign_id,
+        "ended_at": now,
+    }
+
+
+def _purpose_for(category: str) -> str | None:
+    """Return ``safety`` or ``economic`` for a lifecycle's category.
+
+    ``None`` for the adopted lifecycle, whose category is genuinely unknown -- see
+    :func:`_adopted`. Guessing ``economic`` there would be a claim about why the
+    user's money was spent.
+    """
+    if not category:
+        return None
+    return (
+        ACTIVITY_PURPOSE_SAFETY
+        if category == ACTIVITY_CATEGORY_SAFETY_BUY
+        else ACTIVITY_PURPOSE_ECONOMIC
+    )
 
 
 def direction_of(action: str) -> str:

@@ -546,7 +546,9 @@ def test_the_incident_now_reads_as_a_sentence_about_a_battery() -> None:
     kind, message = terminal(EXECUTION_STOP_STAGE_A_HOLD)
 
     assert kind == ECONOMIC_EVENT_CANCELLED
-    assert "No Longer Economically Valid" in message
+    # beta.34: relabelled. A Stage-A withdrawal is one plan replacing another,
+    # and "No Longer Economically Valid" read as a verdict on the plan's worth.
+    assert "Plan Superseded" in message
     assert "1.76 / 8.06 kWh" in message
 
 
@@ -755,7 +757,9 @@ def test_a_known_reason_falling_back_to_the_generic_phrase_is_caught() -> None:
     generic = terminal("a_reason_from_the_future")[1]
 
     assert activity_module._CANCEL_REASONS[EXECUTION_STOP_STAGE_A_HOLD] == (
-        "No Longer Economically Valid"
+        # beta.34. The phrase changed and the rule it proves did not: this reason
+        # has a phrase of its own and never falls through to the generic one.
+        "Plan Superseded"
     )
     for reason in REACHABLE:
         if reason == EXECUTION_STOP_PLAN_REPLACED:

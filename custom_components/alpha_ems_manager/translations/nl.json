@@ -248,7 +248,8 @@
           "inhibited": "Geblokkeerd",
           "eligible": "Gepland",
           "idle": "Rust",
-          "executed": "Actief",
+          "executed": "Uitgevoerd",
+          "executing": "Aan het uitvoeren",
           "error": "Fout"
         }
       },
@@ -268,7 +269,20 @@
           "discharge": "Ontladen",
           "export": "Terugleveren",
           "safety_buy": "Reserve-inkoop",
-          "curtail_pv": "Afregelen"
+          "curtail_pv": "Afregelen",
+          "idle": "Inactief"
+        }
+      },
+      "next_planned_action": {
+        "name": "Volgende geplande actie",
+        "state": {
+          "hold": "Vasthouden",
+          "charge": "Laden",
+          "discharge": "Ontladen",
+          "export": "Terugleveren",
+          "safety_buy": "Reserve-inkoop",
+          "curtail_pv": "Afregelen",
+          "idle": "Inactief"
         }
       }
     }

@@ -19,12 +19,12 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.33` — a public beta.**
+> **Current release: `1.0.0-beta.34` — a public beta.**
 >
 > Stage A is feature-complete. Stage B — the physical execution controller — is
 > wired end to end and, from beta.24, **can charge your battery**. From beta.27 it
 > executes each 15-minute plan interval as an explicit energy target, and can also
-> **export to the grid** when the plan says so. Covered by 4084 automated tests.
+> **export to the grid** when the plan says so. Covered by 4150 automated tests.
 >
 > **Two actions are executable: buying energy into the battery, and selling it back
 > out.** Serving the house from the battery, and curtailing production, are
@@ -54,6 +54,44 @@ switched off.
 > the live installation in `beta.26`; exporting has been proven only in tests. If
 > you enable *Live* on this release, watch your grid meter during the first planned
 > export quarter.
+>
+> **`beta.34` is the release that read its own diagnostics.** `beta.33` ran a full
+> supervised *Live* day on the reference installation, and two diagnostics captures
+> from it are the evidence for everything in this release. The campaign machinery
+> worked on real hardware. Eleven defects surfaced across four layers, none of them
+> visible from the test suite — because in every case a test existed that pinned the
+> behaviour under a condition production cannot produce.
+>
+> **The export protection was using a day index where an offset was expected.** The
+> live installation published a survival requirement of **23.09 kWh on a 21.6 kWh
+> battery** and treated it as a hard test, which forbade every battery-caused export
+> at every interval: not a protection, a prohibition. The window is now converted at
+> the boundary, the floor is clamped to what the pack can actually hold, and where a
+> requirement genuinely cannot be met the decision falls back to the price
+> comparison rather than vetoing outright. With that fixed, a two-day horizon selects
+> **two complete buy-sell cycles**, and seeing tomorrow's prices no longer changes
+> what the plan does today.
+>
+> **A dispatch was armed that ownership could never prove was ours.** For twenty
+> minutes on 2026-08-29 a real charge ran that the controller correctly refused to
+> touch, and only the inverter's own dead-man ended it. The ownership claim now
+> follows whichever authority produced the command, and an arm with no authority at
+> all is refused before anything is written.
+>
+> **A successful charge was recorded as a failure.** 1.063 kWh delivered against
+> 1.11 planned appeared in the logbook as *Failed — Measurement Unavailable*. Three
+> separate faults produced that sentence and all three are fixed: the objective is
+> captured before it can be lost, "no target was published" is no longer filed as
+> "the measurement cannot be trusted", and the completion tolerance is no longer the
+> smallest command the hardware can issue.
+>
+> **Two entities were describing the wrong tense.** *Economic Action* announced
+> tomorrow evening's sale as though it were happening now, with a dateless clock
+> window as the only clue. It now reports the present interval only, and there is a
+> **new `Next Planned Action` sensor** carrying the plan with full timestamps.
+> *Control State* read *Executing* while the dispatch was off and the only thing
+> written was a stale ownership marker; it now says `executing` only while a command
+> that moves the battery is on the wire.
 >
 > **`beta.33` connects the campaign layer `beta.32` shipped unwired.** Every
 > published execution target carried `campaign_id: null`, so no campaign ever
@@ -142,7 +180,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.33` is not offered.
+     dialog if `1.0.0-beta.34` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 

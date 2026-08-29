@@ -133,10 +133,20 @@ def test_the_sample_serialises_for_diagnostics() -> None:
         "ac_power_w",
         "gross_fault_suspected",
         "flows_w",
+        # beta.34. Attribution only: which population a residual came from, and
+        # the two facts it is derived from. ``within_tolerance`` above is
+        # computed from exactly the three allowance terms it always was.
+        "regime",
+        "seconds_since_dispatch_write",
+        "setpoint_delta_kw_since_previous",
     }
     # With no timing information attached the sample is judged on its numbers
     # alone, so it reports a pass or a failure rather than being skipped.
     assert payload["outcome"] == "passed"
+    # And with no setpoint history either, the sample is steady state -- there is
+    # no command it could have caught in flight.
+    assert payload["regime"] == "steady_state"
+    assert payload["seconds_since_dispatch_write"] is None
 
 
 # -- rolling statistics ------------------------------------------------------

@@ -107,6 +107,7 @@ from .const import (
     SENSOR_FORECAST_ERROR_YESTERDAY,
     SENSOR_LEARNING_CONFIDENCE,
     SENSOR_LEARNING_DAYS,
+    SENSOR_NEXT_PLANNED_ACTION,
 )
 from .coordinator import AlphaEmsCoordinator
 from .economic import IMPLEMENTED_ACTIONS, EconomicOutcome
@@ -518,23 +519,33 @@ def _economic_outcome(coordinator: AlphaEmsCoordinator) -> EconomicOutcome | Non
 
 
 def _economic_action_value(coordinator: AlphaEmsCoordinator) -> str | None:
-    """Return the action the optimizer economically wants.
+    """Return what the optimizer is doing in **this** interval.
 
-    The **desired** action, not what would be executed -- and this release
-    executes nothing at all. What implemented actuators could achieve is the
-    ``capability_action`` attribute beside it, and whether anything is sent is
-    ``execution_blocked_reason``, which reads ``execution_unavailable`` on every
-    reading while the release barrier stands.
+    **beta.34 made this entity present-tense, and the reason is a measurement.**
+    It used to publish ``desired.published_run``, which is ``current_run or
+    next_run`` with no bound whatever on how distant ``next_run`` may be. At 14:00
+    on 2026-08-29 tomorrow's prices arrived, the horizon grew from 40 intervals to
+    135, and the entity announced ``export`` -- for a sale planned at 20:30 the
+    *following* evening. The ``window`` attribute renders ``HH:MM-HH:MM`` with no
+    date, so there was nothing in the reading itself to reveal it.
 
-    ``unknown`` rather than ``hold`` when no plan could be built: "nothing is
-    worth doing" and "nothing could be worked out" are different answers, and a
+    The plan has not been hidden; it moved to ``Next Planned Action``, which
+    prints full instants precisely because its run is routinely on another day.
+
+    ``idle`` rather than ``hold`` when no run is in progress. ``hold`` is a
+    verdict -- the optimiser weighed the prices and chose to do nothing -- and
+    this interval simply having no run in it is a weaker statement that deserves
+    its own word.
+
+    ``unknown`` rather than either when no plan could be built: "nothing is worth
+    doing" and "nothing could be worked out" are different answers, and a
     reassuring ``hold`` derived from absent prices would be the second wearing the
     first's clothes.
     """
     outcome = _economic_outcome(coordinator)
     if outcome is None or not outcome.available:
         return None
-    action = outcome.action
+    action = outcome.current_action
     return action if action in ECONOMIC_ACTION_OPTIONS else None
 
 
@@ -570,6 +581,88 @@ def _economic_action_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, A
         "expected_net_value_eur": _round(
             outcome.desired.expected_net_value_eur, ECONOMIC_EUR_PRECISION
         ),
+    }
+
+
+def _economic_run_instant(coordinator: AlphaEmsCoordinator, index: int) -> Any:
+    """Return the local instant a horizon index opens at, or ``None``."""
+    plan = _plan(coordinator)
+    if plan is None or plan.target_day is None or plan.forecast is None:
+        return None
+    return _economic_instant(
+        plan.target_day,
+        index,
+        _today_interval_count(plan),
+        dt_util.get_default_time_zone(),
+    )
+
+
+def _upcoming_target(coordinator: AlphaEmsCoordinator, run: Any) -> dict[str, Any]:
+    """Return the published execution target that describes ``run``.
+
+    Matched on the window's opening instant against
+    :attr:`AlphaEmsCoordinator.execution_targets` rather than rebuilt here. The
+    campaign identity is derived from a calendar the optimizer deliberately does
+    not have, and there must go on being exactly one place that owns that
+    conversion -- a second implementation living in a sensor is how two surfaces
+    come to disagree about which campaign a run belongs to.
+    """
+    if run is None:
+        return {}
+    start = _economic_run_instant(coordinator, run.start_index)
+    if start is None:
+        return {}
+    stamp = start.isoformat()
+    for target in coordinator.execution_targets or ():
+        if target.get("window_start") == stamp:
+            return target
+    return {}
+
+
+def _next_planned_action_value(coordinator: AlphaEmsCoordinator) -> str | None:
+    """Return the action of the next run that has not started yet."""
+    outcome = _economic_outcome(coordinator)
+    if outcome is None or not outcome.available:
+        return None
+    action = outcome.upcoming_action
+    return action if action in ECONOMIC_ACTION_OPTIONS else None
+
+
+def _next_planned_action_attributes(
+    coordinator: AlphaEmsCoordinator,
+) -> dict[str, Any]:
+    """Return when the next planned run is, and what it is for.
+
+    **Full ISO instants, and that is the entity's whole reason for existing.**
+    ``Economic Action`` renders a clock window with no date, which was adequate
+    while the horizon ended at midnight and became a misreport the moment the
+    two-day horizon shipped: a live reading of "20:30-22:00" taken on 2026-08-29
+    was describing 2026-08-30. A reader cannot make that mistake with an instant.
+
+    ``reason`` is carried only when this run is the one the optimizer's own
+    ``reason`` describes -- that field follows ``published_run``, and attaching a
+    current charge's rationale to tomorrow's sale would be a fabrication.
+    """
+    outcome = _economic_outcome(coordinator)
+    if outcome is None or not outcome.available:
+        return {}
+    run = outcome.desired.upcoming_run
+    if run is None:
+        return {"starts_at": None, "ends_at": None, "energy_kwh": None}
+    target = _upcoming_target(coordinator, run)
+    start = _economic_run_instant(coordinator, run.start_index)
+    end = _economic_run_instant(coordinator, run.end_index + 1)
+    published = outcome.desired.published_run
+    return {
+        "starts_at": None if start is None else start.isoformat(),
+        "ends_at": None if end is None else end.isoformat(),
+        "energy_kwh": _round(run.energy_kwh, BATTERY_KWH_PRECISION),
+        "power_kw": _round(run.first_power_kw, BATTERY_KW_PRECISION),
+        "purpose": target.get("purpose", run.action),
+        "campaign_id": target.get("campaign_id"),
+        "price_eur_kwh": run.average_price_eur_kwh,
+        "expected_value_eur": _round(run.net_cash_flow_eur, ECONOMIC_EUR_PRECISION),
+        "reason": outcome.reason if published is run else None,
     }
 
 
@@ -811,6 +904,11 @@ def _execution_view(coordinator: AlphaEmsCoordinator) -> ExecutionView | None:
         activation_confirmed=bool(coordinator.activation_confirmed),
         terminal=terminal,
         campaign_open=isinstance(campaign, dict) and bool(campaign.get("started")),
+        # beta.34: so an Activity line can name the campaign the coordinator
+        # measured. ``plan_id`` cannot -- it is derived from the window.
+        campaign_id=(
+            campaign.get("campaign_id") if isinstance(campaign, dict) else None
+        ),
     )
 
 
@@ -964,10 +1062,12 @@ _USABLE_ENERGY_BASIS: str = (
 
 
 _CONTROL_STATE_BASIS: str = (
-    "what the control pipeline made of this interval's recommendation. "
-    "'inhibited' means the safety gate refused; 'eligible' means it did not and "
-    "only the execution barrier stopped a command; 'idle' means there was "
-    "nothing to send. Nothing executes: this release cannot command the inverter"
+    "what the controller is doing now. 'executing' means a command that moves the "
+    "battery is on the wire; 'inhibited' means the safety gate refused; 'eligible' "
+    "means it did not and only the execution barrier stopped a command; 'idle' "
+    "means nothing is running and nothing was sent; 'off' means control is "
+    "disabled. Whether the last helper write itself succeeded is a separate "
+    "question, answered by control.execution.result.command_result"
 )
 
 
@@ -1133,6 +1233,18 @@ SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
         value_fn=_economic_action_value,
         attributes_fn=_economic_action_attributes,
         activity_fn=_economic_activity,
+    ),
+    AlphaEmsSensorDescription(
+        key=SENSOR_NEXT_PLANNED_ACTION,
+        name="Next Planned Action",
+        icon="mdi:calendar-clock",
+        # The same enum as the action beside it. Deliberately: a user comparing
+        # "now" against "next" is comparing two answers to the same question, and
+        # two vocabularies would make that comparison harder than it is.
+        device_class=SensorDeviceClass.ENUM,
+        options=list(ECONOMIC_ACTION_OPTIONS),
+        value_fn=_next_planned_action_value,
+        attributes_fn=_next_planned_action_attributes,
     ),
     AlphaEmsSensorDescription(
         key=SENSOR_CONTROL_STATE,

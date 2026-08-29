@@ -1087,7 +1087,12 @@ def test_the_control_state_keys_did_not_change() -> None:
         "inhibited",
         "eligible",
         "idle",
+        # Retained, and no longer published: beta.34 moved "the last helper write
+        # succeeded" to ``execution.result.command_result`` and gave the entity a
+        # present-tense value instead. A dashboard built against beta.33 keeps
+        # every member it could already match on.
         "executed",
+        "executing",
         "error",
     )
 
@@ -1136,7 +1141,9 @@ def test_no_lifecycle_state_machine_was_bolted_onto_the_control_state() -> None:
     to use only the ones that do and not to invent state churn:
 
     * **Starting** -- there is no refresh between deciding to write and the write
-      landing. It either succeeded (``executed``) or it failed (``error``).
+      landing. It either succeeded or it failed (``error``); beta.34 moved the
+      success half of that to ``execution.result.command_result``, because it is a
+      command result and not a description of the battery.
     * **Updating** -- a setpoint correction happens on the sixty-second tick, so
       the entity would flip Executing/Updating every minute of a campaign. That is
       churn, and it would make the recorded history less readable rather than more.
@@ -1155,6 +1162,11 @@ def test_no_lifecycle_state_machine_was_bolted_onto_the_control_state() -> None:
         "Inhibited",
         "Planned",
         "Idle",
+        # beta.34: "Executing" moved onto ``executing``, which is published only
+        # while a battery-moving command is on the wire. ``executed`` keeps its
+        # place in the enum and gets a past-tense label of its own, so a dashboard
+        # that recorded it before the upgrade still renders history correctly.
+        "Executed",
         "Executing",
         "Error",
     }

@@ -126,6 +126,7 @@ from .const import (
     BUY_REASON_UNKNOWN,
     CAMPAIGN_BOUNDARY_BATTERY,
     CAMPAIGN_BOUNDARY_METER,
+    CAMPAIGN_REJECTED_PROTECTION,
     CONTROL_EXECUTION_AVAILABLE,
     CONTROL_LIVE_DISPATCH_INTENTS,
     COUNTERFACTUAL_AMBIENT_SELF_CONSUMPTION,
@@ -135,6 +136,7 @@ from .const import (
     ECONOMIC_ACTION_DISCHARGE,
     ECONOMIC_ACTION_EXPORT,
     ECONOMIC_ACTION_HOLD,
+    ECONOMIC_ACTION_IDLE,
     ECONOMIC_ACTION_SAFETY_BUY,
     ECONOMIC_BUCKET_BAND_KWH,
     ECONOMIC_BUCKET_KWH,
@@ -1031,6 +1033,26 @@ class EconomicPlan:
         return None
 
     @property
+    def upcoming_run(self) -> EconomicRun | None:
+        """Return the first run that starts strictly **after** the head.
+
+        **beta.34.** :attr:`next_run` tests ``start_index > 0``, which is an
+        absolute day index, so a run beginning at the horizon's head satisfies it
+        too -- the property returns the run in progress and calls it the next one.
+        That is harmless inside :attr:`published_run`, where :attr:`current_run` is
+        consulted first and wins, and it is wrong anywhere the question really is
+        "what comes after this". ``next_run`` is left exactly as it was so nothing
+        reading it changes behaviour.
+        """
+        if not self.intervals:
+            return None
+        head = self.intervals[0].index
+        for run in self.runs:
+            if run.start_index > head:
+                return run
+        return None
+
+    @property
     def published_run(self) -> EconomicRun | None:
         """Return the run the entity describes: the current one, else the next."""
         return self.current_run or self.next_run
@@ -1500,13 +1522,35 @@ def solve(
                     # self-consumption untouched, (b) keeps a genuinely good sale
                     # available, and (c) keeps the protection about *inventory* the
                     # plan actually needs rather than a blanket reluctance to sell.
-                    if (
-                        gated
-                        and outcome.caused_export
-                        and not export_free[position]
-                        and energies[move.target] < export_floor_kwh[position]
-                    ):
-                        continue
+                    if gated and outcome.caused_export and not export_free[position]:
+                        # **(c), and beta.34 states when it is evidence at all.**
+                        #
+                        # ``energies[-1]`` is the pack's ceiling. A requirement at
+                        # or above it is a test no reachable state can pass, so it
+                        # carries no information about *this* sale -- it says the
+                        # household will be short whatever happens here. The live
+                        # installation published 23.09 kWh against a 21.6 kWh pack
+                        # on 2026-08-29 and read that as "never export".
+                        #
+                        # It is not read that way now. Where the requirement is
+                        # unsatisfiable the price test above decides alone, and it
+                        # is the right test: if the household must buy this energy
+                        # back regardless, a sale below what the buy-back costs is
+                        # a loss and a sale above it is a gain, and (b) is exactly
+                        # that comparison. The refusal that follows is traceable to
+                        # a price rather than to an impossible energy test.
+                        #
+                        # **This deliberately does not loosen the permission.**
+                        # (b) is already required, so the unsatisfiable branch
+                        # refuses precisely what beta.33 refused. What changed is
+                        # that the reason is now sayable, the published floor is
+                        # physical, and the window it was measured over is the
+                        # right one -- see :func:`survival_window_end`.
+                        unsatisfiable = export_floor_kwh[position] >= energies[-1]
+                        if unsatisfiable or (
+                            energies[move.target] < export_floor_kwh[position]
+                        ):
+                            continue
                     onward_state = _resolved_run_state(outcome.run_state, run)
                     onward = following[move.target][onward_state]
                     if onward >= _UNREACHABLE:
@@ -1890,8 +1934,23 @@ def anti_churn_buffer_kwh(
     return bucket_kwh + min(p50_total, err_total) / discharge_efficiency
 
 
+def _cash_eur(plan: EconomicPlan) -> float:
+    """Return the metered money one plan moves, terminal value excluded.
+
+    Every term the household actually pays or is paid inside the horizon, and
+    nothing that prices what is left in the pack at the end of it. Used to state
+    the export permission's cost without the terminal credit netting it away.
+    """
+    return (
+        plan.cost_eur
+        + plan.switching_cost_eur
+        + plan.grid_charge_margin_eur
+        + plan.battery_throughput_cost_eur
+    )
+
+
 def survival_window_end(
-    plan: EconomicPlan, *, actionable_intervals: int
+    plan: EconomicPlan, *, actionable_intervals: int, head_index: int = 0
 ) -> tuple[int, str]:
     """Return where the survival window closes, and on what basis.
 
@@ -1906,13 +1965,43 @@ def survival_window_end(
     one, the window is the reliably known horizon -- the actionable prefix, which
     breaks at the first unpriced *or* unforecast interval. Nothing is invented
     beyond it, and no price is guessed.
+
+    **Both branches return an offset from the horizon head, and beta.34 is where
+    that became true of the first one.** ``campaign.start_index`` is an
+    ``EconomicInterval.index`` -- the *absolute* quarter index within the civil
+    day, 0..95 today and 96..191 tomorrow -- while the caller uses the result as a
+    position into a curve whose zero is the head. The two agreed only while the
+    head was zero, which is the case in every fixture and in no live refresh.
+
+    Measured on the live installation, 2026-08-29 at 14:00: head 57, first charge
+    campaign at absolute 132, window published as **132** rather than 75. The
+    survival window spanned 33 hours instead of 19, and the export floor it
+    produced was 23.09 kWh against a 21.6 kWh pack -- an unsatisfiable
+    requirement, which :func:`solve` then read as "never export".
+
+    ``head_index`` defaults to zero so a caller that genuinely works in
+    head-relative indices is unchanged.
     """
     for campaign in plan.campaigns:
         if campaign.direction != ECONOMIC_DIRECTION_CHARGE:
             continue
         if not campaign.sell_announcement_material:
             continue
-        return campaign.start_index, SURVIVAL_WINDOW_PLAN_CAMPAIGN
+        # Clamped at both ends. A campaign that starts at or before the head is
+        # already under way, and a refill in progress is a zero-length window --
+        # nothing has to be survived to, because the pack is filling now. The
+        # actionable prefix is the furthest anything may be believed.
+        #
+        # Skipping an in-progress campaign and protecting to the *next* one was
+        # tried and withdrawn: the same window sizes the anti-churn buffer
+        # (:func:`anti_churn_buffer_kwh`), so lengthening it raised the enforced
+        # reserve head beyond what a nearly-empty pack could reach and the
+        # permission started causing reserve violations -- which is precisely the
+        # one thing ``tests/test_beta32_protection_is_not_a_bound.py`` exists to
+        # forbid. Measured at 0.6 kWh/quarter and 5.0 kWh stored: 0.79 kWh of
+        # violation that the ungated solve did not have.
+        offset = max(0, campaign.start_index - head_index)
+        return min(offset, actionable_intervals), SURVIVAL_WINDOW_PLAN_CAMPAIGN
     return actionable_intervals, SURVIVAL_WINDOW_ACTIONABLE_PREFIX
 
 
@@ -1923,8 +2012,9 @@ def survival_curves(
     window_end: int,
     floor_energy_kwh: float,
     discharge_efficiency: float,
-) -> tuple[tuple[float, ...], tuple[float | None, ...]]:
-    """Return ``(economic_survival_to_refill_kwh, p_protect)`` per interval.
+    ceiling_kwh: float | None = None,
+) -> tuple[tuple[float, ...], tuple[float, ...], tuple[float | None, ...]]:
+    """Return ``(raw_survival, effective_survival, p_protect)`` per interval.
 
     The energy curve is **DC**: the house is served at AC, so the pack must hold
     ``AC / eta_discharge`` to deliver it. The floor is added because survival means
@@ -1940,18 +2030,29 @@ def survival_curves(
 
     Demand-weighted, because the energy is claimed by demand rather than by time:
     an hour of darkness and an hour of cooking do not have equal call on it.
+
+    **Two energy curves since beta.34, and the difference is the whole point.**
+    The raw curve is what the household would need; it is an estimate of *demand*
+    and may legitimately exceed what any pack could hold. The effective curve is
+    the raw one clamped to ``ceiling_kwh``, and it is the only one an export
+    decision may read -- because a requirement above capacity is not a fact about
+    this export, it is a fact about the week, and a test no state can pass is not
+    evidence. The raw figure stays published so the over-capacity condition is
+    *visible* rather than silently rounded away.
     """
     count = len(upper_net_demand)
+    raw: list[float] = []
     energy: list[float] = []
     price: list[float | None] = []
     for position in range(count):
         stop = min(window_end, count)
         window = range(position, max(position, stop))
         needed_ac = sum(upper_net_demand[k] for k in window)
-        energy.append(
-            floor_energy_kwh
-            + (needed_ac / discharge_efficiency if discharge_efficiency > 0.0 else 0.0)
+        required = floor_energy_kwh + (
+            needed_ac / discharge_efficiency if discharge_efficiency > 0.0 else 0.0
         )
+        raw.append(required)
+        energy.append(required if ceiling_kwh is None else min(required, ceiling_kwh))
         weight = 0.0
         weighted = 0.0
         for k in window:
@@ -1966,7 +2067,7 @@ def survival_curves(
         # to protect and no price to protect it at. ``None``, never zero: zero would
         # read as "any export beats this".
         price.append(weighted / weight if weight > 0.0 else None)
-    return tuple(energy), tuple(price)
+    return tuple(raw), tuple(energy), tuple(price)
 
 
 def _ambient_applies(
@@ -3019,6 +3120,11 @@ class EconomicOutcome:
     #: the plan expects to use. **A permission input, never a reserve** -- it does
     #: not appear in any violation term and cannot force a purchase.
     export_floor_kwh: tuple[float, ...] = ()
+    #: The same requirement **before** the capacity clamp. Published so an
+    #: over-capacity demand estimate stays visible as evidence -- it is a true
+    #: statement about the household -- without being readable as an export
+    #: decision, which is what :attr:`export_floor_kwh` is for.
+    export_floor_raw_kwh: tuple[float, ...] = ()
     #: Per interval, what the protected energy is worth to the house: the
     #: demand-weighted mean import price across the survival window, in EUR per
     #: grid AC kWh. ``None`` where no demand is spoken for.
@@ -3035,24 +3141,52 @@ class EconomicOutcome:
 
     @property
     def export_gate_cost_eur(self) -> float | None:
-        """Return what the export permission cost, or ``None`` if it was off.
+        """Return the **cash** the export permission cost this horizon.
 
-        ``desired - ungated`` on identical inputs, measured on
-        :attr:`EconomicPlan.objective_eur` -- the scalar the recursion minimises.
-        Positive means the permission declined a sale the objective would otherwise
-        have taken; if that figure is materially positive on ordinary shapes, the
-        permission is wrong and this number is how anyone finds out.
+        ``desired - ungated`` on identical inputs, measured on the metered money
+        the household actually moves: ``cost_eur + switching_cost_eur +
+        grid_charge_margin_eur + battery_throughput_cost_eur``. Positive means the
+        permission spent cash it did not have to.
 
-        **It cannot be negative, because the gate only removes moves** -- and that
-        is worth stating because two earlier formulas here made it negative. The
-        first read ``cost_eur``, which is the metered cash flow alone: on the live
-        17:45 horizon it fell 0.4879 -> 0.4659 while ``switching_cost_eur`` rose
-        0.60 -> 0.80, publishing **-0.022** for a permission that had cost 0.178.
-        The second added the fee back and was still wrong on a 96-interval shape at
-        1.2 kWh/quarter -- there the gated plan imported 4.6 kWh more, and the
-        grid-charge margin that buys is 0.05/kWh, which the metered figure also
-        excludes. Only the whole objective is monotone; over a 64-shape sweep its
-        worst case is -4e-16, which is float noise.
+        **The basis changed in beta.34, and the reason is a measured
+        contradiction.** It used to read :attr:`EconomicPlan.objective_eur`, on the
+        stated grounds that only the whole objective is monotone under removing
+        moves. On the live installation it published **-0.1338** and **-1.3259** --
+        a permission reporting a profit. Decomposed on a reconstruction of that
+        horizon: the gated plan spent **1.46 EUR more cash** and ended with
+        **7.93 kWh more** in the pack, credited at 1.74 EUR by the terminal edge
+        value, for a net -0.28. Both halves are true and the sum hid both.
+
+        The monotonicity argument also does not survive contact with the code:
+        ``objective_eur`` is re-derived by :func:`_walk_forward`, which evaluates
+        the ambient-service predicate against ``table.energy(bucket) -
+        ambient_drained_dc_kwh`` while the recursion evaluates it against
+        ``table.energy(bucket)``. The two answers differ near the floor, so the
+        published objective is not exactly the scalar that was minimised, and a
+        subset can report a better one. Measured: 5 of 35 sampled states.
+
+        So this figure is now one honest half of a two-part answer, and
+        :attr:`export_gate_retained_kwh` is the other. Cash out, inventory in --
+        stated separately, because netting them is what produced a permission that
+        appeared to pay for itself.
+
+        **It may be negative, and beta.34 states that rather than asserting
+        otherwise.** beta.32 claimed non-negativity in a docstring and pinned it
+        over 48 shapes; the claim is false and the sweep simply did not contain a
+        counterexample. Two were found on a two-day reconstruction of the live
+        horizon:
+
+        * stored 18.0 kWh: cash **-0.67**, export withheld 4.81 kWh, and the gated
+          plan ends **3.69 kWh lower** than the ungated one. It moved less money
+          because it also kept less energy -- a restriction re-optimises globally,
+          and where the end state is a free variable it can land anywhere.
+        * stored 17.0 kWh on a today-only horizon: cash **-0.0046** with 0.29 kWh
+          *more* retained -- half a cent of genuine free lunch, and the direct
+          fingerprint of the ``_walk_forward`` discrepancy above.
+
+        Neither is large and neither is hidden. The rule for reading it is stated
+        in the payload beside it: **cash and inventory are two measurements, and
+        one of them alone is not the cost of the permission.**
         """
         if self.ungated is None:
             return None
@@ -3061,7 +3195,32 @@ class EconomicOutcome:
             # comparable, and a difference computed anyway would be a number with
             # no meaning. ``None`` says so.
             return None
-        return self.desired.objective_eur - self.ungated.objective_eur
+        return _cash_eur(self.desired) - _cash_eur(self.ungated)
+
+    @property
+    def export_gate_withheld_kwh(self) -> float | None:
+        """Return the meter export the permission declined, in kWh.
+
+        The least ambiguous statement the permission can make about itself: this
+        many kilowatt-hours would have crossed the meter and did not.
+        """
+        if self.ungated is None:
+            return None
+        return max(
+            0.0,
+            self.ungated.planned_grid_export_kwh - self.desired.planned_grid_export_kwh,
+        )
+
+    @property
+    def export_gate_retained_kwh(self) -> float | None:
+        """Return the DC energy still in the pack because of the permission.
+
+        The other half of :attr:`export_gate_cost_eur`. A reader comparing the two
+        can see the whole trade at once: cash spent against inventory kept.
+        """
+        if self.ungated is None:
+            return None
+        return self.desired.end_energy_dc_kwh - self.ungated.end_energy_dc_kwh
 
     #: The same problem solved under beta.30's economics, for comparison only.
     #: ``None`` unless Shadow asked for it. **Temporary**, and flagged as such in
@@ -3090,6 +3249,37 @@ class EconomicOutcome:
         run = self.desired.published_run
         if run is None:
             return ECONOMIC_ACTION_HOLD
+        if run.start_index in self.safety_buy_runs:
+            return ECONOMIC_ACTION_SAFETY_BUY
+        return run.action
+
+    @property
+    def current_action(self) -> str:
+        """Return what is happening in **this** interval, or ``idle``.
+
+        The present tense of :attr:`action`, and the difference is that this one
+        refuses to reach forward. :attr:`action` reads
+        :attr:`EconomicPlan.published_run`, which falls through to a run that may
+        be a day and a half away; on 2026-08-29 at 14:00 the live installation
+        published ``export`` for a sale planned at 20:30 **tomorrow**.
+
+        ``idle`` rather than ``hold`` when no run is in progress: ``hold`` claims
+        the optimiser weighed the prices and chose to do nothing, which is a
+        different and stronger statement than "this interval has no run in it".
+        """
+        run = self.desired.current_run
+        if run is None:
+            return ECONOMIC_ACTION_IDLE
+        if run.start_index in self.safety_buy_runs:
+            return ECONOMIC_ACTION_SAFETY_BUY
+        return run.action
+
+    @property
+    def upcoming_action(self) -> str:
+        """Return the action of the next run that has not started, or ``idle``."""
+        run = self.desired.upcoming_run
+        if run is None:
+            return ECONOMIC_ACTION_IDLE
         if run.start_index in self.safety_buy_runs:
             return ECONOMIC_ACTION_SAFETY_BUY
         return run.action
@@ -3421,6 +3611,7 @@ def build_outcome(
     ungated: EconomicPlan | None = None
 
     export_floor_kwh: tuple[float, ...] = ()
+    export_floor_raw_kwh: tuple[float, ...] = ()
     protect_price: tuple[float | None, ...] = ()
     export_free: tuple[bool, ...] = ()
     upper_net_demand: tuple[float, ...] = ()
@@ -3447,13 +3638,19 @@ def build_outcome(
         survival_window, survival_basis = survival_window_end(
             ungated,  # the plan's own refill, read from the pass without the gate
             actionable_intervals=(actionable_interval_count or horizon.intervals),
+            # **The head, so the campaign's absolute index becomes an offset.**
+            # Every demand carries the civil-day index it was forecast for; the
+            # curve below is indexed from the head. Before beta.34 the two frames
+            # were mixed and the window was the head index itself.
+            head_index=horizon.demands[0].index if horizon.demands else 0,
         )
-        export_floor_kwh, protect_price = survival_curves(
+        export_floor_raw_kwh, export_floor_kwh, protect_price = survival_curves(
             upper_net_demand,
             horizon.prices,
             window_end=survival_window,
             floor_energy_kwh=floor_energy_kwh,
             discharge_efficiency=table.limits.discharge_efficiency,
+            ceiling_kwh=table.ceiling_kwh,
         )
         export_free = tuple(
             # No protection price means nothing is spoken for, so the export is
@@ -3647,6 +3844,7 @@ def build_outcome(
             gated_horizon.planning_reserve_kwh[0] if gated_horizon.intervals else None
         ),
         export_floor_kwh=export_floor_kwh,
+        export_floor_raw_kwh=export_floor_raw_kwh,
         protect_price_eur_per_kwh=protect_price,
         export_free=export_free,
         upper_net_demand_ac_kwh=upper_net_demand,
@@ -4275,11 +4473,18 @@ def _campaigns_as_dicts(
     * **economic export objective**: the meter energy the campaign genuinely
       intends to sell, which is what the Activity announcement quotes.
     """
+    by_index = {row.index: row for row in plan.intervals}
     payload: list[dict[str, Any]] = []
     for campaign in plan.campaigns:
+        rows = [
+            by_index[index]
+            for index in range(campaign.start_index, campaign.end_index + 1)
+            if index in by_index
+        ]
         payload.append(
             {
                 "index": campaign.index,
+                **_campaign_economics(campaign, rows, discharge_efficiency),
                 "direction": campaign.direction,
                 "start_index": campaign.start_index,
                 "end_index": campaign.end_index,
@@ -4338,6 +4543,105 @@ def _campaigns_as_dicts(
             }
         )
     return payload
+
+
+def _campaign_economics(
+    campaign: EconomicCampaign,
+    rows: Sequence[EconomicInterval],
+    discharge_efficiency: float,
+) -> dict[str, Any]:
+    """Return one campaign's euros and its energy provenance, priced per interval.
+
+    **beta.34, and every figure here already existed inside the solve.** The
+    campaign block published the energies and the marginal cost, so a reader could
+    see that a sale moved 8.75 kWh and cost -1.42, and could not see what the
+    -1.42 was made of. Three quantities have entirely different characters and
+    were summed into one: money paid at the meter, money received at the meter,
+    and money **not** paid because the house drank from the pack instead. The
+    third is the one people distrust, and it was the one with no line of its own.
+
+    Priced from ``plan.intervals``, which carry the prices the solve actually
+    used -- not re-derived from a forecast that may since have been revised.
+
+    The charge split is by cause, matching the margin the objective charges: the
+    grid share is the import this campaign's charging *caused*, and everything
+    else came from production that would otherwise have been exported or spilled.
+    """
+    buy = 0.0
+    revenue = 0.0
+    avoided = 0.0
+    for row in rows:
+        if row.import_price_eur_kwh is not None:
+            buy += row.grid_import_kwh * row.import_price_eur_kwh
+            # What the house took from the pack in this interval, at the price it
+            # would otherwise have been bought for.
+            served = max(0.0, row.battery_discharge_ac_kwh - row.grid_export_kwh)
+            avoided += served * row.import_price_eur_kwh
+        if row.export_price_eur_kwh is not None:
+            revenue += row.grid_export_kwh * row.export_price_eur_kwh
+    # **Clamped into the charge itself, at both ends.** ``marginal_grid_import_kwh``
+    # is a *difference* against the idle counterfactual and is legitimately
+    # negative on a discharge campaign -- it bought less than doing nothing would
+    # have. Unclamped that produced ``grid_charge_ac_kwh: -6.92`` beside
+    # ``pv_charge_ac_kwh: 6.92`` on a campaign that charged nothing at all.
+    grid_charge = min(
+        campaign.battery_charge_ac_kwh,
+        max(0.0, campaign.marginal_grid_import_kwh),
+    )
+    start = rows[0].start_energy_dc_kwh if rows else None
+    end = None
+    if rows:
+        last = rows[-1]
+        end = last.start_energy_dc_kwh + last.battery_delta_dc_kwh
+    return {
+        "buy_cost_eur": _round_eur(buy),
+        "export_revenue_eur": _round_eur(revenue),
+        "avoided_import_eur": _round_eur(avoided),
+        "grid_charge_ac_kwh": _round_kwh(grid_charge),
+        "pv_charge_ac_kwh": _round_kwh(
+            max(0.0, campaign.battery_charge_ac_kwh - grid_charge)
+        ),
+        "start_energy_dc_kwh": None if start is None else _round_kwh(start),
+        "end_energy_dc_kwh": None if end is None else _round_kwh(end),
+    }
+
+
+def _rejected_campaigns(outcome: EconomicOutcome) -> list[dict[str, Any]]:
+    """Return the campaigns the ungated solve wanted and the gate did not allow.
+
+    **beta.34, and it is the missing half of the export-permission story.** The
+    payload published what the gate cost in euros and never named a single thing
+    it had withheld, so a user whose battery declined to sell into a visible
+    evening peak had no way to see that a decision had been made at all. The
+    ungated plan is already solved every refresh for exactly this comparison.
+
+    ``protection`` is the only value produced here, and deliberately so: this
+    function compares the two plans the export gate separates. A campaign missing
+    for any other reason was never in the ungated plan either.
+    """
+    ungated = outcome.ungated
+    if ungated is None or not ungated.available:
+        return []
+    kept = {
+        (campaign.direction, campaign.end_index)
+        for campaign in outcome.desired.campaigns
+    }
+    rejected: list[dict[str, Any]] = []
+    for campaign in ungated.campaigns:
+        if (campaign.direction, campaign.end_index) in kept:
+            continue
+        rejected.append(
+            {
+                "direction": campaign.direction,
+                "start_index": campaign.start_index,
+                "end_index": campaign.end_index,
+                "objective_kwh": _round_kwh(campaign.objective_kwh),
+                "grid_export_kwh": _round_kwh(campaign.grid_export_kwh),
+                "marginal_cost_eur": _round_eur(campaign.marginal_cost_eur),
+                "rejected_because": CAMPAIGN_REJECTED_PROTECTION,
+            }
+        )
+    return rejected
 
 
 def _runs_as_dicts(
@@ -5204,6 +5508,21 @@ def economic_as_dict(
                 "export_floor_dc_kwh": [
                     _round_kwh(value) for value in outcome.export_floor_kwh[:12]
                 ],
+                # **The requirement before the capacity clamp, since beta.34.**
+                # A household can genuinely need more than its pack can hold; that
+                # is a true statement and it stays visible here. What it may not
+                # do is become an export decision, because a test no reachable
+                # state can pass is not evidence about any particular sale. The
+                # live installation published 23.09 against a 21.6 kWh pack on
+                # 2026-08-29 and sold nothing all day.
+                "export_floor_raw_dc_kwh": [
+                    _round_kwh(value) for value in outcome.export_floor_raw_kwh[:12]
+                ],
+                "export_floor_clamped": bool(
+                    outcome.export_floor_raw_kwh
+                    and outcome.export_floor_raw_kwh[0]
+                    > outcome.export_floor_kwh[0] + 1e-9
+                ),
                 "protect_price_eur_per_kwh": [
                     None if value is None else _round_eur(value)
                     for value in outcome.protect_price_eur_per_kwh[:12]
@@ -5219,12 +5538,24 @@ def economic_as_dict(
                     outcome.adaptation_ratio_applied
                 ),
                 "adaptation_clipped": outcome.adaptation_clipped,
-                # **The counterfactual that keeps it honest.** If this is
-                # materially positive on ordinary shapes the permission is wrong,
-                # and this figure is how anyone finds out. Measured on the DP's own
-                # objective, not on ``cost_eur``: two earlier formulas published a
-                # negative number for a permission that had genuinely cost money.
+                # **The counterfactual that keeps it honest, in two halves.**
+                # Cash out and inventory in, stated separately: netting them is
+                # what let beta.33 publish -1.3259 for a permission that had cost
+                # the household 1.46 EUR of cash that horizon. See
+                # ``EconomicOutcome.export_gate_cost_eur`` for the measurement.
                 "export_gate_cost_eur": _round_eur(outcome.export_gate_cost_eur),
+                "export_gate_cost_basis": (
+                    "metered cash only -- import cost, export revenue, switching "
+                    "fees, grid-charge margin and throughput cost. the terminal "
+                    "value of energy left in the pack is deliberately excluded "
+                    "and reported beside it as export_gate_retained_kwh"
+                ),
+                "export_gate_withheld_kwh": _round_kwh(
+                    outcome.export_gate_withheld_kwh
+                ),
+                "export_gate_retained_kwh": _round_kwh(
+                    outcome.export_gate_retained_kwh
+                ),
                 "selected_export_energy_kwh": _round_kwh(
                     sum(entry.grid_export_kwh for entry in desired.intervals)
                 ),
@@ -5266,6 +5597,11 @@ def economic_as_dict(
                         None
                         if not outcome.export_floor_kwh
                         else _round_kwh(outcome.export_floor_kwh[0])
+                    ),
+                    "raw_value": (
+                        None
+                        if not outcome.export_floor_raw_kwh
+                        else _round_kwh(outcome.export_floor_raw_kwh[0])
                     ),
                     "can_initiate_grid_purchase": False,
                     "can_increase_triggered_grid_purchase": False,
@@ -5397,6 +5733,8 @@ def economic_as_dict(
         # three run-state transitions and ``runs_from`` published fifteen label
         # slices, with ``charged_switching_fee`` false on every artefact split.
         "campaigns": _campaigns_as_dicts(desired, discharge_efficiency),
+        # **What the gate withheld, named.** See ``_rejected_campaigns``.
+        "rejected_campaigns": _rejected_campaigns(outcome),
         "campaign_counts": {
             "economic_campaign_count": len(desired.campaigns),
             "buy_campaign_count": sum(

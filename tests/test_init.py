@@ -42,6 +42,7 @@ SENSORS = (
     "sensor.alpha_ems_usable_battery_energy",
     "sensor.alpha_ems_dynamic_battery_reserve",
     "sensor.alpha_ems_economic_action",
+    "sensor.alpha_ems_next_planned_action",
     "sensor.alpha_ems_control_state",
     "select.alpha_ems_control_mode",
 )

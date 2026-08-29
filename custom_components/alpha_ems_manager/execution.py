@@ -958,6 +958,21 @@ class AdmittedPlan:
     #: than consulted live, so a run that later vanishes can neither enlarge this
     #: plan nor reach back into a row already open.
     frozen_remaining_at_admission_kwh: float | None = None
+    #: The publication this plan was admitted from, kept whole.
+    #:
+    #: **beta.34, and it exists so a quarter-authority arm can write an ownership
+    #: claim.** Since beta.29 an open row may arm the dispatch after its parent run
+    #: has ended -- that is the fault beta.29 was written to fix -- and the claim
+    #: path still required a ``CarriedRun``, so exactly those arms produced no
+    #: causal record. On 2026-08-29 at 13:30 that combination put a real dispatch
+    #: on the inverter that ownership could never prove was ours; Stage B declined
+    #: to touch it for twenty minutes and the vendor dead-man ended it.
+    #:
+    #: A round trip rather than a summary, for the same reason the record itself
+    #: is: ``parse_target(target_as_published(t))`` must give back ``t``, or a
+    #: restart would restore a run with a different ceiling than the one armed.
+    #: In memory only -- ``as_dict`` is diagnostics and does not carry it.
+    target: Target | None = None
     #: The economic campaign this plan belongs to, frozen at admission with
     #: everything else. ``None`` on a pre-beta.32 publication.
     campaign_id: str | None = None
@@ -1077,6 +1092,7 @@ def admit_plan(
         max_end_energy_kwh=target.max_end_energy_kwh,
         headroom_until=target.headroom_until,
         frozen_remaining_at_admission_kwh=frozen_remaining_kwh,
+        target=target,
     )
 
 
@@ -1722,6 +1738,15 @@ def target_as_published(target: Target) -> dict[str, Any]:
         "required_headroom_kwh": target.required_headroom_kwh,
         "max_end_energy_kwh": target.max_end_energy_kwh,
         "headroom_until": moment(target.headroom_until),
+        # **beta.34, and its absence was a silent campaign break.** beta.32 added
+        # the campaign identity to the published target and to ``parse_target``,
+        # and never added it here -- so the round trip this function's own
+        # docstring asserts was false for exactly the two fields the campaign
+        # lifecycle is keyed on. A restart mid-campaign adopted a run whose
+        # campaign was gone, the accumulator started again from zero and the
+        # terminal named nothing. Found by asserting the round trip on a target
+        # that production actually published, which no earlier test did.
+        "campaign_id": target.campaign_id,
     }
 
 

@@ -1034,7 +1034,7 @@ async def test_the_entity_count_and_the_economic_contract_are_untouched(
 
     await drive_control(hass, setup_integration, import_w=400)
 
-    assert len(CONTRACT) == 13
+    assert len(CONTRACT) == 14
     assert len(ECONOMIC_ATTRIBUTES) == 8
 
     economic = hass.states.get("sensor.alpha_ems_economic_action")

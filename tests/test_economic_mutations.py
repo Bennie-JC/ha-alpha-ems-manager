@@ -1377,7 +1377,7 @@ def test_the_structural_contracts_are_unchanged_by_beta16() -> None:
 
     from .test_entity_contract import CONTRACT
 
-    assert len(CONTRACT) == 13
+    assert len(CONTRACT) == 14
     assert_charge_only_capability()
     assert len(PERMITTED_SERVICES) == 4
     assert set(FAMILIES) == {ACTION_DISCHARGE, ACTION_CHARGE}

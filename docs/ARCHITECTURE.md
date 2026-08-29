@@ -3221,6 +3221,85 @@ table build, inside a fifteen-minute refresh, in the executor.
 `test_economic_model.py` guards a full-day solve against the refresh budget so the
 regression cannot come back silently.
 
+### Two index frames, and the boundary between them
+
+The optimiser indexes intervals two ways, and confusing them is a real defect
+class rather than a hypothetical one.
+
+- **Absolute index.** `IntervalDemand.index` and `EconomicInterval.index` carry
+  the civil-day index of the interval: 0–95 today, 96–191 tomorrow. `EconomicRun`
+  and `EconomicCampaign` inherit it in `start_index` / `end_index`.
+- **Horizon offset.** Everything positional inside a solve — `planning_reserve_kwh`,
+  `export_floor_kwh`, `protect_price`, `export_free`, the DP's `position` — is
+  indexed from the **head** of the horizon, which is `elapsed_intervals + 1`.
+
+**The rule: a function that returns a position must state which frame it is in,
+and a frame conversion happens at exactly one place — the caller boundary, with
+the head passed in explicitly rather than inferred.**
+
+`survival_window_end()` is the worked example. Through `beta.33` one of its two
+branches returned an absolute campaign index and the other returned a count, and
+`survival_curves()` consumed both as offsets. Every test horizon starts at index
+zero, where the two frames coincide, so the suite could not tell them apart. On
+the live two-day horizon at 2026-08-29 14:00 the head was interval 57 and the
+next refill was interval 132; the correct offset was 75 and the published figure
+was 132. It now takes `head_index` and returns `max(0, start - head)`, clamped to
+the actionable prefix, and the returned value is asserted to be bounded by it.
+
+The same class of fault has been found twice before in this codebase — a reserve
+list positioned by offset and indexed by interval id in `beta.21`, and this one —
+so the naming convention is load-bearing: **`_index` is absolute, `position` and
+`offset` are relative, and a `_count` is neither.**
+
+### A protection quantity must be reachable to be evidence
+
+`export_floor_kwh` is compared against `energies[move.target]`, whose maximum is
+the physics table's ceiling. A floor above that ceiling is therefore true for
+every reachable bucket at every interval, in both directions, permanently — it
+has stopped discriminating and become a prohibition.
+
+Two consequences, both structural:
+
+1. **Every published protection quantity is clamped to what the pack can hold**,
+   the way the reserve head already was. The unclamped figure is published beside
+   it (`export_floor_raw_dc_kwh`) so an impossible requirement stays visible as
+   evidence.
+2. **Where a requirement is unsatisfiable the energy test is dropped and the
+   price test stands alone.** The price comparison is the economically meaningful
+   question — is this export worth more than the energy it spends — and it is
+   still applied. This cannot loosen any case where the floor is reachable.
+
+The general rule: *a test that cannot be passed is not a test.* Before adding any
+new gate quantity, ask what its maximum reachable value is and what the gate does
+when the requirement exceeds it.
+
+### The arm and the claim are one decision
+
+Stage B may arm the inverter from either of two authorities:
+
+- the **carried run**, which is the common case; or
+- the **admitted plan's open row**, which is `beta.29`'s design. Stage A's horizon
+  head is `elapsed + 1`, so the publication made *at* 19:45 covers 20:00 onward
+  and structurally cannot affirm the 19:45 run. The run ends, the row stays open,
+  and the row is the authority.
+
+**Invariant: whatever authority builds the command writes the ownership claim,
+and an activation with no authority is not sent at all.**
+
+Through `beta.33` these two were different conditions — the command came from
+either authority, the claim required the carried run — and the disagreement was
+invisible until it produced an unowned dispatch on real hardware for twenty
+minutes on 2026-08-29. The refusal lives at the send site because that is the last
+point where the staged command list and the claim are both in scope, which is the
+only place the two can be held to one condition.
+
+Nothing here grants ownership. A claim is written *before* the writes and is only
+a claim; ownership still requires the later `dispatch_start` readback to match, so
+a dispatch somebody else began cannot be appropriated. `AdmittedPlan` keeps the
+publication it was admitted from so the claim is a full round trip, and
+`target_as_published()` must stay a round trip — it silently dropped `campaign_id`
+from `beta.32` until `beta.34`, which broke campaign continuity across a restart.
+
 ### Known open items — Phase 8 Stage A
 
 **No actuator exists for export or for photovoltaic curtailment.** They are

@@ -123,6 +123,17 @@ CONTRACT: dict[str, dict[str, object]] = {
         "state_class": None,
         "icon": "mdi:cash-clock",
     },
+    # beta.34. The other half of the split: ``economic_action`` answers what is
+    # happening now, this answers what is planned next and prints full instants
+    # for it -- the run it describes is routinely on the following day.
+    "sensor.alpha_ems_next_planned_action": {
+        "unique_id_suffix": "next_planned_action",
+        "name": "Alpha EMS Next Planned Action",
+        "unit": None,
+        "device_class": "enum",
+        "state_class": None,
+        "icon": "mdi:calendar-clock",
+    },
     "sensor.alpha_ems_control_state": {
         "unique_id_suffix": "control_state",
         "name": "Alpha EMS Control State",
@@ -155,7 +166,7 @@ def test_no_entity_is_missing_or_extra(hass: HomeAssistant) -> None:
         if entity.platform == DOMAIN
     }
     assert created == set(CONTRACT)
-    assert len(created) == len(CONTRACT) == 13
+    assert len(created) == len(CONTRACT) == 14
 
 
 #: The entity surface, phase by phase. Named rather than counted, so a new
@@ -203,6 +214,11 @@ PHASE_SEVEN_ENTITIES = {
 #: wrong must not become six rows.
 PHASE_EIGHT_ENTITIES = {
     "sensor.alpha_ems_economic_action",
+    # beta.34, and it is one entity rather than a second attribute because the
+    # two answer different questions. A single value publishing "current run or
+    # next run" announced tomorrow evening's sale as though it were happening,
+    # with a dateless ``HH:MM-HH:MM`` window as the only clue.
+    "sensor.alpha_ems_next_planned_action",
 }
 
 

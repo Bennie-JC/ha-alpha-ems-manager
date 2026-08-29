@@ -372,6 +372,42 @@ BALANCE_SAMPLE_WINDOW: Final = 200
 #: reporting relative to the others.
 BALANCE_MAX_SOURCE_SKEW_SECONDS: Final = 90.0
 
+#: How long after a setpoint write a balance sample is still a *transition*.
+#:
+#: **beta.34, and it is deliberately the same number as the skew allowance
+#: above** rather than a new one. The two questions are the same question. The
+#: skew bound says how far apart two source readings may be taken and still be
+#: treated as describing one instant; so for exactly that long after the battery
+#: setpoint changes, a sample may legitimately pair a reading from before the
+#: change with one from after it, and the identity is being asked to close across
+#: a discontinuity it never saw.
+#:
+#: The evidence is a live sample from 2026-08-29: house 681 W, PV 910 W, charge
+#: 118 W, import 2046 W -- a residual of +2157 W against an allowance of 180 --
+#: taken inside the 11:00-11:45Z quarters where Stage B ramped the setpoint from
+#: 2.4 kW to 10.2 kW. It was marked ``coherent`` because the skew was 7.7 s. Every
+#: source was fresh; they simply were not describing the same setpoint.
+#:
+#: **This changes no verdict.** ``within_tolerance`` is computed exactly as
+#: before, the three allowance terms are untouched, and a transition sample still
+#: counts in the overall pass rate. All it does is let a reader see which
+#: population a failure came from -- see ``BalanceSample.regime``.
+BALANCE_TRANSITION_SECONDS: Final = BALANCE_MAX_SOURCE_SKEW_SECONDS
+
+#: The two populations a failed balance sample can belong to.
+#:
+#: ``command_transition`` -- the setpoint moved recently, or moved by more than
+#: the dispatch deadband since the previous sample. ``steady_state`` -- it did
+#: not, so a residual here is a property of the installation's measurement
+#: boundary rather than of a command in flight.
+BALANCE_REGIME_STEADY_STATE: Final = "steady_state"
+BALANCE_REGIME_COMMAND_TRANSITION: Final = "command_transition"
+
+BALANCE_REGIMES: Final = (
+    BALANCE_REGIME_STEADY_STATE,
+    BALANCE_REGIME_COMMAND_TRANSITION,
+)
+
 #: Oldest acceptable report age for any participating source. Matches
 #: ``MAX_SAMPLE_GAP_SECONDS``: a source silent for five minutes is treated as
 #: not reporting at all, and the balance identity says nothing useful about it.
@@ -847,6 +883,22 @@ CONTROL_MODE_OPTIONS: Final = (
 #: is still false, so in this release it is unreachable by construction, exactly
 #: as ``started`` is on the Activity surface.
 CONTROL_STATE_EXECUTED: Final = "executed"
+#: A command that moves the battery is on the wire **now**.
+#:
+#: **beta.34, and it exists because ``executed`` was answering a different
+#: question.** That value is set by every successful staged write, whatever the
+#: write was for -- and one of the things it is for is releasing a stale ownership
+#: marker, whose entire command list is a single ``input_boolean.turn_off``. The
+#: live installation published Control State ``executed`` -- rendered "Executing"
+#: -- at 14:00 on 2026-08-29 while the dispatch was off, the timer inactive and the
+#: only thing sent was that boolean.
+#:
+#: A public state has to answer "what is the EMS doing now". ``executed`` answers
+#: "did the last helper write succeed", which is a real question and now has a
+#: real home: ``control.execution.result.command_result``. The enum member stays,
+#: so nothing built against beta.33 acquires an unknown value, but the coordinator
+#: no longer publishes it.
+CONTROL_STATE_EXECUTING: Final = "executing"
 #: A command was sent and could not be confirmed, or the device refused it.
 #:
 #: **beta.31, and it names a runtime meaning the sensor previously hid.** The
@@ -871,6 +923,10 @@ CONTROL_STATE_OPTIONS: Final = (
     # changes a barrier rather than an entity's enumeration, and a dashboard built
     # against beta.19 does not acquire a new state it has never seen.
     CONTROL_STATE_EXECUTED,
+    # beta.34. What the coordinator publishes when a battery-moving command is on
+    # the wire. Additive: ``executed`` above is retained so a dashboard built
+    # against beta.33 keeps every value it could already see.
+    CONTROL_STATE_EXECUTING,
     # beta.31. **Additive**: every value an automation could already be matching
     # on still exists and still means what it meant, so nothing built against
     # beta.30 breaks. What changes is that a failed write stops being reported as
@@ -1804,6 +1860,21 @@ ECONOMIC_ACTION_DISCHARGE: Final = "discharge"
 ECONOMIC_ACTION_EXPORT: Final = "export"
 ECONOMIC_ACTION_CURTAIL: Final = "curtail_pv"
 ECONOMIC_ACTION_SAFETY_BUY: Final = "safety_buy"
+#: Nothing is happening in the interval that is happening.
+#:
+#: **beta.34, and it is not a synonym for ``hold``.** ``hold`` is an economic
+#: verdict -- the optimiser looked at the prices and decided that doing nothing is
+#: the best available trade. ``idle`` is an observation about the present interval:
+#: no run starts at the horizon's head, whatever the plan intends later today or
+#: tomorrow.
+#:
+#: The distinction is what the entity was missing. Until beta.34 it published
+#: ``current_run or next_run`` with no bound on how far away ``next_run`` could be,
+#: and the window attribute renders ``HH:MM-HH:MM`` with no date -- so at 14:00 on
+#: 2026-08-29 the live installation announced a Sell for "20:30-22:00" that was
+#: **tomorrow** evening, thirty hours out. Where that plan now goes is
+#: ``SENSOR_NEXT_PLANNED_ACTION``, which prints full instants.
+ECONOMIC_ACTION_IDLE: Final = "idle"
 
 ECONOMIC_ACTION_OPTIONS: Final = (
     ECONOMIC_ACTION_HOLD,
@@ -1812,6 +1883,9 @@ ECONOMIC_ACTION_OPTIONS: Final = (
     ECONOMIC_ACTION_EXPORT,
     ECONOMIC_ACTION_CURTAIL,
     ECONOMIC_ACTION_SAFETY_BUY,
+    # beta.34. Additive: every value beta.33 could publish is still above it, and
+    # ``hold`` keeps its own meaning on the planned-action entity.
+    ECONOMIC_ACTION_IDLE,
 )
 
 #: Why the optimiser wants what it wants. A bounded vocabulary, like every other
@@ -2005,6 +2079,15 @@ DEFAULT_ALLOW_BATTERY_EXPORT: Final = False
 #: Entity key. One, and only one: the counterfactual plans, the per-run detail,
 #: the solver figures and the provenance are all diagnostics.
 SENSOR_ECONOMIC_ACTION: Final = "economic_action"
+
+#: Entity key. The other half of the split beta.34 made in the sentence above.
+#:
+#: ``economic_action`` answers "what is happening now"; this answers "what is
+#: planned next, and when exactly". It exists because those were one entity until
+#: beta.34, and a single value could not answer both without lying about one of
+#: them. Its instants are full ISO timestamps rather than a clock window, because
+#: the run it describes is routinely on the following day.
+SENSOR_NEXT_PLANNED_ACTION: Final = "next_planned_action"
 
 #: The **target** state-space bucket, and the fallback when no better lattice
 #: qualifies. Until beta.17 this was the bucket, full stop; it is now the figure
@@ -2259,6 +2342,22 @@ CONTROL_REFUSE_SERVICE_NOT_PERMITTED: Final = "service_not_permitted"
 #: wrong thing to tell a reader on a release that executes two directions. The
 #: constant keeps its name; only the published text changed.
 CONTROL_REFUSE_ACTION_NOT_EXECUTABLE: Final = "entity_not_executable"
+
+#: An activation was built with no carried run to name it. **beta.34, and it is
+#: fail-closed by construction.**
+#:
+#: The claim that makes a dispatch ownable is written by the arming sequence and
+#: only when a run is carried. The *command* path had no such condition, so a
+#: refresh could arm the vendor helper from an admitted plan whose run Stage A had
+#: already withdrawn -- and then nothing could prove the dispatch was ours. That is
+#: what happened on the live installation on 2026-08-29: armed at 13:30 with the
+#: run withdrawn at 13:00, ``ownership_state: unproven`` on every tick for twenty
+#: minutes, no power correction possible, and the vendor dead-man was what finally
+#: stopped it.
+#:
+#: The answer is not to synthesise ownership afterwards. It is to refuse to arm:
+#: an activation nobody can claim is exactly the dispatch that must not exist.
+CONTROL_REFUSE_NO_CLAIMABLE_RUN: Final = "no_claimable_run"
 
 #: The owner marker's state, as five distinct facts rather than a boolean.
 #:
@@ -2913,6 +3012,25 @@ EXECUTION_FAILED_STOP_REASONS: Final = (
     EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
 )
 
+#: Which stop reasons mean the campaign **finished**, as against being cut short.
+#:
+#: **beta.34, and it names an omission rather than adding a policy.** The terminal
+#: precedence read "any stop reason that is not in the failed set is a
+#: cancellation", and ``window_ended`` is the ordinary way a campaign ends -- it
+#: fires when the last planned quarter closes, on every campaign that runs to
+#: completion. A one-quarter Safety Buy that delivered 1.063 of 1.11 kWh was filed
+#: as *Canceled* on the live installation for exactly this reason. A reason in this
+#: set means the delivery figures decide, and nothing else.
+EXECUTION_COMPLETION_STOP_REASONS: Final = (
+    EXECUTION_STOP_WINDOW_ENDED,
+    EXECUTION_STOP_QUARTER_TARGET_REACHED,
+)
+
+#: Why a terminal could not be judged against a target. Published beside the
+#: outcome so "we could not measure it" and "nobody told us what to measure" stay
+#: different answers -- beta.33 gave both of them ``failed``.
+CAMPAIGN_TARGET_UNAVAILABLE: Final = "target_unavailable"
+
 #: Which side of the plant a campaign's objective is stated at.
 #:
 #: **Two boundaries, one field, and the field says which.** Through beta.31 the
@@ -2981,6 +3099,44 @@ REASON_VOCABULARIES: Final = (
 #: had no objective and cannot fall short of one.
 CAMPAIGN_SUCCESS_TOLERANCE_PER_QUARTER_KWH: Final = MIN_EXECUTABLE_QUARTER_KWH
 
+#: The measurement floor under any campaign objective, as a percent of capacity.
+#:
+#: **Derived, not chosen.** The objective is measured as a state-of-charge delta,
+#: and the vendor sensor reports a level, not an energy. Whole-percent reporting is
+#: the worst case the integration must tolerate, so one percent of usable capacity
+#: is the smallest difference any campaign figure can be trusted to resolve -- 0.216
+#: kWh on the reference pack. The live installation's own sensor does better, 0.4 %
+#: (``soc_coherence.observed_soc_step_percent``), and this stays at the worst case
+#: rather than the observed one because a different pack is not obliged to match it.
+CAMPAIGN_MEASUREMENT_RESOLUTION_PERCENT: Final = 1.0
+
+#: The ceiling on the completion tolerance, as a fraction of the frozen objective.
+#:
+#: **The guard that keeps a large campaign honest.** The additive terms above are
+#: physics and they scale with the number of quarters: a twenty-quarter charge
+#: accumulates twenty quantisation steps, which is 0.55 kWh, and on a small
+#: objective that would excuse most of a miss. So the additive figure is capped at
+#: a fraction of what was promised, and the two together are scale-aware in both
+#: directions -- a 1.11 kWh single quarter tolerates 0.056 and an 18.33 kWh
+#: campaign tolerates 0.59, which is 3.2 %.
+#:
+#: Five percent is where a miss stops being instrumentation and starts being a
+#: fact about delivery. It is a ceiling, never a licence: the additive rule is
+#: almost always the binding one.
+CAMPAIGN_SUCCESS_TOLERANCE_FRACTION: Final = 0.05
+
+#: How long past its own end a campaign may stay open before it is closed anyway.
+#:
+#: **The orphan bound.** A campaign closes when no quarter is open *and* no
+#: published target still names it. Both are necessary, and together they leave a
+#: gap: a quarter carried from a frozen plan that Stage A has stopped affirming
+#: keeps the first condition false for as long as it is carried, so the campaign
+#: never reaches a terminal and its energy is never reported. One hour past the
+#: furthest quarter the campaign ever claimed is well beyond any legitimate
+#: carry -- the admitted schedule is rebuilt every fifteen minutes -- and is short
+#: enough that a reader is not left waiting for a verdict that will never come.
+CAMPAIGN_ORPHAN_GRACE_MINUTES: Final = 60
+
 #: How the realised battery figure was obtained, so a reader can weigh it.
 #:
 #: ``accumulated`` integrates measured battery power and is the better figure
@@ -3044,32 +3200,30 @@ ECONOMIC_CHARGE_SOURCES: Final = (
 #: Activity event kinds. Observational only: nothing in this integration
 #: subscribes to them, no planner or execution state is derived from them, and
 #: losing the recorder changes no figure.
+#: **Five kinds were retired in beta.34, and the reason is that they were never
+#: emitted.** ``changed``, ``ended``, ``refused``, ``would_start`` and
+#: ``would_stop`` were declared here, carried in the classification tuples,
+#: exercised by parametrised tests over those tuples -- and no production path
+#: ever constructed one. ``would_start``/``would_stop`` had even been deliberately
+#: withdrawn in behaviour: :func:`activity._started_entry` says in as many words
+#: that Shadow "now emits nothing here at all", and the constants outlived the
+#: decision. ``changed`` lost its job to the announcement deadband, ``ended`` to
+#: ``finished``, and ``refused`` to the Advisory marker on the Planned line.
+#:
+#: A vocabulary a consumer can subscribe to must not contain words nothing says.
+#: The tests over these tuples passed on values the pipeline could not produce,
+#: which is the same fault the beta.33 reachability test was written to forbid for
+#: stop reasons. Retired rather than emitted, because the beta.34 lifecycle table
+#: has no place for any of them.
 ECONOMIC_EVENT_PLANNED: Final = "planned"
-ECONOMIC_EVENT_CHANGED: Final = "changed"
 ECONOMIC_EVENT_STARTED: Final = "started"
-ECONOMIC_EVENT_ENDED: Final = "ended"
 ECONOMIC_EVENT_CANCELLED: Final = "cancelled"
-ECONOMIC_EVENT_REFUSED: Final = "refused"
 #: A dispatch ended, with the reason it ended. Added in beta.19: ``started`` had
 #: no counterpart, so a stop could only ever be inferred from the absence of a
 #: further line -- and an announcement left standing after its run finished is the
 #: one way this surface can mislead. **Execution-class**, so it is refused exactly
 #: as ``started`` is while nothing can be sent.
 ECONOMIC_EVENT_STOPPED: Final = "stopped"
-
-#: What shadow says instead. Advice-class, and separate kinds rather than the same
-#: kinds worded differently.
-#:
-#: The distinction is load-bearing. ``logbook_payload`` refuses an execution kind
-#: outright while the barrier stands, and that refusal is what guarantees this
-#: surface cannot claim the battery moved. A shadow line describing a dispatch it
-#: *would* have started is not a claim about the battery, but if it carried the
-#: ``started`` kind it would be refused -- and if the refusal were relaxed to let
-#: it through, the guarantee would be gone for the real case too. Two kinds keeps
-#: both: shadow speaks, execution stays refused, and the classification does the
-#: work rather than a caller remembering to word things carefully.
-ECONOMIC_EVENT_WOULD_START: Final = "would_start"
-ECONOMIC_EVENT_WOULD_STOP: Final = "would_stop"
 
 #: A standing condition began or ended. Transitions only: repeating an inhibit
 #: every refresh is the spam the whole surface is designed against. Advice-class,
@@ -3093,24 +3247,22 @@ ECONOMIC_EVENT_ERROR: Final = "error"
 
 ECONOMIC_EVENT_KINDS: Final = (
     ECONOMIC_EVENT_PLANNED,
-    ECONOMIC_EVENT_CHANGED,
     ECONOMIC_EVENT_STARTED,
     ECONOMIC_EVENT_FINISHED,
     ECONOMIC_EVENT_ERROR,
     ECONOMIC_EVENT_STOPPED,
-    ECONOMIC_EVENT_WOULD_START,
-    ECONOMIC_EVENT_WOULD_STOP,
     ECONOMIC_EVENT_INHIBITED,
     ECONOMIC_EVENT_AVAILABLE,
-    ECONOMIC_EVENT_ENDED,
     ECONOMIC_EVENT_CANCELLED,
-    ECONOMIC_EVENT_REFUSED,
 )
 
 #: The kinds that describe *advice*: it appeared, it changed materially, it was
 #: withdrawn before it began, its window elapsed, or it asked for something no
 #: actuator can perform. Every one of them is a statement about what the
 #: optimizer wants, and none is a statement about the battery.
+#:
+#: **Four rather than beta.33's nine**, because five of those nine were never
+#: emitted by anything. See the retirement note above.
 #:
 #: ``cancelled`` moved here in beta.16. beta.14 classified it as execution, on the
 #: reading that cancelling is something you do to a command in flight. But
@@ -3120,14 +3272,8 @@ ECONOMIC_EVENT_KINDS: Final = (
 #: standing as a lie. ``started`` remains the sole execution kind.
 ECONOMIC_ADVICE_EVENT_KINDS: Final = (
     ECONOMIC_EVENT_PLANNED,
-    ECONOMIC_EVENT_CHANGED,
     ECONOMIC_EVENT_CANCELLED,
-    ECONOMIC_EVENT_ENDED,
-    ECONOMIC_EVENT_REFUSED,
-    # beta.19. Shadow's own lifecycle, and the two pipeline transitions. None of
-    # them says the battery did anything.
-    ECONOMIC_EVENT_WOULD_START,
-    ECONOMIC_EVENT_WOULD_STOP,
+    # The two pipeline transitions. Neither says the battery did anything.
     ECONOMIC_EVENT_INHIBITED,
     ECONOMIC_EVENT_AVAILABLE,
 )
@@ -3253,6 +3399,29 @@ ACTIVITY_CATEGORY_MIXED_BUY: Final = "mixed_buy"
 ACTIVITY_CATEGORY_ECONOMIC_SELL: Final = "economic_sell"
 ACTIVITY_CATEGORY_ECONOMIC_DISCHARGE: Final = "economic_discharge"
 ACTIVITY_CATEGORY_CURTAILMENT: Final = "curtailment"
+
+#: Whether a lifecycle exists because the battery had no choice, or because the
+#: prices made it worth doing.
+#:
+#: **beta.34, for the structured Activity payload.** The six categories above are
+#: the right vocabulary for a *sentence* -- a reader wants "Safety Buy" rather
+#: than "compelled purchase" -- and the wrong one for an automation, which needs
+#: the one distinction that changes what a person would do about it. Derived from
+#: the category rather than stored beside it, so the two cannot drift.
+#: Why a campaign the ungated solve chose is not in the plan.
+#:
+#: **beta.34.** One value, and a vocabulary rather than free text so a second
+#: reason cannot arrive as a sentence. Only the export gate can remove a campaign
+#: between the two solves, so only the export gate can name one here.
+CAMPAIGN_REJECTED_PROTECTION: Final = "protection"
+
+ACTIVITY_PURPOSE_SAFETY: Final = "safety"
+ACTIVITY_PURPOSE_ECONOMIC: Final = "economic"
+
+ACTIVITY_PURPOSES: Final = (
+    ACTIVITY_PURPOSE_SAFETY,
+    ACTIVITY_PURPOSE_ECONOMIC,
+)
 
 ACTIVITY_CATEGORIES: Final = (
     ACTIVITY_CATEGORY_SAFETY_BUY,

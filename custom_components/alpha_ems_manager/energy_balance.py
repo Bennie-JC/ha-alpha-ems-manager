@@ -63,7 +63,10 @@ from .const import (
     BALANCE_MAX_SOURCE_SKEW_SECONDS,
     BALANCE_METERING_TOLERANCE,
     BALANCE_MODE_ACTIVE_W,
+    BALANCE_REGIME_COMMAND_TRANSITION,
+    BALANCE_REGIME_STEADY_STATE,
     BALANCE_SUSTAINED_FAILURES,
+    BALANCE_TRANSITION_SECONDS,
     COHERENCE_ACTION_HOLD,
     COHERENCE_ACTION_NONE,
     COHERENCE_ACTION_STOP,
@@ -72,6 +75,7 @@ from .const import (
     COHERENCE_OK,
     CONTROL_COHERENCE_GRACE_TICKS,
     CONTROL_MAX_SOURCE_AGE_SECONDS,
+    DISPATCH_POWER_DEADBAND_KW,
     SAFETY_SAMPLE_SECONDS,
 )
 from .normalization import PowerFlows
@@ -474,6 +478,38 @@ class BalanceSample:
     #: The normalised flows this verdict was reached from.
     flows: PowerFlows | None = None
     coherence: SourceCoherence | None = None
+    #: How long ago the battery setpoint was last written, in seconds, or ``None``
+    #: when this integration has never written one this session.
+    seconds_since_dispatch_write: float | None = None
+    #: How far the setpoint moved at that write, signed, in kW. ``None`` for the
+    #: same reason.
+    setpoint_delta_kw_since_previous: float | None = None
+
+    @property
+    def regime(self) -> str:
+        """Return which population this sample belongs to.
+
+        **beta.34, and it attributes rather than excuses.** The residuals on the
+        reference installation are two distinct populations and neither is a
+        fault: one is the meters catching a kilowatt-scale ramp mid-flight, the
+        other is a proportional DC/AC boundary term that grows with power --
+        41 W of excess per failed sample in the 500-2000 W band against 412 W in
+        the 2000-5000 W band. Reported as one number they look like one problem
+        with a tolerance that is slightly too tight, which is exactly the reading
+        that leads to widening it.
+
+        A transition either way: recently written, **or** moved by more than the
+        dispatch deadband. The second clause catches the sample immediately after
+        a large step even if the write is already outside the window, and the
+        first catches the settling that follows a small one.
+        """
+        elapsed = self.seconds_since_dispatch_write
+        if elapsed is not None and elapsed <= BALANCE_TRANSITION_SECONDS:
+            return BALANCE_REGIME_COMMAND_TRANSITION
+        delta = self.setpoint_delta_kw_since_previous
+        if delta is not None and abs(delta) > DISPATCH_POWER_DEADBAND_KW:
+            return BALANCE_REGIME_COMMAND_TRANSITION
+        return BALANCE_REGIME_STEADY_STATE
 
     @property
     def outcome(self) -> str:
@@ -526,6 +562,19 @@ class BalanceSample:
             "dc_power_w": round(self.dc_power_w, 1),
             "ac_power_w": round(self.ac_power_w, 1),
             "gross_fault_suspected": self.gross_fault_suspected,
+            # beta.34. Attribution, not a verdict: ``within_tolerance`` above is
+            # computed from the same three allowance terms it always was.
+            "regime": self.regime,
+            "seconds_since_dispatch_write": (
+                None
+                if self.seconds_since_dispatch_write is None
+                else round(self.seconds_since_dispatch_write, 1)
+            ),
+            "setpoint_delta_kw_since_previous": (
+                None
+                if self.setpoint_delta_kw_since_previous is None
+                else round(self.setpoint_delta_kw_since_previous, 3)
+            ),
         }
         if self.flows is not None:
             payload["flows_w"] = {
@@ -562,7 +611,11 @@ def _tally(counts: dict[str, int], key: str) -> None:
 
 
 def evaluate_balance(
-    flows: PowerFlows, coherence: SourceCoherence | None = None
+    flows: PowerFlows,
+    coherence: SourceCoherence | None = None,
+    *,
+    seconds_since_dispatch_write: float | None = None,
+    setpoint_delta_kw_since_previous: float | None = None,
 ) -> BalanceSample | None:
     """Evaluate the balance identity, or return ``None`` if it cannot be.
 
@@ -645,6 +698,8 @@ def evaluate_balance(
         mode=infer_balance_mode(flows),
         flows=flows,
         coherence=coherence,
+        seconds_since_dispatch_write=seconds_since_dispatch_write,
+        setpoint_delta_kw_since_previous=setpoint_delta_kw_since_previous,
     )
 
 
@@ -736,6 +791,10 @@ class BalanceMonitor:
     #: symmetric noise does the opposite. Every existing statistic takes an
     #: absolute value first and so cannot see either.
     signed_residual_sum_w: float = 0.0
+    #: Eligible passes and failures per regime, so the two populations that make
+    #: up the overall rate can be read apart. beta.34.
+    passed_by_regime: dict[str, int] = field(default_factory=dict)
+    failed_by_regime: dict[str, int] = field(default_factory=dict)
     #: Eligible failures per AC-power band, and the overshoot accumulated in each.
     failed_by_power_band: dict[str, int] = field(default_factory=dict)
     excess_sum_by_power_band: dict[str, float] = field(default_factory=dict)
@@ -757,6 +816,23 @@ class BalanceMonitor:
         if self.eligible_samples <= 0:
             return None
         return self.passed_samples / self.eligible_samples
+
+    @property
+    def pass_rate_steady_state(self) -> float | None:
+        """Return the pass rate over samples taken away from a command change.
+
+        Published **beside** :attr:`pass_rate`, never instead of it. The overall
+        rate stays exactly what it was so the recorded series remains comparable
+        across releases; this one answers the different question of how well the
+        identity closes when nothing is in flight, which is the number that says
+        something about the installation's measurement boundary.
+        """
+        passed = self.passed_by_regime.get(BALANCE_REGIME_STEADY_STATE, 0)
+        failed = self.failed_by_regime.get(BALANCE_REGIME_STEADY_STATE, 0)
+        eligible = passed + failed
+        if eligible <= 0:
+            return None
+        return passed / eligible
 
     def record_unavailable(self, entity_ids: tuple[str, ...] = ()) -> None:
         """Record that not every source produced a reading.
@@ -811,11 +887,13 @@ class BalanceMonitor:
         if sample.within_tolerance:
             self.passed_samples += 1
             _tally(self.passed_by_mode, sample.mode)
+            _tally(self.passed_by_regime, sample.regime)
             self.consecutive_failures = 0
             self._warned_for_current_run = False
         else:
             self.failed_samples += 1
             _tally(self.failed_by_mode, sample.mode)
+            _tally(self.failed_by_regime, sample.regime)
             if sample.residual_w >= 0.0:
                 self.positive_failures += 1
             else:
@@ -897,6 +975,20 @@ class BalanceMonitor:
             # failures spread across every mode the system enters.
             "passed_samples_by_mode": dict(self.passed_by_mode),
             "failed_samples_by_mode": dict(self.failed_by_mode),
+            # beta.34. The two populations, and the rate over the quiet one. The
+            # overall rate above is unchanged and stays the comparable series.
+            "failed_samples_by_regime": dict(self.failed_by_regime),
+            "passed_samples_by_regime": dict(self.passed_by_regime),
+            "pass_rate_steady_state": (
+                None
+                if self.pass_rate_steady_state is None
+                else round(self.pass_rate_steady_state, 4)
+            ),
+            "regime_basis": (
+                "command_transition when the battery setpoint was written within "
+                f"{BALANCE_TRANSITION_SECONDS:.0f}s or moved by more than "
+                f"{DISPATCH_POWER_DEADBAND_KW:.2f} kW; steady_state otherwise"
+            ),
             # Residual shape. Reporting only: nothing here gates control, and
             # the reason it does not is worth stating plainly. Where house load
             # is derived from one grid meter and this check reads another, the
