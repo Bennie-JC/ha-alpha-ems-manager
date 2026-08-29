@@ -568,7 +568,7 @@ def test_the_terminal_comparison_is_absent_rather_than_zero() -> None:
 
 
 def test_the_solver_runs_four_solves_not_five() -> None:
-    """Three unconditional solves, plus three that must be asked for.
+    """Three unconditional solves, plus four that must be asked for.
 
     Desired, capability and the reserve-relaxed label solve run every refresh. The
     three conditional ones:
@@ -587,6 +587,13 @@ def test_the_solver_runs_four_solves_not_five() -> None:
     * the beta.31 **legacy comparison**, behind ``compare_legacy``, which only
       Shadow requests.
 
+    * the beta.35 **terminal counterfactual**, which re-solves the same horizon
+      with the beta.34 flat terminal credit so a reader can see what the new
+      demand-bounded terminal value changed. Conditional twice over: it runs only
+      when a terminal value was supplied *and* it is not already the flat rule, so
+      a caller with no post-horizon demand pays nothing for it. Diagnostics only --
+      it never reaches an execution target.
+
     An unconditional fourth would be the regression this test exists to catch.
 
     The one beta.18 deleted was different in kind: it priced a constraint that no
@@ -604,8 +611,8 @@ def test_the_solver_runs_four_solves_not_five() -> None:
                 ):
                     calls += 1
 
-    # Three of the six are conditional; see the docstring for each.
-    assert calls == 6
+    # Four of the seven are conditional; see the docstring for each.
+    assert calls == 7
 
     # **Both conditional solves must actually be conditional.** Counting is not
     # enough -- the fault this test guards against is an *unconditional* solve, and
@@ -636,7 +643,7 @@ def test_the_solver_runs_four_solves_not_five() -> None:
         and node.func.id == "solve"
     ]
     conditional = [node for node in solves if _is_conditional(node)]
-    assert len(conditional) == 3, "exactly three solves may be conditional"
+    assert len(conditional) == 4, "exactly four solves may be conditional"
     assert len(solves) - len(conditional) == 3, "three solves run every refresh"
 
 

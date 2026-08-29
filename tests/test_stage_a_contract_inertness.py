@@ -105,15 +105,25 @@ def test_the_solve_count_is_pinned_and_every_solve_is_accounted_for() -> None:
     regression dressed as reporting, and would be easy to miss: the plan would be
     identical and every figure correct.
 
-    Six appear in the source since beta.32. **Three are unconditional** -- desired,
-    capability and reserve-relaxed -- and three are conditional: the ungated pass
-    the export permission is built from, which runs only when there is measured
-    evidence to build one; the audit baseline re-solve, which runs only when the
-    anti-churn head bump has moved the enforced head; and the ``compare_legacy``
-    comparison that only Shadow requests. The ungated pass is *not* reporting:
-    without it the permission has no non-circular definition of the refill the plan
-    expects to use. An unconditional fourth would be exactly the regression this
-    test catches.
+    Seven appear in the source since beta.35. **Three are unconditional** --
+    desired, capability and reserve-relaxed -- and four are conditional: the
+    ungated pass the export permission is built from, which runs only when there
+    is measured evidence to build one; the audit baseline re-solve, which runs only
+    when the anti-churn head bump has moved the enforced head; the
+    ``compare_legacy`` comparison that only Shadow requests; and the beta.35
+    terminal-value counterfactual.
+
+    **The seventh is the one worth arguing.** beta.35 ships a new terminal value
+    *binding*, so what it altered has to be visible rather than asserted -- it
+    re-solves the same horizon with the beta.34 flat edge credit and publishes the
+    difference in end energy, export and cost. It is conditional on the two
+    terminals being numerically different, so the common case (no post-horizon
+    demand known, which is most of the day before tomorrow's prices land) costs
+    nothing, and it reaches no execution target: diagnostics only.
+
+    The ungated pass is *not* reporting: without it the permission has no
+    non-circular definition of the refill the plan expects to use. An
+    unconditional eighth would be exactly the regression this test catches.
     """
     source = pathlib.Path(economic_module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -128,8 +138,8 @@ def test_the_solve_count_is_pinned_and_every_solve_is_accounted_for() -> None:
                 ):
                     calls += 1
 
-    # Three of the six are conditional; see the docstring for each.
-    assert calls == 6
+    # Four of the seven are conditional; see the docstring for each.
+    assert calls == 7
 
     # **Both conditional solves must actually be conditional.** Counting is not
     # enough -- the fault this test guards against is an *unconditional* solve, and
@@ -160,7 +170,7 @@ def test_the_solve_count_is_pinned_and_every_solve_is_accounted_for() -> None:
         and node.func.id == "solve"
     ]
     conditional = [node for node in solves if _is_conditional(node)]
-    assert len(conditional) == 3, "exactly three solves may be conditional"
+    assert len(conditional) == 4, "exactly four solves may be conditional"
     assert len(solves) - len(conditional) == 3, "three solves run every refresh"
 
 

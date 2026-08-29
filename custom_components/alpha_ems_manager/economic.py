@@ -177,6 +177,7 @@ from .const import (
     EXECUTION_INTENT_SERVE_LOAD,
     MAX_ECONOMIC_RUN_INTERVALS_REPORTED,
     MAX_ECONOMIC_RUNS_REPORTED,
+    MAX_VALUE_CURVE_POINTS_PUBLISHED,
     MIN_EXECUTABLE_QUARTER_KWH,
     MODE_CHARGE,
     MODE_DISCHARGE,
@@ -184,8 +185,14 @@ from .const import (
     QUARTER_NOT_EXECUTABLE_INTENT,
     QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE,
     QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION,
+    STORED_VALUE_UNDEFINED_NO_CURVE,
+    STORED_VALUE_UNDEFINED_TOP_BUCKET,
+    STORED_VALUE_UNDEFINED_UNREACHABLE,
+    STORED_VALUE_UNDEFINED_VIOLATION,
     SURVIVAL_WINDOW_ACTIONABLE_PREFIX,
     SURVIVAL_WINDOW_PLAN_CAMPAIGN,
+    TERMINAL_VALUE_BASIS_DEMAND_BOUNDED,
+    TERMINAL_VALUE_BASIS_FLAT_EDGE,
 )
 from .simulation import IntervalDemand
 
@@ -239,6 +246,33 @@ _RUN_IDLE = 0
 _RUN_CHARGE = 1
 _RUN_DISCHARGE = 2
 _RUN_STATES = (_RUN_IDLE, _RUN_CHARGE, _RUN_DISCHARGE)
+
+#: The run states, published for the one caller outside this module that needs to
+#: name one: the coordinator, reporting which direction is physically executing.
+#:
+#: **beta.35.** Kept as thin aliases rather than by exporting the private names,
+#: so the search space stays this module's business and the boundary stays a
+#: vocabulary rather than an implementation detail.
+RUN_STATE_IDLE = _RUN_IDLE
+RUN_STATE_CHARGE = _RUN_CHARGE
+RUN_STATE_DISCHARGE = _RUN_DISCHARGE
+
+
+def run_state_for_intent(intent: str | None) -> int:
+    """Return the run state an executing Stage-B intent corresponds to.
+
+    A *fact* about the inverter, not a preference about the plan: the coordinator
+    reads which direction is running and Stage A stops charging a run-start fee to
+    go on doing it. Anything that is not one of the two executable intents --
+    ``serve_load``, ``hold``, nothing at all -- is idle, because none of them is a
+    run the switching fee was ever charged for.
+    """
+    if intent == EXECUTION_INTENT_GRID_CHARGE:
+        return _RUN_CHARGE
+    if intent == EXECUTION_INTENT_NET_EXPORT:
+        return _RUN_DISCHARGE
+    return _RUN_IDLE
+
 
 #: The published name of each run state, so a campaign's direction and the
 #: solver's own state are the same vocabulary rather than two that must be kept
@@ -958,6 +992,99 @@ class EconomicPlan:
     #: asset, not a saving.
     edge_energy_kwh: float = 0.0
     edge_value_eur: float = 0.0
+    #: How that credit was arrived at. ``None`` on a plan solved by a pre-beta.35
+    #: caller, which is the flat rule by definition.
+    terminal_value: TerminalValue | None = None
+    #: The run state the head was in when this plan was solved.
+    head_run_state: int = _RUN_IDLE
+    #: The optimal cost-to-go from *now*, per bucket, per run state.
+    #:
+    #: **The dual of the storage constraint, and beta.34 computed it every refresh
+    #: and threw it away.** ``solve`` rotates a two-layer value table, so after the
+    #: last backward step the surviving layer *is* position zero -- the exact worth
+    #: of standing at each energy level with the whole horizon still ahead.
+    #: Differencing it across adjacent buckets gives the marginal value of one
+    #: stored kilowatt-hour, which is the honest answer to "is this energy worth
+    #: more held, spent, or sold" and needs no inventory convention whatsoever.
+    #:
+    #: Read-only. Nothing in the recursion consults it, so publishing it cannot
+    #: change a decision.
+    head_value: tuple[tuple[tuple[float, float], ...], ...] = ()
+
+    # -- the marginal value of stored energy ------------------------------
+
+    def _head_row(self, bucket: int) -> tuple[float, float] | None:
+        """Return the head value at ``bucket`` in the head run state, or ``None``."""
+        if not self.head_value or not 0 <= bucket < len(self.head_value):
+            return None
+        row = self.head_value[bucket]
+        if not 0 <= self.head_run_state < len(row):
+            return None
+        pair = row[self.head_run_state]
+        return None if pair >= _UNREACHABLE else pair
+
+    def marginal_value_eur_per_kwh(
+        self, bucket: int, *, bucket_kwh: float
+    ) -> tuple[float | None, str | None]:
+        """Return what one more stored kWh is worth here, and why not where not.
+
+        ``(value, None)`` or ``(None, reason)``. The gradient of the cost-to-go
+        across one bucket, negated because the table holds a cost and the answer is
+        a worth.
+
+        **``None`` is a defined answer and zero is not.** Three cases earn it:
+
+        * the two buckets disagree about ``violation``. The pair is lexicographic,
+          so their money terms were never ranked against one another and their
+          difference is not a price of anything;
+        * either state is unreachable, and carries a sentinel rather than a cost;
+        * the top bucket, whose energy interval is short because ``PhysicsTable``
+          clamps it to the ceiling -- dividing by that width would report a slope
+          the lattice cannot actually offer.
+
+        Publishing ``0.00`` for any of them would read as "this energy is
+        worthless", which is a claim, and the wrong one.
+        """
+        if not self.head_value:
+            return None, STORED_VALUE_UNDEFINED_NO_CURVE
+        if bucket >= len(self.head_value) - 1:
+            return None, STORED_VALUE_UNDEFINED_TOP_BUCKET
+        here = self._head_row(bucket)
+        above = self._head_row(bucket + 1)
+        if here is None or above is None:
+            return None, STORED_VALUE_UNDEFINED_UNREACHABLE
+        if here[0] != above[0]:
+            return None, STORED_VALUE_UNDEFINED_VIOLATION
+        if bucket_kwh <= 0.0:
+            return None, STORED_VALUE_UNDEFINED_NO_CURVE
+        return (here[1] - above[1]) / bucket_kwh, None
+
+    def stored_value_eur(
+        self, *, floor_bucket: int, current_bucket: int
+    ) -> tuple[float | None, str | None]:
+        """Return what the energy above the floor is worth, and why not where not.
+
+        ``V(floor) - V(current)``: how much better off this plan is for standing at
+        the current level rather than at the floor, with the whole horizon still to
+        come. By telescoping it is exactly the integral of
+        :meth:`marginal_value_eur_per_kwh` over the buckets between them, so the
+        two figures cannot disagree.
+
+        **This is the answer to "was buying twenty and selling five a good trade",
+        and it needs no inventory model at all.** It prices the *position*, from
+        now forward, at the margin -- not the history of how the position was
+        acquired. What a kilowatt-hour cost in the past cannot change what the next
+        one is worth, which is the argument ``realized`` has made since beta.18.
+        """
+        if not self.head_value:
+            return None, STORED_VALUE_UNDEFINED_NO_CURVE
+        low = self._head_row(max(0, floor_bucket))
+        high = self._head_row(current_bucket)
+        if low is None or high is None:
+            return None, STORED_VALUE_UNDEFINED_UNREACHABLE
+        if low[0] != high[0]:
+            return None, STORED_VALUE_UNDEFINED_VIOLATION
+        return low[1] - high[1], None
 
     # -- what the entity reads --------------------------------------------
 
@@ -1323,6 +1450,142 @@ def edge_creditable_energy_kwh(
 
 # -- the solver --------------------------------------------------------------
 
+
+@dataclass(frozen=True, slots=True)
+class TerminalValue:
+    """What energy left in the pack at the end of the horizon is worth.
+
+    **beta.35, and it replaces a flat rate with a shape.** Through beta.34 the
+    terminal credit was ``v_edge * min(E, cap)`` -- one scalar, linear in stored
+    energy, where ``v_edge`` was the 25th percentile of known import prices. That
+    figure is a *replacement cost sampled from the wrong distribution*: energy
+    sitting in the pack at the horizon's end is consumed by the household overnight
+    and next morning, not at the cheapest quartile of the whole day. On the
+    reference installation the consequence was visible in one number -- the chosen
+    plan ended the horizon at ``end_energy_dc_kwh: 0.00``, having exported 14.22
+    kWh on its last evening. The optimiser was liquidating the pack because it had
+    been told the pack was nearly worthless.
+
+    The replacement is the same question asked properly: **what will this energy
+    actually do?**
+
+    * The household will consume some of it before the pack refills for nothing.
+      That share is worth the import price it displaces.
+    * Whatever is left over will still be there when production arrives, so it is
+      worth at most what it could have been sold for -- and, above the room the
+      incoming surplus needs, nothing at all, which is the beta.32 headroom rule
+      kept intact.
+
+    Two segments, so the function is **concave**: the first kilowatt-hour is worth
+    the most and the marginal worth falls as the pack fills. That is the correct
+    shape for storage and it is what stops the value becoming a licence to hoard --
+    a flat rate high enough to prevent liquidation would also have justified buying
+    a full pack at any price.
+
+    Every input is a quantity the planner already had:
+
+    ``demand_ac_kwh``
+        Forecast net household demand after the horizon ends, stopping at the first
+        interval that forecasts a production surplus -- the next *free* refill,
+        which is a physical fact and carries no price. The demand forecast already
+        outlives the price horizon by design, so nothing new is forecast here.
+    ``displaced_price_eur_kwh``
+        What that demand would otherwise cost, priced by clock position from the
+        known series: today's 02:00 is the best available estimate of tomorrow's
+        02:00. The same construct the export gate's ``protect_price`` already uses.
+    ``export_price_eur_kwh``
+        What the spare share could be sold for, or zero where export is not
+        permitted.
+
+    ``flat`` reconstructs the beta.34 rule exactly, for the live counterfactual.
+    """
+
+    demand_ac_kwh: float = 0.0
+    displaced_price_eur_kwh: float = 0.0
+    export_price_eur_kwh: float = 0.0
+    discharge_efficiency: float = 1.0
+    #: The beta.34 terms, kept because the counterfactual needs them and because
+    #: the spare segment is still bounded by the incoming surplus.
+    edge_value_eur_per_kwh: float = 0.0
+    edge_creditable_kwh: float = float("inf")
+    basis: str = TERMINAL_VALUE_BASIS_DEMAND_BOUNDED
+
+    @property
+    def flat(self) -> TerminalValue:
+        """Return the beta.34 rule, for comparison and for nothing else."""
+        return TerminalValue(
+            demand_ac_kwh=0.0,
+            displaced_price_eur_kwh=0.0,
+            export_price_eur_kwh=0.0,
+            discharge_efficiency=self.discharge_efficiency,
+            edge_value_eur_per_kwh=self.edge_value_eur_per_kwh,
+            edge_creditable_kwh=self.edge_creditable_kwh,
+            basis=TERMINAL_VALUE_BASIS_FLAT_EDGE,
+        )
+
+    @property
+    def equivalent_to_flat(self) -> bool:
+        """Return whether the two rules must produce identical credits.
+
+        With no post-horizon demand to serve and no export price, the served
+        segment vanishes and the spare segment is credited at zero -- which is not
+        the flat rule, so the two genuinely differ and the counterfactual is worth
+        solving. They coincide only when this rule is already the flat one.
+        """
+        return self.basis == TERMINAL_VALUE_BASIS_FLAT_EDGE
+
+    def credit_eur(self, energy_kwh: float, floor_kwh: float) -> float:
+        """Return the credit for ending with ``energy_kwh`` stored. Never negative.
+
+        Split at the boundary the energy will actually cross. ``served`` is AC --
+        it is what the house takes -- so it is converted back through the discharge
+        efficiency to find how much DC inventory it consumes, and the remainder is
+        the spare.
+        """
+        above = max(0.0, energy_kwh - floor_kwh)
+        if self.basis == TERMINAL_VALUE_BASIS_FLAT_EDGE:
+            return self.edge_value_eur_per_kwh * min(
+                energy_kwh, self.edge_creditable_kwh
+            )
+        eta = self.discharge_efficiency if self.discharge_efficiency > 0.0 else 1.0
+        served_ac = min(above * eta, max(0.0, self.demand_ac_kwh))
+        served_dc = served_ac / eta
+        spare_dc = max(0.0, above - served_dc)
+        # The headroom cap applies to the spare share only. Energy the house will
+        # have eaten before the sun arrives cannot be displaced by it, which is
+        # what the ``demand`` bound already established.
+        creditable_spare = min(spare_dc, max(0.0, self.edge_creditable_kwh))
+        return max(
+            0.0,
+            served_ac * max(0.0, self.displaced_price_eur_kwh)
+            + creditable_spare * eta * max(0.0, self.export_price_eur_kwh),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the bounded diagnostics form."""
+        return {
+            "basis": self.basis,
+            "post_horizon_demand_ac_kwh": _round_kwh(self.demand_ac_kwh),
+            "displaced_price_eur_kwh": round(self.displaced_price_eur_kwh, 5),
+            "export_price_eur_kwh": round(self.export_price_eur_kwh, 5),
+            "edge_value_eur_per_kwh": round(self.edge_value_eur_per_kwh, 5),
+            "edge_creditable_kwh": (
+                None
+                if not math.isfinite(self.edge_creditable_kwh)
+                else _round_kwh(self.edge_creditable_kwh)
+            ),
+            "rule": (
+                "energy the household will consume before the next forecast "
+                "production surplus is credited at the import price it displaces; "
+                "everything above that is credited at the export price and only "
+                "within the room the incoming surplus needs. concave by "
+                "construction, and lexicographically subordinate to reserve "
+                "feasibility -- it lives in the cost term and never in the "
+                "violation term"
+            ),
+        }
+
+
 #: A value that is worse than any reachable one, for an infeasible state. A
 #: finite sentinel rather than an infinity so an arithmetic slip surfaces as an
 #: absurd number in a test rather than as a ``nan`` two steps later.
@@ -1341,6 +1604,22 @@ def solve(
     battery_throughput_cost_eur_per_kwh: float = 0.0,
     edge_value_eur_per_kwh: float = 0.0,
     edge_creditable_kwh: float = float("inf"),
+    #: What terminal inventory is worth, as a *function* of the energy held rather
+    #: than a rate on it. ``None`` falls back to the beta.34 flat credit built from
+    #: the two fields above, so every legacy caller and every test that predates
+    #: beta.35 solves exactly the problem it always did.
+    terminal_value: TerminalValue | None = None,
+    #: The run state the horizon's head *is already in*, as a fact reported by
+    #: Stage B rather than a preference expressed by anyone.
+    #:
+    #: **beta.35, and it is a correction rather than a feature.** The recursion
+    #: charges ``minimum_trade_gain_eur`` on every transition out of idle, and it
+    #: began every solve at idle -- so an export physically in flight was priced as
+    #: a *fresh run start* on each refresh, and the optimiser paid a fee it had
+    #: already paid to go on doing what it was doing. On 2026-08-29 the plan moved
+    #: its export from 20:00 to 21:00 under exactly that pressure. Continuing a
+    #: campaign is now free; starting a new one still is not.
+    head_run_state: int = _RUN_IDLE,
     #: The configured hard floor, in DC kWh. Read only to decide whether the pack
     #: can physically cover a residual load; defaults to the terminal floor, which
     #: every production caller passes as the same figure.
@@ -1468,18 +1747,29 @@ def solve(
     value: list[list[tuple[float, float]]] = [
         [_UNREACHABLE for _ in _RUN_STATES] for _ in range(buckets + 1)
     ]
-    # **Where the edge value enters, and it is one line of arithmetic.** The
+    # **Where the terminal value enters, and it is still one array.** The
     # terminal condition used to be a pure feasibility test carrying no price,
     # which is exactly what made energy above the floor worth nothing at the
-    # horizon end. Seeding it with ``-v_edge * E`` gives terminal inventory an
-    # explicit worth, so the backward induction trades it against today prices at
-    # the margin instead of against a wall. A *credit*, hence a negative cost.
+    # horizon end. Seeding it with a credit gives terminal inventory an explicit
+    # worth, so the backward induction trades it against today's prices at the
+    # margin instead of against a wall. A *credit*, hence a negative cost.
     #
-    # It cannot reintroduce "pay anything": it is finite, bounded above by the
-    # dearest price seen, and it lives in the second element of the pair, so
-    # reserve feasibility still dominates it lexicographically.
+    # beta.35 replaces the flat rate with :class:`TerminalValue`, which is concave
+    # and bounded by the demand it can actually serve. The seed is the same shape,
+    # the same one array, and costs the search nothing: it is a function of the
+    # bucket alone, which is the standing rule for anything that may enter this
+    # recursion at all.
+    #
+    # It cannot reintroduce "pay anything": it is finite, non-negative, bounded
+    # above by the dearest price seen, and it lives in the second element of the
+    # pair, so reserve feasibility still dominates it lexicographically.
+    terminal = terminal_value or TerminalValue(
+        edge_value_eur_per_kwh=edge_value_eur_per_kwh,
+        edge_creditable_kwh=edge_creditable_kwh,
+        basis=TERMINAL_VALUE_BASIS_FLAT_EDGE,
+    )
     edge_credit = [
-        edge_value_eur_per_kwh * min(table.energy(bucket), edge_creditable_kwh)
+        terminal.credit_eur(table.energy(bucket), enforced_floor_kwh)
         for bucket in range(buckets + 1)
     ]
     for bucket in range(buckets + 1):
@@ -1607,7 +1897,7 @@ def solve(
                 value[bucket][run] = best
                 choice[position][bucket][run] = best_move
 
-    if value[start_bucket][_RUN_IDLE] >= _UNREACHABLE:  # pragma: no cover
+    if value[start_bucket][head_run_state] >= _UNREACHABLE:  # pragma: no cover
         # Note the margin cannot reach this branch. It is a *cost*, and the
         # objective compares ``(violation, cost)`` lexicographically, so no cost
         # can make a state unreachable or outrank reserve feasibility -- it can
@@ -1636,6 +1926,14 @@ def solve(
         battery_throughput_cost_eur_per_kwh=battery_throughput_cost_eur_per_kwh,
         edge_value_eur_per_kwh=edge_value_eur_per_kwh,
         edge_creditable_kwh=edge_creditable_kwh,
+        terminal_value=terminal,
+        head_run_state=head_run_state,
+        # **The head layer, kept rather than discarded.** ``value`` has just been
+        # rotated for the last time, so it holds position zero: the optimal
+        # cost-to-go from *now*, per bucket, per run state. That is the marginal
+        # value of stored energy, already computed, and beta.34 threw it away every
+        # refresh. Retaining it costs one reference and changes no decision.
+        head_value=tuple(tuple(row) for row in value),
     )
 
 
@@ -2363,6 +2661,9 @@ def _walk_forward(
     battery_throughput_cost_eur_per_kwh: float = 0.0,
     edge_value_eur_per_kwh: float = 0.0,
     edge_creditable_kwh: float = float("inf"),
+    terminal_value: TerminalValue | None = None,
+    head_run_state: int = _RUN_IDLE,
+    head_value: tuple[tuple[tuple[float, float], ...], ...] = (),
     hard_floor_kwh: float = 0.0,
 ) -> EconomicPlan:
     """Replay the chosen moves to produce the plan the caller reads.
@@ -2373,7 +2674,10 @@ def _walk_forward(
     """
     entries: list[EconomicInterval] = []
     bucket = start_bucket
-    run = _RUN_IDLE
+    # **The state the head is already in**, not an assumption that it is at rest.
+    # A campaign in flight continues without paying a second run-start fee; see
+    # ``solve``'s ``head_run_state``.
+    run = head_run_state
     total_cost = 0.0
     # DC energy the inverter has drawn ambiently so far. Not representable on the
     # bucket lattice -- that is the whole reason ambient service exists as a
@@ -2519,9 +2823,16 @@ def _walk_forward(
             battery_throughput_cost_eur_per_kwh * total_throughput
         ),
         edge_energy_kwh=table.energy(bucket),
+        # Recomputed from the same function the seed used, at the bucket the walk
+        # actually landed on. Reporting only -- the policy was already chosen.
         edge_value_eur=(
-            edge_value_eur_per_kwh * min(table.energy(bucket), edge_creditable_kwh)
+            terminal_value.credit_eur(table.energy(bucket), terminal_floor_kwh)
+            if terminal_value is not None
+            else edge_value_eur_per_kwh * min(table.energy(bucket), edge_creditable_kwh)
         ),
+        terminal_value=terminal_value,
+        head_run_state=head_run_state,
+        head_value=head_value,
         marginal_grid_charge_kwh=total_grid_charge,
         terminal_floor_kwh=terminal_floor_kwh,
         terminal_binding=bucket <= terminal_bucket,
@@ -3056,6 +3367,11 @@ class EconomicOutcome:
     max_representable_power_kw: float
     table_ms: float
     solve_ms: float
+    #: How many backward inductions this refresh actually performed. **Counted,
+    #: never asserted**: three run unconditionally and the rest depend on the day,
+    #: so a literal here would be right once and wrong afterwards -- which is
+    #: exactly what the published ``4`` had been for two releases.
+    solve_count: int = 0
     #: Per-direction peaks, and the configured limits they are measured against.
     #: beta.16 published only the larger of the two, which hid an asymmetry that
     #: reaches thirty per cent on a small-power installation.
@@ -3100,6 +3416,11 @@ class EconomicOutcome:
     #: it is where the survival window's refill comes from, and its cost is what
     #: makes the permission auditable.
     ungated: EconomicPlan | None = None
+    #: The same horizon solved with the **beta.34 flat terminal credit**, so what
+    #: the new terminal value changed is visible rather than asserted. Diagnostics
+    #: only: it never reaches an execution target and never executes. ``None`` when
+    #: the two rules are the same arithmetic and a second solve would be waste.
+    terminal_legacy: EconomicPlan | None = None
     #: The triggered Safety extension, DC kWh. **Zero whenever no bridge exists**,
     #: which is what makes it incapable of initiating a purchase; see
     #: :func:`anti_churn_buffer_kwh`.
@@ -3539,6 +3860,12 @@ def build_outcome(
     #: ``None`` disables the permission entirely, so a caller with no evidence
     #: plans exactly as beta.31 did.
     forecast_risk: ForecastRisk | None = None,
+    #: What terminal inventory is worth. ``None`` keeps the beta.34 flat credit,
+    #: so every caller that predates beta.35 solves the problem it always did.
+    terminal_value: TerminalValue | None = None,
+    #: The run state Stage B is *already* in at the head of this horizon, reported
+    #: as a fact. See ``solve``'s own parameter for why continuing must be free.
+    head_run_state: int = _RUN_IDLE,
 ) -> EconomicOutcome:
     """Run both solves and the label solve, and derive everything published.
 
@@ -3579,6 +3906,12 @@ def build_outcome(
         "edge_creditable_kwh": edge_creditable_kwh,
         "floor_energy_kwh": floor_energy_kwh,
         "ambient_self_consumption": ambient_modelled,
+        # Shared by every pass for the same reason the fees are: a counterfactual
+        # priced on a different terminal value would not be a counterfactual, it
+        # would be a different question. The one deliberate exception is the
+        # terminal counterfactual itself, below, which varies exactly this.
+        "terminal_value": terminal_value,
+        "head_run_state": head_run_state,
     }
 
     started = time.perf_counter()
@@ -3617,6 +3950,10 @@ def build_outcome(
     upper_net_demand: tuple[float, ...] = ()
     survival_window = 0
     survival_basis = SURVIVAL_WINDOW_ACTIONABLE_PREFIX
+    # Incremented at every call site below rather than inferred from which plans
+    # came back: two of the passes assign the same name, so a count derived from
+    # the results would silently report one where two ran.
+    solve_count = 0
     adaptation_applied = 1.0
     adaptation_clipped = False
     if forecast_risk is not None and horizon.intervals:
@@ -3628,6 +3965,7 @@ def build_outcome(
             permitted=desired_permitted,
             **economics,
         )
+        solve_count += 1
         upper_net_demand, adaptation_applied, adaptation_clipped = (
             upper_net_demand_curve(
                 horizon.demands,
@@ -3721,8 +4059,10 @@ def build_outcome(
                 permitted=desired_permitted,
                 **economics,
             )
+            solve_count += 1
 
     # ------------------------------------------------------------------ pass 2
+    solve_count += 3  # desired, capability and reserve-relaxed, always all three
     desired = solve(
         table=table,
         horizon=gated_horizon,
@@ -3780,6 +4120,7 @@ def build_outcome(
             limited_by=horizon.limited_by,
         )
         if len(legacy_horizon.planning_reserve_kwh) == len(horizon.demands):
+            solve_count += 1
             legacy = solve(
                 table=table,
                 horizon=legacy_horizon,
@@ -3804,6 +4145,37 @@ def build_outcome(
     # publishing a zero would state that a constraint costs nothing rather than
     # that no constraint exists. The terminal figures are reported absent instead.
     unbounded = None
+
+    # ------------------------------------------- the terminal counterfactual
+    #
+    # **beta.35 ships a new terminal value binding, and audits it live.** The old
+    # flat credit is solved beside the new one on every refresh that could differ,
+    # and the difference is published -- campaign shapes, end energy, export, the
+    # credit itself. Diagnostics only: nothing here reaches an execution target,
+    # and a structural test pins that.
+    #
+    # Skipped when the binding rule *is* the flat rule, because then the two solves
+    # are the same arithmetic and one of them would be waste. This is the common
+    # case for a caller with no post-horizon demand.
+    terminal_legacy: EconomicPlan | None = None
+    if (
+        terminal_value is not None
+        and not terminal_value.equivalent_to_flat
+        and horizon.intervals
+    ):
+        legacy_economics = dict(economics)
+        legacy_economics["terminal_value"] = terminal_value.flat
+        solve_count += 1
+        terminal_legacy = solve(
+            table=table,
+            horizon=gated_horizon,
+            start_energy_kwh=start_energy_kwh,
+            terminal_floor_kwh=terminal_floor_kwh,
+            permitted=desired_permitted,
+            export_floor_kwh=export_floor_kwh or None,
+            export_free=export_free or None,
+            **legacy_economics,
+        )
     solve_ms = (time.perf_counter() - started) * 1000.0
 
     return EconomicOutcome(
@@ -3823,6 +4195,7 @@ def build_outcome(
         bucket_rule=bucket_rule,
         table_ms=table_ms,
         solve_ms=solve_ms,
+        solve_count=solve_count,
         edge_value_eur_per_kwh=edge_value_eur_per_kwh,
         edge_creditable_kwh=edge_creditable_kwh,
         battery_throughput_cost_eur_per_kwh=battery_throughput_cost_eur_per_kwh,
@@ -3852,6 +4225,7 @@ def build_outcome(
         survival_window_basis=survival_basis,
         adaptation_ratio_applied=adaptation_applied,
         adaptation_clipped=adaptation_clipped,
+        terminal_legacy=terminal_legacy,
         safety_buy_runs=_safety_buy_runs(desired, relaxed, table.bucket_kwh),
         safety_buy_attribution=_safety_buy_attribution(desired, relaxed),
         legacy=legacy,
@@ -4644,6 +5018,145 @@ def _rejected_campaigns(outcome: EconomicOutcome) -> list[dict[str, Any]]:
     return rejected
 
 
+def _stored_value_as_dict(outcome: EconomicOutcome) -> dict[str, Any]:
+    """Return the marginal worth of stored energy, and why not where not.
+
+    **The number a reader needs to judge a partial sale.** Selling five of twenty
+    kilowatt-hours is not a good trade because the five cleared a spread; it is a
+    good trade if the fifteen still in the pack are worth less held than sold, and
+    that is exactly what the marginal value says.
+
+    ``None`` with a reason is a real answer here and zero is not -- see
+    ``EconomicPlan.marginal_value_eur_per_kwh``.
+    """
+    plan = outcome.desired
+    bucket_kwh = outcome.bucket_kwh
+    if not plan.available or not plan.intervals or not bucket_kwh:
+        return {"available": False}
+    floor_bucket = int(plan.terminal_floor_kwh / bucket_kwh)
+    current_bucket = int(plan.intervals[0].start_energy_dc_kwh / bucket_kwh)
+    marginal, marginal_reason = plan.marginal_value_eur_per_kwh(
+        current_bucket, bucket_kwh=bucket_kwh
+    )
+    stored, stored_reason = plan.stored_value_eur(
+        floor_bucket=floor_bucket, current_bucket=current_bucket
+    )
+    return {
+        "available": bool(plan.head_value),
+        "floor_bucket": floor_bucket,
+        "current_bucket": current_bucket,
+        "bucket_kwh": round(bucket_kwh, 6),
+        "marginal_value_eur_per_kwh": (
+            None if marginal is None else round(marginal, 5)
+        ),
+        "marginal_value_undefined_reason": marginal_reason,
+        "stored_value_eur": None if stored is None else _round_eur(stored),
+        "stored_value_undefined_reason": stored_reason,
+        "value_curve": _value_curve(plan, bucket_kwh),
+        "rule": (
+            "the dual of the storage constraint, read from the optimiser's own "
+            "cost-to-go table at the head of this solve. stored_value_eur is "
+            "V(floor) - V(current): how much better off the plan is for holding "
+            "this energy rather than sitting at the floor. it is an opportunity "
+            "value from now and never a purchase cost, so it needs no inventory "
+            "convention and makes no claim about where any kilowatt-hour came "
+            "from. read by no decision path"
+        ),
+    }
+
+
+def _value_curve(plan: EconomicPlan, bucket_kwh: float) -> list[dict[str, Any]]:
+    """Return the head value curve, sampled evenly with both endpoints kept.
+
+    The shape is the point: a reader should be able to see the concavity that
+    makes a marginal value meaningful, and eighty-three rows in a download is not
+    something a person reads.
+
+    **Spaced across the lattice rather than stepped along it.** A fixed stride of
+    ``total // 15`` collapses to one on any pack whose lattice is smaller than
+    sixteen times the sample count -- so a 27-bucket solve published all 27 rows
+    and quietly broke the diagnostics size bound. The endpoints are always kept,
+    because the floor and the full pack are the two buckets a reader compares.
+    """
+    if not plan.head_value:
+        return []
+    total = len(plan.head_value)
+    wanted = max(1, min(total, MAX_VALUE_CURVE_POINTS_PUBLISHED))
+    if wanted == 1:
+        indices = [0]
+    else:
+        span = total - 1
+        indices = sorted(
+            {round(point * span / (wanted - 1)) for point in range(wanted)}
+        )
+    points: list[dict[str, Any]] = []
+    for bucket in indices:
+        marginal, reason = plan.marginal_value_eur_per_kwh(
+            bucket, bucket_kwh=bucket_kwh
+        )
+        points.append(
+            {
+                "bucket": bucket,
+                "energy_dc_kwh": round(bucket * bucket_kwh, 3),
+                "marginal_value_eur_per_kwh": (
+                    None if marginal is None else round(marginal, 5)
+                ),
+                "undefined_reason": reason,
+            }
+        )
+    return points
+
+
+def _terminal_value_as_dict(outcome: EconomicOutcome) -> dict[str, Any]:
+    """Return how the horizon's edge was priced, and what that changed.
+
+    The counterfactual is the whole point of publishing this: beta.35 ships a new
+    terminal value **binding**, so what it altered has to be visible rather than
+    argued. ``legacy`` is the same horizon solved with the beta.34 flat credit and
+    is executed by nothing.
+    """
+    terminal = outcome.desired.terminal_value
+    if terminal is None:
+        return {"available": False, "basis": TERMINAL_VALUE_BASIS_FLAT_EDGE}
+    payload: dict[str, Any] = {"available": True, **terminal.as_dict()}
+    payload["credit_eur"] = _round_eur(outcome.desired.edge_value_eur)
+    payload["terminal_energy_dc_kwh"] = _round_kwh(outcome.desired.edge_energy_kwh)
+    legacy = outcome.terminal_legacy
+    if legacy is None or not legacy.available:
+        payload["legacy"] = None
+        payload["legacy_skipped_reason"] = (
+            "identical_arithmetic" if terminal.equivalent_to_flat else "not_solved"
+        )
+        return payload
+    payload["legacy"] = {
+        "credit_eur": _round_eur(legacy.edge_value_eur),
+        "end_energy_dc_kwh": _round_kwh(legacy.end_energy_dc_kwh),
+        "grid_export_kwh": _round_kwh(legacy.planned_grid_export_kwh),
+        "grid_import_kwh": _round_kwh(legacy.planned_grid_import_kwh),
+        "cost_eur": _round_eur(legacy.cost_eur),
+        "run_count": len(legacy.runs),
+    }
+    payload["plan_change"] = {
+        "end_energy_dc_kwh": _round_kwh(
+            outcome.desired.end_energy_dc_kwh - legacy.end_energy_dc_kwh
+        ),
+        "grid_export_kwh": _round_kwh(
+            outcome.desired.planned_grid_export_kwh - legacy.planned_grid_export_kwh
+        ),
+        "grid_import_kwh": _round_kwh(
+            outcome.desired.planned_grid_import_kwh - legacy.planned_grid_import_kwh
+        ),
+        "cost_eur": _round_eur(outcome.desired.cost_eur - legacy.cost_eur),
+        "run_count": len(outcome.desired.runs) - len(legacy.runs),
+        "rule": (
+            "the binding plan minus the beta.34 flat-terminal plan, on the same "
+            "horizon and the same economics. diagnostics only: the legacy solve "
+            "never reaches an execution target"
+        ),
+    }
+    return payload
+
+
 def _runs_as_dicts(
     outcome: EconomicOutcome,
     desired: EconomicPlan,
@@ -5203,6 +5716,7 @@ def economic_as_dict(
     pack_ceiling_kwh: float | None = None,
     execution_targets: list[dict[str, Any]] | None = None,
     realized: dict[str, Any] | None = None,
+    realized_multi_day: dict[str, Any] | None = None,
     horizon_start: Any = None,
     horizon_end: Any = None,
     provenance: dict[str, Any] | None = None,
@@ -5699,12 +6213,33 @@ def economic_as_dict(
             "is executable"
         ),
         "realized": realized or {"available": False, "reason": "not_computed"},
+        # **The same ledger, unbound from the civil day. beta.35.** A pack charged
+        # overnight and sold the next evening is one economic position, and a view
+        # that resets at midnight cannot describe it.
+        "realized_window": (
+            realized_multi_day or {"available": False, "reason": "not_computed"}
+        ),
         "solver": {
             "buckets": outcome.buckets,
             "bucket_kwh": outcome.bucket_kwh,
             "table_ms": round(outcome.table_ms, 1),
             "solve_ms": round(outcome.solve_ms, 1),
-            "solves": 4,
+            # **Counted, not asserted. beta.35.** This was a literal ``4`` while
+            # six passes ran, which is the shape of every reporting defect this
+            # project has met: a figure that was true once and has been agreeing
+            # with nothing ever since. Three passes always run; the rest are
+            # conditional, so the honest number is the one this refresh actually
+            # performed.
+            "solves": outcome.solve_count,
+            "solve_rule": (
+                "every pass is executor-bound and none touches the event loop. "
+                "three run unconditionally -- desired, capability and "
+                "reserve-relaxed -- and the remainder are conditional: the "
+                "ungated pass the export permission is built from, the audit "
+                "baseline re-solve after an anti-churn head bump, the Shadow-only "
+                "legacy comparison, and the beta.35 terminal-value "
+                "counterfactual. solve_ms is the wall time of all of them"
+            ),
             # The largest AC power a single transition can express, per
             # direction. beta.16 published only the larger of the two, which hid
             # an asymmetry reaching thirty per cent on a small-power pack.
@@ -5725,6 +6260,10 @@ def economic_as_dict(
             ),
         },
         "legacy_comparison": _legacy_comparison(outcome),
+        # beta.35. What the pack is worth and what the horizon's edge is worth --
+        # the two halves of "should this energy be held, spent or sold".
+        "stored_value": _stored_value_as_dict(outcome),
+        "terminal_value": _terminal_value_as_dict(outcome),
         "runs": _runs_as_dicts(outcome, desired, runs),
         # **The campaigns, beside the runs and not instead of them.** A run is the
         # honest per-interval record of what the battery was doing; a campaign is

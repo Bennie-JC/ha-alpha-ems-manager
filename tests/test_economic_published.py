@@ -42,18 +42,35 @@ from .live_capability import assert_charge_only_capability
 from .test_beta24_live_charge import charge_now_price
 
 ECONOMIC_ENTITY = "sensor.alpha_ems_economic_action"
+PLANNED_ENTITY = "sensor.alpha_ems_next_planned_action"
 
-#: Exactly the eight the contract allows, and no more. A plan with twenty ways of
+#: Exactly the eleven the contract allows, and no more. A plan with twenty ways of
 #: being interesting must not unpack all twenty into an entity.
+#:
+#: **Rewritten for beta.35, and the shape of the change is the argument.** This
+#: entity used to publish a *plan* view -- ``window``, ``energy_kwh``,
+#: ``price_eur_kwh``, ``expected_net_value_eur`` -- while its state claimed to
+#: describe the present. Those are different runs, and on 2026-08-29 they visibly
+#: were: the state read ``idle`` beside a window, an energy and a price all
+#: belonging to a sale planned for 21:00, rendered ``HH:MM-HH:MM`` with no date.
+#:
+#: So the plan-shaped fields moved to ``Next Planned Action``, which prints full
+#: ISO instants and is the entity that can honestly carry them, and what is left
+#: here all comes from the one execution the state describes: whether it is owned,
+#: under which mode, for which campaign and run, what it promised, what it has
+#: delivered, at what power, since when.
 ECONOMIC_ATTRIBUTES = {
     "capability_action",
     "execution_blocked_reason",
+    "owned",
+    "mode",
+    "purpose",
+    "campaign_id",
+    "run_id",
+    "planned_kwh",
+    "realised_kwh",
     "power_kw",
-    "energy_kwh",
-    "window",
-    "reason",
-    "price_eur_kwh",
-    "expected_net_value_eur",
+    "started_at",
 }
 CORE_ATTRIBUTES = {
     "unit_of_measurement",
@@ -166,7 +183,7 @@ async def test_the_economic_entity_carries_exactly_eight_attributes(
     attributes = attributes_of(hass, ECONOMIC_ENTITY)
 
     assert set(attributes) - CORE_ATTRIBUTES == ECONOMIC_ATTRIBUTES
-    assert len(ECONOMIC_ATTRIBUTES) == 8
+    assert len(ECONOMIC_ATTRIBUTES) == 11
 
 
 async def test_the_capability_action_is_published_beside_the_desired_one(
@@ -240,24 +257,39 @@ async def test_an_unavailable_plan_still_says_why_nothing_is_sent(
 async def test_the_published_power_and_energy_agree_with_the_plan(
     hass: HomeAssistant, setup_integration: MockConfigEntry, frank: FakeFrank
 ) -> None:
-    """The entity is a view of the plan, not a second calculation of it."""
+    """The plan view is a view of the plan, not a second calculation of it.
+
+    **Asked of ``Next Planned Action`` since beta.35.** The figures are the same
+    figures; what changed is which entity is allowed to carry them. ``Economic
+    Action`` now describes the execution its state describes, and asking it for the
+    plan's power was asking one entity to be two -- which is exactly the confusion
+    that let ``idle`` be published beside a 21:00 sale's price and energy.
+    """
     coordinator = setup_integration.runtime_data
     allow_trading(coordinator, allow_grid_charging=True)
     await drive(coordinator, frank)
 
     outcome = (coordinator.data or {}).get("economic")
-    attributes = attributes_of(hass, ECONOMIC_ENTITY)
     if outcome is None or not outcome.available:
         pytest.skip("no economic plan for this fixture")
+    attributes = attributes_of(hass, PLANNED_ENTITY)
 
-    run = outcome.desired.published_run
+    from custom_components.alpha_ems_manager.sensor import _next_planned_run
+
+    run, _target = _next_planned_run(coordinator)
+    if run is None:
+        assert attributes["planned_kwh"] is None
+        return
+    assert attributes["planned_kwh"] == pytest.approx(
+        round(run.energy_kwh, 2), abs=0.005
+    )
     assert attributes["power_kw"] == pytest.approx(
-        round(outcome.desired.power_kw, 2), abs=0.005
+        round(run.first_power_kw, 2), abs=0.005
     )
-    assert attributes["energy_kwh"] == pytest.approx(
-        round(0.0 if run is None else run.energy_kwh, 2), abs=0.005
-    )
-    assert attributes["reason"] == outcome.reason
+    # The optimiser's rationale follows ``published_run``, so it is carried only
+    # where it actually describes this run -- never borrowed for a different one.
+    published = outcome.desired.published_run
+    assert attributes["reason"] == (outcome.reason if published is run else None)
 
 
 # --- diagnostics ------------------------------------------------------------

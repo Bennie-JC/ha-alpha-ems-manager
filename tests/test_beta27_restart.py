@@ -143,7 +143,7 @@ async def test_the_adoption_marks_the_progress_unknown(
 
     from custom_components.alpha_ems_manager.alphaess_adapter import read_snapshot
 
-    coordinator._adopt_persisted_run(read_snapshot(hass))
+    coordinator._adopt_persisted_run(read_snapshot(hass), local(NORMAL, 10, 46))
 
     assert coordinator._carried is not None
     assert coordinator._quarter_progress_unknown is True
@@ -180,7 +180,7 @@ async def test_the_same_holds_for_an_owned_active_export(
 
     from custom_components.alpha_ems_manager.alphaess_adapter import read_snapshot
 
-    coordinator._adopt_persisted_run(read_snapshot(hass))
+    coordinator._adopt_persisted_run(read_snapshot(hass), local(NORMAL, 10, 46))
 
     assert coordinator._quarter_progress_unknown is True
 
@@ -222,7 +222,7 @@ async def test_a_dispatch_with_no_marker_is_never_adopted(
 
     from custom_components.alpha_ems_manager.alphaess_adapter import read_snapshot
 
-    coordinator._adopt_persisted_run(read_snapshot(hass))
+    coordinator._adopt_persisted_run(read_snapshot(hass), local(NORMAL, 10, 46))
 
     assert coordinator._carried is None
     assert coordinator._quarter_progress_unknown is False
@@ -253,7 +253,7 @@ async def test_no_active_dispatch_means_no_adoption_and_no_write(
     # refresh run, which legitimately re-admits a run through ``carry_forward``.
     # What is under test is whether *adoption* fires, not whether anything else did.
     simulate_restart(coordinator)
-    coordinator._adopt_persisted_run(snapshot)
+    coordinator._adopt_persisted_run(snapshot, local(NORMAL, 10, 46))
 
     assert coordinator._carried is None
     assert coordinator._quarter_progress_unknown is False

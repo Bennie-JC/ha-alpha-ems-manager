@@ -391,15 +391,30 @@ def test_the_four_bounds_that_keep_a_carried_run_short() -> None:
     assert ended.ended == EXECUTION_STOP_WINDOW_ENDED
 
     # 2. freshness, re-anchored on each affirmation but never removed.
+    #
+    # **Asserted against silence, since beta.35.** The deadline detects Stage A
+    # having gone quiet, so it is measured where Stage A is quiet. It used to be
+    # asserted with an affirming publication in the same call -- which passed only
+    # because staleness was judged before that publication was read, and that
+    # ordering killed live runs the very refresh was re-anchoring. The bound is
+    # unchanged and is still absolute; what changed is that this refresh's own
+    # evidence is now read before the verdict rather than after it.
     brief = admit(
         parse_target(
             published(OPENS, stale_after=(OPENS + timedelta(minutes=5)).isoformat())
         ),
         BEFORE,
     )
-    stale = carry_forward(brief, [published(OPENS)], OPENS + timedelta(minutes=10))
+    stale = carry_forward(brief, [], OPENS + timedelta(minutes=10))
     assert stale.carried is None
     assert stale.ended == EXECUTION_STOP_STALE_PLAN
+
+    # And it is a real bound rather than an unreachable one: an affirmation only
+    # ever moves the deadline to the one the *publication* carries, so a run whose
+    # publications stop is stale within one ``stale_after`` of the last of them.
+    affirmed = carry_forward(brief, [published(OPENS)], OPENS + timedelta(minutes=10))
+    assert affirmed.carried is not None
+    assert affirmed.carried.stale_after == parse_target(published(OPENS)).stale_after
 
     # 3. withdrawal, within a single refresh. 4. the grid ceiling, which the
     # budget gate owns and which is asserted where it is enforced.

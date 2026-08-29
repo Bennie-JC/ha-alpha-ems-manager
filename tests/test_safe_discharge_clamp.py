@@ -1028,14 +1028,22 @@ async def test_the_clamp_changes_no_economic_figure(
 async def test_the_entity_count_and_the_economic_contract_are_untouched(
     hass, setup_integration, control_surface
 ) -> None:
-    """No new entity, no new attribute. This change is diagnostics and safety."""
+    """No new entity, no new attribute. This change is diagnostics and safety.
+
+    The attribute count is read from the contract this test guards rather than
+    restated here: beta.35 rewrote the Economic Action attribute set on purpose --
+    the plan-shaped fields moved to ``Next Planned Action`` -- and a second copy of
+    the number would have made that deliberate change look like this clamp's doing.
+    What matters to *this* test is that the safety work added nothing of its own,
+    which the ``safety_limited`` assertion below is what actually proves.
+    """
     from .test_economic_published import ECONOMIC_ATTRIBUTES
     from .test_entity_contract import CONTRACT
 
     await drive_control(hass, setup_integration, import_w=400)
 
     assert len(CONTRACT) == 14
-    assert len(ECONOMIC_ATTRIBUTES) == 8
+    assert "safety_limited" not in ECONOMIC_ATTRIBUTES
 
     economic = hass.states.get("sensor.alpha_ems_economic_action")
     assert economic is not None

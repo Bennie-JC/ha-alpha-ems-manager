@@ -626,6 +626,24 @@ def next_activity(
             for identity in live
         ):
             continue
+        if _still_executing(lifecycle, execution):
+            # **A started campaign is not retracted because the plan moved.
+            # beta.35.**
+            #
+            # This loop asks "is the plan we announced still in the plan", and for
+            # a *future* announcement that is exactly the right question. For one
+            # that is physically running it is the wrong one: Stage A's horizon
+            # head is ``elapsed + 1``, so the campaign executing right now is
+            # structurally absent from every fresh publication, and reading that
+            # absence as a withdrawal produced the line the reference installation
+            # printed for a sale that had just moved 1.92 kWh --
+            #
+            #     Canceled Plan ID: ... -- Plan Replaced -- 0.00 / 5.05 kWh
+            #
+            # The campaign owns its own ending. ``_campaign_terminal`` files it
+            # once, from figures measured where the energy crossed the boundary,
+            # and this loop keeps its hands off until then.
+            continue
         expired = lifecycle.identity.end_utc <= now
         reason = _CANCEL_EXPIRED if expired else _CANCEL_REPLACED
         # **The figures come from the plan being cancelled, not from Stage B's
@@ -1129,6 +1147,23 @@ def plan_id_for(identity: PlanIdentity) -> str:
 def _within_window_tolerance(left: datetime, right: datetime) -> bool:
     """Return whether two window ends mean the same window."""
     return abs((left - right).total_seconds()) <= ECONOMIC_DEADBAND_MINUTES * 60
+
+
+def _still_executing(lifecycle: Lifecycle, execution: ExecutionView | None) -> bool:
+    """Return whether Stage B is still running the campaign this lifecycle names.
+
+    Identity first, because it is the thing that survives the horizon rolling: a
+    campaign id is derived from the campaign's *end*, so it does not churn as the
+    head advances. The run id is the fallback for a lifecycle adopted before any
+    campaign existed.
+    """
+    if execution is None or not execution.campaign_open:
+        return False
+    if not lifecycle.started:
+        return False
+    if lifecycle.campaign_id is not None and execution.campaign_id is not None:
+        return lifecycle.campaign_id == execution.campaign_id
+    return lifecycle.run_id is not None and lifecycle.run_id == execution.run_id
 
 
 def _lifecycle_for(state: ActivityState, execution: ExecutionView) -> Lifecycle | None:

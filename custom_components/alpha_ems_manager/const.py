@@ -2111,6 +2111,53 @@ ECONOMIC_BUCKET_STATE_BUDGET: Final = 0.10
 #: a fixed, small cost at setup rather than something that scales with the pack.
 ECONOMIC_BUCKET_MAX_DIVISOR: Final = 80
 
+#: How far past the horizon the terminal value may look for household demand.
+#:
+#: **beta.35, and it is a cap that almost never binds.** The terminal value asks
+#: how much of the energy left in the pack the house will actually consume before
+#: it refills for free, and the answer is bounded twice: by the first forecast
+#: production surplus after the horizon -- which is physical, price-blind, and
+#: usually within a few hours -- and by this figure.
+#:
+#: One civil day, because that is the longest window over which the clock-matched
+#: price estimator is defensible. The estimator prices a post-horizon interval at
+#: the known price of the *same clock position*, so beyond twenty-four hours it
+#: repeats itself and adds no information. It is not tuned to any observed trace:
+#: 96 is the interval count of an ordinary day, and a 92- or 100-interval
+#: daylight-saving day is handled by the surplus bound long before this matters.
+TERMINAL_LOOKAHEAD_INTERVALS: Final = 96
+
+#: How the terminal inventory was valued, published so a reader can see which.
+#:
+#: ``demand_bounded`` is the beta.35 rule: energy the household will consume before
+#: the next free refill is worth the import price it displaces, and energy beyond
+#: that is worth only what it could be sold for. ``flat_edge_credit`` is the
+#: beta.34 rule -- a single 25th-percentile rate on a capped quantity -- retained
+#: as a live counterfactual and never used to execute.
+TERMINAL_VALUE_BASIS_DEMAND_BOUNDED: Final = "demand_bounded"
+TERMINAL_VALUE_BASIS_FLAT_EDGE: Final = "flat_edge_credit"
+
+#: Why a marginal stored-energy value could not be stated.
+#:
+#: **``None`` is a defined answer here and zero is not.** The value function is
+#: lexicographic ``(violation, cost)``: differencing the money term across two
+#: buckets that disagree about reserve feasibility compares quantities that were
+#: never ranked against each other, and an unreachable state carries a sentinel
+#: rather than a price. Publishing 0.00 EUR/kWh for either would read as "this
+#: energy is worthless", which is a claim, and the wrong one.
+STORED_VALUE_UNDEFINED_VIOLATION: Final = "violation_differs"
+STORED_VALUE_UNDEFINED_UNREACHABLE: Final = "state_unreachable"
+STORED_VALUE_UNDEFINED_NO_CURVE: Final = "no_value_curve"
+STORED_VALUE_UNDEFINED_TOP_BUCKET: Final = "top_bucket_is_clamped"
+
+#: How many buckets of the head value curve reach diagnostics.
+#:
+#: The curve has one entry per bucket -- 83 on the reference pack -- and a reader
+#: needs its shape rather than every point. Sampled evenly, endpoints always
+#: included, so the concavity that makes the number meaningful stays visible in a
+#: download that a person can actually read.
+MAX_VALUE_CURVE_POINTS_PUBLISHED: Final = 16
+
 #: Which rule produced the lattice actually in use. Published because two
 #: installations can legitimately end up on different lattices -- an installation
 #: where no candidate clears the no-regression test keeps the beta.16 bucket --
@@ -3026,6 +3073,80 @@ EXECUTION_COMPLETION_STOP_REASONS: Final = (
     EXECUTION_STOP_QUARTER_TARGET_REACHED,
 )
 
+#: Stage A revised the *future*. Nothing happened to the battery.
+#:
+#: **beta.35, and it is the distinction the 2026-08-29 Sell was destroyed by.** A
+#: run stops being carried for three ordinary reasons -- its freshness deadline
+#: passed, no publication re-affirmed it, or a different run is running -- and
+#: every one of them is a statement about what Stage A now intends *next*. None of
+#: them is a statement about the quarter physically executing under a frozen
+#: schedule that was admitted before any of it happened.
+#:
+#: Through beta.34 all three produced ``reset_required`` and aborted the dispatch.
+#: On the reference installation that reset a real export at 20:00 whose own
+#: ``admitted_plan``, ``_quarter`` and ``control.intent`` all still described it
+#: correctly -- and then, because the teardown was partial, the surviving frozen
+#: schedule re-armed the inverter from a later row fifteen minutes afterwards.
+#:
+#: A reason in this set may be **withheld** while the admitted plan still covers
+#: the moment with an executable row and the campaign has started. It is never
+#: withheld silently: the coordinator publishes ``withheld_stop_reason`` and
+#: ``authority_basis`` so the withdrawal stays visible in diagnostics.
+EXECUTION_WITHDRAWAL_STOP_REASONS: Final = (
+    EXECUTION_STOP_STALE_PLAN,
+    EXECUTION_STOP_STAGE_A_HOLD,
+    EXECUTION_STOP_PLAN_REPLACED,
+)
+
+#: Something happened *to* the dispatch. It stops now, and the teardown is total.
+#:
+#: **The other half of the beta.35 split, and it may never be suppressed.** Safety,
+#: a lost or contested ownership marker, a dead-man that did not advance, a failed
+#: command, the user withdrawing permission, and a restart that lost a quarter's
+#: measurement are all conditions under which continuing would be a claim the
+#: integration cannot support. Every one of them converges on
+#: ``_abandon_execution``, which tears the whole authority state down at once --
+#: see :data:`EXECUTION_ABORT_IS_TOTAL`.
+#:
+#: ``window_ended`` is deliberately in neither set. It is the natural terminal of a
+#: campaign that ran to the end of its schedule, and it is already classified by
+#: :data:`EXECUTION_COMPLETION_STOP_REASONS`.
+EXECUTION_ABORT_STOP_REASONS: Final = (
+    EXECUTION_STOP_SAFETY,
+    EXECUTION_STOP_OWNERSHIP_CONFLICT,
+    EXECUTION_STOP_MARKER_LOST,
+    EXECUTION_STOP_TIMER_NOT_REFRESHED,
+    EXECUTION_STOP_EXECUTION_ERROR,
+    EXECUTION_STOP_SWITCHED_OFF,
+    EXECUTION_STOP_SWITCHED_TO_SHADOW,
+    EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
+)
+
+#: What an abort must leave behind: nothing.
+#:
+#: **The beta.35 invariant, stated as a list so a later change has to edit it.**
+#: The 20:00-20:24 hardware trace showed the machine holding two contradictory
+#: beliefs at once -- the lifecycle terminated, the frozen schedule still
+#: authoritative -- and walking straight back into the schedule a quarter later.
+#: Every field named here is cleared by ``_abandon_execution`` and by nothing else,
+#: so the three abort paths cannot drift apart the way they had.
+EXECUTION_ABORT_IS_TOTAL: Final = (
+    "execution_record",
+    "sustained_deadline",
+    "sustained_run_id",
+    "quarter",
+    "quarter_progress",
+    "quarter_progress_unknown",
+    "carried_run",
+    "admitted_plan",
+    "campaign",
+)
+
+#: Why an authority was allowed to keep executing, or was torn down.
+AUTHORITY_BASIS_ADMITTED_PLAN: Final = "admitted_plan"
+AUTHORITY_BASIS_CARRIED_RUN: Final = "carried_run"
+AUTHORITY_BASIS_NONE: Final = "none"
+
 #: Why a terminal could not be judged against a target. Published beside the
 #: outcome so "we could not measure it" and "nobody told us what to measure" stay
 #: different answers -- beta.33 gave both of them ``failed``.
@@ -3144,6 +3265,16 @@ CAMPAIGN_ORPHAN_GRACE_MINUTES: Final = 60
 #: is the only one that survives a restart. They are published together rather
 #: than reconciled, because where they disagree the disagreement is the
 #: information.
+#: How many aborted campaign identities are remembered for the session.
+#:
+#: **beta.35.** An aborted campaign's frozen schedule must never re-arm, and the
+#: cheapest way to guarantee it is to remember what was abandoned. Bounded like
+#: every other latch here: a day of quarter-hour campaigns cannot approach it, and
+#: it is session-local on purpose -- a restart legitimately re-evaluates from the
+#: persisted record and the physical state rather than from a memory of a decision
+#: taken before the reboot.
+MAX_ABORTED_CAMPAIGNS_REMEMBERED: Final = 64
+
 EXECUTION_BASIS_ACCUMULATED: Final = "accumulated"
 EXECUTION_BASIS_SOC_DELTA: Final = "state_of_charge_delta"
 EXECUTION_BASIS_BOTH: Final = "accumulated_and_state_of_charge"
@@ -3414,6 +3545,39 @@ ACTIVITY_CATEGORY_CURTAILMENT: Final = "curtailment"
 #: reason cannot arrive as a sentence. Only the export gate can remove a campaign
 #: between the two solves, so only the export gate can name one here.
 CAMPAIGN_REJECTED_PROTECTION: Final = "protection"
+
+#: How a published ledger figure was arrived at. **Never decorative.**
+#:
+#: **beta.35.** The realised ledger mixes four kinds of number and a fifth kind of
+#: non-number, and reporting them without saying which is which is how a model term
+#: comes to be read as money. ``measured`` was integrated from a source reading.
+#: ``attributed`` is measured energy split by a stated per-interval rule -- never a
+#: claim that particular electrons took a particular path, which a battery cannot
+#: support. ``estimated`` came from a model constant such as an efficiency.
+#: ``planner_derived`` came from the optimiser's own value function rather than
+#: from any meter. ``model_term`` is a hurdle or a wear proxy in the objective and
+#: is **not cash**: putting the minimum trade gain into a cash total would be the
+#: same error as pricing sunk cost.
+LEDGER_BASIS_MEASURED: Final = "measured"
+LEDGER_BASIS_ATTRIBUTED: Final = "attributed"
+LEDGER_BASIS_ESTIMATED: Final = "estimated"
+LEDGER_BASIS_PLANNER_DERIVED: Final = "planner_derived"
+LEDGER_BASIS_MODEL_TERM: Final = "model_term"
+
+LEDGER_BASES: Final = (
+    LEDGER_BASIS_MEASURED,
+    LEDGER_BASIS_ATTRIBUTED,
+    LEDGER_BASIS_ESTIMATED,
+    LEDGER_BASIS_PLANNER_DERIVED,
+    LEDGER_BASIS_MODEL_TERM,
+)
+
+#: How many civil days the cross-midnight ledger view spans by default.
+#:
+#: Two, because the question the ledger exists to answer -- "was buying that energy
+#: worth it" -- routinely straddles one midnight and almost never straddles two.
+#: Every input is already persisted for a year, so a caller may ask for more.
+LEDGER_DEFAULT_WINDOW_DAYS: Final = 2
 
 ACTIVITY_PURPOSE_SAFETY: Final = "safety"
 ACTIVITY_PURPOSE_ECONOMIC: Final = "economic"

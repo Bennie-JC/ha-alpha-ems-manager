@@ -40,6 +40,7 @@ from .const import (
     FORECAST_RAW_RETENTION_DAYS,
     FORECAST_STORAGE_VERSION,
     FORECAST_SUMMARY_RETENTION_DAYS,
+    LEDGER_DEFAULT_WINDOW_DAYS,
     MAX_DECISION_RECORDS_PUBLISHED,
     MAX_HISTORY_DAYS,
     MIN_DAY_COMPLETENESS,
@@ -629,6 +630,9 @@ def _economic_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any
         horizon_end=end,
         execution_targets=list(coordinator.execution_targets),
         realized=coordinator.realized_today(plan),
+        realized_multi_day=coordinator.realized_days(
+            plan, days=LEDGER_DEFAULT_WINDOW_DAYS
+        ),
         provenance={
             "settings": {
                 "minimum_trade_gain_eur": config.minimum_trade_gain_eur,

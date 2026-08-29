@@ -1069,11 +1069,19 @@ def test_clearing_the_record_before_the_reset_lands_is_caught() -> None:
     # result rather than the public state -- but not its position, which is what
     # this test is about: the success branch runs before the claim is released.
     marker = "_mark_command_result(report, CONTROL_STATE_EXECUTED)"
-    clear = "if self._pending_is_reset:\n                self._clear_execution_record()"
+    # beta.35 routes the teardown through one helper, so the marker is the call
+    # rather than the first field it happens to clear. The rule under test is
+    # unchanged: the claim is released only once the stop has actually landed.
+    # Matched on the call alone: the reason it is given now depends on which abort
+    # path arrived, and pinning the argument list would make this test fail every
+    # time a new one converges here -- which is the opposite of what it is for.
+    clear = "self._abandon_execution("
 
     assert marker in text
-    assert clear in text
-    assert text.index(marker) < text.index(clear)
+    # **After the marker, not merely present.** The helper is also called from the
+    # two tick-path stops, which sit earlier in the file, so comparing first
+    # occurrences would compare the wrong call and pass whatever the send site did.
+    assert clear in text[text.index(marker) :]
 
 
 def test_releasing_the_marker_before_deactivation_is_caught() -> None:
@@ -1445,6 +1453,18 @@ async def test_a_live_campaign_says_three_things(
 
     A start line is emitted only because an activation write actually succeeded, and
     the sustaining refreshes after it say nothing at all.
+
+    **One start per campaign identity, since beta.35** -- not one start in total.
+    Eight refreshes span more than one admitted window on this shape, and a second
+    campaign genuinely starting is news rather than noise. What may never happen is
+    an identity announcing itself twice, which is what reopening a closed campaign
+    would produce and what would erase the first one's realised energy.
+
+    And the terminal that beta.34 wrote here is gone. On this same fixture beta.34
+    said ``Canceled -- Plan Replaced -- 0.00 / 5.42 kWh`` about a campaign it had
+    announced as started four refreshes earlier and had not stopped -- a future
+    plan being revised, reported as the cancellation of a running one. beta.35
+    closes it on its own window with its own figures.
     """
     from homeassistant.const import EVENT_LOGBOOK_ENTRY
 
@@ -1456,11 +1476,25 @@ async def test_a_live_campaign_says_three_things(
     lifecycle = [entry["message"] for entry in logbook]
 
     assert lifecycle
-    # One start at most, and in Live it can only have come from a confirmed
-    # activation -- Shadow emits no start line at all.
+    # In Live a start can only have come from a confirmed activation -- Shadow
+    # emits no start line at all.
     starts = [m for m in lifecycle if " Started — " in m]
-    assert len(starts) == 1, lifecycle
-    assert "Shadow" not in starts[0]
+    assert starts, lifecycle
+    assert not any("Shadow" in message for message in starts)
+    # One per identity. The plan id prefix is the identity in these lines.
+    identities = [message.split(" — ")[0] for message in starts]
+    assert len(identities) == len(set(identities)), lifecycle
+
+    # **No started campaign is retracted because the plan moved.**
+    started = set(identities)
+    replaced = [
+        message
+        for message in lifecycle
+        if "Plan Replaced" in message
+        and any(identity in message for identity in started)
+    ]
+    assert replaced == [], lifecycle
+
     # Nothing repeated, and far fewer lines than refreshes.
     assert len(lifecycle) == len(set(lifecycle)), lifecycle
     assert len(lifecycle) < 8, lifecycle

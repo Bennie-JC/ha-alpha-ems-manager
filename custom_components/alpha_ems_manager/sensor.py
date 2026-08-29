@@ -84,17 +84,20 @@ from .const import (
     DOMAIN,
     ECONOMIC_ACTION_CHARGE,
     ECONOMIC_ACTION_EXPORT,
+    ECONOMIC_ACTION_IDLE,
     ECONOMIC_ACTION_OPTIONS,
     ECONOMIC_ACTION_SAFETY_BUY,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     ECONOMIC_DIRECTION_CHARGE,
     ECONOMIC_EUR_PRECISION,
+    EXECUTION_INTENT_GRID_CHARGE,
     EXECUTION_INTENT_NET_EXPORT,
     EXECUTION_STATE_ARMED,
     EXECUTION_STATE_PREPARED,
     EXECUTION_STATE_RUNNING,
     FORECAST_ERROR_WINDOW_DAYS,
     NAME,
+    OWNERSHIP_OWNED,
     SENSOR_BATTERY_PLANNED_POWER,
     SENSOR_BATTERY_RECOMMENDATION,
     SENSOR_BATTERY_USABLE_ENERGY,
@@ -518,69 +521,158 @@ def _economic_outcome(coordinator: AlphaEmsCoordinator) -> EconomicOutcome | Non
     return outcome if isinstance(outcome, EconomicOutcome) else None
 
 
+def _executing_view(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return what Stage B is acting on right now, or an empty mapping.
+
+    **The layer that can answer the question, since beta.35.** Stage A cannot: its
+    horizon head is ``elapsed + 1``, so the plan describes the *next* interval and
+    structurally never the one in progress. beta.34 made ``Economic Action``
+    present-tense on the plan, which moved the fault rather than fixing it -- on
+    2026-08-29 a real owned 10 kW export was running and the entity read ``idle``,
+    because no planned run happened to start at the head.
+
+    What is executing is a Stage-B fact, and this reads it from the control report.
+
+    **The open row is asked first, and the carried run last.** That order is the
+    beta.29 authority model and getting it backwards is why a first draft of this
+    still read ``idle`` through a live Sell: under quarter authority the carried
+    run is ``None``, so ``execution.intent``, ``execution.target`` and
+    ``execution.power`` are all ``None`` too, and every field this entity wants
+    lives in the executing quarter and the admitted schedule instead. Those are
+    the surfaces that describe what is running; the run block describes what Stage
+    A is carrying, which is a different question and was empty at the exact moment
+    the answer mattered.
+    """
+    control = (coordinator.data or {}).get("control") or {}
+    report = control.get("execution") or {}
+    if not report:
+        return {}
+    quarter = report.get("quarter") or {}
+    admitted = report.get("admitted_plan") or {}
+    target = report.get("target") or {}
+    intent = quarter.get("intent") or admitted.get("intent") or report.get("intent")
+    if not isinstance(intent, str) or not intent:
+        return {}
+    ownership = report.get("ownership") or {}
+    progress = report.get("progress") or {}
+    campaign = report.get("open_campaign") or {}
+    carried = (report.get("carried") or {}).get("run") or {}
+    controller = report.get("controller") or {}
+    export = intent == EXECUTION_INTENT_NET_EXPORT
+    planned = campaign.get("frozen_target_kwh") if isinstance(campaign, dict) else None
+    if planned is None:
+        planned = (
+            target.get("grid_target_kwh")
+            if export
+            else target.get("battery_target_kwh")
+        )
+    if planned is None:
+        planned = (
+            quarter.get("grid_target_this_quarter_kwh")
+            if export
+            else quarter.get("battery_target_this_quarter_kwh")
+        )
+    return {
+        "intent": intent,
+        "purpose": (
+            report.get("purpose") or admitted.get("purpose") or target.get("purpose")
+        ),
+        "owned": ownership.get("state") == OWNERSHIP_OWNED,
+        "mode": control.get("mode"),
+        "state": report.get("state"),
+        "campaign_id": (
+            campaign.get("campaign_id") if isinstance(campaign, dict) else None
+        ),
+        "run_id": (
+            carried.get("run_id") or admitted.get("run_id") or report.get("plan_id")
+        ),
+        "planned_kwh": planned,
+        "realised_kwh": progress.get("objective_realized_kwh"),
+        "power_kw": (
+            (report.get("power") or {}).get("applied_kw")
+            or controller.get("applied_setpoint_kw")
+        ),
+        "started_at": (
+            campaign.get("started_at") if isinstance(campaign, dict) else None
+        ),
+    }
+
+
+def _executing_action(view: dict[str, Any]) -> str:
+    """Return the economic word for what is executing, or ``idle``.
+
+    ``safety_buy`` comes from the published target's own ``purpose``, which
+    ``execution_target`` already sets from the solve's safety attribution -- so the
+    entity and the diagnostics cannot disagree about which purchases were
+    compelled.
+    """
+    if not view:
+        return ECONOMIC_ACTION_IDLE
+    if view.get("purpose") == ECONOMIC_ACTION_SAFETY_BUY:
+        return ECONOMIC_ACTION_SAFETY_BUY
+    intent = view.get("intent")
+    if intent == EXECUTION_INTENT_GRID_CHARGE:
+        return ECONOMIC_ACTION_CHARGE
+    if intent == EXECUTION_INTENT_NET_EXPORT:
+        return ECONOMIC_ACTION_EXPORT
+    # ``serve_load`` and everything else: natural inverter self-consumption is not
+    # an economic execution, and never was.
+    return ECONOMIC_ACTION_IDLE
+
+
 def _economic_action_value(coordinator: AlphaEmsCoordinator) -> str | None:
-    """Return what the optimizer is doing in **this** interval.
+    """Return what Alpha EMS is economically executing **now**.
 
-    **beta.34 made this entity present-tense, and the reason is a measurement.**
-    It used to publish ``desired.published_run``, which is ``current_run or
-    next_run`` with no bound whatever on how distant ``next_run`` may be. At 14:00
-    on 2026-08-29 tomorrow's prices arrived, the horizon grew from 40 intervals to
-    135, and the entity announced ``export`` -- for a sale planned at 20:30 the
-    *following* evening. The ``window`` attribute renders ``HH:MM-HH:MM`` with no
-    date, so there was nothing in the reading itself to reveal it.
+    **beta.35 moved this off the plan and onto the execution surface, because the
+    plan cannot see the present.** The horizon head is ``elapsed + 1``; the quarter
+    in progress is behind it by construction. beta.34's ``current_run`` therefore
+    reported a run that *starts* at the head -- which has not started, it begins in
+    up to fifteen minutes -- and reported ``idle`` for a sale that was physically
+    exporting 8.7 kW at that very moment.
 
-    The plan has not been hidden; it moved to ``Next Planned Action``, which
-    prints full instants precisely because its run is routinely on another day.
+    In **Live** this is what the inverter is doing under an owned dispatch. In
+    **Shadow** it is the intent Stage B is acting on and would have sent, published
+    with ``owned: false`` and ``mode: shadow`` beside it: Shadow exists to be
+    watched, and an entity that reads ``idle`` all day cannot be watched. In
+    **Off**, nothing is admitted, so ``idle``.
 
-    ``idle`` rather than ``hold`` when no run is in progress. ``hold`` is a
-    verdict -- the optimiser weighed the prices and chose to do nothing -- and
-    this interval simply having no run in it is a weaker statement that deserves
-    its own word.
-
-    ``unknown`` rather than either when no plan could be built: "nothing is worth
-    doing" and "nothing could be worked out" are different answers, and a
-    reassuring ``hold`` derived from absent prices would be the second wearing the
-    first's clothes.
+    ``unknown`` only when no plan could be built at all -- "nothing is happening"
+    and "nothing could be worked out" are different answers.
     """
     outcome = _economic_outcome(coordinator)
     if outcome is None or not outcome.available:
         return None
-    action = outcome.current_action
+    action = _executing_action(_executing_view(coordinator))
     return action if action in ECONOMIC_ACTION_OPTIONS else None
 
 
 def _economic_action_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
-    """Return the eight flat values behind the economic action.
+    """Return the facts behind what is executing. **The same execution.**
 
-    Eight, which is the cap, and chosen to answer one question each: what would
-    implemented actuators do, why can nothing be sent, what would it do *now* and
-    at what power, over how much energy and when, why, at what price, and for
-    what gain. Everything else -- the capability plan's own totals, the per-run
-    detail, the counterfactuals, the solver figures and the provenance -- is in
-    diagnostics.
+    beta.34 left this reading ``published_run`` while the state read the plan's
+    current run, so on the live capture the state said ``idle`` while ``window``,
+    ``energy_kwh``, ``price_eur_kwh`` and ``reason`` all described a sale planned
+    for 21:00. An entity whose state and attributes describe different things is
+    worse than one that describes neither.
 
-    ``power_kw`` is the **first actionable interval's** power, never the run
-    average. A multi-interval run varies with load, production, headroom, the
-    reserve trajectory and the clamp, so an average would describe none of its
-    intervals; the average is published per run in diagnostics where it belongs.
+    Every field here now comes from the execution view the state came from.
     """
     outcome = _economic_outcome(coordinator)
     if outcome is None or not outcome.available:
         return {"execution_blocked_reason": ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE}
-    run = outcome.desired.published_run
+    view = _executing_view(coordinator)
     return {
+        "owned": bool(view.get("owned")),
+        "mode": view.get("mode"),
+        "purpose": view.get("purpose"),
+        "campaign_id": view.get("campaign_id"),
+        "run_id": view.get("run_id"),
+        "planned_kwh": _round(view.get("planned_kwh"), BATTERY_KWH_PRECISION),
+        "realised_kwh": _round(view.get("realised_kwh"), BATTERY_KWH_PRECISION),
+        "power_kw": _round(view.get("power_kw"), BATTERY_KW_PRECISION),
+        "started_at": view.get("started_at"),
         "capability_action": outcome.capability_action,
         "execution_blocked_reason": _economic_blocked_reason(coordinator),
-        "power_kw": _round(outcome.desired.power_kw, BATTERY_KW_PRECISION),
-        "energy_kwh": _round(
-            0.0 if run is None else run.energy_kwh, BATTERY_KWH_PRECISION
-        ),
-        "window": _economic_window(coordinator, run),
-        "reason": outcome.reason,
-        "price_eur_kwh": outcome.price_eur_kwh,
-        "expected_net_value_eur": _round(
-            outcome.desired.expected_net_value_eur, ECONOMIC_EUR_PRECISION
-        ),
     }
 
 
@@ -619,25 +711,71 @@ def _upcoming_target(coordinator: AlphaEmsCoordinator, run: Any) -> dict[str, An
     return {}
 
 
+def _next_planned_run(coordinator: AlphaEmsCoordinator) -> tuple[Any, dict[str, Any]]:
+    """Return the nearest run that has not started, and its published target.
+
+    **Two corrections, and they pull in opposite directions. beta.35.**
+
+    *It must not skip the nearest one.* beta.34 used ``upcoming_run``, which takes
+    the first run with ``start_index > head``. But the head is ``elapsed + 1`` --
+    it is the **next** interval, not the one in progress -- so a run beginning *at*
+    the head has not started either; it begins within fifteen minutes and it is
+    precisely the next planned action. Skipping it is why the entity read
+    ``charge`` at 19:30 while a Sell was about to start at 19:45: the Sell was the
+    run at the head, and the reading jumped over it to tomorrow's refill.
+
+    *It must not point at what is already running.* Once that Sell starts, its
+    remaining rows can still appear in the plan, and naming them would make "next"
+    mean "now". Excluded by campaign identity rather than by index, because the
+    identity is the thing that survives the head advancing.
+
+    Returns ``(None, {})`` when nothing is planned ahead.
+    """
+    outcome = _economic_outcome(coordinator)
+    if outcome is None or not outcome.available:
+        return None, {}
+    plan = outcome.desired
+    if not plan.intervals:
+        return None, {}
+    head = plan.intervals[0].index
+    executing = _executing_view(coordinator).get("campaign_id")
+    for run in plan.runs:
+        if run.start_index < head:
+            continue
+        target = _upcoming_target(coordinator, run)
+        if executing is not None and target.get("campaign_id") == executing:
+            continue
+        return run, target
+    return None, {}
+
+
 def _next_planned_action_value(coordinator: AlphaEmsCoordinator) -> str | None:
-    """Return the action of the next run that has not started yet."""
+    """Return the action of the nearest campaign that has not started yet."""
     outcome = _economic_outcome(coordinator)
     if outcome is None or not outcome.available:
         return None
-    action = outcome.upcoming_action
+    run, target = _next_planned_run(coordinator)
+    if run is None:
+        return ECONOMIC_ACTION_IDLE
+    purpose = target.get("purpose")
+    if purpose == ECONOMIC_ACTION_SAFETY_BUY:
+        return ECONOMIC_ACTION_SAFETY_BUY
+    if run.start_index in outcome.safety_buy_runs:
+        return ECONOMIC_ACTION_SAFETY_BUY
+    action = run.action
     return action if action in ECONOMIC_ACTION_OPTIONS else None
 
 
 def _next_planned_action_attributes(
     coordinator: AlphaEmsCoordinator,
 ) -> dict[str, Any]:
-    """Return when the next planned run is, and what it is for.
+    """Return when the next planned campaign is, and what it is for.
 
     **Full ISO instants, and that is the entity's whole reason for existing.**
-    ``Economic Action`` renders a clock window with no date, which was adequate
-    while the horizon ended at midnight and became a misreport the moment the
-    two-day horizon shipped: a live reading of "20:30-22:00" taken on 2026-08-29
-    was describing 2026-08-30. A reader cannot make that mistake with an instant.
+    ``Economic Action`` describes the present and carries no clock at all; this one
+    describes something that is routinely on another day, and a dateless
+    ``HH:MM-HH:MM`` window is how a sale planned for tomorrow evening came to be
+    read as one starting within the hour.
 
     ``reason`` is carried only when this run is the one the optimizer's own
     ``reason`` describes -- that field follows ``published_run``, and attaching a
@@ -646,20 +784,20 @@ def _next_planned_action_attributes(
     outcome = _economic_outcome(coordinator)
     if outcome is None or not outcome.available:
         return {}
-    run = outcome.desired.upcoming_run
+    run, target = _next_planned_run(coordinator)
     if run is None:
-        return {"starts_at": None, "ends_at": None, "energy_kwh": None}
-    target = _upcoming_target(coordinator, run)
+        return {"starts_at": None, "ends_at": None, "planned_kwh": None}
     start = _economic_run_instant(coordinator, run.start_index)
     end = _economic_run_instant(coordinator, run.end_index + 1)
     published = outcome.desired.published_run
     return {
         "starts_at": None if start is None else start.isoformat(),
         "ends_at": None if end is None else end.isoformat(),
-        "energy_kwh": _round(run.energy_kwh, BATTERY_KWH_PRECISION),
+        "planned_kwh": _round(run.energy_kwh, BATTERY_KWH_PRECISION),
         "power_kw": _round(run.first_power_kw, BATTERY_KW_PRECISION),
         "purpose": target.get("purpose", run.action),
         "campaign_id": target.get("campaign_id"),
+        "run_id": target.get("plan_id"),
         "price_eur_kwh": run.average_price_eur_kwh,
         "expected_value_eur": _round(run.net_cash_flow_eur, ECONOMIC_EUR_PRECISION),
         "reason": outcome.reason if published is run else None,
@@ -856,7 +994,16 @@ def _execution_view(coordinator: AlphaEmsCoordinator) -> ExecutionView | None:
                 else ExecutionView(executed=True, terminal=terminal)
             )
         objective_target = float(objective)
-        objective_realized = float(progress.get("grid_export_realized_kwh") or 0.0)
+        # **The run's own objective, at its own boundary. beta.35.**
+        #
+        # This read ``grid_export_realized_kwh``, and nothing in the package has
+        # ever written that key -- one hit in the whole tree, and it was this
+        # reader. ``.get(...) or 0.0`` therefore hard-coded 0.00 for every export
+        # run whose campaign target had not frozen, which is how a sale that moved
+        # 1.92 kWh was published as ``0.00 / 5.05``. The coordinator now publishes
+        # ``objective_realized_kwh`` beside the boundary it was measured at, from
+        # the same accumulator the campaign uses.
+        objective_realized = float(progress.get("objective_realized_kwh") or 0.0)
     else:
         objective_target = float(target.get("battery_target_kwh") or 0.0)
         objective_realized = float(progress.get("battery_realized_kwh") or 0.0)

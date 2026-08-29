@@ -111,20 +111,30 @@ def test_a_plan_that_starts_later_reads_idle_now() -> None:
     assert _economic_action_value(_Published(outcome)) == ECONOMIC_ACTION_IDLE
 
 
-def test_a_run_in_progress_still_reads_as_itself() -> None:
-    """The other direction: present-tense must not mean silent.
+def test_a_run_at_the_head_has_not_started_yet() -> None:
+    """**beta.35 corrected this one, and the correction is the point.**
 
-    A charge that is genuinely happening in this interval reports ``charge``, so
-    the fix narrows what the entity claims without taking away what it says.
+    beta.34 read a run whose ``start_index`` equals the head as "happening now".
+    It is not: the head is ``elapsed + 1``, so that run begins in up to fifteen
+    minutes. With nothing executing, ``Economic Action`` is ``idle`` -- and the
+    run belongs to ``Next Planned Action``, which beta.34 skipped past it.
+
+    The live symptom was reported from the dashboard: at 19:30, with a Sell due at
+    19:45, *Next Planned Action* read ``charge`` -- tomorrow's refill -- because
+    the Sell was the run at the head and ``upcoming_run`` required
+    ``start_index > head``.
     """
     from custom_components.alpha_ems_manager.sensor import _economic_action_value
 
     from .beta34_shape import solve_at
 
     outcome = solve_at(head=52, end=96, stored=11.0).outcome
-    assert outcome.desired.current_run is not None
+    at_head = outcome.desired.current_run
+    assert at_head is not None, "the shape must have a run beginning at the head"
+    assert at_head.start_index == outcome.desired.intervals[0].index
 
-    assert _economic_action_value(_Published(outcome)) == "charge"
+    # Nothing is executing in this stub, so nothing is happening now.
+    assert _economic_action_value(_Published(outcome)) == ECONOMIC_ACTION_IDLE
 
 
 def test_idle_is_not_a_synonym_for_hold() -> None:
@@ -201,7 +211,7 @@ async def test_the_planned_action_prints_full_instants(
     value = _next_planned_action_value(coordinator)
 
     assert value in ECONOMIC_ACTION_OPTIONS
-    for name in ("starts_at", "ends_at", "energy_kwh"):
+    for name in ("starts_at", "ends_at", "planned_kwh"):
         assert name in attributes, name
     starts = attributes["starts_at"]
     # A shape with no upcoming run would make every assertion below vacuous, so

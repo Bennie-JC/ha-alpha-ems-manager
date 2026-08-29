@@ -360,6 +360,14 @@ def test_the_realised_layer_reads_no_plan_and_no_price_forecast() -> None:
 
     So it cannot accidentally acquire a forecast and start reporting one as
     realised -- the signature is the guard.
+
+    **beta.35 widened it, and every addition is still a measurement or a scalar
+    handed in.** The two battery series are measured energy, the two inventory
+    values are computed by the planner and *passed* rather than fetched -- this
+    module may not import the solver, and that separation is the point of it --
+    and the three model terms are the objective's own hurdle figures, reported so
+    a plan can be reconciled and kept out of every cash total. No forecast, no
+    plan object, no price series that is not already an argument.
     """
     parameters = set(inspect.signature(realized_window).parameters)
 
@@ -374,6 +382,13 @@ def test_the_realised_layer_reads_no_plan_and_no_price_forecast() -> None:
         "capacity_kwh",
         "charge_efficiency",
         "discharge_efficiency",
+        "battery_charge_kwh",
+        "battery_discharge_kwh",
+        "opening_inventory_value_eur",
+        "closing_inventory_value_eur",
+        "model_switching_cost_eur",
+        "model_grid_charge_margin_eur",
+        "model_throughput_cost_eur",
     }
 
 

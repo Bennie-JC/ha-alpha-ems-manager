@@ -331,15 +331,24 @@ def test_shadow_can_report_the_window_ending() -> None:
 
 
 def test_shadow_can_report_a_stale_plan() -> None:
-    """Freshness is checked before affirmation, so this arm wins where both apply."""
-    stale = charge_publication(
+    """A run Stage A has stopped publishing at all is stale, and Shadow says so.
+
+    **The silence is the point, and beta.35 made it the condition.** This was
+    written with the expired publication still in hand, and passed because
+    freshness was judged *before* that publication was read -- an ordering that,
+    on live hardware, declared a run stale in the same refresh that was
+    re-anchoring it. The deadline detects Stage A having gone quiet, so it is
+    asserted where Stage A is quiet; the reason, the absence of a reset and the
+    Shadow reporting of all three are unchanged.
+    """
+    brief = charge_publication(
         WINDOW_START, stale_after=(WINDOW_START + timedelta(minutes=5)).isoformat()
     )
-    admitted = carry_forward(None, [stale], ADMITTED)
+    admitted = carry_forward(None, [brief], ADMITTED)
     assert admitted.carried is not None
 
     later = WINDOW_START + timedelta(minutes=30)
-    outcome = carry_forward(admitted.carried, [stale], later)
+    outcome = carry_forward(admitted.carried, [], later)
     decision = decision_for(outcome, later)
 
     assert outcome.ended == EXECUTION_STOP_STALE_PLAN

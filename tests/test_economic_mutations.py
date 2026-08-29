@@ -2209,6 +2209,12 @@ def test_running_a_fourth_solve_to_price_nothing_is_caught() -> None:
     the ungated pass is re-solved on that head, so the published export-gate cost
     prices the permission rather than the buffer; that runs only on a refresh where
     a Safety Buy is already compelled.
+
+    beta.35 adds a fourth conditional one on the same terms: the terminal
+    counterfactual re-solves with the beta.34 flat credit so the new terminal value
+    is auditable live rather than merely asserted. It is skipped whenever the two
+    rules are the same arithmetic, which is exactly the guard that keeps it from
+    becoming the byte-identical re-solve beta.18 removed.
     """
     source = pathlib.Path(economic_module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -2237,7 +2243,7 @@ def test_running_a_fourth_solve_to_price_nothing_is_caught() -> None:
     # measured evidence the permission is off, so an ungated pass would be
     # byte-identical to the desired one -- a solve whose difference from another is
     # identically zero by construction, which is the fault beta.18 deleted.
-    assert calls == 6
+    assert calls == 7
 
     # And both extras are genuinely conditional: neither can run unless asked.
     guarded = [
@@ -2276,5 +2282,5 @@ def test_running_a_fourth_solve_to_price_nothing_is_caught() -> None:
         and node.func.id == "solve"
     ]
     conditional = [node for node in solves if _is_conditional(node)]
-    assert len(conditional) == 3, "exactly three solves may be conditional"
+    assert len(conditional) == 4, "exactly four solves may be conditional"
     assert len(solves) - len(conditional) == 3, "three solves run every refresh"

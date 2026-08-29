@@ -1908,21 +1908,34 @@ def carry_forward(
             return CarryOutcome(carried=None)
         return CarryOutcome(carried=admit(candidate, now), admitted=True)
 
-    # A carried run outliving its own limits ends regardless of what was
-    # published: these are the bounds that keep a carried plan from becoming an
+    # A carried run outliving its own window ends regardless of what was
+    # published: this is the bound that keeps a carried plan from becoming an
     # indefinite one.
-    if carried.stale_at(now):
-        return CarryOutcome(
-            carried=None, ended=EXECUTION_STOP_STALE_PLAN, ended_run=carried
-        )
     if now >= carried.window_end:
         return CarryOutcome(
             carried=None, ended=EXECUTION_STOP_WINDOW_ENDED, ended_run=carried
         )
 
+    # **The publication is read before the deadline is judged. beta.35.**
+    #
+    # Staleness used to be tested first, and it made this refresh's own evidence
+    # unreachable: a run whose deadline had passed a few seconds ago was declared
+    # stale even when the very publication being processed re-anchored it. The
+    # deadline exists to detect Stage A having *gone quiet* -- and a publication in
+    # hand is proof it has not. Judging the run stale while holding the answer is
+    # deciding on the older of two facts.
+    #
+    # Nothing is weakened: an affirmation must still be for the same intent and
+    # must still overlap the carried window, and a run with no affirming
+    # publication is still stale on exactly the same deadline, below.
     affirming = next((entry for entry in published if affirms(carried, entry)), None)
     if affirming is not None:
         return CarryOutcome(carried=affirm(carried, affirming, now), affirmed=True)
+
+    if carried.stale_at(now):
+        return CarryOutcome(
+            carried=None, ended=EXECUTION_STOP_STALE_PLAN, ended_run=carried
+        )
 
     # Nothing re-affirmed it. Either Stage A moved this campaign elsewhere or
     # dropped it; both are a withdrawal, and both are visible within one refresh.
@@ -2918,7 +2931,13 @@ def serve_load_power_kw(*, house_load_kw: float, remaining_kw: float) -> float:
     return max(0.0, min(max(0.0, house_load_kw), max(0.0, remaining_kw)))
 
 
-def as_dict(decision: Decision, *, mode: str, executed: bool) -> dict[str, Any]:
+def as_dict(
+    decision: Decision,
+    *,
+    mode: str,
+    executed: bool,
+    objective: tuple[float, str] | None = None,
+) -> dict[str, Any]:
     """Return the diagnostics view of one decision.
 
     Bounded scalars only, and every Stage-A expectation sits beside what actually
@@ -3003,6 +3022,16 @@ def as_dict(decision: Decision, *, mode: str, executed: bool) -> dict[str, Any]:
                 "battery_realized_kwh": round(progress.realized_kwh, 3),
                 "battery_realized_basis": progress.basis,
                 "battery_realized_quality": progress.quality,
+                # **The objective, at the boundary the objective is stated at.**
+                # beta.35, and the field above is why it is needed: that one is
+                # battery-side whatever the run is for, so an export published its
+                # meter objective's progress as a battery figure that a charge-only
+                # accumulator had already reduced to zero. A charge and an export
+                # are judged on different quantities and now say which.
+                "objective_realized_kwh": (
+                    None if objective is None else round(objective[0], 3)
+                ),
+                "objective_boundary": None if objective is None else objective[1],
                 "current_quarter_energy_kwh": (
                     None
                     if progress.current_quarter_kwh is None

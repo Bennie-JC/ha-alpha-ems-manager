@@ -9,6 +9,285 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.35] - 2026-08-29
+
+**The release that kept a campaign alive across its own boundary.** `beta.34` put
+the first real economic Sell on the reference inverter, and quarter one worked
+exactly as designed: 10.05 kW battery discharge, 8.7–8.9 kW meter export, P1
+genuinely negative, ownership `owned`, dead-man armed, **2.211 kWh** measured out
+of the pack and **1.92 kWh** across the meter.
+
+Quarter two did not happen, and then quarter three came back from the dead.
+
+At 20:00:05.889489 the refresh adopted the persisted ownership claim, read it as
+`stale_plan`, and reset the dispatch. Through the whole of quarter two the
+controller went on *describing* the campaign — same `plan_id`, same `run_id`, the
+same 2.50 kWh / 2.28 kWh targets — while its own ticks reported
+`dispatch_not_active` and **≈0.001 kWh** crossed the meter against 2.28 planned.
+At 20:15 the still-live frozen schedule advanced to its third row and **re-armed
+the inverter**. The logbook recorded the whole thing as
+`Canceled — Plan Replaced — 0.00 / 5.05 kWh`.
+
+So the defect was never "the campaign ended early". **Lifecycle and authority
+disagreed**: the run had been declared stale and its claim released, while the
+frozen schedule retained enough authority to skip a quarter and then restart the
+same campaign. `beta.35` makes that state unrepresentable rather than unlikely.
+
+Beside it, the second half of the release: the optimiser now knows what the energy
+it is holding is worth, and says so.
+
+### Fixed: the ownership claim expired at the boundary it was made for
+
+A `beta.34` regression, introduced by the `beta.34` ownership fix. A
+quarter-authority arm persisted `stale_after = quarter.quarter_end` — reasoning
+correctly about the *arm*, which is reissued every quarter, and wrongly about the
+*claim*, which has to survive the boundary for the next refresh to adopt it and
+hand over.
+
+The arithmetic closes exactly. The refresh fires a few seconds after the row ends
+against a deadline that **is** the instant it was triggered by; `carry_forward`
+hits its staleness guard and the dispatch resets. Structural, not jitter: every
+such claim was already expired by the time anything read it.
+
+The claim is now bounded by `plan.ends_at` — frozen at admission, immutable
+afterwards, and exactly how long that authority legitimately lasts.
+
+### Fixed: an opened frozen row was aborted because Stage A revised the future
+
+`carry_plan` has stated the rule since `beta.29` and states it correctly: **an
+opened plan is returned unchanged** until its own end, because Stage A's horizon
+head is `elapsed + 1` and no publication issued after a row opened can describe
+it. `AdmittedPlan` has no staleness field at all. The stop path never honoured
+that rule, so a revision of the *future* aborted a row that was already frozen and
+already running.
+
+Two named vocabularies now separate the two kinds of stop:
+
+- **Withdrawal** — `stale_plan`, `stage_a_hold`, `plan_replaced`. Stage A has
+  changed its mind about what comes next. Suppressed while an opened frozen
+  schedule still covers this instant, and published as `withheld_stop_reason` so a
+  reset that does not happen is still readable.
+- **Abort** — safety, an ownership conflict, a lost marker, a stalled dead-man, a
+  failed command, the user's own switch, and a genuinely lost measurement.
+  **Never suppressed.**
+
+The suppression is bounded three ways and cannot become indefinite execution: the
+plan's own `ends_at`, the row covering this instant, and the vendor dead-man, which
+is re-armed only while the sustain actually runs.
+
+Three further disagreements between the arm, the claim and the sustain are closed
+with it. The sustain compared against the carried run alone — `None` on every
+ordinary quarter-authority refresh — so continuation was unreachable by the path
+meant to reach it; all three now read one identity helper. Adopting a persisted
+claim set `quarter_progress_unknown` unconditionally, which forces a reset with no
+stop reason at all; it is now set only where continuity is genuinely absent, which
+is a restart and not a boundary. And an affirming publication present in the same
+refresh is read **before** the deadline is judged: the deadline detects Stage A
+having gone quiet, and a publication in hand is proof it has not.
+
+### Fixed: the abort was partial, so a terminated schedule re-armed the inverter
+
+The post-reset cleanup cleared the record, the dead-man observation and the row,
+and argued the rule correctly for the row: *its authority came from a dispatch that
+is no longer running*. The same sentence is true of the schedule the row came from,
+and it was never applied. `self._plan` survived every reset — which is why quarter
+three came back.
+
+There is now **one teardown**, `_abandon_execution`, and every genuine abort path
+converges on it: the refresh reset, the sixty-second tick's stop, the emergency
+self-stop, and — new in this release — the refresh's *own* emergency stop, which
+turned the dispatch off and tore nothing down, so the next row armed it again. It
+clears the record, the dead-man, the row, the carried run, the admitted plan and
+the campaign; files exactly one terminal; and remembers the abandoned campaign so
+no later row of that schedule may re-arm and no closed identity may reopen.
+
+Realised history is immutable from the moment a campaign starts. Its identity, its
+frozen target and its measured energy survive every replan, and a campaign closes
+exactly once.
+
+### Fixed: a campaign that moved 1.92 kWh reported 0.00 against a null target
+
+Three independent faults compounded into one line in the logbook.
+
+The frozen target was read from `execution_targets` — *this* refresh's solve, whose
+head is `elapsed + 1`. A campaign whose remaining rows are all behind that head
+appears in no published target at all, so every read returned `None` and the freeze
+had nothing to freeze. The objective now comes from the **admitted schedule**,
+which was frozen before any of it happened.
+
+The freeze itself is also spelled `X if X is not None else Y` rather than
+`X or Y`. That one is a latch and not a fix — today the two agree in every
+reachable state — but "this campaign sells nothing" and "nobody published it" are
+different answers, and the difference is one refactor away from mattering.
+
+Run-level realised energy was accumulated charge-only, in both bases: a power
+accumulator clamped at `max(0.0, power)` and a state-of-charge delta clamped at
+`max(0.0, stored - opening)`. A `net_export` campaign integrates to **exactly
+zero** on both — so every export campaign this project has ever run reported zero
+realised energy at run level. Both bases are now signed by direction.
+
+And `sensor.py` read `progress.get("grid_export_realized_kwh")`, a key written
+nowhere in the package — one hit in the whole tree, and it was the reader. The
+execution payload now publishes `objective_realized_kwh` and `objective_boundary`,
+and a **structural test** walks every reader module's payload reads against a
+payload the production path actually produced. That defect class has shipped three
+times; it will not ship a fourth.
+
+Finally, Activity no longer retracts a campaign that has started because a *future*
+plan moved. Only the campaign's own terminal can close it, which is what makes
+"exactly once" true rather than hoped for.
+
+### Fixed: both public entities described the wrong run
+
+`Economic Action` asked Stage A what was happening now. Stage A structurally cannot
+answer: its head is the *next* interval and never the one in progress, so a real
+owned 10 kW export read `idle`. It now reads the execution surface — the intent of
+the admitted open row, whether it is owned, under which mode, for which campaign —
+and its attributes describe the same execution its state does. In **Shadow** it
+shows the intent that *would* execute, marked `owned: false`: a mode that exists to
+be watched cannot read `idle` all day.
+
+`Next Planned Action` took the first run *after* the head and therefore skipped the
+run **at** the head — which has not started either, and is precisely the next
+planned action. That is why it read `charge` while a Sell stood fifteen minutes
+away. It now takes the nearest run at or after the head, excluding the campaign
+already executing, and prints full ISO instants: a bare `19:45–20:30` is how a sale
+planned for the following evening came to be read as one starting within the hour.
+
+### Changed: the horizon's edge is priced by what the energy will actually do
+
+Through `beta.34` the terminal credit was `v_edge × min(E, cap)` — one flat rate,
+where `v_edge` was the 25th percentile of known import prices. That is a
+replacement cost sampled from the wrong distribution: energy left in the pack at
+the horizon's end is consumed by the household overnight and next morning, not at
+the cheapest quartile of the whole day. The consequence was visible in one number
+— the chosen plan ended at `end_energy_dc_kwh: 0.00`, having exported 14.22 kWh on
+its last evening. The optimiser was liquidating the pack because it had been told
+the pack was nearly worthless.
+
+The replacement asks the question properly. Energy the household will consume
+before the pack next refills for free is worth the import price it displaces;
+whatever is left over is worth what it could be sold for. Two segments, so the
+function is **concave** — the first kilowatt-hour above the floor is worth the most
+and the marginal worth falls as the pack fills. That shape is what stops a fix for
+liquidation becoming a licence to hoard: a flat rate high enough to prevent the one
+would have justified buying a full pack at any price.
+
+Every input is a quantity the planner already had. Post-horizon demand comes from
+the reserve forecast, which already outlives the price horizon; it stops at the
+first forecast production surplus — the next *free* refill, a physical fact
+carrying no price — and is capped at one civil day. The price is the known series
+read by clock position: today's 02:00 is the best available estimate of tomorrow's
+02:00. **Nothing new is forecast**, and no price beyond the published horizon is
+invented.
+
+The new terminal value **binds**, and every applicable refresh also solves the same
+horizon with the `beta.34` flat credit and publishes the difference in end energy,
+export, import, cost and campaign count. The legacy solve reaches no execution
+target; it is diagnostics, and it is skipped when the two rules are the same
+arithmetic.
+
+### Added: what the energy already in the pack is worth
+
+The backward induction ends holding the optimal cost-to-go for every storage state
+at the head of the horizon — the dual of the storage constraint, the exact marginal
+worth of one more stored kilowatt-hour with all future load, prices, fees and the
+reserve already accounted for. `beta.34` computed it on every refresh and threw it
+away.
+
+It is now kept and published: the marginal value at the current level, the curve
+across the lattice, and `V(floor) − V(current)` — how much better off the plan is
+for standing where it stands rather than at the floor. **This is the answer to "was
+buying twenty kilowatt-hours and selling five a good trade", and it needs no
+inventory model at all.** It prices the position, from now, at the margin.
+
+Deliberately **not** implemented: FIFO layers, average purchase cost, and any rule
+that refuses to sell below what the energy cost. Those price *sunk cost* —
+`realized.py` has argued since `beta.18` why that is wrong — and a "never sell
+below average buy price" veto would decline a profitable spike because of a price
+paid yesterday.
+
+Where the value is undefined it is published as `null` **with a reason**, never as
+zero: buckets whose violation terms differ were never ranked on money, so their
+difference prices nothing; an unreachable state carries a sentinel rather than a
+cost; and the top bucket's energy interval is clamped short by the ceiling.
+`0.00` would read as "this energy is worthless", which is a claim, and the wrong
+one.
+
+Zero solver cost, and **no decision path reads any of it** — pinned structurally.
+
+### Added: a realised economic ledger, with every figure's provenance beside it
+
+`realized.py` gains grid-charge and PV-charge attribution, battery-to-grid and
+battery-to-house energy, avoided import value, a conversion-loss estimate, opening
+and closing stored energy and value, realised net value, and realised-plus-remaining
+value. It still imports no Home Assistant, is read by no decision path, and
+`trade_profit_eur` is still `None`.
+
+Every figure carries one of five bases, published beside it: `measured` from a
+meter, `attributed` where measured energy is split by a stated per-interval rule,
+`estimated` from a model constant, `planner_derived` from the optimiser's value
+function, and `model_term` for the objective's hurdle rates and wear proxy —
+**which are not money anybody paid and appear in no cash total.**
+
+The attributed split is `min(import, charge)` and `min(export, discharge)` per
+interval — a bound, never a claim that particular energy took a particular path,
+because a battery has no physical ordering that would make one true. Both sides of
+each minimum are AC: the series are state-of-charge deltas, and comparing DC
+against a meter reading overstates the grid's share by the whole charging loss.
+
+The ledger is also unbound from the civil day. A pack charged overnight and sold
+the next evening is one economic position, and `realized_window(days=N)` describes
+it. **No new storage**: every input is already persisted — `DayRecord` keeps the
+measured series for 365 days and `PriceSnapshot` keeps the prices — so it rebuilds
+itself after a restart with nothing else to remember.
+
+### Changed: Stage B tells Stage A what is physically running
+
+The recursion charges the minimum trade gain on every transition out of idle, and
+every solve began at idle — so an export physically in flight was priced as a
+**fresh run start** on every refresh, once a quarter, for a fee already paid when
+the campaign began. That is the economic half of the same boundary failure: at
+20:00 the plan moved the export to 21:00.
+
+The head is now seeded with what is actually running, read from the admitted open
+row and the persisted claim and from nothing else. **Stage B invents no economics
+here**: it reports a physical fact — which direction the inverter is being driven
+in — and Stage A remains the only thing that decides anything. Only the head is
+seeded, so starting anything genuinely new still pays.
+
+### Not changed
+
+- **No new setting, and none removed.** `control_horizon_minutes` stays withdrawn
+  and inert; the 20/25 dead-man alternation and the five-minute cleanup duration
+  stay internal.
+- **No storage migration.** `CONFIG_ENTRY_VERSION`, `STORAGE_VERSION` and
+  `CLAIM_SCHEMA_VERSION` all stay at 2. The value written into `stale_after`
+  changed; its shape did not, so a `beta.34` record still parses — it simply
+  expires earlier, which is the safe direction. On the first refresh after an
+  upgrade an old row-bounded claim is stopped once, and the teardown is total, so
+  nothing survives for a later row to arm from.
+- **The reserve stays price-blind.** No protection quantity enters the violation
+  term.
+- **Energy balance stays an observation.** The three tolerance constants are
+  unchanged and it is still never a control gate.
+- **All eight `beta.34` economic findings are preserved**, including the absence
+  of a non-negativity invariant on the export gate cost — which is not forced
+  positive, because it is genuinely negative in cases the sweep contains.
+- **The head value curve is not asserted to be pointwise concave**, because it is
+  not: a fixed switching fee inside a minimisation breaks concavity of the
+  cost-to-go, and that is a property of the model rather than a defect in it. What
+  is asserted is what is true — finite, non-negative, and worth materially less at
+  the top of the pack than just above the floor.
+
+### Hardware validation
+
+**Not yet performed.** Everything above is proved against the measured 2026-08-29
+trace replayed through the production refresh path, and against the full suite and
+the mutation harness. The multi-quarter Sell has not been re-run on the reference
+inverter under `beta.35`, and until it has, the campaign-continuity fix is
+software-proved and hardware-unproved.
+
 ## [1.0.0-beta.34] - 2026-08-29
 
 **The release that read its own diagnostics.** `beta.33` ran a full supervised
@@ -5213,7 +5492,9 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.33...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.35...HEAD
+[1.0.0-beta.35]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.34...v1.0.0-beta.35
+[1.0.0-beta.34]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.33...v1.0.0-beta.34
 [1.0.0-beta.33]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.32...v1.0.0-beta.33
 [1.0.0-beta.32]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.31...v1.0.0-beta.32
 [1.0.0-beta.31]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.30...v1.0.0-beta.31

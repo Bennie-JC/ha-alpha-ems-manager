@@ -2,7 +2,9 @@
 
 Pure. Nothing here imports Home Assistant, and nothing here is read by the
 optimizer, the reserve, the policy, the safety gate or the control pipeline --
-which is the whole point and is asserted structurally rather than trusted.
+which is the whole point and is asserted structurally rather than trusted. The one
+import beyond the standard library is ``const``, which is itself pure: a shared
+vocabulary is not a dependency on a runtime.
 
 Realized is not expected
 ------------------------
@@ -57,6 +59,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from .const import (
+    LEDGER_BASIS_ATTRIBUTED,
+    LEDGER_BASIS_ESTIMATED,
+    LEDGER_BASIS_MEASURED,
+    LEDGER_BASIS_MODEL_TERM,
+    LEDGER_BASIS_PLANNER_DERIVED,
+)
+
 #: Rounding for published energies and euro figures, matching the rest of Phase 8.
 _KWH_DECIMALS = 3
 _EUR_DECIMALS = 4
@@ -107,6 +117,46 @@ class RealizedWindow:
     opening_inventory_kwh: float | None
     opening_inventory_provenance: str
 
+    # -- beta.35: the attributed split, and the model terms kept out of cash ----
+    #
+    #: Grid energy that arrived while the battery was charging, and what it cost.
+    #:
+    #: **Attributed, never provenance.** The rule is stated and applied per
+    #: interval -- ``min(import, battery_charge)`` -- and it is a *bound*, not a
+    #: claim that those electrons entered the pack. A battery has no physical
+    #: ordering that would make any stronger statement true, which is the same
+    #: argument this module has made against a cost basis since beta.18.
+    realized_grid_charge_kwh: float | None = None
+    realized_grid_charge_cost_eur: float | None = None
+    #: The remainder of the charge, by subtraction. Attributed on the same terms.
+    realized_pv_charge_kwh: float | None = None
+    #: Discharge that left through the meter, ``min(export, battery_discharge)``.
+    realized_battery_to_grid_kwh: float | None = None
+    #: Conversion loss, from the configured efficiencies. **Estimated**: it is a
+    #: model constant applied to measured energy, and a real inverter's loss varies
+    #: with power in ways one round-trip figure cannot express.
+    realized_conversion_loss_kwh: float | None = None
+    #: Stored energy at the last priced interval.
+    closing_inventory_kwh: float | None = None
+    #: What that closing inventory is worth, from the planner's own value function.
+    #:
+    #: **Planner-derived, and not a measurement of anything.** It is
+    #: ``V(floor) - V(current)`` at the head of the current solve: how much better
+    #: off the plan is for holding this energy rather than sitting at the floor.
+    #: ``None`` where the optimiser could not state it -- see the stored-value
+    #: undefined reasons -- because zero would read as "worthless".
+    closing_inventory_value_eur: float | None = None
+    #: The same figure for the opening inventory, where one was recorded.
+    opening_inventory_value_eur: float | None = None
+    #: The objective's hurdle and wear terms. **Not cash, and never totalled with
+    #: it.** The minimum trade gain is a hurdle rate, the grid-charge margin is a
+    #: hurdle per purchased kWh and the throughput cost is a wear proxy. None of
+    #: them is an expense anybody paid, and adding them to a cash total would be
+    #: the same error as pricing sunk cost.
+    model_switching_cost_eur: float | None = None
+    model_grid_charge_margin_eur: float | None = None
+    model_throughput_cost_eur: float | None = None
+
     @property
     def realized_net_cash_flow_eur(self) -> float:
         """Return cost less revenue. **Positive means money left the household.**
@@ -119,6 +169,101 @@ class RealizedWindow:
             self.realized_import_cost_eur - self.realized_export_revenue_eur,
             _EUR_DECIMALS,
         )
+
+    @property
+    def realized_net_value_eur(self) -> float | None:
+        """Return what the household is better off by, this window, in cash terms.
+
+        Avoided import is a real saving and belongs here; the model terms do not.
+        **Negative means money left the household**, which is the opposite sign
+        from :attr:`realized_net_cash_flow_eur` on purpose: that one is a cost and
+        this one is a benefit, and giving them the same sign would make them look
+        like the same quantity.
+        """
+        if self.realized_load_avoidance_value_eur is None:
+            return None
+        return round(
+            self.realized_load_avoidance_value_eur - self.realized_net_cash_flow_eur,
+            _EUR_DECIMALS,
+        )
+
+    @property
+    def realized_plus_remaining_value_eur(self) -> float | None:
+        """Return the window's value **including the change in what is stored**.
+
+        **The answer to "was buying twenty and selling five worth it".** Judging
+        that trade on the sold slice alone is exactly the error the user named: the
+        fifteen still in the pack are worth something, and what they are worth is
+        not their purchase price but what the plan can still do with them.
+
+        ``None`` rather than a partial sum wherever either inventory could not be
+        valued -- a total missing one of its terms is not a smaller total, it is a
+        different number wearing the same name.
+        """
+        base = self.realized_net_value_eur
+        if (
+            base is None
+            or self.closing_inventory_value_eur is None
+            or self.opening_inventory_value_eur is None
+        ):
+            return None
+        return round(
+            base + self.closing_inventory_value_eur - self.opening_inventory_value_eur,
+            _EUR_DECIMALS,
+        )
+
+    def ledger(self) -> dict[str, object]:
+        """Return the beta.35 ledger block, with every figure's basis beside it.
+
+        **Descriptive. It is not a second decision engine and cannot become one:**
+        this module imports no Home Assistant, is read by no planner, reserve,
+        policy, safety or control path, and a structural test pins all of that.
+
+        It answers a question the forecast figures cannot -- *what actually
+        happened, and where does the position stand now* -- and it answers it
+        without inventing provenance. ``trade_profit_eur`` stays absent for the
+        reason it always has.
+        """
+        return {
+            "ledger": {
+                "grid_charge_kwh": self.realized_grid_charge_kwh,
+                "grid_charge_cost_eur": self.realized_grid_charge_cost_eur,
+                "pv_charge_kwh": self.realized_pv_charge_kwh,
+                "battery_to_grid_kwh": self.realized_battery_to_grid_kwh,
+                "battery_to_house_kwh": self.realized_load_avoidance_kwh,
+                "avoided_import_value_eur": self.realized_load_avoidance_value_eur,
+                "conversion_loss_kwh": self.realized_conversion_loss_kwh,
+                "opening_inventory_kwh": self.opening_inventory_kwh,
+                "opening_inventory_value_eur": self.opening_inventory_value_eur,
+                "closing_inventory_kwh": self.closing_inventory_kwh,
+                "closing_inventory_value_eur": self.closing_inventory_value_eur,
+                "realised_net_value_eur": self.realized_net_value_eur,
+                "realised_plus_remaining_value_eur": (
+                    self.realized_plus_remaining_value_eur
+                ),
+                "model_terms": {
+                    "switching_cost_eur": self.model_switching_cost_eur,
+                    "grid_charge_margin_eur": self.model_grid_charge_margin_eur,
+                    "throughput_cost_eur": self.model_throughput_cost_eur,
+                    "is_cash": False,
+                    "rule": (
+                        "hurdle rates and a wear proxy from the optimiser's "
+                        "objective, not expenses anybody paid. reported here so a "
+                        "plan's arithmetic can be reconciled, and kept out of "
+                        "every cash total on purpose"
+                    ),
+                },
+                "basis": _basis_map(),
+                "rule": (
+                    "attributed figures split measured energy by a stated "
+                    "per-interval rule and are bounds, never a claim that "
+                    "particular energy took a particular path -- a battery has no "
+                    "physical ordering that would make one true. inventory values "
+                    "come from the planner's own value function and are an "
+                    "opportunity value from now, never a purchase cost"
+                ),
+            }
+        }
 
     def as_dict(self) -> dict[str, object]:
         """Return the published shape, with its own caveats attached."""
@@ -138,6 +283,7 @@ class RealizedWindow:
             "opening_inventory_kwh": self.opening_inventory_kwh,
             "opening_inventory_provenance": self.opening_inventory_provenance,
             "trade_profit_eur": None,
+            **self.ledger(),
             "rule": (
                 "measured flows at the prices recorded for the same intervals. "
                 "these are realised figures, never forecasts, and nothing in the "
@@ -149,6 +295,43 @@ class RealizedWindow:
                 "inventory and never priced"
             ),
         }
+
+
+def _basis_map() -> dict[str, str]:
+    """Return which kind of number every ledger figure is.
+
+    **Published beside the figures, not in a docstring.** The ledger mixes four
+    kinds of number and a fifth kind of non-number, and a reader who cannot tell
+    them apart will eventually add a hurdle rate to a cash total. Measured came
+    from a meter; attributed is measured energy split by a stated rule; estimated
+    came from a model constant; planner-derived came from the optimiser's value
+    function; and a model term is not money at all.
+    """
+    return {
+        "grid_import_kwh": LEDGER_BASIS_MEASURED,
+        "grid_export_kwh": LEDGER_BASIS_MEASURED,
+        "import_cost_eur": LEDGER_BASIS_MEASURED,
+        "export_revenue_eur": LEDGER_BASIS_MEASURED,
+        "net_cash_flow_eur": LEDGER_BASIS_MEASURED,
+        "battery_charge_kwh": LEDGER_BASIS_MEASURED,
+        "battery_discharge_kwh": LEDGER_BASIS_MEASURED,
+        "opening_inventory_kwh": LEDGER_BASIS_MEASURED,
+        "closing_inventory_kwh": LEDGER_BASIS_MEASURED,
+        "grid_charge_kwh": LEDGER_BASIS_ATTRIBUTED,
+        "grid_charge_cost_eur": LEDGER_BASIS_ATTRIBUTED,
+        "pv_charge_kwh": LEDGER_BASIS_ATTRIBUTED,
+        "battery_to_grid_kwh": LEDGER_BASIS_ATTRIBUTED,
+        "battery_to_house_kwh": LEDGER_BASIS_ATTRIBUTED,
+        "avoided_import_value_eur": LEDGER_BASIS_ATTRIBUTED,
+        "conversion_loss_kwh": LEDGER_BASIS_ESTIMATED,
+        "opening_inventory_value_eur": LEDGER_BASIS_PLANNER_DERIVED,
+        "closing_inventory_value_eur": LEDGER_BASIS_PLANNER_DERIVED,
+        "realised_net_value_eur": LEDGER_BASIS_MEASURED,
+        "realised_plus_remaining_value_eur": LEDGER_BASIS_PLANNER_DERIVED,
+        "model_terms.switching_cost_eur": LEDGER_BASIS_MODEL_TERM,
+        "model_terms.grid_charge_margin_eur": LEDGER_BASIS_MODEL_TERM,
+        "model_terms.throughput_cost_eur": LEDGER_BASIS_MODEL_TERM,
+    }
 
 
 def _finite(value: float | None) -> float | None:
@@ -174,6 +357,20 @@ def realized_window(
     capacity_kwh: float | None = None,
     charge_efficiency: float | None = None,
     discharge_efficiency: float | None = None,
+    #: Per-interval battery movement, when it is measured densely enough to split
+    #: the grid flows against. Absent leaves every attributed figure ``None``,
+    #: which is the honest answer rather than a zero.
+    battery_charge_kwh: Sequence[float | None] | None = None,
+    battery_discharge_kwh: Sequence[float | None] | None = None,
+    #: What the optimiser says the pack is worth at each end of the window.
+    #: Planner-derived and passed in rather than computed here, because this
+    #: module may not import the solver -- that separation is the point of it.
+    opening_inventory_value_eur: float | None = None,
+    closing_inventory_value_eur: float | None = None,
+    #: The objective's hurdle and wear terms, reported and never totalled as cash.
+    model_switching_cost_eur: float | None = None,
+    model_grid_charge_margin_eur: float | None = None,
+    model_throughput_cost_eur: float | None = None,
 ) -> RealizedWindow:
     """Return what the measured intervals actually cost.
 
@@ -190,6 +387,13 @@ def realized_window(
     measurement error in the other four terms and would look like a battery figure
     while being a residual.
     """
+    charge_series = battery_charge_kwh or ()
+    discharge_series = battery_discharge_kwh or ()
+    grid_charge_kwh = 0.0
+    grid_charge_cost = 0.0
+    battery_to_grid_kwh = 0.0
+    attributable = bool(charge_series) or bool(discharge_series)
+
     count = min(
         len(grid_import_kwh),
         len(grid_export_kwh),
@@ -226,6 +430,37 @@ def realized_window(
             total_export += exported
             revenue += exported * sell
 
+        # **The attributed split, per interval, by a stated rule. beta.35.**
+        #
+        # ``min(import, charge)`` bounds how much of this interval's import could
+        # have gone into the pack, and ``min(export, discharge)`` bounds how much
+        # of the export could have come out of it. Both are *bounds*, and the
+        # ledger says so: a battery has no physical ordering that would let anyone
+        # claim more, which is why there is still no cost basis anywhere here.
+        #
+        # **Both sides of each minimum are AC, and getting that wrong is silent.**
+        # The series arrive as state-of-charge deltas, which are DC; the meter
+        # reads AC. Comparing the two directly overstates how much of an import
+        # could have reached the pack by the whole charging loss, and the residual
+        # ``pv_charge_kwh`` then inherits the error with the opposite sign -- a
+        # 6.32 kWh AC charge split as 3.00 grid and 3.32 production when the honest
+        # answer is 3.16 and 3.16. Converted here with the same two efficiencies
+        # ``_battery_from_state_of_charge`` uses on the totals, so the per-interval
+        # split and the window totals are in one unit by construction.
+        moved_in = _finite(charge_series[index]) if index < len(charge_series) else None
+        moved_out = (
+            _finite(discharge_series[index]) if index < len(discharge_series) else None
+        )
+        if moved_in is not None and imported is not None:
+            drawn = max(0.0, moved_in) / (charge_efficiency or 1.0)
+            attributed = min(max(0.0, imported), drawn)
+            grid_charge_kwh += attributed
+            if buy is not None:
+                grid_charge_cost += attributed * buy
+        if moved_out is not None and exported is not None:
+            delivered = max(0.0, moved_out) * (discharge_efficiency or 1.0)
+            battery_to_grid_kwh += min(max(0.0, exported), delivered)
+
         if have_avoidance and buy is not None:
             load = _finite(load_kwh[index]) if index < len(load_kwh) else None
             produced = (
@@ -253,6 +488,31 @@ def realized_window(
             if opening is not None:
                 break
 
+    # The last level the pack was recorded at, which is where the position stands
+    # now. Measured, like the opening figure, and priced by nobody here.
+    closing = None
+    if stored_energy_kwh:
+        for value in reversed(stored_energy_kwh):
+            closing = _finite(value)
+            if closing is not None:
+                break
+
+    # **Estimated, and labelled so.** One round-trip figure split symmetrically is
+    # what the model has; a real inverter's loss varies with power in ways it
+    # cannot express, so this is an indication of scale rather than a measurement.
+    conversion_loss = None
+    if charge is not None and discharge is not None:
+        eta_c = charge_efficiency if charge_efficiency else 1.0
+        eta_d = discharge_efficiency if discharge_efficiency else 1.0
+        conversion_loss = round(
+            max(0.0, charge * (1.0 - eta_c)) + max(0.0, discharge * (1.0 - eta_d)),
+            _KWH_DECIMALS,
+        )
+
+    pv_charge = None
+    if charge is not None:
+        pv_charge = round(max(0.0, charge - grid_charge_kwh), _KWH_DECIMALS)
+
     return RealizedWindow(
         intervals_priced=priced,
         intervals_skipped=skipped,
@@ -273,6 +533,28 @@ def realized_window(
             round(opening, _KWH_DECIMALS) if opening is not None else None
         ),
         opening_inventory_provenance=PROVENANCE_UNKNOWN,
+        # The attributed split. ``None`` throughout when no per-interval battery
+        # series was supplied -- there is nothing to attribute against, and a zero
+        # would claim the pack neither charged from the grid nor exported.
+        realized_grid_charge_kwh=(
+            round(grid_charge_kwh, _KWH_DECIMALS) if attributable else None
+        ),
+        realized_grid_charge_cost_eur=(
+            round(grid_charge_cost, _EUR_DECIMALS) if attributable else None
+        ),
+        realized_pv_charge_kwh=pv_charge if attributable else None,
+        realized_battery_to_grid_kwh=(
+            round(battery_to_grid_kwh, _KWH_DECIMALS) if attributable else None
+        ),
+        realized_conversion_loss_kwh=conversion_loss,
+        closing_inventory_kwh=(
+            round(closing, _KWH_DECIMALS) if closing is not None else None
+        ),
+        opening_inventory_value_eur=opening_inventory_value_eur,
+        closing_inventory_value_eur=closing_inventory_value_eur,
+        model_switching_cost_eur=model_switching_cost_eur,
+        model_grid_charge_margin_eur=model_grid_charge_margin_eur,
+        model_throughput_cost_eur=model_throughput_cost_eur,
     )
 
 

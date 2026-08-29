@@ -148,6 +148,11 @@ def solve_at(
     forecast_risk: Any = _LIVE_RISK,
     allow_export: bool = True,
     allow_charge: bool = True,
+    #: beta.35. What Stage B reports is physically running at the head, and how the
+    #: horizon's edge is priced. Both default to the beta.34 behaviour -- idle, and
+    #: the flat edge credit -- so every existing caller solves exactly as it did.
+    head_run_state: int = 0,
+    terminal_value: Any = None,
 ) -> Solved:
     """Solve one horizon through the production path, at absolute indices.
 
@@ -219,6 +224,8 @@ def solve_at(
         ambient_self_consumption=True,
         forecast_risk=forecast_risk,
         bucket_rule=rule,
+        head_run_state=head_run_state,
+        terminal_value=terminal_value,
     )
     return Solved(outcome=outcome, table=table, head=head)
 
