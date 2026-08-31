@@ -36,7 +36,7 @@ arithmetic exists only here.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .alphaess_device import (
     DISPATCH_DEADMAN_MINUTES,
@@ -577,10 +577,55 @@ def decide_charge(
     * **Free production is still absorbed once the grid budget is spent**: the cap
       falls to the surplus alone, and the charge continues under the battery,
       headroom and reserve limits rather than pushing production to the meter.
+
+    **beta.36 makes that fourth promise true.** It was not, and a hardware
+    measurement is what exposed it. The grid authorisation was applied *twice*: once
+    correctly, added to the production surplus below, and again as a bare entry in
+    :data:`_CLAMP_FIELDS` bounding the **battery** power. So with the grid budget
+    spent, the second application pulled the battery to zero however much free
+    production was standing there.
+
+    Measured on the reference inverter on 2026-08-31: an unfinished 0.56 kWh charge
+    row, grid budget 98 % spent, PV 2.8 kW against a 1.5 kW house -- 1.3 kW of free
+    surplus. ``applied_kw`` came out ``0.000`` and this function's own
+    ``desired_grid_kw`` came out **-1.240**: the controller was arithmetically
+    predicting that it would export 1.24 kW of production it had been asked to
+    store. The same row now commands the surplus and imports ``0.060 kW`` -- exactly
+    the authorisation that remained, and not a watt more.
+
+    **The ceiling is not weakened; it is honoured in its own domain.** A charge at
+    the production surplus causes *no import at all*
+    (``desired_grid_kw = house - pv + applied`` is zero when ``applied`` is the
+    surplus), and the attribution in ``_accrue_quarter_progress`` spends production
+    first, so a PV-sourced charge never consumes grid authorisation it did not use.
+    The run-level authorisation and its downward revision are kept, folded into the
+    grid term below where they belong, so nothing that bounded grid import stops
+    bounding it.
+
+    **What this explains, and what it does not.** A charge command of zero becomes a
+    ``None`` intent, which ``safety`` reports as unsafe by construction, and an unsafe
+    verdict on an owned live dispatch was promoted to an unsuppressable abort -- so
+    this path can reach the 2026-08-31 failure. Whether it *did* is **not determinable
+    from that capture**: ``remaining_grid_energy`` is published by both applications
+    of the authorisation, so the token cannot tell them apart, and that day's rows
+    charged substantially rather than sitting at zero. The defect is real, is proven
+    arithmetically in ``test_beta36_charge_domains.py``, and is fixed on its own
+    merits. No claim is made that it caused that abort.
+
+    **The economics never changed; the ceiling was simply being charged to the wrong
+    meter.**
     """
     pv_surplus_kw = max(0.0, pv_kw - house_load_kw)
     required_battery_kw = progress.battery_rate_kw
+
+    # **One grid domain, and both bounds live in it.** The row's own remaining
+    # authorisation, and the run-level remainder carrying the downward revision,
+    # whichever binds harder. Taking the tighter of the two rates keeps every bound
+    # the clamp used to apply -- it only stops them being charged against the
+    # battery, which is a different quantity that free production also feeds.
     grid_rate_cap_kw = progress.grid_rate_kw
+    if limits.remaining_grid_kw is not None:
+        grid_rate_cap_kw = min(grid_rate_cap_kw, max(0.0, limits.remaining_grid_kw))
 
     applied_kw = required_battery_kw
     reason = DISPATCH_LIMIT_NONE
@@ -591,8 +636,17 @@ def decide_charge(
         applied_kw = battery_cap_kw
         reason = DISPATCH_LIMIT_REMAINING_GRID_ENERGY
 
-    # The physical clamps, unchanged in meaning and order.
-    clamped_kw, clamp_reason = clamp_charge_kw(applied_kw, limits)
+    # **The physical clamps, with the grid authorisation withheld from them.**
+    # Unchanged in meaning and order otherwise, and the reported vocabulary is
+    # unchanged too: the branch above still names ``remaining_grid_energy`` when the
+    # authorisation is what binds, so no published token moves.
+    #
+    # ``decide_export`` and the run-level ``decide_setpoint`` fallback are untouched:
+    # neither reaches this line, and the beta.26 arithmetic the hardware accepted
+    # keeps applying the clamp exactly as before.
+    clamped_kw, clamp_reason = clamp_charge_kw(
+        applied_kw, replace(limits, remaining_grid_kw=None)
+    )
     if clamp_reason != DISPATCH_LIMIT_NONE:
         applied_kw, reason = clamped_kw, clamp_reason
     else:

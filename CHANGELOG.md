@@ -9,6 +9,259 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.36] - 2026-09-01
+
+**The release that stopped a quarter's success from destroying its campaign.** On
+two consecutive days a Live charge campaign was terminated hours before its window
+ended, and on neither day was anything wrong with the economics, the plant, the
+ownership claim or the dead-man timer. Both times the campaign was destroyed by its
+own execution layer, and both times the trigger was an ending that was not a
+failure.
+
+**2026-08-30 — a quarter reaching its target.** At 06:59:26Z a row met its own
+battery objective, which is a success, and `beta.35` routed that success through the
+atomic abort helper. The campaign identity was latched into `_abandoned_campaigns`;
+`campaign_identity` is a digest of the campaign's *end*, so it is byte-identical
+across every republication of one live campaign, and `_refresh_executing_quarter`
+therefore nulled the frozen schedule on **every refresh for the next five and a half
+hours**. The charge ran on the degraded run-level fallback: no admitted quarter, no
+campaign, no per-row grid ceiling, no completed-quarter record. At 12:45:06Z a
+`stage_a_hold` arrived — and `_plan_authority_holds` returns `False` whenever the
+plan is gone, so `beta.35`'s own withdrawal suppression was structurally unreachable
+and the run was reset with **9.889 of 16.11 kWh unrealised**. The terminal reported
+`0.27 / 16.74 kWh`, `quarters_admitted: 2` against three rows, and Activity rendered
+`Finished — Partial`.
+
+**2026-08-31 — a quarter resting.** Campaign `1be3a9699b41dab1` was terminated at
+09:00:06Z with `reason: safety`, at the refresh where its *fourth* row opened.
+Nothing was unsafe. Production was covering the house and the row's grid budget was
+70–96 % spent, so `decide_charge` clamped the authorised rate to zero — a correct
+clamp — `quarter_intent_for` returned nothing for a row that was open, owned and
+armed, `safety.evaluate(None, …)` reported unsafe by construction, and
+`unsafe_while_owned` promoted that to `EXECUTION_STOP_SAFETY`: the one member of the
+abort family that may never be suppressed. Then the same latch, and a zombie loop on
+top of it — the run layer minted a fresh run from a target still naming the dead
+campaign every fifteen minutes while the plan layer destroyed that run's plan on the
+same refresh.
+
+**`beta.36`'s premise is that a row ending, a run ending and a campaign ending are
+three different events.** Through `beta.35` they shared one teardown.
+
+### Fixed: the grid ceiling bounds the grid, not the battery
+
+**Found by measuring the hardware, and it is the most consequential fix in the
+release.** `decide_charge` applied the grid authorisation **twice**: once correctly,
+added to the production surplus to give the battery's cap, and again through the
+physical clamp list as a bare bound on **battery power**. So once the grid budget was
+spent the second application pulled the battery to zero however much free production
+was standing there — and the function's own `desired_grid_kw` said so, in watts.
+
+Its docstring had promised the opposite since `beta.27`:
+
+> **Free production is still absorbed once the grid budget is spent**: the cap falls
+> to the surplus alone, and the charge continues under the battery, headroom and
+> reserve limits rather than pushing production to the meter.
+
+Reproduced exactly, at the arithmetic level: an unfinished 0.56 kWh charge row with
+its grid budget 98 % spent, PV 2.8 kW against a 1.5 kW house — 1.3 kW of free
+surplus. `applied_kw` came out `0.000` and `desired_grid_kw` came out **−1.240**. The
+controller was predicting that it would export production it had been asked to store.
+The same row now commands the surplus and imports `0.060 kW` — exactly the
+authorisation that remained, and not a watt more.
+
+**The ceiling is not weakened; it is honoured in its own domain.** A charge at the
+production surplus needs no grid at all, so the fix cannot buy energy the plan did not
+authorise, and the accrual attributes production before grid so a PV-sourced charge
+never spends authorisation it did not use. The run-level authorisation and its
+downward revision are both kept, folded into the grid term where they belong. The
+published clamp token is unchanged.
+
+`decide_export` and the run-level `decide_setpoint` fallback are untouched.
+
+### Changed: the 0 kW hold is for a satisfied row, and says why
+
+Hardware measurement, 2026-09-01, with the helpers driven by hand: dispatch on, mode
+2, command `0.0 kW`, SoC ~75 %, PV 2.8 kW, house 1.5 kW → **battery power exactly
+0 W**, and the 1.3 kW surplus exported.
+
+**Mode 2 at 0 kW is a total hold.** It suppresses battery *charging* as well as
+discharging; it does not merely withhold commanded grid charging. That makes it
+exactly right for a row whose frozen objective is already met — it is the only
+command on this surface that cannot overshoot one, and there is no "charge from PV
+only" primitive among the modes this release may command — and it would be
+indefensible on an unfinished row. Asking why the controller ever wanted 0 kW on an
+unfinished row is what found the domain error above.
+
+After that correction, a sub-resolution rate implies there is genuinely under one
+commandable step of production and grid authorisation combined, so the hold gives up
+at most `CONTROL_MIN_POWER_KW × 60 s` — about 3 Wh, an eighth of an actuator step —
+before the next tick re-evaluates. That is the case `const.py` has documented as
+covered by the inverter's own behaviour since `beta.24`.
+
+**Mode 2 is never released mid-row, and that is deliberate.** Ownership in this design
+is *defined* by a running dispatch: `ownership_of` answers `none` the instant
+`dispatch_active` is false, and a marker on with nothing behind it is by definition
+stale and gets released. Pausing the dispatch to let the inverter fall back to its own
+behaviour would mean surrendering the claim, the per-row grid ceiling and the frozen
+objective, then re-acquiring them by claiming the marker again from the sixty-second
+tick. Correcting the domain error keeps the battery under command for the whole row
+instead — so same-row recovery needs no re-arm, and natural fallback discharge, whose
+interaction with a frozen charge objective could not have been guaranteed, never
+arises.
+
+### Fixed: a row that meets its objective rests instead of ending the campaign
+
+`_async_end_quarter` stopped the dispatch with no "does a further executable row
+follow?" test, and the stop it performed was the total abort. A satisfied row now
+**holds at 0 kW**: ownership, the claim, the frozen schedule and the campaign
+instance all stay, and the next boundary transitions straight into the next frozen
+row.
+
+The hold had three traps and all three are closed. It bypasses `_dispatch_setpoint`,
+because `_finish` substitutes the *held* value for any move smaller than
+`DISPATCH_POWER_DEADBAND_KW` — two whole actuator steps — so a row satisfied while
+sitting at 0.1 kW would have kept drawing 0.1 kW with `within_deadband` printed
+beside it. It is **not** spelled `ACTION_HOLD`, because `_cutoff_for` gives a
+non-charge action the discharge *floor*, which would write "stop at 21 %" to a pack
+at 61 % — the `beta.19` inversion. And it keeps re-arming the vendor dead-man, whose
+expiry raises `EXECUTION_STOP_TIMER_NOT_REFRESHED`, an abort reason: a rest that
+stopped re-arming would be a stop with extra steps.
+
+### Fixed: a rate below the actuator's resolution is a rest, not a safety abort
+
+The 2026-08-31 path. Anything inside `CONTROL_MIN_POWER_KW` — the same two-step
+figure `safety` uses for `power_below_device_minimum` and `limit_command` uses for
+its floor — now rests at zero and **recovers inside its own row** the moment the
+clamp lifts. Nothing about the row, the plan, the campaign or the claim is torn down
+to achieve it.
+
+### Fixed: the stop vocabulary is a partition, and the inhibit vocabulary has classes
+
+Seven stop reasons belonged to none of the three published vocabularies, and
+`_decide` sets `reset_required` for four of them — `target_reached`,
+`battery_ceiling`, `grid_ceiling`, `headroom_reached` — all ordinary *successful*
+endings. Every one reached the total-teardown helper and latched its campaign.
+`EXECUTION_COMPLETION_STOP_REASONS` already existed and was read in exactly one
+place: the outcome verdict, never the teardown path. Every `EXECUTION_STOP_*` reason
+is now in exactly one of withdrawal / completion / abort, asserted structurally.
+
+The inhibit vocabulary gains the same treatment, by closed enumeration with a
+**hazard default**: withdrawal and no-command are listed, hazard is everything else,
+so an inhibit added in a later release is a hazard until somebody argues otherwise
+in a diff. Nothing in the hazard list is weakened — a stale sensor, a lost marker, a
+contested dispatch, an out-of-range cutoff and a would-export all still abort, still
+unsuppressably. A campaign terminal reporting `reason: safety` must now have a
+matching hazard inhibit from the same refresh.
+
+### Fixed: Stage A publishing no plan is a withdrawal, not a hazard
+
+`INHIBIT_NO_PLAN` had two producers at the same ladder position and they were
+indistinguishable — one meaning "Stage A published nothing", a statement about the
+future, and one meaning "there is nothing to send at this instant", a statement about
+now. They are now `no_plan` (the published string is unchanged, so existing
+automations are unaffected) and `nothing_to_command`. The first is withheld while a
+frozen plan still covers this instant, bounded exactly as every other withdrawal is;
+the second is a rest.
+
+### Fixed: the lifecycle is keyed on the attempt, not on the identity
+
+"No campaign reopens after its terminal" was written at the level of the campaign
+*identity*, and that is what barred both campaigns for a whole session. It is now
+per **instance**, with an immutable `campaign_instance_id` minted exactly once when
+an attempt opens and never recomputed, and the asymmetry is deliberate:
+
+- after a genuine **abort**, a new admission of the same campaign may open a **new
+  instance** — with its own frozen objective and its own zeroed accounting, because
+  it genuinely is a second physical attempt, and the first attempt's measured energy
+  is never touched;
+- after a **completion** the economic campaign is final, and Stage A continuing to
+  publish it — its horizon still contains it — may never open another instance.
+
+What an abort latches is the **admission**, so the attempt that went wrong can never
+re-arm while the intention behind it stays available. `carry_forward` reads the same
+latch, so the run layer and the plan layer can no longer disagree about whether an
+attempt is dead.
+
+### Fixed: the terminal counts the quarter it closed on
+
+`_async_end_quarter` stopped the dispatch first, and the physical stop reaches
+`_close_campaign`, which nulled `_campaign_id`; only *then* was the row recorded, so
+the accrual returned early on its campaign-identity guard and the quarter that
+**caused** the terminal was missing from the total. `_close_campaign` also read the
+realised figure after nulling the identity, so the open-quarter term it promised to
+include was structurally always `0.0` — while the live `open_campaign` figure beside
+it used the same helper with the campaign open and *did* include it. The two
+published figures disagreed by exactly the closing quarter, provable from the public
+payload alone.
+
+The accrual now happens before the stop, guarded to fire exactly once per row
+because three separate sites can record a completed row and nothing said they were
+mutually exclusive. The ledger identities are asserted as **equalities**.
+
+### Fixed: a campaign Stage A is still publishing is not over
+
+A run reaching its `window_end`, and a withdrawal standing once the plan's authority
+is genuinely spent, both left the dispatch finished and the campaign running — which
+is the ordinary shape of a campaign split by a `serve_load` interval into two
+published runs, and the shape the 2026-08-30 campaign had. Closing it anyway filed a
+terminal mid-campaign. One predicate now owns that question and both layers read it.
+
+### Fixed: the head run state no longer lies about the physics
+
+`_head_run_state` read the admitted row and nothing else, so with the schedule gone
+it reported `IDLE` while the inverter was demonstrably charging under a live claim —
+and every Stage-A solve paid a fresh run-start fee to continue a charge it was
+already running, silently reverting `beta.35`'s own stored-value correction. The
+carried run is now the fallback, and it is a fact of the same kind. A genuinely
+torn-down execution still seeds `IDLE`.
+
+### Added: what a row actually attempted
+
+The 0.56 kWh row of 2026-08-30 was admitted, derived, ticked against fifteen times
+and moved nothing, and its whole published trace was
+`binding_clamps: ["quarter_expired"]` — which is also exactly what a mid-row teardown
+writes. No tick reason, authorisation refusal or write-boundary refusal could reach
+that record. Completed rows now publish `armed`, `arm_attempts`, `write_count`,
+`hold_writes` and `refusals`, kept apart from `binding_clamps` on purpose: a clamp
+reduced a command that was *sent*, a refusal means none was.
+
+**No claim is made about what happened on that row.** It is not determinable from the
+capture and it is not guessed; what changed is that the next occurrence names itself.
+
+### Added: why there is no admitted plan
+
+`carry_plan` had eight refusal clauses and reported none of them, so for an incident
+whose whole shape is "no admitted plan for five and a half hours" the payload said
+only `admitted_plan: null`. A new `admission` block names the clause that refused,
+the admission key, the campaign instance, and the same question one layer down for
+the carried run — and it is never silent while there is no plan.
+
+### Unchanged, deliberately
+
+No economics moved. `minimum_trade_gain_eur`, `grid_charge_margin`, the throughput
+cost, the configured minimum state of charge, the Safety Buy's meaning, the export
+gate, the terminal-value policy, the forecast horizon and the completion tolerance
+are all exactly as they were. Missed energy is still never carried into another
+quarter. The three shortfalls of 2026-08-31 are physically explained by an exhausted
+grid ceiling with production helping, which is the documented regime, and nothing was
+changed to flatter them. No schema version moved.
+
+### Verified
+
+4251 automated tests, and two mutation harnesses that break each invariant on purpose
+and require a named test to notice: 35 mutations for this release and 19 for
+`beta.35`, all killed, including two that break the *fixture* to prove its own
+vacuity gates and six that protect the hardware contract above. The offline economic re-solve the plan called for is **not** included:
+it needs the installation's persisted price history, which is in neither diagnostics
+capture, and inventing prices to report euros would be the exact defect this suite
+exists to distrust. What could be proven without it — the capture's internal
+contradiction, the loss arithmetic, the run-start fee distortion and the dominance
+properties — is proven and labelled, and what could not is declared as not
+recoverable.
+
+**The 0 kW hold is measured, not assumed.** See the release notes for what the
+measurement showed and what it changed.
+
 ## [1.0.0-beta.35] - 2026-08-29
 
 **The release that kept a campaign alive across its own boundary.** `beta.34` put

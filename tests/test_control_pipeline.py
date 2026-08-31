@@ -69,12 +69,16 @@ from custom_components.alpha_ems_manager.const import (
     INHIBIT_EXCESS_EXPORT_ACTIVE,
     INHIBIT_GRID_STALE,
     INHIBIT_GRID_UNUSABLE,
+    INHIBIT_HAZARD_REASONS,
     INHIBIT_HOUSE_LOAD_STALE,
     INHIBIT_HOUSE_LOAD_UNUSABLE,
     INHIBIT_MISSING_CONTROL_ENTITY,
+    INHIBIT_NO_BATTERY_PLAN,
+    INHIBIT_NO_COMMAND_REASONS,
     INHIBIT_NO_DECISION,
     INHIBIT_NO_FAILSAFE_AUTOMATION,
     INHIBIT_NO_PLAN,
+    INHIBIT_NOTHING_TO_COMMAND,
     INHIBIT_PEAK_SHAVING_ACTIVE,
     INHIBIT_PLAN_UNAVAILABLE,
     INHIBIT_POWER_ABOVE_DEVICE_MAXIMUM,
@@ -84,6 +88,7 @@ from custom_components.alpha_ems_manager.const import (
     INHIBIT_STALE_PLAN_AGE,
     INHIBIT_STALE_PLAN_DAY,
     INHIBIT_STALE_PLAN_INTERVAL,
+    INHIBIT_WITHDRAWAL_REASONS,
     INHIBIT_WOULD_EXPORT,
     MAX_CONTROL_HORIZON_MINUTES,
     MIN_CONTROL_HORIZON_MINUTES,
@@ -720,6 +725,18 @@ def test_each_condition_inhibits_with_its_own_reason(
     assert verdict.inhibit_reason == reason
 
 
+#: The one reason no table row can express, with the test that does prove it.
+#:
+#: ``nothing_to_command`` fires on ``intent is None``, and every row above supplies a
+#: real intent and varies the *context*. It is proven by
+#: ``test_a_missing_intent_inhibits_rather_than_raising`` instead. Named here rather
+#: than subtracted silently, and compared by equality below, so a reason that stops
+#: needing the exemption fails until the entry is removed.
+_PROVEN_WITHOUT_A_CONTEXT_FIELD: frozenset[str] = frozenset(
+    {INHIBIT_NOTHING_TO_COMMAND}
+)
+
+
 def test_every_gate_case_is_covered() -> None:
     """The parametrised table covers the whole documented vocabulary.
 
@@ -727,7 +744,7 @@ def test_every_gate_case_is_covered() -> None:
     """
     covered = {reason for reason, _ in GATE_CASES}
 
-    assert covered == set(CONTROL_INHIBIT_REASONS)
+    assert covered == set(CONTROL_INHIBIT_REASONS) - _PROVEN_WITHOUT_A_CONTEXT_FIELD
 
 
 def test_only_the_first_failing_condition_is_reported() -> None:
@@ -857,11 +874,47 @@ def test_the_gate_gives_the_same_verdict_in_every_mode(mode: str) -> None:
 
 
 def test_a_missing_intent_inhibits_rather_than_raising() -> None:
-    """Total, like everything else on the refresh path."""
+    """Total, like everything else on the refresh path.
+
+    **The reason is ``nothing_to_command`` since beta.36**, and the rename is the
+    whole point: this says "there is nothing to send at this instant", which is a
+    statement about *now* and recoverable inside the same quarter. It used to share
+    the string ``"no_plan"`` with the gate below, which says "Stage A published
+    nothing" -- a statement about the future. The gate itself is unchanged in
+    strength: a ``None`` intent is still refused, still here, still before the
+    staleness tests.
+    """
     verdict = evaluate(None, make_context())
 
     assert verdict.safe is False
-    assert verdict.inhibit_reason == INHIBIT_NO_PLAN
+    assert verdict.inhibit_reason == INHIBIT_NOTHING_TO_COMMAND
+
+
+def test_the_two_kinds_of_nothing_are_told_apart() -> None:
+    """**D14, and the reason a working campaign died as a safety stop.**
+
+    Both conditions used to append the same ``("no_plan", False)`` pair at the same
+    ladder position, so neither ``verdict.inhibit_reason`` nor ``verdict.checks``
+    could separate them -- and the coordinator promoted both to an unsuppressable
+    abort. They belong to different classes and now say so: one is a Stage-A
+    withdrawal, bounded by the frozen plan's own authority; the other is a rest.
+
+    ``INHIBIT_NO_BATTERY_PLAN`` keeps the published string ``"no_plan"`` on purpose,
+    so an automation matching on it is unaffected.
+    """
+    withheld = evaluate(
+        make_intent(energy_ac_kwh=0.5),
+        make_context(plan_problem=INHIBIT_NO_BATTERY_PLAN),
+    )
+    resting = evaluate(None, make_context())
+
+    assert withheld.inhibit_reason != resting.inhibit_reason
+    assert INHIBIT_NO_BATTERY_PLAN == "no_plan"
+    assert withheld.inhibit_reason in INHIBIT_WITHDRAWAL_REASONS
+    assert resting.inhibit_reason in INHIBIT_NO_COMMAND_REASONS
+    # Neither is a hazard, and the hazard class is what stays unsuppressable.
+    assert withheld.inhibit_reason not in INHIBIT_HAZARD_REASONS
+    assert resting.inhibit_reason not in INHIBIT_HAZARD_REASONS
 
 
 # ===========================================================================

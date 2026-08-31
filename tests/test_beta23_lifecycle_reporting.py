@@ -639,17 +639,25 @@ def test_no_reason_reaches_a_person_as_an_identifier() -> None:
 def test_every_declared_reason_has_wording_of_its_own() -> None:
     """No constant may fall through to the generic phrase.
 
-    The two tables partition the reasons: a cancellation is the optimizer or the
-    world changing its mind, an error is something that needs looking at, and
-    ``target_reached`` is neither because it is the success. Nothing may be in both
-    tables, and nothing may be in neither.
+    The three sets partition the reasons: a cancellation is the optimizer or the
+    world changing its mind, an error is something that needs looking at, and a
+    success is neither. Nothing may be in two of them, and nothing may be in none.
+
+    **beta.36 widened the success half from one reason to three.** It was written as
+    the literal ``target_reached`` because that was the only ending the surface knew
+    about; a quarter meeting its objective and a campaign meeting its objective are
+    the same kind of event and were rendering as cancellations.
     """
     cancels = activity_module._CANCEL_REASONS
     errors = activity_module._ERROR_REASONS
+    successes = activity_module._SUCCESS_REASONS
     declared = set(EXECUTION_STOP_REASONS)
 
     assert not set(cancels) & set(errors)
-    assert declared == set(cancels) | set(errors) | {EXECUTION_STOP_TARGET_REACHED}
+    assert not set(cancels) & successes
+    assert not set(errors) & successes
+    assert EXECUTION_STOP_TARGET_REACHED in successes
+    assert declared == set(cancels) | set(errors) | successes
     for phrase in (*cancels.values(), *errors.values()):
         assert phrase and phrase == phrase.title(), phrase
 

@@ -53,7 +53,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, Final
 
 from .battery import INTERVAL_HOURS
 from .const import (
@@ -976,6 +976,28 @@ class AdmittedPlan:
     #: The economic campaign this plan belongs to, frozen at admission with
     #: everything else. ``None`` on a pre-beta.32 publication.
     campaign_id: str | None = None
+    #: The instant Stage A means this campaign to finish, frozen at admission.
+    #:
+    #: **beta.36 gives this field its first consumer.** It has been published since
+    #: beta.32 (``economic.execution_target``) and read by nothing, so the
+    #: coordinator had no way to know a campaign extended past the rows of the one
+    #: admitted plan in front of it -- and closed a thirty-three-row campaign after
+    #: three. The observed high-water mark it used instead only ever moves
+    #: *backwards* relative to the truth, because it is built from rows already seen.
+    #:
+    #: **Safe to freeze, for a non-obvious reason:** ``campaign_identity`` is a
+    #: digest *of this instant*, so a campaign whose end moves is a campaign whose
+    #: id changes -- a different campaign. For as long as one id is in force this
+    #: value cannot legitimately change.
+    #:
+    #: ``None`` on any record written before beta.36, and absent degrades to the
+    #: other two finality signals rather than failing.
+    campaign_end: datetime | None = None
+
+    @property
+    def admission_key(self) -> str:
+        """Return this admission's immutable identity. See :func:`admission_key`."""
+        return admission_key_of(self.plan_id, self.admitted_at)
 
     @property
     def starts_at(self) -> datetime:
@@ -1086,6 +1108,7 @@ def admit_plan(
         intent=target.intent,
         purpose=target.purpose,
         campaign_id=target.campaign_id,
+        campaign_end=target.campaign_end,
         admitted_at=now,
         rows=target.quarter_schedule,
         reserve_floor_kwh=target.reserve_floor_kwh,
@@ -1094,6 +1117,25 @@ def admit_plan(
         frozen_remaining_at_admission_kwh=frozen_remaining_kwh,
         target=target,
     )
+
+
+def admission_key_of(plan_id: str, admitted_at: datetime) -> str:
+    """Return the immutable identity of one *admission* of one publication.
+
+    **``revision`` is deliberately not in this key, and that is the whole point.**
+    The obvious key is ``(plan_id, revision, admitted_at)`` -- and it is wrong,
+    because :func:`affirm` writes ``revision=carried.revision + (1 if moved else 0)``
+    whenever Stage A materially moves a figure. A key containing ``revision`` would
+    therefore change *during* the life of a single physical attempt, which means an
+    aborted admission could slip its latch by doing nothing more than being
+    re-published with a different target figure. ``plan_id`` and ``admitted_at`` are
+    both frozen at admission and both preserved by every affirmation, so this key is
+    stable for exactly as long as the attempt it names.
+
+    One admission of one publication is one physical attempt on the inverter. That
+    is the thing an abort must kill and a re-admission must be free of.
+    """
+    return f"{plan_id}|{admitted_at.isoformat()}"
 
 
 def carry_plan(
@@ -1124,35 +1166,70 @@ def carry_plan(
     admission already answers "which publication is Stage B executing"; asking it
     twice, differently, is how the two answers drift apart.
     """
+    plan, _refusal = carry_plan_verbose(
+        current,
+        targets,
+        now,
+        run=run,
+        frozen_remaining_kwh=frozen_remaining_kwh,
+        executable_intents=executable_intents,
+    )
+    return plan
+
+
+def carry_plan_verbose(
+    current: AdmittedPlan | None,
+    targets: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    now: datetime,
+    *,
+    run: CarriedRun | None,
+    frozen_remaining_kwh: float | None = None,
+    executable_intents: frozenset[str] = frozenset({EXECUTION_INTENT_GRID_CHARGE}),
+) -> tuple[AdmittedPlan | None, str | None]:
+    """Return :func:`carry_plan`'s answer **and why**, when it declined.
+
+    **The one copy of the guard order lives here, and beta.36 added the second
+    return value rather than a second copy of the logic.** ``carry_plan`` returned a
+    bare ``AdmittedPlan | None`` with six distinct ways of meaning ``None`` and no
+    channel to say which, so ``admitted_plan: null`` was the entire published
+    evidence of the 2026-08-30 and 2026-08-31 incidents -- five hours and three hours
+    respectively in which the payload could not distinguish "nothing was published"
+    from "a plan was admitted and then destroyed".
+
+    The refusal is ``None`` when a plan was returned, and also when the answer is a
+    legitimate *keep* of the plan already admitted: neither is a refusal.
+    """
     if current is not None:
         if current.has_opened(now) and now < current.ends_at:
-            return current
+            return current, None
         if now >= current.ends_at:
             current = None
 
     if run is None:
-        return current
+        return current, ADMISSION_REFUSED_NO_RUN
     if run.target.intent not in executable_intents:
-        return current
+        return current, ADMISSION_REFUSED_INTENT_NOT_EXECUTABLE
     candidate = admit_plan(
         run.target, run=run, now=now, frozen_remaining_kwh=frozen_remaining_kwh
     )
-    if candidate is None or now >= candidate.ends_at:
-        return current
+    if candidate is None:
+        return current, ADMISSION_REFUSED_NO_SCHEDULE
+    if now >= candidate.ends_at:
+        return current, ADMISSION_REFUSED_SPENT
     # **Opening now or next, within the refresh jitter.** A strictly-future rule can
     # never admit the row that opens *at* this refresh, which is the second half of
     # the skipped-boundary defect: the refresh lands a few seconds after the boundary
     # it is meant to open. A row that opened minutes ago is refused, because its
     # elapsed delivery was never measured.
     if (now - candidate.starts_at).total_seconds() > PLAN_ADMISSION_LOOKBACK_SECONDS:
-        return current
+        return current, ADMISSION_REFUSED_OPENED_TOO_LONG_AGO
     if not any(row.executable for row in candidate.rows):
-        # Nothing in it Stage B could arm. Reported by the caller, not admitted.
-        return current
+        # Nothing in it Stage B could arm.
+        return current, ADMISSION_REFUSED_NOTHING_ARMABLE
     if current is not None and candidate.plan_id == current.plan_id:
         # The same publication, re-derived. Keep the admitted instant.
-        return current
-    return candidate
+        return current, None
+    return candidate, None
 
 
 def admit_quarter(
@@ -1306,6 +1383,23 @@ class Target:
     #: one lifecycle can span the several windows Stage B necessarily sees as
     #: separate.
     campaign_id: str | None = None
+    #: The instant Stage A means this campaign to finish, frozen at admission.
+    #:
+    #: **beta.36 gives this field its first consumer.** It has been published since
+    #: beta.32 (``economic.execution_target``) and read by nothing, so the
+    #: coordinator had no way to know a campaign extended past the rows of the one
+    #: admitted plan in front of it -- and closed a thirty-three-row campaign after
+    #: three. The observed high-water mark it used instead only ever moves
+    #: *backwards* relative to the truth, because it is built from rows already seen.
+    #:
+    #: **Safe to freeze, for a non-obvious reason:** ``campaign_identity`` is a
+    #: digest *of this instant*, so a campaign whose end moves is a campaign whose
+    #: id changes -- a different campaign. For as long as one id is in force this
+    #: value cannot legitimately change.
+    #:
+    #: ``None`` on any record written before beta.36, and absent degrades to the
+    #: other two finality signals rather than failing.
+    campaign_end: datetime | None = None
 
     @property
     def constrained(self) -> bool:
@@ -1415,6 +1509,7 @@ def parse_target(raw: dict[str, Any]) -> Target | None:
         campaign_id=(
             raw.get("campaign_id") if isinstance(raw.get("campaign_id"), str) else None
         ),
+        campaign_end=instant_of(raw.get("campaign_end")),
     )
 
 
@@ -1516,6 +1611,17 @@ class CarriedRun:
     #: Re-anchored on every affirmation, because an affirming publication is
     #: Stage A restating the intent.
     stale_after: datetime
+
+    @property
+    def admission_key(self) -> str:
+        """Return this admission's immutable identity. See :func:`admission_key_of`.
+
+        The run and the plan admitted from it answer the **same** key, which is what
+        lets the run layer and the plan layer agree about which physical attempt is
+        dead -- the disagreement that let a torn-down campaign be minted afresh every
+        refresh while its plan was destroyed every refresh.
+        """
+        return admission_key_of(self.plan_id, self.admitted_at)
 
     @property
     def intent(self) -> str:
@@ -1747,6 +1853,10 @@ def target_as_published(target: Target) -> dict[str, Any]:
         # terminal named nothing. Found by asserting the round trip on a target
         # that production actually published, which no earlier test did.
         "campaign_id": target.campaign_id,
+        # **The same debt beta.34 paid for ``campaign_id``, paid once.** This
+        # function's docstring asserts a round trip that two tests check, and a new
+        # parsed field that is not written back here makes it quietly false.
+        "campaign_end": moment(target.campaign_end),
     }
 
 
@@ -1867,6 +1977,32 @@ def _materially_moved(accepted: Target, published: Target) -> bool:
     return False
 
 
+#: Why no plan was admitted. **beta.36**, and every one of these was previously
+#: published as an indistinguishable ``admitted_plan: null``.
+ADMISSION_REFUSED_NO_RUN: Final = "no_carried_run"
+ADMISSION_REFUSED_INTENT_NOT_EXECUTABLE: Final = "intent_not_executable"
+ADMISSION_REFUSED_NO_SCHEDULE: Final = "publication_carried_no_schedule"
+ADMISSION_REFUSED_SPENT: Final = "schedule_already_spent"
+ADMISSION_REFUSED_OPENED_TOO_LONG_AGO: Final = "opened_too_long_ago"
+ADMISSION_REFUSED_NOTHING_ARMABLE: Final = "no_executable_row"
+#: The plan was admitted and then destroyed, because its attempt is dead.
+ADMISSION_REFUSED_ABANDONED: Final = "admission_abandoned"
+
+ADMISSION_REFUSALS: Final = (
+    ADMISSION_REFUSED_NO_RUN,
+    ADMISSION_REFUSED_INTENT_NOT_EXECUTABLE,
+    ADMISSION_REFUSED_NO_SCHEDULE,
+    ADMISSION_REFUSED_SPENT,
+    ADMISSION_REFUSED_OPENED_TOO_LONG_AGO,
+    ADMISSION_REFUSED_NOTHING_ARMABLE,
+    ADMISSION_REFUSED_ABANDONED,
+)
+
+#: Why ``carry_forward`` declined a publication rather than simply finding none.
+CARRY_REFUSED_CAMPAIGN_FINAL: Final = "campaign_already_final"
+CARRY_REFUSED_ADMISSION_ABANDONED: Final = "admission_abandoned"
+
+
 @dataclass(frozen=True, slots=True)
 class CarryOutcome:
     """What the carry-forward machine concluded this refresh."""
@@ -1881,6 +2017,13 @@ class CarryOutcome:
     #: Whether this refresh's publication re-affirmed the carried run.
     affirmed: bool = False
     admitted: bool = False
+    #: Why no run is carried, when a publication was declined rather than absent.
+    #:
+    #: **beta.36.** ``carried=None`` used to mean four different things -- nothing
+    #: published, nothing executable, the run ended, or the run was declined -- and
+    #: a reader had no way to tell them apart. The 2026-08-31 download shows the cost:
+    #: five hours in which the only published evidence was ``admitted_plan: null``.
+    refused: str | None = None
 
 
 def carry_forward(
@@ -1889,12 +2032,29 @@ def carry_forward(
     now: datetime,
     *,
     executable_intents: frozenset[str] = frozenset({EXECUTION_INTENT_GRID_CHARGE}),
+    abandoned_admissions: frozenset[str] = frozenset(),
+    final_campaigns: frozenset[str] = frozenset(),
 ) -> CarryOutcome:
     """Return the carried run after this refresh's publication.
 
     The state machine, in one place and in priority order. Every transition is
     driven by an instant, an intent or a published figure -- never by a price and
     never by a preference between two targets.
+
+    **The two lifecycle sets are the beta.36 addition, and they are the fix for one
+    specific loop.** Through beta.35 this function knew nothing about abandonment,
+    so after an abort it minted a *fresh* run from a target that still named the
+    torn-down campaign, while ``_refresh_executing_quarter`` destroyed that run's
+    plan on the very same refresh -- for ever. The run layer resurrected and the
+    plan layer killed, once every fifteen minutes, and neither was wrong on its own
+    terms. They now consult the same two facts:
+
+    * ``abandoned_admissions`` -- *this physical attempt* is dead. Keyed on
+      :func:`admission_key_of`, so it names an attempt and not a campaign, and a
+      genuinely new attempt at the same campaign is untouched by it.
+    * ``final_campaigns`` -- this *economic campaign* finished. Republication may
+      never start it again, which is what stops a completed campaign looping
+      through fresh instances for the rest of the day.
     """
     published = [
         parsed
@@ -1906,7 +2066,22 @@ def carry_forward(
         candidate = actionable_target(targets, now)
         if candidate is None or candidate.intent not in executable_intents:
             return CarryOutcome(carried=None)
+        if candidate.campaign_id is not None and (
+            candidate.campaign_id in final_campaigns
+        ):
+            # The campaign already ran to its end. Stage A keeps publishing it
+            # because its horizon still contains it, which is not a reason to
+            # execute it twice.
+            return CarryOutcome(carried=None, refused=CARRY_REFUSED_CAMPAIGN_FINAL)
         return CarryOutcome(carried=admit(candidate, now), admitted=True)
+
+    # **A dead attempt is not carried, whatever is published.** Reached only if a
+    # carried run survived an abort -- a restart reading a persisted record, or a
+    # future caller reinstating one. No ``ended`` reason: the abort already filed
+    # one, and a second terminal for one attempt is exactly what this release
+    # exists to prevent.
+    if carried.admission_key in abandoned_admissions:
+        return CarryOutcome(carried=None, refused=CARRY_REFUSED_ADMISSION_ABANDONED)
 
     # A carried run outliving its own window ends regardless of what was
     # published: this is the bound that keeps a carried plan from becoming an
@@ -2824,6 +2999,7 @@ def quarter_intent_for(
     target_day: date,
     start_index: int,
     built_at: datetime,
+    holds_at_zero: bool = False,
 ) -> ControlIntent | None:
     """Return the command an **open quarter** wants, or ``None``.
 
@@ -2869,8 +3045,23 @@ def quarter_intent_for(
     if action not in (ACTION_CHARGE, ACTION_DISCHARGE):
         return None
     power_kw = max(0.0, battery_power_kw)
-    if power_kw <= 0.0:
+    # **The zero refusal is kept, and the hold is admitted beside it rather than
+    # through it. beta.36.**
+    #
+    # Returning ``None`` for a zero power was right while zero meant "there is
+    # nothing here": the caller then had no intent, ``evaluate`` reported unsafe
+    # with ``nothing_to_command``, and on an *owned live* dispatch that unsafe
+    # verdict was promoted to ``safety`` -- an unsuppressable total abort. On
+    # 2026-08-31 that destroyed a charge campaign whose only fault was that
+    # production had covered the row.
+    #
+    # So a caller that *knows* the row is resting says so, and gets a command it
+    # can send. A caller that does not still gets ``None``, and the refusal keeps
+    # its old meaning for every path that has not been taught the difference.
+    if power_kw <= 0.0 and not holds_at_zero:
         return None
+    if holds_at_zero:
+        power_kw = 0.0
     return ControlIntent(
         action=action,
         energy_ac_kwh=power_kw * INTERVAL_HOURS,
@@ -2891,6 +3082,7 @@ def quarter_intent_for(
         # substitute anything either -- the device layer refuses a charge whose
         # ceiling cannot be established.
         ceiling_soc_percent=(ceiling_soc_percent if action == ACTION_CHARGE else None),
+        holds_at_zero=holds_at_zero,
     )
 
 

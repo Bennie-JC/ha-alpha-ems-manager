@@ -40,6 +40,7 @@ from custom_components.alpha_ems_manager.const import (
     EXECUTION_ABORT_IS_TOTAL,
     EXECUTION_ABORT_STOP_REASONS,
     EXECUTION_INTENT_NET_EXPORT,
+    EXECUTION_STOP_CAMPAIGN_COMPLETE,
     EXECUTION_STOP_SAFETY,
     EXECUTION_STOP_STAGE_A_HOLD,
     EXECUTION_STOP_STALE_PLAN,
@@ -435,7 +436,7 @@ async def test_a_safety_abort_stops_at_once_and_q3_never_rearms(
     assert coordinator._campaign_id is None
 
 
-async def test_an_abandoned_campaign_never_opens_a_second_time(
+async def test_an_aborted_attempt_is_replaced_by_a_new_instance_not_reopened(
     hass: HomeAssistant,
     config_data: dict,
     source_entities: None,
@@ -443,32 +444,98 @@ async def test_an_abandoned_campaign_never_opens_a_second_time(
     live_surface: LiveSurface,
     monkeypatch,
 ) -> None:
-    """**Realised history is immutable, and this is where that becomes true.**
+    """**Realised history is immutable, and beta.36 says of what.**
 
-    Reopening a closed identity restarts ``_campaign_realized_kwh`` at zero and
-    files a second terminal for one campaign. On the reference trace that would
-    have reported quarter three's energy as the whole sale, with quarter one's
-    measured 1.92 kWh erased.
+    beta.35 wrote this rule at the level of the campaign *identity*, and that is what
+    destroyed two Live campaigns. ``campaign_identity`` is a digest of the campaign's
+    end, so every republication of one live campaign is byte-identical -- and a single
+    hazard abort therefore barred that campaign from ever admitting a plan again for
+    the rest of the session. The 2026-08-31 capture shows the consequence directly:
+    an affirmed carried run accumulating energy beside ``admitted_plan: null``, for
+    every refresh until the process restarted.
 
-    *Mutation: allow ``_note_campaign_progress`` to reopen a closed id and this
-    fails.*
+    The rule that actually holds is about the **attempt**. A hazard abort ends one
+    physical attempt; a genuinely new admission afterwards is a second attempt, with
+    its own frozen objective, its own realised total and its own terminal. What may
+    never happen is the *closed* attempt coming back: its instance identity is dead,
+    its terminal is final, and its measured energy is never touched again.
+
+    *Mutation: let ``_note_campaign_progress`` reuse the closed instance's identity,
+    or carry its realised total forward, and this fails.*
     """
     coordinator = await start_the_campaign(
         hass, config_data, frank, live_surface, monkeypatch
     )
+    first_instance = coordinator._campaign_instance_id
+    first_opened = coordinator._campaign_opened_at
+    assert first_instance is not None
+    assert first_opened is not None
+
     coordinator._abandon_execution(opens_at(1), EXECUTION_STOP_SAFETY)
     first_terminal = dict(coordinator._closed_campaign or {})
     assert first_terminal
+    assert first_terminal["campaign_instance_id"] == first_instance
+    realised = first_terminal["objective_realized_kwh"]
+    assert realised > 0.0, "the aborted attempt measured something"
 
-    # Put the schedule back by force -- the strongest form of the zombie -- and
-    # drive a refresh at the third row's window.
+    # Put the schedule back and drive a refresh at the third row's window: this is
+    # Stage A republishing a campaign its horizon still contains.
     coordinator._plan = admitted_plan()
     coordinator._quarter = coordinator._plan.executing_quarter(
         opens_at(2) + timedelta(minutes=1)
     )
     coordinator._note_campaign_progress(opens_at(2) + timedelta(minutes=1), None)
 
-    assert coordinator._campaign_id is None, "a closed campaign may not reopen"
+    assert coordinator._campaign_id == CAMPAIGN_ID, "a new attempt may execute"
+    assert coordinator._campaign_instance_id is not None
+    assert coordinator._campaign_instance_id != first_instance, (
+        "a second attempt is a second instance, never the closed one reopened"
+    )
+    assert coordinator._campaign_opened_at != first_opened
+    assert coordinator._campaign_realized_kwh == 0.0, (
+        "the new attempt starts at zero and the closed one keeps its measurement"
+    )
+    assert coordinator._closed_campaign == first_terminal, (
+        "one terminal per instance, and the closed one is immutable"
+    )
+    assert first_terminal["objective_realized_kwh"] == realised
+
+
+async def test_a_completed_campaign_may_not_open_another_instance(
+    hass: HomeAssistant,
+    config_data: dict,
+    source_entities: None,
+    frank,
+    live_surface: LiveSurface,
+    monkeypatch,
+) -> None:
+    """The other half of the asymmetry, and the reason it is not simply "allow it".
+
+    An abort is a failed attempt and deserves another. A campaign that reached its
+    objective, or ran out of schedule, is **finished** -- and Stage A goes on
+    publishing it for as long as its horizon contains it. Without this, a completed
+    campaign would open a fresh instance on the very next refresh and loop for ever,
+    each iteration buying the same energy again.
+
+    *Mutation: latch the final set on any reason, or on none, and this passes while
+    the test above fails -- which is why both exist.*
+    """
+    coordinator = await start_the_campaign(
+        hass, config_data, frank, live_surface, monkeypatch
+    )
+    coordinator._close_campaign(opens_at(1), EXECUTION_STOP_CAMPAIGN_COMPLETE)
+    first_terminal = dict(coordinator._closed_campaign or {})
+    assert first_terminal
+    assert coordinator._campaign_id is None
+
+    coordinator._plan = admitted_plan()
+    coordinator._quarter = coordinator._plan.executing_quarter(
+        opens_at(2) + timedelta(minutes=1)
+    )
+    coordinator._note_campaign_progress(opens_at(2) + timedelta(minutes=1), None)
+
+    assert coordinator._campaign_id is None, "a finished campaign does not run again"
+    assert coordinator._campaign_instance_id is None
     assert coordinator._closed_campaign == first_terminal, "one terminal, exactly"
 
 

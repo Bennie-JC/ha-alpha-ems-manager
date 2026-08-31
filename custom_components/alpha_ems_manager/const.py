@@ -1070,8 +1070,31 @@ INHIBIT_PEAK_SHAVING_ACTIVE: Final = "peak_shaving_active"
 INHIBIT_DISPATCH_ACTIVE: Final = "dispatch_active"
 #: The battery hardware facts are incomplete.
 INHIBIT_BATTERY_NOT_CONFIGURED: Final = "battery_not_configured"
-#: No plan, an unusable plan, or a plan that reached no decision.
-INHIBIT_NO_PLAN: Final = "no_plan"
+#: Stage A published no battery plan at all this refresh.
+#:
+#: **beta.36 splits one token that carried two meanings.** ``safety.evaluate`` had
+#: two adjacent producers of ``"no_plan"`` -- this one, relayed from
+#: ``ControlContext.plan_problem``, and "there is no intent to send" one line below
+#: -- appending the identical pair at the identical ladder position, so neither
+#: ``verdict.checks`` nor any published field could separate them. One is a
+#: statement about Stage A's future intent; the other is a statement about *this
+#: instant*. They now have different names and different classes.
+#:
+#: **The string is unchanged on purpose.** It is a published value a user automation
+#: may match on, and the Stage-A side is the one that has always produced it in the
+#: field, so it keeps the name. See :data:`INHIBIT_NOTHING_TO_COMMAND`.
+INHIBIT_NO_BATTERY_PLAN: Final = "no_plan"
+#: Backwards-compatible alias. Prefer the explicit name above.
+INHIBIT_NO_PLAN: Final = INHIBIT_NO_BATTERY_PLAN
+#: There is a valid owned frozen row, and nothing to command at this instant.
+#:
+#: **Not a hazard, and treating it as one is what destroyed the 2026-08-31
+#: campaign.** The authorised rate collapsed to zero -- production was covering the
+#: row and the grid ceiling was nearly spent -- so ``quarter_intent_for`` returned
+#: ``None``, ``evaluate`` reported unsafe, and an unsafe verdict on an owned live
+#: dispatch was promoted to ``safety``: an unsuppressable total abort that
+#: blacklisted the campaign for the session. Nothing was wrong with the plant.
+INHIBIT_NOTHING_TO_COMMAND: Final = "nothing_to_command"
 INHIBIT_PLAN_UNAVAILABLE: Final = "plan_unavailable"
 INHIBIT_NO_DECISION: Final = "no_decision"
 #: The plan describes a different interval, a different day, or is too old.
@@ -1110,7 +1133,8 @@ CONTROL_INHIBIT_REASONS: Final = (
     INHIBIT_PEAK_SHAVING_ACTIVE,
     INHIBIT_DISPATCH_ACTIVE,
     INHIBIT_BATTERY_NOT_CONFIGURED,
-    INHIBIT_NO_PLAN,
+    INHIBIT_NO_BATTERY_PLAN,
+    INHIBIT_NOTHING_TO_COMMAND,
     INHIBIT_PLAN_UNAVAILABLE,
     INHIBIT_NO_DECISION,
     INHIBIT_STALE_PLAN_INTERVAL,
@@ -1131,6 +1155,58 @@ CONTROL_INHIBIT_REASONS: Final = (
     INHIBIT_GRID_STALE,
     INHIBIT_WOULD_EXPORT,
 )
+
+#: Stage A revised the future. The frozen row may keep executing.
+#:
+#: **beta.36, and it is the inhibit-side twin of
+#: :data:`EXECUTION_WITHDRAWAL_STOP_REASONS`.** Exactly one member, deliberately:
+#: the approved decision is that "Stage A published nothing this refresh" is a
+#: statement about future intent, so while a frozen admitted plan still covers this
+#: instant the withdrawal is withheld and published rather than obeyed. Bounded
+#: identically to every other withdrawal -- by ``plan.ends_at``, by the row
+#: covering now, and by the vendor dead-man.
+#:
+#: ``plan_unavailable`` and ``no_decision`` are deliberately **not** here. They are
+#: adjacent in shape and were left in the hazard class, because narrowing further
+#: than the evidence supports is how a safety gate becomes decorative.
+INHIBIT_WITHDRAWAL_REASONS: Final = (INHIBIT_NO_BATTERY_PLAN,)
+
+#: There is nothing to command right now. Hold, never abort.
+#:
+#: Two members, and both mean the same physical thing: the authorised rate at this
+#: instant is not something the actuator can express. One is exactly zero, the
+#: other is inside ``(0, CONTROL_MIN_POWER_KW)``.
+#:
+#: **The codebase already argued this and then did the opposite.**
+#: :data:`CONTROL_MIN_POWER_KW` says of a sub-minimum command that *"the undelivered
+#: energy is at most one step over one interval, and the inverter's own behaviour
+#: already covers it"* -- which is a **start** rationale, and it was being applied
+#: to a *continuation* through a code path that classified it with a stale
+#: state-of-charge sensor.
+INHIBIT_NO_COMMAND_REASONS: Final = (
+    INHIBIT_NOTHING_TO_COMMAND,
+    INHIBIT_POWER_BELOW_DEVICE_MINIMUM,
+)
+
+#: Something is wrong with the plant, the surface, or our claim on it. Abort.
+#:
+#: **Derived by subtraction, and that is the whole safety argument.** A reason is a
+#: hazard unless it was explicitly placed in one of the two sets above, so a new
+#: inhibit added later is a hazard until somebody argues otherwise in a diff. There
+#: is no default-permit path: ``INHIBIT_HAZARD_REASONS`` is not a hand-written list
+#: that could omit a new arrival.
+INHIBIT_HAZARD_REASONS: Final = tuple(
+    reason
+    for reason in CONTROL_INHIBIT_REASONS
+    if reason not in INHIBIT_WITHDRAWAL_REASONS + INHIBIT_NO_COMMAND_REASONS
+)
+
+#: Every inhibit belongs to exactly one class, asserted rather than described.
+INHIBIT_REASON_CLASSES: Final = {
+    "hazard": INHIBIT_HAZARD_REASONS,
+    "withdrawal": INHIBIT_WITHDRAWAL_REASONS,
+    "no_command": INHIBIT_NO_COMMAND_REASONS,
+}
 
 # --- Phase 4: why execution was not authorized --------------------------------
 #
@@ -2739,6 +2815,15 @@ TICK_SKIPPED_DISPATCH_INACTIVE: Final = "dispatch_not_active"
 TICK_SKIPPED_OWNERSHIP: Final = "ownership_not_owned"
 TICK_STOPPED_TARGET_REACHED: Final = "stopped_target_reached"
 TICK_STOPPED_QUARTER_EXPIRED: Final = "stopped_quarter_expired"
+#: The tick held an armed dispatch at zero. **beta.36.**
+#:
+#: Two reasons, kept apart because one is terminal for the row and the other is
+#: transient: a satisfied row will not need power again, whereas a rate-limited
+#: one may recover within the same quarter.
+TICK_HELD_QUARTER_SATISFIED: Final = "held_quarter_satisfied"
+TICK_HELD_RATE_BELOW_RESOLUTION: Final = "held_rate_below_resolution"
+#: The zero-kilowatt hold write did not read back.
+TICK_HOLD_WRITE_FAILED: Final = "hold_write_not_verified"
 TICK_ERROR: Final = "controller_error"
 
 #: Which cadence produced a diagnostics record. Published so a sixty-second tick
@@ -3019,8 +3104,41 @@ EXECUTION_STOP_TIMER_NOT_REFRESHED: Final = "deadman_not_refreshed"
 #: reset, and neither is a fault -- but "complete" and "stopped for headroom" are
 #: not the same sentence.
 EXECUTION_STOP_HEADROOM_REACHED: Final = "headroom_reached"
+#: The campaign delivered its whole frozen objective, or its last row did.
+#:
+#: **beta.36.** Before this there was no way to say "the campaign finished" --
+#: only ``window_ended`` (the schedule ran out) and the *quarter* reasons, which
+#: is how a row meeting its own target came to file a campaign terminal. A
+#: campaign-scoped stop now has a campaign-scoped word.
+EXECUTION_STOP_CAMPAIGN_COMPLETE: Final = "campaign_objective_reached"
+#: Stage A published no battery plan at all this refresh.
+#:
+#: **A statement about the future, not about the dispatch.** Through beta.35 this
+#: arrived as an unsafe verdict and was promoted to ``safety``, which tore the
+#: campaign down -- so one missing solve destroyed a multi-quarter charge. It is a
+#: withdrawal: while a frozen admitted plan still covers this instant the row
+#: keeps executing, and the reason is published rather than acted on.
+EXECUTION_STOP_NO_BATTERY_PLAN: Final = "no_battery_plan"
 
 EXECUTION_STOP_REASONS: Final = (
+    EXECUTION_STOP_CAMPAIGN_COMPLETE,
+    EXECUTION_STOP_NO_BATTERY_PLAN,
+    # **beta.36 admits three more reasons the code has always produced.** Each is
+    # assigned in the controller and none was in this tuple, so the partition below
+    # could not see them, the teardown path treated them all as hazards, and the
+    # Activity map printed "Plan Replaced" for every one. ``quarter_expired`` and
+    # ``quarter_target_reached`` are the two the 2026-08-30 campaign died of.
+    #
+    # ``EXECUTION_STOP_CONFLICTING_FAMILY`` is deliberately **not** here. It is
+    # declared, and it is classified as an abort so the partition is total over the
+    # declared constants -- but no production module assigns it, and its string is
+    # the *refusal* token ``CONTROL_REFUSE_CONFLICTING_FAMILY`` rather than a stop
+    # anything writes. This tuple is the published vocabulary, and admitting a value
+    # nothing produces is precisely the R10 defect: a reason a test can reach and the
+    # code cannot. It joins the day it acquires a producer.
+    EXECUTION_STOP_QUARTER_EXPIRED,
+    EXECUTION_STOP_QUARTER_TARGET_REACHED,
+    EXECUTION_STOP_COHERENCE_LOST,
     EXECUTION_STOP_BATTERY_CEILING,
     EXECUTION_STOP_TIMER_NOT_REFRESHED,
     EXECUTION_STOP_HEADROOM_REACHED,
@@ -3068,9 +3186,23 @@ EXECUTION_FAILED_STOP_REASONS: Final = (
 #: completion. A one-quarter Safety Buy that delivered 1.063 of 1.11 kWh was filed
 #: as *Canceled* on the live installation for exactly this reason. A reason in this
 #: set means the delivery figures decide, and nothing else.
+#: **beta.36 widens this from two members to eight, and the reason is the
+#: partition below.** Seven stop reasons belonged to no vocabulary at all, and four
+#: of them -- ``target_reached``, ``battery_ceiling``, ``grid_energy_ceiling``,
+#: ``headroom_reached`` -- are ordinary successful endings that ``_decide`` raises
+#: with ``reset_required=owned``. Unclassified, each one reached the abort helper
+#: and blacklisted its campaign. Being here means the *delivery figures* decide the
+#: outcome, which is the honest verdict for a run that stopped because it hit a
+#: bound the plan itself authorised.
 EXECUTION_COMPLETION_STOP_REASONS: Final = (
     EXECUTION_STOP_WINDOW_ENDED,
     EXECUTION_STOP_QUARTER_TARGET_REACHED,
+    EXECUTION_STOP_QUARTER_EXPIRED,
+    EXECUTION_STOP_CAMPAIGN_COMPLETE,
+    EXECUTION_STOP_TARGET_REACHED,
+    EXECUTION_STOP_BATTERY_CEILING,
+    EXECUTION_STOP_GRID_CEILING,
+    EXECUTION_STOP_HEADROOM_REACHED,
 )
 
 #: Stage A revised the *future*. Nothing happened to the battery.
@@ -3096,6 +3228,9 @@ EXECUTION_WITHDRAWAL_STOP_REASONS: Final = (
     EXECUTION_STOP_STALE_PLAN,
     EXECUTION_STOP_STAGE_A_HOLD,
     EXECUTION_STOP_PLAN_REPLACED,
+    # **beta.36.** Stage A publishing nothing is the most extreme form of Stage A
+    # revising the future, which is exactly what this set exists for.
+    EXECUTION_STOP_NO_BATTERY_PLAN,
 )
 
 #: Something happened *to* the dispatch. It stops now, and the teardown is total.
@@ -3120,7 +3255,72 @@ EXECUTION_ABORT_STOP_REASONS: Final = (
     EXECUTION_STOP_SWITCHED_OFF,
     EXECUTION_STOP_SWITCHED_TO_SHADOW,
     EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
+    # **beta.36 classifies the last two.** A measurement the controller cannot
+    # trust and a competing helper family are both conditions under which
+    # continuing would be a claim the integration cannot support.
+    EXECUTION_STOP_COHERENCE_LOST,
+    EXECUTION_STOP_CONFLICTING_FAMILY,
 )
+
+#: Every stop reason belongs to exactly one of the three, and the partition is
+#: asserted rather than described.
+#:
+#: **This is the guard that would have caught the whole beta.35/beta.36 family
+#: before hardware.** Seven of twenty reasons were in no set, so nothing could tell
+#: a success from a hazard on the teardown path -- and the teardown path treated
+#: them all as hazards. A reason added later with no home fails the build.
+EXECUTION_STOP_REASON_CLASSES: Final = {
+    "withdrawal": EXECUTION_WITHDRAWAL_STOP_REASONS,
+    "completion": EXECUTION_COMPLETION_STOP_REASONS,
+    "abort": EXECUTION_ABORT_STOP_REASONS,
+}
+
+#: How far a stop reaches. **Three scopes, because beta.35 had one.**
+#:
+#: A row ending is not a run ending and neither is a campaign ending, yet
+#: ``_async_stop_owned_run`` collapsed all three onto ``_abandon_execution``. On
+#: 2026-08-30 that turned one row meeting its own target into the permanent
+#: destruction of a five-and-a-half-hour charge campaign.
+#:
+#: The *physical* write is the same in every scope -- stop the dispatch, then rest
+#: it. What differs is what survives afterwards.
+STOP_SCOPE_ROW: Final = "row"
+STOP_SCOPE_CAMPAIGN: Final = "campaign"
+STOP_SCOPE_ABORT: Final = "abort"
+
+STOP_SCOPES: Final = (STOP_SCOPE_ROW, STOP_SCOPE_CAMPAIGN, STOP_SCOPE_ABORT)
+
+#: Why an armed dispatch is commanding nothing.
+#:
+#: **Not a stop reason, and deliberately outside the ``EXECUTION_STOP_`` family: a
+#: hold is a state of a run that is still going.** Two causes, and the difference
+#: between them is recoverability. A satisfied row stays satisfied; a rate that
+#: fell below the actuator's resolution recovers on its own the moment production
+#: drops or the grid budget frees up, and the row resumes inside its own window.
+HOLD_REASON_QUARTER_SATISFIED: Final = "quarter_satisfied"
+HOLD_REASON_RATE_BELOW_RESOLUTION: Final = "rate_below_resolution"
+
+HOLD_REASONS: Final = (
+    HOLD_REASON_QUARTER_SATISFIED,
+    HOLD_REASON_RATE_BELOW_RESOLUTION,
+)
+
+#: How many consecutive unverified zero-kilowatt hold writes before the hold
+#: escalates to a real abort.
+#:
+#: A dispatch we cannot command down is a dispatch we do not control. Three ticks
+#: is three minutes of delivery nobody authorised -- bounded anyway, because the
+#: objective the tick horizon caps against is already met -- and it is the smallest
+#: bound that tolerates one transient helper unavailability without tolerating a
+#: broken surface.
+HOLD_WRITE_FAILURE_LIMIT: Final = 3
+
+#: How many distinct refusals one quarter's provenance record keeps.
+#:
+#: Deduplicated by string and capped, so the field cannot grow with tick count. A
+#: row that refused for eight different reasons has a bigger problem than the
+#: ninth.
+MAX_QUARTER_REFUSALS_RECORDED: Final = 8
 
 #: What an abort must leave behind: nothing.
 #:

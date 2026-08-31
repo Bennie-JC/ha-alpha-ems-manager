@@ -116,7 +116,7 @@ from .const import (
     INHIBIT_HOUSE_LOAD_UNUSABLE,
     INHIBIT_MISSING_CONTROL_ENTITY,
     INHIBIT_NO_FAILSAFE_AUTOMATION,
-    INHIBIT_NO_PLAN,
+    INHIBIT_NOTHING_TO_COMMAND,
     INHIBIT_PEAK_SHAVING_ACTIVE,
     INHIBIT_POWER_ABOVE_DEVICE_MAXIMUM,
     INHIBIT_POWER_BELOW_DEVICE_MINIMUM,
@@ -434,8 +434,22 @@ def evaluate(intent: ControlIntent | None, context: ControlContext) -> SafetyVer
     if context.plan_problem is not None:
         check(context.plan_problem, False)
         return SafetyVerdict(False, context.plan_problem, tuple(checks))
-    if not check(INHIBIT_NO_PLAN, intent is not None):
-        return SafetyVerdict(False, INHIBIT_NO_PLAN, tuple(checks))
+    # **Two meanings, two names, since beta.36.**
+    #
+    # ``context.plan_problem`` above relays *"Stage A published nothing"*, which is
+    # a statement about future intent. This one says *"there is nothing to send at
+    # this instant"*, which is a statement about now. Both used to append the same
+    # ``"no_plan"`` pair at this same ladder position, so nothing downstream --
+    # including ``verdict.checks`` -- could tell them apart, and both were promoted
+    # to ``safety`` on an owned live dispatch. One of them then destroyed a campaign
+    # whose only fault was that production had covered its row.
+    #
+    # This gate is unchanged in *strength*: an intent of ``None`` is still refused,
+    # still here, still before the staleness tests. Only its name changed, and with
+    # it the class the coordinator reads to decide whether refusing means holding or
+    # tearing down.
+    if not check(INHIBIT_NOTHING_TO_COMMAND, intent is not None):
+        return SafetyVerdict(False, INHIBIT_NOTHING_TO_COMMAND, tuple(checks))
 
     # -- is the decision about *now*? ---------------------------------------
     if not check(

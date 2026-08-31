@@ -31,6 +31,7 @@ import pytest
 from homeassistant.core import HomeAssistant
 
 from custom_components.alpha_ems_manager.const import (
+    EXECUTION_STOP_WINDOW_ENDED,
     LEDGER_BASES,
     LEDGER_BASIS_ATTRIBUTED,
     LEDGER_BASIS_ESTIMATED,
@@ -436,3 +437,104 @@ async def test_a_day_whose_prices_were_never_stored_is_skipped_not_zeroed(
     assert many["days_requested"] == 7
     assert many["days_priced"] == 1, "only today has both a record and prices"
     assert many["first_day"] == many["last_day"] == NORMAL.isoformat()
+
+
+# ===========================================================================
+# beta.36: the campaign ledger's identities, as equalities
+# ===========================================================================
+
+
+async def test_a_row_is_accrued_exactly_once(
+    hass: HomeAssistant,
+    config_data: dict,
+    source_entities: None,
+    frank,
+    live_surface: LiveSurface,
+    monkeypatch,
+) -> None:
+    """**Exactly once, made a property of a field rather than of call ordering.**
+
+    Three sites can record a completed row -- the tick's end-of-row, the tick's
+    end-of-quarter and the refresh's between-ticks catch-up -- and nothing said they
+    were mutually exclusive. beta.35 published ``quarters_admitted: 2`` against three
+    completed rows, which is the *losing* half of that ambiguity; the same gap makes
+    double-counting representable, and no trace has happened to exhibit it yet.
+
+    Driven by calling the accrual twice for one row, which is exactly what two of
+    those sites firing for the same boundary would do.
+
+    *Mutation: drop the ``_campaign_accrued_row`` latch and this fails.*
+    """
+    from .test_beta35_campaign_continuity import start_the_campaign
+
+    coordinator = await start_the_campaign(
+        hass, config_data, frank, live_surface, monkeypatch
+    )
+    row = coordinator._quarter
+    assert row is not None
+    assert coordinator._campaign_id == row.campaign_id, "the witness: it is accruable"
+
+    # The fixture already accrued this row, so the guard is already latched -- and
+    # that is the first half of the property: a row cannot be accrued a second time
+    # just because another site got there.
+    assert coordinator._campaign_accrued_row == row.quarter_start
+    latched_kwh = coordinator._campaign_realized_kwh
+    latched_rows = coordinator._campaign_quarters_admitted
+    coordinator._accrue_campaign_progress(row, 1.5)
+    assert coordinator._campaign_realized_kwh == latched_kwh
+    assert coordinator._campaign_quarters_admitted == latched_rows
+
+    # And the second half: released, exactly one of two calls lands.
+    coordinator._campaign_accrued_row = None
+    before_kwh = coordinator._campaign_realized_kwh
+    before_rows = coordinator._campaign_quarters_admitted
+
+    coordinator._accrue_campaign_progress(row, 1.5)
+    once_kwh = coordinator._campaign_realized_kwh
+    once_rows = coordinator._campaign_quarters_admitted
+
+    coordinator._accrue_campaign_progress(row, 1.5)
+
+    assert once_kwh == before_kwh + 1.5
+    assert once_rows == before_rows + 1
+    # Equalities, not inequalities: ">= the first reading" would pass on a double.
+    assert coordinator._campaign_realized_kwh == once_kwh
+    assert coordinator._campaign_quarters_admitted == once_rows
+    assert coordinator._campaign_accrued_row == row.quarter_start
+
+
+async def test_the_terminal_ledger_balances_as_equalities(
+    hass: HomeAssistant,
+    config_data: dict,
+    source_entities: None,
+    frank,
+    live_surface: LiveSurface,
+    monkeypatch,
+) -> None:
+    """**Three identities, and every one of them an ``==``.**
+
+    ``>=`` would have passed on the 2026-08-30 payload in one direction and on a
+    double-count in the other. The terminal's realised energy is the sum of the rows
+    it accrued, its row count is the number it accrued, and neither figure may
+    disagree with the live one it was read from a moment earlier.
+    """
+    from .test_beta35_campaign_continuity import start_the_campaign
+
+    coordinator = await start_the_campaign(
+        hass, config_data, frank, live_surface, monkeypatch
+    )
+    row = coordinator._quarter
+    assert row is not None
+    coordinator._accrue_campaign_progress(row, 1.25)
+
+    live_kwh = coordinator._campaign_realized_now()
+    live_rows = coordinator._campaign_quarters_admitted
+    assert live_rows >= 1, "the witness: something was accrued"
+
+    coordinator._close_campaign(row.quarter_end, EXECUTION_STOP_WINDOW_ENDED)
+    terminal = coordinator._closed_campaign or {}
+
+    assert terminal, "a started campaign files a terminal"
+    assert terminal["objective_realized_kwh"] == pytest.approx(live_kwh, abs=1e-9)
+    assert terminal["quarters_admitted"] == live_rows
+    assert terminal["rows_completed"] == live_rows

@@ -105,10 +105,27 @@ class ControlIntent:
     #: discharge floor here would have written "stop at 21 %" to a pack already at
     #: 61 %, and the first Live charge would simply not have run.
     ceiling_soc_percent: float | None = None
+    #: A commanded rest inside a live run: this row has nothing to ask for at this
+    #: instant, the dispatch stays armed, and the commanded power is exactly zero.
+    #:
+    #: **beta.36, and it is deliberately not ``ACTION_HOLD``.** A Phase-3 hold means
+    #: *there is no run*; this means *there is a run and it is resting*. Spelling it
+    #: as ``ACTION_HOLD`` would also change which cutoff the device layer writes --
+    #: ``_cutoff_for`` sends a non-charge action to the **discharge floor** helper,
+    #: so a resting charge would have written "stop at 21 %" to a pack at 61 %,
+    #: which is the beta.19 inversion resurrected by a state whose whole purpose is
+    #: safety. The direction action is therefore preserved and this flag carries the
+    #: rest.
+    holds_at_zero: bool = False
 
     @property
     def moves_battery(self) -> bool:
-        """Return whether this intent asks the battery to do anything."""
+        """Return whether this intent asks the battery to do anything.
+
+        **A hold answers ``False`` and that is the honest answer**: zero energy is
+        zero energy. The distinction a caller needs -- "resting inside a run" versus
+        "no run at all" -- is :attr:`holds_at_zero`, not this.
+        """
         return self.action != ACTION_HOLD and self.energy_ac_kwh > 0.0
 
     def as_dict(self) -> dict[str, Any]:
@@ -125,6 +142,7 @@ class ControlIntent:
                 else round(self.ceiling_soc_percent, BATTERY_SOC_PRECISION)
             ),
             "energy_limit_bound": self.energy_limit_bound,
+            "holds_at_zero": self.holds_at_zero,
             "horizon_minutes": self.horizon_minutes,
             "target_day": self.target_day.isoformat(),
             "start_index": self.start_index,

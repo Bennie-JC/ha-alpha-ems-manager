@@ -33,6 +33,7 @@ from custom_components.alpha_ems_manager.const import (
     EXECUTION_INTENT_NET_EXPORT,
     MIN_EXECUTABLE_QUARTER_KWH,
     QUARTER_END_EXPIRED,
+    STOP_SCOPE_CAMPAIGN,
 )
 from custom_components.alpha_ems_manager.execution import (
     AdmittedPlan,
@@ -472,14 +473,21 @@ async def test_a_row_ending_inside_a_campaign_hands_over_without_stopping(
     coordinator._plan = plan
     coordinator._quarter = first
 
+    # **The spy follows the scoped helper since beta.36.** ``_async_end_row`` no
+    # longer reaches the total-teardown alias: it asks ``_completion_scope`` which
+    # of the three scopes this ending has, and a row finishing inside a campaign
+    # gets none at all. Watching the old name would record nothing and pass
+    # vacuously, so the scope is captured and asserted too.
     stops: list[bool] = []
-    original = type(coordinator)._async_stop_owned_run
+    scopes: list[str] = []
+    original = type(coordinator)._async_stop_dispatch
 
-    async def record(self, now, snapshot, reason):
+    async def record(self, now, snapshot, reason, *, scope):
         stops.append(True)
-        return await original(self, now, snapshot, reason)
+        scopes.append(scope)
+        return await original(self, now, snapshot, reason, scope=scope)
 
-    coordinator.__class__._async_stop_owned_run = record  # type: ignore[assignment]
+    coordinator.__class__._async_stop_dispatch = record  # type: ignore[assignment]
     try:
         # The boundary: the second row exists, so the handover must not stop.
         coordinator._quarter = plan.executing_quarter(
@@ -499,8 +507,12 @@ async def test_a_row_ending_inside_a_campaign_hands_over_without_stopping(
             last, opens + 2 * QUARTER, None, stop=coordinator._quarter is None
         )
         assert stops == [True], "the last row of a campaign must stop the dispatch"
+        # And it stops as a *campaign*, not as an abort: the plan is cleared and the
+        # lifecycle closes, but nothing is latched as abandoned. A campaign that
+        # finished is not a campaign that failed.
+        assert scopes == [STOP_SCOPE_CAMPAIGN]
     finally:
-        coordinator.__class__._async_stop_owned_run = original  # type: ignore[assignment]
+        coordinator.__class__._async_stop_dispatch = original  # type: ignore[assignment]
 
 
 async def test_the_handover_resets_the_measurements_and_nothing_else(

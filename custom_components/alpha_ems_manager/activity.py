@@ -109,13 +109,18 @@ from .const import (
     ECONOMIC_EVENT_STOPPED,
     ECONOMIC_EXECUTION_EVENT_KINDS,
     EXECUTION_STOP_BATTERY_CEILING,
+    EXECUTION_STOP_CAMPAIGN_COMPLETE,
+    EXECUTION_STOP_COHERENCE_LOST,
     EXECUTION_STOP_EXECUTION_ERROR,
     EXECUTION_STOP_GRID_CEILING,
     EXECUTION_STOP_HEADROOM_REACHED,
     EXECUTION_STOP_MARKER_LOST,
+    EXECUTION_STOP_NO_BATTERY_PLAN,
     EXECUTION_STOP_OWNERSHIP_CONFLICT,
     EXECUTION_STOP_PLAN_REPLACED,
+    EXECUTION_STOP_QUARTER_EXPIRED,
     EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
+    EXECUTION_STOP_QUARTER_TARGET_REACHED,
     EXECUTION_STOP_SAFETY,
     EXECUTION_STOP_STAGE_A_HOLD,
     EXECUTION_STOP_STALE_PLAN,
@@ -203,7 +208,33 @@ _CANCEL_REASONS: dict[str, str] = {
     EXECUTION_STOP_SAFETY: "Safety Stop",
     EXECUTION_STOP_HEADROOM_REACHED: "Headroom Reached",
     EXECUTION_STOP_GRID_CEILING: "Grid Limit Reached",
+    # **beta.36 names two endings the pipeline has always produced.**
+    #
+    # ``quarter_expired`` is written at ``_async_end_row`` and reached on every
+    # ordinary row boundary; ``no_battery_plan`` is the beta.36 split of the old
+    # ``no_plan`` token. Both fell through to ``_CANCEL_REPLACED`` and printed
+    # "Plan Replaced" -- the R10 shape, and the reason the reachability test in
+    # ``test_const_vocabularies`` exists.
+    EXECUTION_STOP_QUARTER_EXPIRED: "Window Expired",
+    EXECUTION_STOP_NO_BATTERY_PLAN: "Plan Withdrawn",
 }
+
+#: The endings that are successes, and therefore render as ``finished``.
+#:
+#: **beta.36, and it is the same correction in a third place.** Only
+#: ``target_reached`` was ever tested here, so the two endings that mean a *quarter*
+#: or a *campaign* met its objective fell through to ``_cancelled`` and printed
+#: "Canceled -- Plan Replaced" for a success. Read from an explicit set rather than
+#: from ``EXECUTION_COMPLETION_STOP_REASONS``: a window closing on time is a
+#: completion at the lifecycle layer and still not a success at this one, and
+#: collapsing the two would make "Finished" mean "stopped".
+_SUCCESS_REASONS: frozenset[str] = frozenset(
+    {
+        EXECUTION_STOP_TARGET_REACHED,
+        EXECUTION_STOP_QUARTER_TARGET_REACHED,
+        EXECUTION_STOP_CAMPAIGN_COMPLETE,
+    }
+)
 
 #: The stop reasons that make a terminal ``stopped`` rather than ``cancelled``.
 #:
@@ -244,6 +275,11 @@ _ERROR_REASONS: dict[str, str] = {
     # now forbids.
     EXECUTION_STOP_MARKER_LOST: "Ownership Marker Lost",
     EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN: "Progress Unknown After Restart",
+    # **A third, same vintage as those two and missed by the same audit.** The
+    # sixty-second tick has written this since beta.25 and no map ever named it, so
+    # a measurement the controller could not reconcile printed as the optimiser
+    # changing its mind.
+    EXECUTION_STOP_COHERENCE_LOST: "Measurement Not Coherent",
 }
 
 #: What to say when a plan is withdrawn and no stop reason was recorded, which is
@@ -751,7 +787,7 @@ def _terminal_entry(
         return None
     reason = execution.stop_reason or ""
 
-    if reason == EXECUTION_STOP_TARGET_REACHED:
+    if reason in _SUCCESS_REASONS:
         return _finished(state, lifecycle, execution, now=now)
     if reason in _ERROR_REASONS:
         return _failed(state, lifecycle, _ERROR_REASONS[reason], reason=reason)

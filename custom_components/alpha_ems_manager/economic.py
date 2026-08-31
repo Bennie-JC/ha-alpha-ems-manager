@@ -5637,6 +5637,30 @@ def campaign_identity(direction: str, campaign_end_utc: datetime) -> str:
     return digest[:ECONOMIC_FINGERPRINT_CHARS]
 
 
+def campaign_instance_identity(campaign_id: str, opened_at: datetime) -> str:
+    """Return the identity of one **physical attempt** at one economic campaign.
+
+    ``(campaign_id, opened_at)``, digested. **beta.36.**
+
+    :func:`campaign_identity` answers *which campaign*, and answers it the same way
+    on every refresh -- which is exactly what it is for, and exactly why it cannot
+    also answer *which attempt*. An economic campaign may legitimately be attempted
+    twice in one day: once aborted for a genuine hazard, once afresh once the hazard
+    has cleared. Those are two lifecycles, with two frozen objectives, two realised
+    totals and two terminals, because they are two different things that happened --
+    and keying the lifecycle on the campaign alone forced them to be one, which is
+    how "exactly one terminal" and "a new attempt may proceed" became contradictory.
+
+    **Microsecond resolution, unlike the campaign's own minute resolution.** A
+    campaign end is a quarter boundary and sub-minute digits there could only carry
+    clock noise; an attempt's opening instant is a real event, and two attempts
+    within one minute must not collide.
+    """
+    stamp = opened_at.isoformat()
+    digest = hashlib.sha256(f"{campaign_id}|{stamp}".encode()).hexdigest()
+    return digest[:ECONOMIC_FINGERPRINT_CHARS]
+
+
 def _execution_plan_id(intent: str, window_start: datetime) -> str:
     """Return a short stable identifier for one planned run.
 

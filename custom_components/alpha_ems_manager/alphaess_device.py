@@ -512,6 +512,12 @@ class DeviceCommand:
     #: ``power_kw`` unless a clamp reduced it, which is what
     #: :attr:`safety_limited` reads.
     requested_power_kw: float = 0.0
+    #: Carried from :attr:`~.control.ControlIntent.holds_at_zero`. **beta.36.**
+    #:
+    #: A resting run, not an absent one. The write boundary reads it to choose the
+    #: hold branch, which re-asserts the cutoff and the dead-man while commanding
+    #: nothing -- so the distinction has to survive the intent-to-command boundary.
+    holds_at_zero: bool = False
 
     @property
     def safety_limited(self) -> bool:
@@ -586,6 +592,7 @@ def build_command(intent: ControlIntent) -> DeviceCommand:
             commanded_energy_ac_kwh=0.0,
             interval_hours=intent.interval_hours,
             requested_power_kw=0.0,
+            holds_at_zero=intent.holds_at_zero,
         )
 
     power = device_power_kw(intent.energy_ac_kwh, intent.interval_hours)
@@ -605,6 +612,7 @@ def build_command(intent: ControlIntent) -> DeviceCommand:
             commanded_energy_ac_kwh=0.0,
             interval_hours=intent.interval_hours,
             requested_power_kw=0.0,
+            holds_at_zero=intent.holds_at_zero,
         )
     return DeviceCommand(
         action=intent.action,
@@ -617,6 +625,7 @@ def build_command(intent: ControlIntent) -> DeviceCommand:
         commanded_energy_ac_kwh=power * intent.interval_hours,
         interval_hours=intent.interval_hours,
         requested_power_kw=power,
+        holds_at_zero=intent.holds_at_zero,
     )
 
 
