@@ -538,6 +538,17 @@ async def _forecast_history_report(
                 "decision path"
             ),
         },
+        # **What the optimiser believes this plan is worth, and why. beta.37.**
+        #
+        # The same derivation the Economic Value entity publishes and the same one
+        # persisted into each decision record, so a download and a dashboard cannot
+        # disagree about a figure. Read-only: an AST test names every function
+        # permitted to touch the value curve and forbids every decision path.
+        #
+        # ``state`` is null exactly when no valid comparison could be formed, and
+        # ``0.0`` exactly when a valid comparison came out equal. Those are different
+        # answers and neither is allowed to render as the other.
+        "economic_value": coordinator.economic_value(),
     }
 
 

@@ -54,9 +54,24 @@ def export_of(import_eur: float) -> float:
     return max(0.0, _EXPORT_SLOPE * import_eur - _EXPORT_OFFSET)
 
 
-def hour_of(index: int) -> float:
-    """Return the local hour for an absolute quarter index from midnight."""
-    return (index % 96) / 4.0
+#: How many chronological intervals the replayed civil day has.
+#:
+#: **96 by default, and parametrisable since beta.37.** A civil day is 92 intervals
+#: on a spring-forward day and 100 on a fall-back day, and the per-civil-day economic
+#: decomposition is the first economic figure whose correctness depends on that
+#: number -- so the harness had to stop asserting it. Every existing caller solves
+#: exactly as it did, because the default is the value that was hardcoded.
+DAY_INTERVALS = 96
+
+
+def hour_of(index: int, *, day_intervals: int = DAY_INTERVALS) -> float:
+    """Return the local hour for an absolute quarter index from midnight.
+
+    The modulus is the day's own length, so an index in the second day of a horizon
+    maps to the same clock position it would on the installation -- which is only
+    true if the length is the real one.
+    """
+    return (index % max(1, day_intervals)) / 4.0
 
 
 def price_29aug(index: int) -> float:
@@ -153,6 +168,11 @@ def solve_at(
     #: the flat edge credit -- so every existing caller solves exactly as it did.
     head_run_state: int = 0,
     terminal_value: Any = None,
+    #: beta.37. Whether the inverter serves residual house load from the battery
+    #: unbidden. ``True`` by default because that is what the harness has always
+    #: passed to ``build_outcome``; exposed so the comparator correction can be
+    #: measured with it both on and off.
+    ambient_self_consumption: bool = True,
 ) -> Solved:
     """Solve one horizon through the production path, at absolute indices.
 
@@ -221,7 +241,7 @@ def solve_at(
         reachability=enforced,
         uncertainty=uncertainty,
         actionable_interval_count=actionable,
-        ambient_self_consumption=True,
+        ambient_self_consumption=ambient_self_consumption,
         forecast_risk=forecast_risk,
         bucket_rule=rule,
         head_run_state=head_run_state,
@@ -230,7 +250,12 @@ def solve_at(
     return Solved(outcome=outcome, table=table, head=head)
 
 
-def risk_of(mae: float = 0.06353, bias: float = -0.00154, rho: float = 0.1825):
+def risk_of(
+    mae: float = 0.06353,
+    bias: float = -0.00154,
+    rho: float = 0.1825,
+    day_intervals: int = DAY_INTERVALS,
+):
     """Return the live ForecastRisk from the 29 August payload."""
     from custom_components.alpha_ems_manager.economic import ForecastRisk
 
@@ -239,7 +264,7 @@ def risk_of(mae: float = 0.06353, bias: float = -0.00154, rho: float = 0.1825):
         mae_kwh=mae,
         error_persistence=rho,
         adaptation_ratio=1.0218,
-        today_interval_count=96,
+        today_interval_count=day_intervals,
     )
 
 

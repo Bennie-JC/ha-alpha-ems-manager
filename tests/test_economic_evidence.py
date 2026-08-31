@@ -323,7 +323,7 @@ async def test_the_stored_document_reloads_from_disk(
     assert reloaded.days[NORMAL].economic_fingerprints == [snapshot.fingerprint]
     assert reloaded.corrupt is False
     assert reloaded.reset_by_migration is False
-    assert FORECAST_STORAGE_MINOR_VERSION == 7
+    assert FORECAST_STORAGE_MINOR_VERSION == 8
 
 
 async def test_a_day_with_no_plan_carries_no_economic_keys(
@@ -559,7 +559,7 @@ def test_no_storage_migration_was_performed_for_the_removal() -> None:
         FORECAST_STORAGE_MINOR_VERSION,
     )
 
-    assert FORECAST_STORAGE_MINOR_VERSION == 7
+    assert FORECAST_STORAGE_MINOR_VERSION == 8
     # The keys are still written, and still absent-not-zero.
     payload = snapshot_of().to_dict()
     for key in ("tplc", "tpli", "tfrc"):

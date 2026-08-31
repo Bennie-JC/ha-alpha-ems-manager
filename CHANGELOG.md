@@ -9,6 +9,199 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.37] - 2026-09-01
+
+**Economic Value observability.** `beta.36` made the execution lifecycle correct;
+this release makes the optimiser's reasoning *inspectable*. One new sensor answers
+the two questions a supervised Live day actually turns on — *is retaining one more
+kilowatt-hour worth more than exporting it now?* and *is the selected plan better
+than doing nothing, and by how much?* — and nothing about it can move a decision.
+
+Most of the machinery already existed and was simply not on a dashboard. `beta.35`
+computed the marginal value of stored energy and retained the head layer of the value
+table on every plan; the plan-versus-passive comparator has existed since `beta.16`;
+a bounded decision ledger since `beta.31`; a month-partitioned evidence store since
+Phase 2. So this is largely a surfacing release, plus two corrections the work turned
+up.
+
+### Added: one sensor, `Economic Value`
+
+Its **state** is the expected advantage of the selected plan over the passive
+counterfactual, over the horizon currently known, in EUR:
+
+```
+state = desired.hold_cost_eur - desired.cost_eur
+```
+
+`device_class: monetary`, and **no state class** — it is a forecast over a horizon
+that shortens through the day, so a long-term statistic would average a moving
+definition. It is not cash profit, not the plan's cost, not `objective_eur`, not
+`expected_net_value_eur`, and not realised money.
+
+**`unknown` and `0.00` are different answers, and the distinction is load-bearing.**
+`unknown` means no valid comparison could be formed — no plan, an empty horizon, no
+actionable interval, or a reserve violation, which under the lexicographic objective
+means no monetary alternative was ever ranked. `0.00` means a *valid* comparison that
+came out equal, which is a real result. Neither is allowed to render as the other.
+
+**Missing tomorrow prices do not make it unavailable.** Before the day-ahead auction
+publishes there is still a horizon and still a comparison; `tomorrow_prices_known`
+goes `false` and the tomorrow-specific figures go null, and the headline stays a
+number. A sensor that went `unknown` for half of every day would be useless.
+
+Its attributes carry the audit trail: the retention-side marginal value of stored
+energy with both one-sided slopes and a kink flag beside it, the current import and
+export price for context, the terminal edge value, the plan's cost decomposition with
+`model_terms_are_cash: false`, the plan-level expected energies, and a per-civil-day
+breakdown. One entity, because two economic sensors could disagree.
+
+### Added: the retention-side marginal value of stored energy
+
+`stored_energy_marginal_value_eur_kwh` is `(V(b-1) - V(b)) / bucket_kwh` — what
+*keeping* the energy already in the pack is worth. The retention side, because the
+alternative to holding is giving energy up; the upward difference is published beside
+it as a diagnostic and is a different number at every kink. Read from the row of the
+value table matching the run state Stage B reports as physically running, which
+`beta.36` is what made truthful.
+
+Absent with a reason rather than zero, in five named cases: no curve, the top bucket
+whose width is clamped, an unreachable state, two buckets that disagree about reserve
+feasibility, and — new in `beta.37` — the bottom bucket, which has no lower side.
+Publishing `0.00 EUR/kWh` for any of them would read as "this energy is worthless",
+which is a claim, and the wrong one.
+
+### Added: a per-civil-day decomposition, on a basis that says so
+
+`today_interval_value_eur` and `tomorrow_interval_value_eur`, plus per-day import
+cost, export revenue, avoided import, switching fee and energies. Every one of those
+is exactly additive, because `cost_eur` is built as a sum over the same intervals.
+
+**They are named with `interval` in them because they are on a different basis from
+the state and do not sum to it.** The state is the plan measured against one
+whole-horizon ambient walk, which has no per-interval series and whose trajectory
+depends on the whole horizon; these are each interval measured against its own
+leave-the-battery-alone baseline. A test asserts the non-equality, so a future tidy-up
+cannot silently force an identity the mathematics forbids. The terminal credit is a
+boundary term and is published once, unsplit, belonging to neither day.
+
+The civil-day boundary is the day's own length — 92, 96 or 100 — and this is the first
+economic figure whose correctness depends on it, so the shape fixture stopped
+hardcoding 96 and all three lengths are tested.
+
+### Fixed: the passive comparator was priced under the wrong model
+
+`hold_cost()` never received `ambient_self_consumption`, whose default is `False`,
+while every plan it is compared against *is* solved with it on an installation whose
+inverter reports that it serves house load from the battery unbidden. So the baseline
+never discharged to the house while the plan modelled that it did, and the reported
+advantage credited the battery for a saving the inverter would have delivered while
+idle. That is the "battery power exactly zero" baseline, and it is not this product's
+concept of doing nothing economically active.
+
+Measured on the reference horizon: `hold_cost_eur` **3.7125 → 3.1941**, and the
+advantage with it.
+
+**`expected_net_value_eur` and the new sensor therefore read lower on affected
+installations.** That is the correction, not a regression. `cost_eur`, the objective,
+every action, both energy trajectories, the campaign boundaries and the execution
+targets are unchanged — proven by solving the same horizon through a reconstructed
+`beta.36` path and comparing structurally.
+
+One residual is recorded and deliberately not fixed: `hold_cost` passes
+`permitted=_ALL_ACTIONS` including `curtail`, which matches `desired` — the plan the
+sensor reads — but not `capability`.
+
+### Fixed: a publish-only bucket lookup was off by one
+
+Both readers of the value curve converted kWh to a bucket index with a bare
+`int(energy / bucket_kwh)`. `start_energy_dc_kwh` is the float product
+`n * bucket_kwh`, which need not divide cleanly, so an exact multiple floors to
+`n - 1` for roughly four per cent of bucket sizes in the live 0.15–0.40 band. When it
+happened, the published marginal value was the slope of the neighbouring interval and
+`stored_value_eur` was short by one bucket's worth. Both sites now use an
+epsilon-carrying helper, and a regression pins a pair that exposes the bug.
+
+Publish-only: neither site is read by any decision path.
+
+### Added: thirty days of decision-time economic evidence
+
+Two tiers, both existing architecture, no new persistence framework:
+
+- the **hot ring** — `LearningStore.decisions`, per refresh, still bounded at 192
+  records. Each record simply grows by the economic scalars, prefixed `ev_`. **No
+  schema version moves**, because that record has always been a free-form dict;
+- the **thirty-day evidence** — `EconomicSnapshot` in the month-partitioned
+  forecast-history store, written change-triggered on the input fingerprint. That is
+  what makes a month affordable: a quiet day costs one row rather than ninety-six
+  near-identical ones, and Home Assistant never rewrites a monolithic document on the
+  sixty-second debounce.
+
+This is the decision-time half of a comparison a future release can complete against
+measured outcomes, and it is the half that cannot be recovered afterwards: prices are
+revised, forecasts are replaced, the pack moves. **Nothing learns from it, and nothing
+reads it back into a decision.** Linkage to the realised ledger is by
+`(day, price_fingerprint)`, both of which the record already carried.
+
+### Unchanged, deliberately
+
+**Zero additional dynamic-programming solves.** Every figure is read from the outcome
+the refresh already produced, and `solve_count` is asserted rather than argued. No
+economics moved: the minimum trade gain, the grid-charge margin, the throughput cost,
+the configured minimum state of charge, the Safety Buy's meaning, the export gate, the
+reserve and the terminal-value policy are exactly as they were. No user-configurable
+setting was added. `realized.py` is untouched.
+
+The entity id remains **derived from the config-entry title**, as every entity here
+always has been — `sensor.alpha_ems_economic_value` on an installation titled "Alpha
+EMS", `sensor.alpha_ems_manager_economic_value` on one titled "Alpha EMS Manager".
+A parametrised regression pins the derivation for both, and no existing entity id
+changed.
+
+### Not implemented, on purpose
+
+`replacement_cost_eur_kwh` is **not published.** The only candidate figure is
+`edge_value_eur_per_kwh`, which exists to price the *horizon edge* and already seeds
+the terminal credit into the value table — so it is inside the marginal stored-energy
+value already, and publishing it as an acquisition price would both double-count it
+and present a boundary parameter as something a person could go and buy at. It is
+published under its own name, `terminal_edge_value_eur_kwh`. No replacement-cost
+number was manufactured.
+
+`next_refill_price_eur_kwh` is not published either: "next refill" names no quantity
+in the optimiser. In its place, `next_planned_charge_price_eur_kwh` — the average
+import price of the next planned charge run, or null when the plan has none.
+
+Per-day grid-charge cost is not published: it needs a per-interval field that does not
+exist, and approximating it would be a different number wearing the same name.
+
+### Found, not fixed
+
+Two frame confusions between an absolute interval index and a horizon position, both
+recorded with file and line so the next release starts from evidence. Neither is fixed
+here, because fixing either would change the dynamic programme's objective and this
+release must be decision-neutral.
+
+1. **`_terminal_value` reads a clock-matched price at the wrong offset.** It computes
+   `clock = demand.index % today_interval_count` and reads `prices[clock]`, but the
+   price series is positionally aligned with a horizon whose head is `elapsed + 1`, so
+   it reads the price of `clock + elapsed + 1`. **This reaches a priced quantity** —
+   the terminal credit — and so is a candidate economic defect for its own release.
+2. **`ForecastRisk.today_interval_count` is a whole-day count compared against a
+   horizon position.** Lower severity: it affects only `upper_net_demand_curve`, which
+   is protection-only and documented as never entering a priced quantity.
+
+### Verified
+
+4320 automated tests. Three mutation harnesses break each invariant on purpose and
+require a named test to notice — 43 mutations for this release, 35 for `beta.36` and
+19 for `beta.35`, all killed, including two that break the test *fixture* to prove its
+own vacuity gates and five that check the sensor cannot lie about missing data.
+
+Nine of the 43 survived their first run. Every one was a vacuous test rather than a
+weak mutation: comparisons made at the wrong tolerance, edge states chosen where the
+two candidate answers happen to coincide, and node ids pointing at the wrong test.
+All nine were fixed by strengthening the test, which is what the harness is for.
+
 ## [1.0.0-beta.36] - 2026-09-01
 
 **The release that stopped a quarter's success from destroying its campaign.** On

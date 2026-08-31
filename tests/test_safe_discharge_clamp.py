@@ -1042,7 +1042,7 @@ async def test_the_entity_count_and_the_economic_contract_are_untouched(
 
     await drive_control(hass, setup_integration, import_w=400)
 
-    assert len(CONTRACT) == 14
+    assert len(CONTRACT) == 15
     assert "safety_limited" not in ECONOMIC_ATTRIBUTES
 
     economic = hass.states.get("sensor.alpha_ems_economic_action")
@@ -1155,7 +1155,7 @@ def test_the_clamp_changed_no_persisted_schema() -> None:
     # that is a control figure -- the assertions below still forbid a command, a
     # safety verdict or a power from reaching either store.
     assert STORAGE_MINOR_VERSION == 6
-    assert FORECAST_STORAGE_MINOR_VERSION == 7
+    assert FORECAST_STORAGE_MINOR_VERSION == 8
 
     for module in (storage, history_store):
         source = inspect.getsource(module)

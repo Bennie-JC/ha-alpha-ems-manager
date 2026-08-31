@@ -391,6 +391,14 @@ def test_no_decision_path_reads_the_stored_value() -> None:
         "economic.py:_stored_value_as_dict",
         "economic.py:_value_curve",
         "coordinator.py:_stored_value_eur",
+        # **beta.37, extended deliberately and by name.** The Economic Value sensor
+        # publishes the retention-side marginal value, so one more function reads
+        # the curve. It is a pure summariser whose entire job is to build a payload:
+        # it takes an outcome and returns a dict, touches no state, and is called
+        # from the entity, the diagnostics report and the decision record. The
+        # ``forbidden`` set below is what actually holds the invariant, and it is
+        # unchanged.
+        "economic.py:economic_value_summary",
     }
     assert set(readers) <= permitted, sorted(set(readers) - permitted)
     # And none of them is a decision path. Named individually rather than inferred,

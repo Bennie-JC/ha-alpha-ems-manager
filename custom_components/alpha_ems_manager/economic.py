@@ -117,6 +117,7 @@ from .battery import (
 )
 from .const import (
     ADAPT_PROTECTION_CEILING,
+    ADVANTAGE_BASIS_METERED_CASH,
     BATTERY_KWH_PRECISION,
     BUY_REASON_ARBITRAGE,
     BUY_REASON_FUTURE_SELF_USE,
@@ -127,10 +128,12 @@ from .const import (
     CAMPAIGN_BOUNDARY_BATTERY,
     CAMPAIGN_BOUNDARY_METER,
     CAMPAIGN_REJECTED_PROTECTION,
+    COMPARATOR_MODEL_AMBIENT_WALK,
     CONTROL_EXECUTION_AVAILABLE,
     CONTROL_LIVE_DISPATCH_INTENTS,
     COUNTERFACTUAL_AMBIENT_SELF_CONSUMPTION,
     COUNTERFACTUAL_IDLE_IMPORT,
+    DAY_SPLIT_BASIS_INTERVAL_IDLE,
     ECONOMIC_ACTION_CHARGE,
     ECONOMIC_ACTION_CURTAIL,
     ECONOMIC_ACTION_DISCHARGE,
@@ -148,6 +151,7 @@ from .const import (
     ECONOMIC_CHARGE_SOURCE_MIXED,
     ECONOMIC_CHARGE_SOURCE_NONE,
     ECONOMIC_CHARGE_SOURCE_PRODUCTION,
+    ECONOMIC_DEADBAND_POWER_KW,
     ECONOMIC_DIRECTION_CHARGE,
     ECONOMIC_DIRECTION_DISCHARGE,
     ECONOMIC_DIRECTION_IDLE,
@@ -170,11 +174,17 @@ from .const import (
     ECONOMIC_TOMORROW_ABSENT,
     ECONOMIC_UNAVAILABLE_HORIZON_EMPTY,
     ECONOMIC_UNAVAILABLE_TERMINAL_UNREACHABLE,
+    ECONOMIC_VALUE_UNAVAILABLE_EMPTY_HORIZON,
+    ECONOMIC_VALUE_UNAVAILABLE_NO_PLAN,
+    ECONOMIC_VALUE_UNAVAILABLE_NOT_ACTIONABLE,
+    ECONOMIC_VALUE_UNAVAILABLE_VIOLATION,
     EXECUTION_INTENT_ACTIONS,
     EXECUTION_INTENT_GRID_CHARGE,
     EXECUTION_INTENT_HOLD,
     EXECUTION_INTENT_NET_EXPORT,
     EXECUTION_INTENT_SERVE_LOAD,
+    MARGINAL_VALUE_BASIS_RETENTION,
+    MARGINAL_VALUE_KINK_TOLERANCE_EUR_KWH,
     MAX_ECONOMIC_RUN_INTERVALS_REPORTED,
     MAX_ECONOMIC_RUNS_REPORTED,
     MAX_VALUE_CURVE_POINTS_PUBLISHED,
@@ -185,6 +195,14 @@ from .const import (
     QUARTER_NOT_EXECUTABLE_INTENT,
     QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE,
     QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION,
+    REASON_CODE_AWAITING_PLANNED_ACTION,
+    REASON_CODE_CHEAP_CHARGE_HELPS,
+    REASON_CODE_EXPORT_NOW_DOMINATES,
+    REASON_CODE_NO_MATERIAL_ACTION,
+    REASON_CODE_PHYSICAL_SAFETY_BUY,
+    REASON_CODE_RETAINED_ABOVE_EXPORT,
+    REASON_CODE_VALUE_UNDEFINED,
+    STORED_VALUE_UNDEFINED_BOTTOM_BUCKET,
     STORED_VALUE_UNDEFINED_NO_CURVE,
     STORED_VALUE_UNDEFINED_TOP_BUCKET,
     STORED_VALUE_UNDEFINED_UNREACHABLE,
@@ -487,6 +505,27 @@ class PhysicsTable:
         if energy_kwh <= 0.0:
             return 0
         return min(self.buckets, math.ceil(energy_kwh / self.bucket_kwh - 1e-9))
+
+
+def bucket_at_or_below_kwh(energy_kwh: float, *, bucket_kwh: float) -> int:
+    """Return the highest bucket at or below an energy, without a table.
+
+    **The same arithmetic as :meth:`PhysicsTable.bucket_at_or_below`, epsilon
+    included, for the two publish paths that do not hold a table.** beta.35 wrote
+    both of them as a bare ``int(energy_kwh / bucket_kwh)``, and that mis-floors an
+    exact multiple to ``n - 1``: ``start_energy_dc_kwh`` is the float product
+    ``n * bucket_kwh``, which need not divide cleanly, and roughly four per cent of
+    bucket sizes in the live 0.15--0.40 band land on the wrong side. The published
+    marginal value was then the slope of the neighbouring interval and
+    ``stored_value_eur`` was short by one bucket's worth.
+
+    Unclamped at the top, because the callers do not know ``buckets``; every caller
+    passes the value to a method that range-checks it and answers ``None`` with a
+    reason if it is out of range.
+    """
+    if energy_kwh <= 0.0 or bucket_kwh <= 0.0:
+        return 0
+    return math.floor(energy_kwh / bucket_kwh + 1e-9)
 
 
 def _directional_peaks(table: PhysicsTable) -> tuple[float, float]:
@@ -1920,6 +1959,7 @@ def solve(
         terminal_floor_kwh=enforced_floor_kwh,
         terminal_bucket=terminal_bucket,
         hard_floor_kwh=hard_floor_kwh,
+        ambient_self_consumption=ambient_self_consumption,
         minimum_trade_gain_eur=minimum_trade_gain_eur,
         permitted=permitted,
         grid_charge_margin_eur_per_kwh=grid_charge_margin_eur_per_kwh,
@@ -2665,6 +2705,7 @@ def _walk_forward(
     head_run_state: int = _RUN_IDLE,
     head_value: tuple[tuple[tuple[float, float], ...], ...] = (),
     hard_floor_kwh: float = 0.0,
+    ambient_self_consumption: bool = False,
 ) -> EconomicPlan:
     """Replay the chosen moves to produce the plan the caller reads.
 
@@ -2815,6 +2856,10 @@ def _walk_forward(
             horizon=horizon,
             table=table,
             start_energy_kwh=table.energy(start_bucket),
+            # beta.37: the baseline and the plan are priced under one model. See
+            # ``hold_cost``.
+            ambient_self_consumption=ambient_self_consumption,
+            hard_floor_kwh=hard_floor_kwh,
         ),
         switching_cost_eur=total_switching,
         grid_charge_margin_eur=total_margin,
@@ -2849,6 +2894,8 @@ def hold_cost(
     horizon: EconomicHorizon,
     table: PhysicsTable,
     start_energy_kwh: float,
+    ambient_self_consumption: bool = False,
+    hard_floor_kwh: float = 0.0,
 ) -> float:
     """Return what the horizon costs if the battery is left alone.
 
@@ -2866,11 +2913,35 @@ def hold_cost(
     between two plans in the same physical world. The objective never reads this
     function, so nothing about the chosen plan changes -- only what is reported
     about it.
+
+    **beta.37 completes that argument by pricing both under one *model*, not just
+    one trajectory.** This function did not receive ``ambient_self_consumption``,
+    whose default is ``False``, while every plan it is compared against *is* solved
+    with it on an installation whose inverter reports that it serves house load from
+    the battery unbidden (``coordinator._ambient_self_consumption``). So the baseline
+    never discharged to the house while the plan modelled that it did, and the
+    reported advantage credited the battery for a saving the inverter would have
+    delivered while idle. That is the "battery power exactly zero" baseline, and it
+    is not this product's concept of doing nothing economically active.
+
+    The correction lowers ``expected_net_value_eur`` on affected installations. It
+    is still not read by the objective, so it still changes no decision -- an exact
+    plan-equality regression holds that.
     """
     if not horizon.intervals:
         return 0.0
 
     ac_by_delta = _ac_by_delta(table)
+    # Mirrored from ``solve`` rather than re-derived: the clamp is the authority for
+    # what a delta actually delivers, and two derivations are how a baseline and the
+    # plan it is compared against come to model different hardware.
+    max_discharge_ac_kwh = table.limits.max_discharge_kw * INTERVAL_HOURS
+    discharges = [
+        discharge_ac
+        for delta, (_charge_ac, discharge_ac) in ac_by_delta.items()
+        if delta < 0 and discharge_ac > 0.0
+    ]
+    smallest_discharge_ac_kwh = min(discharges) if discharges else 0.0
     outcomes_per_interval = [
         _interval_outcomes(
             ac_by_delta=ac_by_delta,
@@ -2878,6 +2949,10 @@ def hold_cost(
             pv_ac_kwh=demand.pv_kwh or 0.0,
             price=horizon.prices[position],
             permitted=_ALL_ACTIONS,
+            ambient_self_consumption=ambient_self_consumption,
+            max_discharge_ac_kwh=max_discharge_ac_kwh,
+            discharge_efficiency=table.limits.discharge_efficiency,
+            smallest_discharge_ac_kwh=smallest_discharge_ac_kwh,
         )
         for position, demand in enumerate(horizon.demands)
     ]
@@ -2890,10 +2965,23 @@ def hold_cost(
 
     total = 0.0
     bucket = start_bucket
+    # **The drained pack, exactly as the forward walk carries it.** Ambient service
+    # is real energy the lattice cannot represent, so without this offset the clamp
+    # would read a state of charge that never falls and authorise ambient service
+    # straight through the floor.
+    ambient_drained_dc_kwh = 0.0
     for position, target in enumerate(ambient):
         outcome = outcomes_per_interval[position].get(target - bucket)
         if outcome is not None:
-            total += outcome.cost_eur
+            energy_now_kwh = max(0.0, table.energy(bucket) - ambient_drained_dc_kwh)
+            serves_ambiently = outcome.ambient is not None and _ambient_applies(
+                outcome, energy_kwh=energy_now_kwh, floor_energy_kwh=hard_floor_kwh
+            )
+            if serves_ambiently and outcome.ambient is not None:
+                total += outcome.ambient.cost_eur
+                ambient_drained_dc_kwh += outcome.ambient.dc_kwh
+            else:
+                total += outcome.cost_eur
         bucket = target
     return total
 
@@ -5018,6 +5106,368 @@ def _rejected_campaigns(outcome: EconomicOutcome) -> list[dict[str, Any]]:
     return rejected
 
 
+# ===========================================================================
+# Economic value -- beta.37, and it decides nothing
+# ===========================================================================
+
+
+def _day_slice(
+    plan: EconomicPlan, *, today_interval_count: int, tomorrow: bool
+) -> tuple[EconomicInterval, ...]:
+    """Return the plan's intervals belonging to one civil day.
+
+    The boundary is the single integer ``today_interval_count``: an index below it
+    is today, at or above it is tomorrow. That integer is 92, 96 or 100 depending
+    on the civil day, so it is **read rather than assumed** -- this is the first
+    economic figure whose correctness depends on it.
+
+    ``today_interval_count <= 0`` means the caller could not establish the day
+    length, and the honest answer is an empty slice rather than a guess about which
+    day a figure belongs to.
+    """
+    if today_interval_count <= 0:
+        return ()
+    if tomorrow:
+        return tuple(
+            entry for entry in plan.intervals if entry.index >= today_interval_count
+        )
+    return tuple(
+        entry for entry in plan.intervals if entry.index < today_interval_count
+    )
+
+
+def _day_block(
+    entries: tuple[EconomicInterval, ...], *, fee_per_start_eur: float
+) -> dict[str, Any]:
+    """Return one civil day's cash decomposition, from per-interval sums only.
+
+    **Every figure here is exactly additive**, because ``cost_eur`` is built as a
+    sum over these same intervals (see ``_walk_forward``) and each energy is a field
+    on the interval. Nothing whose value depends on the whole horizon appears: the
+    terminal credit is a boundary term and the passive comparator has no
+    per-interval series, so both are published once, unsplit, elsewhere.
+    """
+    if not entries:
+        return {
+            "intervals": 0,
+            "interval_value_eur": None,
+            "grid_import_cost_eur": None,
+            "export_revenue_eur": None,
+            "avoided_import_eur": None,
+            "switching_cost_eur": None,
+            "grid_import_kwh": None,
+            "grid_export_kwh": None,
+            "battery_charge_ac_kwh": None,
+            "battery_discharge_ac_kwh": None,
+        }
+    imports = sum(
+        entry.grid_import_kwh * (entry.import_price_eur_kwh or 0.0) for entry in entries
+    )
+    exports = sum(
+        entry.grid_export_kwh * (entry.export_price_eur_kwh or 0.0) for entry in entries
+    )
+    # **Avoided import is the import the plan did *not* make**, priced at the same
+    # interval's own import price. ``marginal_grid_import_kwh`` is
+    # ``grid_import - idle_import``, so a plan importing less than idle gives a
+    # negative marginal and a positive avoidance.
+    avoided = sum(
+        -entry.marginal_grid_import_kwh * (entry.import_price_eur_kwh or 0.0)
+        for entry in entries
+    )
+    return {
+        "intervals": len(entries),
+        # The per-interval idle counterfactual, sign-flipped so positive is money
+        # saved. **Not the same basis as the sensor state** -- see the rule string.
+        "interval_value_eur": _round_eur(
+            -sum(entry.marginal_cost_eur for entry in entries)
+        ),
+        "grid_import_cost_eur": _round_eur(imports),
+        "export_revenue_eur": _round_eur(exports),
+        "avoided_import_eur": _round_eur(avoided),
+        # A model term, apportioned to the day a run *starts* in. Not cash.
+        "switching_cost_eur": _round_eur(
+            fee_per_start_eur * sum(1 for entry in entries if entry.run_start)
+        ),
+        "grid_import_kwh": _round_kwh(sum(e.grid_import_kwh for e in entries)),
+        "grid_export_kwh": _round_kwh(sum(e.grid_export_kwh for e in entries)),
+        "battery_charge_ac_kwh": _round_kwh(
+            sum(e.battery_charge_ac_kwh for e in entries)
+        ),
+        "battery_discharge_ac_kwh": _round_kwh(
+            sum(e.battery_discharge_ac_kwh for e in entries)
+        ),
+    }
+
+
+def _next_planned_charge_price(plan: EconomicPlan) -> float | None:
+    """Return the average import price of the next planned charge run, or ``None``.
+
+    **Offered as what refilling would cost according to the plan already chosen**,
+    and deliberately not as a "replacement cost". It is ``None`` whenever the plan
+    contains no future charge -- which is often, and is the honest answer rather
+    than reaching for the cheapest visible price and calling it a refill.
+    """
+    if not plan.intervals:
+        return None
+    head = plan.intervals[0].index
+    for run in plan.runs:
+        if run.action != ECONOMIC_ACTION_CHARGE:
+            continue
+        if run.start_index < head:
+            continue
+        return run.average_price_eur_kwh
+    return None
+
+
+def _reason_code(
+    outcome: EconomicOutcome,
+    *,
+    action: str,
+    advantage_eur: float,
+    marginal_eur_kwh: float | None,
+    export_price_eur_kwh: float | None,
+    material_eur: float,
+) -> str:
+    """Return why the plan is doing what it is doing. **Explanatory only.**
+
+    Derived from the selected plan -- the run covering the horizon head, and the
+    Safety-Buy attribution the reserve comparison already produced -- and never from
+    a comparison of two prices. A reason code computed as
+    ``export_price > stored_value`` would be a second, cruder optimiser whose answer
+    could contradict the real one, and the contradiction would be invisible.
+
+    The order is by *authority*, not by convenience: a compelled purchase outranks
+    every economic reading, an immaterial advantage outranks a direction, and an
+    undefined marginal value is stated rather than worked around.
+    """
+    run = outcome.desired.current_run
+    if run is not None and run.start_index in outcome.safety_buy_runs:
+        return REASON_CODE_PHYSICAL_SAFETY_BUY
+    if abs(advantage_eur) < material_eur:
+        return REASON_CODE_NO_MATERIAL_ACTION
+    if action == ECONOMIC_ACTION_CHARGE:
+        return REASON_CODE_CHEAP_CHARGE_HELPS
+    if action in (ECONOMIC_ACTION_EXPORT, ECONOMIC_ACTION_DISCHARGE):
+        return REASON_CODE_EXPORT_NOW_DOMINATES
+    if marginal_eur_kwh is None:
+        return REASON_CODE_VALUE_UNDEFINED
+    if export_price_eur_kwh is not None and marginal_eur_kwh > export_price_eur_kwh:
+        return REASON_CODE_RETAINED_ABOVE_EXPORT
+    # **Idle at the head with something material ahead is not "nothing worth
+    # doing".** The plan may be worth several euros over the horizon and simply have
+    # its first run later -- which is the ordinary Hold, and reporting it as
+    # immaterial would be the most misleading answer available.
+    if outcome.desired.next_run is not None:
+        return REASON_CODE_AWAITING_PLANNED_ACTION
+    return REASON_CODE_NO_MATERIAL_ACTION
+
+
+def economic_value_summary(
+    outcome: EconomicOutcome | None,
+    *,
+    today_interval_count: int = 0,
+    import_price_eur_kwh: float | None = None,
+    export_price_eur_kwh: float | None = None,
+    comparator_model: str = COMPARATOR_MODEL_AMBIENT_WALK,
+    tomorrow_prices_known: bool = False,
+) -> dict[str, Any]:
+    """Return everything the Economic Value sensor publishes. Pure, and read-only.
+
+    **The one place the figures are derived**, so the entity, the diagnostics
+    payload and the persisted evidence cannot disagree about what any of them mean.
+    Nothing here solves anything: every quantity is read from the outcome this
+    refresh already produced, which is why the release adds no dynamic-programming
+    solve at all.
+
+    ``state`` is ``hold_cost_eur - cost_eur``: the expected advantage of the
+    selected plan over the passive counterfactual over the horizon that is known.
+
+    **``None`` and ``0.0`` are different answers, and the distinction is
+    load-bearing.** ``None`` means no valid comparison could be formed -- an
+    unavailable plan, an empty horizon, no actionable interval, or a reserve
+    violation, which under the lexicographic objective means no monetary
+    alternative was ever ranked. ``0.0`` means a *valid* comparison whose plan and
+    counterfactual are economically equal, which is a real result and must not be
+    suppressed into ``unknown``. Both failure directions are forbidden: no-data must
+    never render as zero, and a genuine zero must never render as no-data.
+    """
+    if outcome is None:
+        return {
+            "available": False,
+            "state": None,
+            "unavailable_reason": ECONOMIC_VALUE_UNAVAILABLE_NO_PLAN,
+        }
+    plan = outcome.desired
+    reason: str | None = None
+    if not plan.available:
+        reason = ECONOMIC_VALUE_UNAVAILABLE_NO_PLAN
+    elif not plan.intervals:
+        reason = ECONOMIC_VALUE_UNAVAILABLE_EMPTY_HORIZON
+    elif outcome.actionable_interval_count <= 0:
+        reason = ECONOMIC_VALUE_UNAVAILABLE_NOT_ACTIONABLE
+    elif plan.violation_kwh > 0.0:
+        reason = ECONOMIC_VALUE_UNAVAILABLE_VIOLATION
+    if reason is not None:
+        return {"available": False, "state": None, "unavailable_reason": reason}
+
+    advantage = plan.hold_cost_eur - plan.cost_eur
+
+    # --- the marginal worth of stored energy, retention side ----------------
+    bucket_kwh = outcome.bucket_kwh
+    current_bucket = bucket_at_or_below_kwh(
+        plan.intervals[0].start_energy_dc_kwh, bucket_kwh=bucket_kwh
+    )
+    floor_bucket = bucket_at_or_below_kwh(
+        plan.terminal_floor_kwh, bucket_kwh=bucket_kwh
+    )
+    if current_bucket <= 0:
+        retention: float | None = None
+        retention_reason: str | None = STORED_VALUE_UNDEFINED_BOTTOM_BUCKET
+    else:
+        retention, retention_reason = plan.marginal_value_eur_per_kwh(
+            current_bucket - 1, bucket_kwh=bucket_kwh
+        )
+    upward, upward_reason = plan.marginal_value_eur_per_kwh(
+        current_bucket, bucket_kwh=bucket_kwh
+    )
+    stored_value, stored_value_reason = plan.stored_value_eur(
+        floor_bucket=floor_bucket, current_bucket=current_bucket
+    )
+    # **A kink is reported, never smoothed.** A fixed switching fee inside a
+    # minimisation breaks concavity, so the two one-sided slopes genuinely disagree
+    # at a fee boundary -- by up to ``fee / bucket_kwh``. Publishing their average
+    # would invent a derivative the lattice does not have.
+    kinked = (
+        None
+        if retention is None or upward is None
+        else abs(retention - upward) > MARGINAL_VALUE_KINK_TOLERANCE_EUR_KWH
+    )
+
+    action = outcome.current_action
+    material = (
+        ECONOMIC_DEADBAND_POWER_KW
+        * INTERVAL_HOURS
+        * max(0.0, import_price_eur_kwh or 0.0)
+    )
+    fee_per_start = plan.switching_cost_eur / max(1, plan.direction_changes)
+    today = _day_slice(plan, today_interval_count=today_interval_count, tomorrow=False)
+    tomorrow = _day_slice(
+        plan, today_interval_count=today_interval_count, tomorrow=True
+    )
+    today_block = _day_block(today, fee_per_start_eur=fee_per_start)
+    tomorrow_block = _day_block(tomorrow, fee_per_start_eur=fee_per_start)
+
+    return {
+        "available": True,
+        "state": _round_eur(advantage),
+        "unavailable_reason": None,
+        "current_action": action,
+        "reason_code": _reason_code(
+            outcome,
+            action=action,
+            advantage_eur=advantage,
+            marginal_eur_kwh=retention,
+            export_price_eur_kwh=export_price_eur_kwh,
+            material_eur=material,
+        ),
+        "decision_advantage_eur": _round_eur(advantage),
+        # **Equal to the state, and publishing both is the proof rather than a
+        # duplication.** ``cost_eur`` and ``hold_cost_eur`` are both metered cash --
+        # every euro in them reconciles to grid energy at the interval's own prices
+        # -- so their difference contains no model term. The switching fee, the
+        # grid-charge margin, the throughput cost and the terminal credit all sit
+        # *outside* it, in ``objective_eur``, and are published as plan context with
+        # ``is_cash: False``. A reader comparing these two lines can see that
+        # nothing notional leaked into the headline.
+        "advantage_cash_eur": _round_eur(advantage),
+        "advantage_basis": ADVANTAGE_BASIS_METERED_CASH,
+        "comparator_model": comparator_model,
+        "today_interval_value_eur": today_block["interval_value_eur"],
+        "tomorrow_interval_value_eur": tomorrow_block["interval_value_eur"],
+        "day_split_basis": DAY_SPLIT_BASIS_INTERVAL_IDLE,
+        "day_split_rule": (
+            "the two interval values sum exactly over their own components and do "
+            "NOT sum to decision_advantage_eur: the state is the plan against one "
+            "whole-horizon ambient walk, and these are each interval against its "
+            "own leave-the-battery-alone baseline. the terminal credit is a "
+            "boundary term and belongs to neither day. the attribute names carry "
+            "the basis for that reason"
+        ),
+        "stored_energy_marginal_value_eur_kwh": _round_eur(retention),
+        "marginal_value_basis": MARGINAL_VALUE_BASIS_RETENTION,
+        "marginal_value_unavailable_reason": retention_reason,
+        "terminal_edge_value_eur_kwh": _round_eur(outcome.edge_value_eur_per_kwh),
+        "next_planned_charge_price_eur_kwh": _round_eur(
+            _next_planned_charge_price(plan)
+        ),
+        "current_import_price_eur_kwh": _round_eur(import_price_eur_kwh),
+        "current_export_price_eur_kwh": _round_eur(export_price_eur_kwh),
+        "stored_energy_kwh": _round_kwh(plan.intervals[0].start_energy_dc_kwh),
+        "first_interval_index": plan.intervals[0].index,
+        "last_interval_index": plan.intervals[-1].index,
+        "horizon_intervals": len(plan.intervals),
+        "actionable_intervals": outcome.actionable_interval_count,
+        "tomorrow_prices_known": tomorrow_prices_known,
+        "stored_value": {
+            "marginal_value_up_eur_kwh": _round_eur(upward),
+            "marginal_value_down_eur_kwh": _round_eur(retention),
+            "marginal_value_kinked": kinked,
+            "marginal_value_basis": MARGINAL_VALUE_BASIS_RETENTION,
+            # Four decimals, not two: the bucket is the width of the difference quotient
+            # and rounding 0.2635 to 0.26 would misstate the number the slope
+            # was actually divided by.
+            "marginal_value_resolution_kwh": _round_eur(bucket_kwh),
+            "marginal_value_unavailable_reason": retention_reason,
+            "marginal_value_up_unavailable_reason": upward_reason,
+            "head_run_state": plan.head_run_state,
+            "current_bucket": current_bucket,
+            "stored_value_eur": _round_eur(stored_value),
+            "stored_value_unavailable_reason": stored_value_reason,
+            "rule": (
+                "the headline is the retention side, V(b-1) - V(b): the alternative "
+                "to holding is giving energy up. the upward side is what one more "
+                "kWh would be worth and is a diagnostic, never the headline. null "
+                "with a reason is a defined answer and zero is not"
+            ),
+        },
+        "plan": {
+            "selected_plan_cost_eur": _round_eur(plan.cost_eur),
+            "counterfactual_cost_eur": _round_eur(plan.hold_cost_eur),
+            "objective_eur": _round_eur(plan.objective_eur),
+            "expected_net_value_eur": _round_eur(plan.expected_net_value_eur),
+            "switching_cost_eur": _round_eur(plan.switching_cost_eur),
+            "grid_charge_margin_eur": _round_eur(plan.grid_charge_margin_eur),
+            "battery_throughput_cost_eur": _round_eur(plan.battery_throughput_cost_eur),
+            "edge_value_eur": _round_eur(plan.edge_value_eur),
+            "run_count": len(plan.runs),
+            "campaign_count": len(plan.campaigns),
+            "safety_buy_ac_kwh": _round_kwh(outcome.safety_buy_ac_kwh),
+            "bridge_kwh_now": _round_kwh(outcome.bridge_kwh_now),
+            "model_terms_are_cash": False,
+            "rule": (
+                "positive cost means money leaves the household. the four model "
+                "terms and the terminal credit are NOT in cost_eur and therefore "
+                "not in the advantage: they live in objective_eur, which is the "
+                "scalar the plan was chosen to minimise. no model term is cash"
+            ),
+        },
+        "energy": {
+            "expected_grid_import_kwh": _round_kwh(plan.planned_grid_import_kwh),
+            "expected_grid_export_kwh": _round_kwh(plan.planned_grid_export_kwh),
+            "expected_battery_throughput_kwh": _round_kwh(plan.battery_throughput_kwh),
+            "expected_curtailed_kwh": _round_kwh(plan.planned_curtailed_kwh),
+            "rule": (
+                "plan-level sums over the intervals, not the per-run "
+                "expected_grid_* fields in the execution targets -- those are "
+                "marginal figures against an idle baseline and a different quantity "
+                "under a similar name"
+            ),
+        },
+        "today": today_block,
+        "tomorrow": tomorrow_block,
+    }
+
+
 def _stored_value_as_dict(outcome: EconomicOutcome) -> dict[str, Any]:
     """Return the marginal worth of stored energy, and why not where not.
 
@@ -5033,8 +5483,12 @@ def _stored_value_as_dict(outcome: EconomicOutcome) -> dict[str, Any]:
     bucket_kwh = outcome.bucket_kwh
     if not plan.available or not plan.intervals or not bucket_kwh:
         return {"available": False}
-    floor_bucket = int(plan.terminal_floor_kwh / bucket_kwh)
-    current_bucket = int(plan.intervals[0].start_energy_dc_kwh / bucket_kwh)
+    floor_bucket = bucket_at_or_below_kwh(
+        plan.terminal_floor_kwh, bucket_kwh=bucket_kwh
+    )
+    current_bucket = bucket_at_or_below_kwh(
+        plan.intervals[0].start_energy_dc_kwh, bucket_kwh=bucket_kwh
+    )
     marginal, marginal_reason = plan.marginal_value_eur_per_kwh(
         current_bucket, bucket_kwh=bucket_kwh
     )
@@ -6492,6 +6946,34 @@ class EconomicSnapshot:
     #: plan because the run count over-states it and a later reader cannot
     #: recompute the difference from scalars alone.
     direction_changes: int = 0
+    #: **The Economic Value scalars. beta.37, and the reason this store is where the
+    #: thirty days live.**
+    #:
+    #: The decision-time half of a comparison a later release can complete against
+    #: measured outcomes, and the half that cannot be recovered afterwards: prices are
+    #: revised, forecasts are replaced, and the pack moves. Written change-triggered
+    #: on the input fingerprint like every other snapshot family, so a quiet day costs
+    #: one row rather than ninety-six near-identical ones -- which is what makes a
+    #: month of evidence affordable in a partitioned document.
+    #:
+    #: Additive. A document from any earlier release simply has none of them, and they
+    #: are **not** back-filled: they were not computed then, and making old and new
+    #: figures look continuous would be a fabrication.
+    decision_advantage_eur: float | None = None
+    advantage_cash_eur: float | None = None
+    counterfactual_cost_eur: float | None = None
+    stored_energy_marginal_value_eur_kwh: float | None = None
+    marginal_value_unavailable_reason: str | None = None
+    terminal_edge_value_eur_kwh: float | None = None
+    stored_energy_dc_kwh: float | None = None
+    head_run_state: int | None = None
+    reason_code: str | None = None
+    today_interval_value_eur: float | None = None
+    tomorrow_interval_value_eur: float | None = None
+    tomorrow_prices_known: bool | None = None
+    actionable_intervals: int | None = None
+    comparator_model: str | None = None
+    state_unavailable_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the compact serialisable form, matching the sibling families."""
@@ -6518,6 +7000,23 @@ class EconomicSnapshot:
             "mrc": self.max_representable_charge_kw,
             "mrd": self.max_representable_discharge_kw,
             "dc": self.direction_changes,
+            # beta.37, short-keyed like every other field here because a month of
+            # partitions is read by a machine and written on every issuance.
+            "eva": self.decision_advantage_eur,
+            "evc": self.advantage_cash_eur,
+            "evcf": self.counterfactual_cost_eur,
+            "evm": self.stored_energy_marginal_value_eur_kwh,
+            "evmr": self.marginal_value_unavailable_reason,
+            "evte": self.terminal_edge_value_eur_kwh,
+            "evs": self.stored_energy_dc_kwh,
+            "evhr": self.head_run_state,
+            "evrc": self.reason_code,
+            "evtd": self.today_interval_value_eur,
+            "evtm": self.tomorrow_interval_value_eur,
+            "evtk": self.tomorrow_prices_known,
+            "evai": self.actionable_intervals,
+            "evcm": self.comparator_model,
+            "evur": self.state_unavailable_reason,
             "vi": self.violation_kwh,
             "sb": self.safety_buy_ac_kwh,
             "tf": self.terminal_floor_kwh,
@@ -6583,6 +7082,34 @@ class EconomicSnapshot:
             max_representable_charge_kw=_finite(raw.get("mrc")),
             max_representable_discharge_kw=_finite(raw.get("mrd")),
             direction_changes=(raw["dc"] if isinstance(raw.get("dc"), int) else 0),
+            # **Read defensively, and absent rather than zero.** A pre-beta.37
+            # document has none of these, and a missing advantage is not an advantage
+            # of nothing.
+            decision_advantage_eur=_finite(raw.get("eva")),
+            advantage_cash_eur=_finite(raw.get("evc")),
+            counterfactual_cost_eur=_finite(raw.get("evcf")),
+            stored_energy_marginal_value_eur_kwh=_finite(raw.get("evm")),
+            marginal_value_unavailable_reason=(
+                raw.get("evmr") if isinstance(raw.get("evmr"), str) else None
+            ),
+            terminal_edge_value_eur_kwh=_finite(raw.get("evte")),
+            stored_energy_dc_kwh=_finite(raw.get("evs")),
+            head_run_state=(raw["evhr"] if isinstance(raw.get("evhr"), int) else None),
+            reason_code=(raw.get("evrc") if isinstance(raw.get("evrc"), str) else None),
+            today_interval_value_eur=_finite(raw.get("evtd")),
+            tomorrow_interval_value_eur=_finite(raw.get("evtm")),
+            tomorrow_prices_known=(
+                raw["evtk"] if isinstance(raw.get("evtk"), bool) else None
+            ),
+            actionable_intervals=(
+                raw["evai"] if isinstance(raw.get("evai"), int) else None
+            ),
+            comparator_model=(
+                raw.get("evcm") if isinstance(raw.get("evcm"), str) else None
+            ),
+            state_unavailable_reason=(
+                raw.get("evur") if isinstance(raw.get("evur"), str) else None
+            ),
             violation_kwh=_finite(raw.get("vi")) or 0.0,
             safety_buy_ac_kwh=_finite(raw.get("sb")) or 0.0,
             terminal_floor_kwh=_finite(raw.get("tf")) or 0.0,
@@ -6625,9 +7152,20 @@ def build_economic_snapshot(
     pv_fingerprint: str | None = None,
     reserve_fingerprint: str | None = None,
     unavailable_reason: str | None = None,
+    economic_value: dict[str, Any] | None = None,
 ) -> EconomicSnapshot:
-    """Return the snapshot for one refresh."""
+    """Return the snapshot for one refresh.
+
+    ``economic_value`` is the payload :func:`economic_value_summary` produced for the
+    same outcome, passed in rather than recomputed so the persisted figures and the
+    published ones are the *same* derivation. ``None`` -- or an unavailable payload --
+    leaves every beta.37 field absent, which is what an earlier document also looks
+    like and is the honest state for a refresh that could form no comparison.
+    """
     available = outcome is not None and outcome.available
+    value = economic_value or {}
+    valued = bool(value.get("available"))
+    stored_block = value.get("stored_value") or {}
     return EconomicSnapshot(
         issued_at=issued_at,
         target_day=target_day,
@@ -6681,6 +7219,39 @@ def build_economic_snapshot(
             else None
         ),
         direction_changes=(outcome.desired.direction_changes if available else 0),
+        decision_advantage_eur=(
+            value.get("decision_advantage_eur") if valued else None
+        ),
+        advantage_cash_eur=value.get("advantage_cash_eur") if valued else None,
+        counterfactual_cost_eur=(
+            (value.get("plan") or {}).get("counterfactual_cost_eur") if valued else None
+        ),
+        stored_energy_marginal_value_eur_kwh=(
+            value.get("stored_energy_marginal_value_eur_kwh") if valued else None
+        ),
+        marginal_value_unavailable_reason=(
+            value.get("marginal_value_unavailable_reason") if valued else None
+        ),
+        terminal_edge_value_eur_kwh=(
+            value.get("terminal_edge_value_eur_kwh") if valued else None
+        ),
+        stored_energy_dc_kwh=value.get("stored_energy_kwh") if valued else None,
+        head_run_state=stored_block.get("head_run_state") if valued else None,
+        reason_code=value.get("reason_code") if valued else None,
+        today_interval_value_eur=(
+            value.get("today_interval_value_eur") if valued else None
+        ),
+        tomorrow_interval_value_eur=(
+            value.get("tomorrow_interval_value_eur") if valued else None
+        ),
+        tomorrow_prices_known=(value.get("tomorrow_prices_known") if valued else None),
+        actionable_intervals=value.get("actionable_intervals") if valued else None,
+        comparator_model=value.get("comparator_model") if valued else None,
+        # Present on both branches, because "why is there no state" is the question a
+        # reader has about a row with no advantage in it.
+        state_unavailable_reason=(
+            None if valued else (value.get("unavailable_reason") or None)
+        ),
         violation_kwh=(
             _round_kwh(outcome.desired.violation_kwh) or 0.0 if available else 0.0
         ),

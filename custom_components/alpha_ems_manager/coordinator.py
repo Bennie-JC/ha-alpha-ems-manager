@@ -96,6 +96,8 @@ from .const import (
     CAMPAIGN_TARGET_UNAVAILABLE,
     CAP_NONE,
     CLAIM_SCHEMA_VERSION,
+    COMPARATOR_MODEL_AMBIENT_ABSORB_ONLY,
+    COMPARATOR_MODEL_AMBIENT_WALK,
     CONF_ALLOW_BATTERY_EXPORT,
     CONF_ALLOW_GRID_CHARGING,
     CONF_BATTERY_CAPACITY_KWH,
@@ -300,6 +302,7 @@ from .economic import (
     IntervalPrice,
     TerminalValue,
     actionable_intervals,
+    bucket_at_or_below_kwh,
     build_economic_snapshot,
     build_horizon,
     build_outcome,
@@ -307,6 +310,7 @@ from .economic import (
     campaign_identity,
     campaign_instance_identity,
     desired_grid_kw_at,
+    economic_value_summary,
     edge_creditable_energy_kwh,
     edge_value_eur_per_kwh,
     execution_revision,
@@ -3223,8 +3227,75 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "tomorrow_prices_available_at": self._tomorrow_prices_available_at,
                 **self._price_evidence(outcome),
                 **self._gate_evidence(outcome),
+                # **What the optimiser believed it was worth, at the moment it
+                # chose. beta.37.** The decision-time half of a comparison a later
+                # release can complete against measured outcomes, and the half that
+                # is irrecoverable afterwards: prices are revised, forecasts are
+                # replaced, and the state of charge moves. Scalars and an existing
+                # fingerprint only -- the series themselves are already retained for
+                # a year by the evidence layers, and duplicating them here would
+                # make this a database.
+                **self._economic_value_evidence(outcome, plan, now),
             }
         )
+
+    @callback
+    def _economic_value_evidence(
+        self, outcome: Any, plan: Any, now: datetime
+    ) -> dict[str, Any]:
+        """Return the Economic Value scalars for one persisted record.
+
+        A flat projection of :meth:`_economic_value_for`, because a record is read by
+        a replay harness rather than a dashboard and nested blocks would make every
+        field a two-step lookup. Prefixed ``ev_`` so a reader can tell at a glance
+        which figures arrived in beta.37 and which were already there -- and so a
+        name can never collide with one of the twenty-odd keys already in the record.
+        """
+        summary = self._economic_value_for(outcome, plan, now)
+        if not summary.get("available"):
+            return {
+                "ev_available": False,
+                "ev_state_unavailable_reason": summary.get("unavailable_reason"),
+            }
+        stored = summary.get("stored_value") or {}
+        energy = summary.get("energy") or {}
+        return {
+            "ev_available": True,
+            "ev_state_unavailable_reason": None,
+            "ev_selected_plan_cost_eur": (summary.get("plan") or {}).get(
+                "selected_plan_cost_eur"
+            ),
+            "ev_counterfactual_cost_eur": (summary.get("plan") or {}).get(
+                "counterfactual_cost_eur"
+            ),
+            "ev_decision_advantage_eur": summary.get("decision_advantage_eur"),
+            "ev_advantage_cash_eur": summary.get("advantage_cash_eur"),
+            "ev_stored_energy_marginal_value_eur_kwh": summary.get(
+                "stored_energy_marginal_value_eur_kwh"
+            ),
+            "ev_marginal_value_unavailable_reason": summary.get(
+                "marginal_value_unavailable_reason"
+            ),
+            "ev_terminal_edge_value_eur_kwh": summary.get(
+                "terminal_edge_value_eur_kwh"
+            ),
+            "ev_stored_energy_dc_kwh": summary.get("stored_energy_kwh"),
+            "ev_head_run_state": stored.get("head_run_state"),
+            "ev_selected_action": summary.get("current_action"),
+            "ev_reason_code": summary.get("reason_code"),
+            "ev_expected_grid_import_kwh": energy.get("expected_grid_import_kwh"),
+            "ev_expected_grid_export_kwh": energy.get("expected_grid_export_kwh"),
+            "ev_expected_battery_throughput_kwh": energy.get(
+                "expected_battery_throughput_kwh"
+            ),
+            "ev_today_interval_value_eur": summary.get("today_interval_value_eur"),
+            "ev_tomorrow_interval_value_eur": summary.get(
+                "tomorrow_interval_value_eur"
+            ),
+            "ev_tomorrow_prices_known": summary.get("tomorrow_prices_known"),
+            "ev_actionable_intervals": summary.get("actionable_intervals"),
+            "ev_comparator_model": summary.get("comparator_model"),
+        }
 
     @callback
     def _terminal_value(
@@ -3330,12 +3401,128 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         # Against the floor the plan is actually held to, which is the only
         # reference point that makes "above the floor" mean anything.
-        floor_bucket = int(plan.terminal_floor_kwh / bucket_kwh)
-        current_bucket = int(plan.intervals[0].start_energy_dc_kwh / bucket_kwh)
+        #
+        # **``bucket_at_or_below_kwh``, not ``int(e / bucket_kwh)``. beta.37.** The
+        # bare division mis-floors an exact multiple to ``n - 1``, because
+        # ``start_energy_dc_kwh`` is the float product ``n * bucket_kwh`` and need not
+        # divide cleanly -- roughly four per cent of bucket sizes in the live
+        # 0.15--0.40 band. When it happens this figure is short by one bucket's worth.
+        floor_bucket = bucket_at_or_below_kwh(
+            plan.terminal_floor_kwh, bucket_kwh=bucket_kwh
+        )
+        current_bucket = bucket_at_or_below_kwh(
+            plan.intervals[0].start_energy_dc_kwh, bucket_kwh=bucket_kwh
+        )
         value, _reason = plan.stored_value_eur(
             floor_bucket=floor_bucket, current_bucket=current_bucket
         )
         return value
+
+    @callback
+    def current_prices(self, now: datetime) -> tuple[float | None, float | None]:
+        """Return the import and export price of the interval **in progress**.
+
+        ``(import, export)``, either of which may be ``None``.
+
+        **Not the horizon head, and the difference has caused two published
+        defects.** Stage A's head is ``elapsed_intervals + 1`` -- the *next* whole
+        interval -- so ``desired.intervals[0]`` is not now. A reader asking "what is
+        electricity costing me at this moment" wants the interval containing this
+        instant, which is what ``PriceForecast.interval_at`` answers, half-open and
+        with no fallback to a neighbour: an instant nobody priced has no price.
+
+        Read-only, and no decision path calls it. Prices deliberately reach no
+        decision layer at all -- see the note above ``_price_forecasts_safely`` -- and
+        this exists so one *entity* can show a person the context their plan was made
+        in, not so the plan can consult it.
+        """
+        for forecast in self.price_forecasts.values():
+            interval = forecast.interval_at(now)
+            if interval is not None:
+                return (
+                    interval.import_price_eur_kwh,
+                    interval.export_price_eur_kwh,
+                )
+        return None, None
+
+    @callback
+    def economic_value(self, now: datetime | None = None) -> dict[str, Any]:
+        """Return the Economic Value payload for this refresh. Publish-only.
+
+        The entity's reader. It takes the outcome from the published refresh, which
+        is what an entity is allowed to see.
+        """
+        outcome = (self.data or {}).get("economic")
+        if not isinstance(outcome, EconomicOutcome):
+            outcome = None
+        return self._economic_value_for(outcome, self.battery_plan, now)
+
+    @callback
+    def _economic_value_for(
+        self, outcome: Any, plan: Any, now: datetime | None = None
+    ) -> dict[str, Any]:
+        """Return the Economic Value payload for one outcome. **One derivation.**
+
+        Assembled here because this is where the calendar and the prices are, and
+        computed in :func:`economic.economic_value_summary` because that is where the
+        plan is -- so the entity, the diagnostics payload and the persisted evidence
+        are three readers of one derivation rather than three derivations that have
+        to agree.
+
+        Takes the outcome as an argument rather than reading ``self.data``, because
+        the decision record is written *before* the refresh publishes: a persisted
+        figure and the entity's figure must describe the same solve, and the only way
+        to guarantee that is to hand both the same object.
+        """
+        moment = dt_util.now() if now is None else now
+        import_price, export_price = self.current_prices(moment)
+        today_count = 0
+        if plan is not None:
+            today = plan.forecast.get("today") or {}
+            count = today.get("interval_count")
+            today_count = count if isinstance(count, int) else 0
+        # **Known, not merely requested.** A forecast that exists but carries no
+        # usable series is not knowledge, and publishing ``true`` for it would tell a
+        # reader the horizon reaches tomorrow when it does not.
+        tomorrow_forecast = self.price_forecasts.get(moment.date() + timedelta(days=1))
+        tomorrow_known = bool(
+            tomorrow_forecast is not None and tomorrow_forecast.available
+        )
+        summary = economic_value_summary(
+            outcome,
+            today_interval_count=today_count,
+            import_price_eur_kwh=import_price,
+            export_price_eur_kwh=export_price,
+            comparator_model=(
+                COMPARATOR_MODEL_AMBIENT_WALK
+                if self._ambient_self_consumption()[0]
+                else COMPARATOR_MODEL_AMBIENT_ABSORB_ONLY
+            ),
+            tomorrow_prices_known=tomorrow_known,
+        )
+        if not summary.get("available"):
+            return summary
+        # The calendar half, added here rather than in the pure layer: an interval
+        # index becomes an instant only against a civil day and its real length.
+        target_day = None if plan is None else plan.target_day
+        tz = dt_util.get_default_time_zone()
+
+        def instant(index: int) -> str | None:
+            """Return the local instant a chronological index begins at."""
+            if target_day is None or today_count <= 0:
+                return None
+            if index < today_count:
+                start = interval_start_utc(target_day, index, tz)
+            else:
+                start = interval_start_utc(
+                    target_day + timedelta(days=1), index - today_count, tz
+                )
+            return dt_util.as_local(start).isoformat()
+
+        summary["horizon_from"] = instant(summary["first_interval_index"])
+        # The instant the horizon stops covering, not the start of its last quarter.
+        summary["horizon_to"] = instant(summary["last_interval_index"] + 1)
+        return summary
 
     @callback
     def _head_run_state(self, now: datetime | None = None) -> int:
@@ -8169,6 +8356,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             reserve_fingerprint=(
                 None if reserve_snapshot is None else reserve_snapshot.fingerprint
             ),
+            # **The same derivation the entity publishes. beta.37.** Passed in rather
+            # than recomputed inside the builder, so a persisted figure and a
+            # dashboard figure describing the same solve cannot differ -- and so the
+            # pure snapshot layer keeps knowing nothing about calendars or prices.
+            economic_value=self._economic_value_for(outcome, plan, now),
         )
         if self.history.add_economic_snapshot(snapshot):
             # Debounced, like the four evidence layers beside it.

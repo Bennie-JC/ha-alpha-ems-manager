@@ -294,7 +294,7 @@ async def test_the_stored_document_reloads_from_disk(
     assert reloaded.days[NORMAL].reserve_fingerprints == [snapshot.fingerprint]
     assert reloaded.corrupt is False
     assert reloaded.reset_by_migration is False
-    assert FORECAST_STORAGE_MINOR_VERSION == 7
+    assert FORECAST_STORAGE_MINOR_VERSION == 8
 
 
 async def test_a_day_with_no_requirement_carries_no_reserve_keys(

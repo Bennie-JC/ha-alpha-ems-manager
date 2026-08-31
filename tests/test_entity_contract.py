@@ -115,6 +115,22 @@ CONTRACT: dict[str, dict[str, object]] = {
     # Phase 8. An enum like the recommendation and the control state, and for the
     # same reason: it is categorical, so a long-term statistic over it means
     # nothing.
+    "sensor.alpha_ems_economic_value": {
+        "unique_id_suffix": "economic_value",
+        "name": "Alpha EMS Economic Value",
+        # ``CURRENCY_EURO``, Home Assistant's own constant, which is the symbol
+        # rather than the ISO code. The attribute names still carry ``_eur``; the
+        # *unit* uses the constant so the entity behaves like every other monetary
+        # sensor Home Assistant knows about.
+        "unit": "€",
+        "device_class": "monetary",
+        # **No state class**, deliberately. ``MONETARY`` pairs with ``TOTAL`` in
+        # Home Assistant, and this is neither a total nor a measurement: it is a
+        # forecast over a rolling horizon that shortens through the day, so a
+        # long-term statistic over it would average a moving definition.
+        "state_class": None,
+        "icon": "mdi:cash-clock",
+    },
     "sensor.alpha_ems_economic_action": {
         "unique_id_suffix": "economic_action",
         "name": "Alpha EMS Economic Action",
@@ -166,7 +182,7 @@ def test_no_entity_is_missing_or_extra(hass: HomeAssistant) -> None:
         if entity.platform == DOMAIN
     }
     assert created == set(CONTRACT)
-    assert len(created) == len(CONTRACT) == 14
+    assert len(created) == len(CONTRACT) == 15
 
 
 #: The entity surface, phase by phase. Named rather than counted, so a new
@@ -212,6 +228,14 @@ PHASE_SEVEN_ENTITIES = {
 #: solver figures, the reserve-protection cost and the provenance the calculation
 #: does not consult are diagnostics-only: an optimizer with six ways of being
 #: wrong must not become six rows.
+#: beta.37 adds exactly one, and it is the integration's first monetary entity.
+#: Every counterfactual figure, the whole value curve, the per-day decomposition and
+#: the persisted decision evidence are attributes or diagnostics of that one entity:
+#: an optimiser whose reasoning has fifteen readable quantities must not become
+#: fifteen rows on a dashboard, and two economic sensors could disagree.
+BETA_THIRTY_SEVEN_ENTITIES = {
+    "sensor.alpha_ems_economic_value",
+}
 PHASE_EIGHT_ENTITIES = {
     "sensor.alpha_ems_economic_action",
     # beta.34, and it is one entity rather than a second attribute because the
@@ -219,6 +243,7 @@ PHASE_EIGHT_ENTITIES = {
     # next run" announced tomorrow evening's sale as though it were happening,
     # with a dateless ``HH:MM-HH:MM`` window as the only clue.
     "sensor.alpha_ems_next_planned_action",
+    *BETA_THIRTY_SEVEN_ENTITIES,
 }
 
 

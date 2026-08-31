@@ -48,6 +48,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import (
+    CURRENCY_EURO,
     EVENT_LOGBOOK_ENTRY,
     PERCENTAGE,
     UnitOfEnergy,
@@ -104,6 +105,7 @@ from .const import (
     SENSOR_CONTROL_STATE,
     SENSOR_DYNAMIC_RESERVE,
     SENSOR_ECONOMIC_ACTION,
+    SENSOR_ECONOMIC_VALUE,
     SENSOR_EXPECTED_LOAD_TODAY,
     SENSOR_EXPECTED_LOAD_TOMORROW,
     SENSOR_FORECAST_ERROR_WINDOW,
@@ -1259,6 +1261,96 @@ def _control_state_attributes(
     }
 
 
+#: What the Economic Value sensor's state is, in one sentence a person can read.
+_ECONOMIC_VALUE_BASIS = (
+    "expected advantage of the selected plan over doing nothing economically "
+    "active, over the horizon that is currently known, on the exact basis the "
+    "optimiser minimised. both sides are metered cash, so no notional term is in "
+    "it. a forecast, not money earned: unknown means no valid comparison could be "
+    "formed, and 0.00 means a valid comparison that came out equal"
+)
+
+#: The flat attributes a dashboard card reads, in the order a person would.
+#: Everything else is nested, and the nesting is where the audit trail lives.
+_ECONOMIC_VALUE_FLAT = (
+    "current_action",
+    "reason_code",
+    "decision_advantage_eur",
+    "advantage_cash_eur",
+    "advantage_basis",
+    "comparator_model",
+    "today_interval_value_eur",
+    "tomorrow_interval_value_eur",
+    "day_split_basis",
+    "stored_energy_marginal_value_eur_kwh",
+    "marginal_value_basis",
+    "marginal_value_unavailable_reason",
+    "terminal_edge_value_eur_kwh",
+    "next_planned_charge_price_eur_kwh",
+    "current_import_price_eur_kwh",
+    "current_export_price_eur_kwh",
+    "stored_energy_kwh",
+    "horizon_from",
+    "horizon_to",
+    "horizon_intervals",
+    "actionable_intervals",
+    "tomorrow_prices_known",
+    "unavailable_reason",
+)
+
+
+def _economic_value_payload(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return this refresh's Economic Value payload, or an empty dict."""
+    try:
+        return coordinator.economic_value()
+    except Exception:  # pragma: no cover - the entity must never take the refresh
+        _LOGGER.debug("Economic value could not be summarised", exc_info=True)
+        return {}
+
+
+def _economic_value_value(coordinator: AlphaEmsCoordinator) -> float | None:
+    """Return the expected advantage of the plan over doing nothing, in EUR.
+
+    **``None`` and ``0.00`` are different answers here.** ``None`` means no valid
+    comparison could be formed -- no plan, no horizon, no actionable interval, or a
+    reserve violation, which under the lexicographic objective means no monetary
+    alternative was ever ranked at all. ``0.00`` means a *valid* comparison whose
+    plan and passive counterfactual came out economically equal, which is a real
+    result. Suppressing it into ``unknown`` would be as dishonest as rendering
+    missing data as zero, and this module already forbids the second.
+    """
+    payload = _economic_value_payload(coordinator)
+    if not payload.get("available"):
+        return None
+    state = payload.get("state")
+    return state if isinstance(state, (int, float)) else None
+
+
+def _economic_value_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return the audit trail for the state above.
+
+    Flat where a Mushroom card reads it, nested where a person auditing the number
+    does. Gated on the same predicate as the state, so the two can never describe
+    different refreshes -- and on an unavailable refresh the reason is still
+    published, because "why is this unknown" is the question a reader has.
+    """
+    payload = _economic_value_payload(coordinator)
+    if not payload:
+        return {}
+    attributes: dict[str, Any] = {"basis": _ECONOMIC_VALUE_BASIS}
+    if not payload.get("available"):
+        attributes["unavailable_reason"] = payload.get("unavailable_reason")
+        return attributes
+    for name in _ECONOMIC_VALUE_FLAT:
+        if name in payload:
+            attributes[name] = payload[name]
+    for block in ("stored_value", "plan", "energy", "today", "tomorrow"):
+        if isinstance(payload.get(block), dict):
+            attributes[block] = payload[block]
+    attributes["day_split_rule"] = payload.get("day_split_rule")
+    return attributes
+
+
 SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
     AlphaEmsSensorDescription(
         key=SENSOR_EXPECTED_LOAD_TODAY,
@@ -1404,6 +1496,21 @@ SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
         options=list(CONTROL_STATE_OPTIONS),
         value_fn=_control_state_value,
         attributes_fn=_control_state_attributes,
+    ),
+    AlphaEmsSensorDescription(
+        key=SENSOR_ECONOMIC_VALUE,
+        name="Economic Value",
+        icon="mdi:cash-clock",
+        # **The integration's first monetary entity.** ``MONETARY`` with no state
+        # class: Home Assistant pairs that device class with ``TOTAL``, and this is
+        # neither a total nor a measurement -- it is a forecast over a rolling
+        # horizon, which is exactly the case the forecast sensors above decline a
+        # state class for. A long-term statistic over it would average a number
+        # whose horizon shrinks through the day.
+        device_class=SensorDeviceClass.MONETARY,
+        native_unit_of_measurement=CURRENCY_EURO,
+        value_fn=_economic_value_value,
+        attributes_fn=_economic_value_attributes,
     ),
 )
 

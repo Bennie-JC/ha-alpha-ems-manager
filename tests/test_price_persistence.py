@@ -331,7 +331,7 @@ async def test_the_stored_document_reloads_from_disk(
     )
     assert reloaded.corrupt is False
     assert reloaded.reset_by_migration is False
-    assert FORECAST_STORAGE_MINOR_VERSION == 7
+    assert FORECAST_STORAGE_MINOR_VERSION == 8
 
 
 async def test_an_installation_without_a_price_source_stores_nothing(

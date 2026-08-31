@@ -201,7 +201,7 @@ async def test_a_beta5_forecast_document_is_read_not_discarded(
     # moved on six times since -- it is pinned here so a *major* bump, which
     # would decide the document is unreadable, cannot slip in as a minor one.
     assert FORECAST_STORAGE_VERSION == 1
-    assert FORECAST_STORAGE_MINOR_VERSION == 7
+    assert FORECAST_STORAGE_MINOR_VERSION == 8
     assert store.days[DAY_ONE].pv_fingerprints == []
     assert store.days[DAY_ONE].price_fingerprints == []
     assert store.price_snapshots(DAY_ONE) == []
@@ -247,6 +247,7 @@ async def test_a_beta5_installation_keeps_every_entity_and_unique_id(
         ),
         "sensor.alpha_ems_economic_action": f"{entry_id}_economic_action",
         "sensor.alpha_ems_next_planned_action": (f"{entry_id}_next_planned_action"),
+        "sensor.alpha_ems_economic_value": f"{entry_id}_economic_value",
         "sensor.alpha_ems_control_state": f"{entry_id}_control_state",
         "select.alpha_ems_control_mode": f"{entry_id}_control_mode",
     }

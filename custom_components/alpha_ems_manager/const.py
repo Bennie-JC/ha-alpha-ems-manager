@@ -474,12 +474,24 @@ FORECAST_STORAGE_VERSION: Final = 1
 #:   written earlier simply lack them; they are **not** back-filled, because
 #:   making old and new figures look continuous would be a fabrication.
 #:
+#: * **1.8** -- v1.0.0-beta.37. Economic snapshots gained the Economic Value
+#:   scalars: the plan-versus-passive advantage and its cash half, the retention-side
+#:   marginal value of stored energy and why it is absent where it is, the terminal
+#:   edge rate, the per-civil-day interval values, and the state of the horizon the
+#:   figures were computed over. These are the decision-time half of a future
+#:   decision-versus-outcome comparison, and they are the part that is irrecoverable
+#:   afterwards: what the optimiser believed at the moment it chose.
+#:
+#:   Additive. A document written by any earlier release reads unchanged and simply
+#:   has no economic-value figures, which is honest -- they were not computed then and
+#:   are not back-filled.
+#:
 #: One honest note for anyone diffing stored documents: photovoltaic snapshots
 #: (``pvs``/``pvo``) arrived in v1.0.0-beta.9 **without** a minor bump, so a
 #: document stamped 1.2 may or may not carry them. The reader tolerates both,
 #: which is why that omission is recorded here rather than papered over by
 #: restamping documents that were written correctly.
-FORECAST_STORAGE_MINOR_VERSION: Final = 7
+FORECAST_STORAGE_MINOR_VERSION: Final = 8
 
 #: Index document: schema version, the month partitions that exist, and the
 #: small daily summary rows. Always loaded.
@@ -2165,6 +2177,16 @@ SENSOR_ECONOMIC_ACTION: Final = "economic_action"
 #: the run it describes is routinely on the following day.
 SENSOR_NEXT_PLANNED_ACTION: Final = "next_planned_action"
 
+#: Entity key. **The only EUR-valued entity in the integration.** beta.37.
+#:
+#: Its state is the expected advantage of the selected plan over the passive
+#: counterfactual, on the exact basis the dynamic programme minimised -- so a reader
+#: is looking at the quantity the optimiser actually chose on, not a cash summary
+#: that can move the opposite way. Everything a person needs to audit that number is
+#: an attribute of the same entity, because a family of economic sensors would let
+#: two of them disagree.
+SENSOR_ECONOMIC_VALUE: Final = "economic_value"
+
 #: The **target** state-space bucket, and the fallback when no better lattice
 #: qualifies. Until beta.17 this was the bucket, full stop; it is now the figure
 #: :func:`economic.select_bucket_kwh` aims at while it looks for a lattice that
@@ -2225,6 +2247,108 @@ STORED_VALUE_UNDEFINED_VIOLATION: Final = "violation_differs"
 STORED_VALUE_UNDEFINED_UNREACHABLE: Final = "state_unreachable"
 STORED_VALUE_UNDEFINED_NO_CURVE: Final = "no_value_curve"
 STORED_VALUE_UNDEFINED_TOP_BUCKET: Final = "top_bucket_is_clamped"
+#: **beta.37, and it is the retention side's own edge.** The headline marginal value
+#: is ``V(b - 1) - V(b)`` -- what keeping the energy you have is worth -- so at
+#: bucket zero there is no lower neighbour to give it up to. Distinct from
+#: ``state_unreachable``, which would be the reason the existing method reports for a
+#: negative index and would be misleading: nothing is unreachable here, the question
+#: simply has no lower side.
+STORED_VALUE_UNDEFINED_BOTTOM_BUCKET: Final = "bottom_bucket_has_no_lower_side"
+
+#: Every reason the marginal stored-energy value can be absent. Swept by the
+#: vocabulary test, so a sixth cannot be added without appearing here.
+STORED_VALUE_UNDEFINED_REASONS: Final = (
+    STORED_VALUE_UNDEFINED_VIOLATION,
+    STORED_VALUE_UNDEFINED_UNREACHABLE,
+    STORED_VALUE_UNDEFINED_NO_CURVE,
+    STORED_VALUE_UNDEFINED_TOP_BUCKET,
+    STORED_VALUE_UNDEFINED_BOTTOM_BUCKET,
+)
+
+#: Which side of the value function the published headline is differenced on.
+#:
+#: **The retention side, and the choice is the whole point.** The alternative to
+#: holding stored energy is giving it up, so the slope that answers "why am I holding
+#: instead of exporting" is the downward one, ``V(b - 1) - V(b)``. The upward
+#: difference -- what one *more* kWh would be worth -- is published beside it as a
+#: diagnostic, never as the headline, because the two disagree at every kink and only
+#: one of them answers the question a reader is asking.
+MARGINAL_VALUE_BASIS_RETENTION: Final = "downward_difference_retention"
+
+#: How far the two one-sided slopes may differ before the point is called kinked.
+#:
+#: One actuator step's worth of price, which is the smallest difference that could
+#: change a decision anybody could act on. Below it the disagreement is lattice
+#: noise; above it there is a genuine switching-fee or feasibility boundary between
+#: the two buckets and a reader must not treat the headline as a derivative.
+MARGINAL_VALUE_KINK_TOLERANCE_EUR_KWH: Final = 0.01
+
+#: What the sensor state is a difference of. Both sides are metered cash -- every
+#: euro in ``cost_eur`` and ``hold_cost_eur`` reconciles to grid energy at the
+#: interval's own prices -- so the advantage carries no notional term. The switching
+#: fee, the grid-charge margin, the throughput cost and the terminal credit all sit
+#: outside it, in ``objective_eur``.
+ADVANTAGE_BASIS_METERED_CASH: Final = "metered_cash_both_sides"
+
+#: Which passive baseline the advantage is measured against. The ambient walk: free
+#: production is absorbed, nothing is bought, nothing is sold, and the inverter
+#: covers residual house load from the battery exactly where the installation's own
+#: inverter does. beta.37 made that last clause true.
+COMPARATOR_MODEL_AMBIENT_WALK: Final = "ambient_walk_with_self_consumption"
+COMPARATOR_MODEL_AMBIENT_ABSORB_ONLY: Final = "ambient_walk_absorb_only"
+
+#: Why the Economic Value sensor has no state. **Never rendered as 0.0 EUR**: a
+#: genuine zero advantage is a valid, publishable result, and conflating the two
+#: would make "the optimiser found nothing worth doing" indistinguishable from "the
+#: optimiser could not answer".
+ECONOMIC_VALUE_UNAVAILABLE_NO_PLAN: Final = "plan_unavailable"
+ECONOMIC_VALUE_UNAVAILABLE_EMPTY_HORIZON: Final = "horizon_empty"
+ECONOMIC_VALUE_UNAVAILABLE_NOT_ACTIONABLE: Final = "no_actionable_intervals"
+ECONOMIC_VALUE_UNAVAILABLE_VIOLATION: Final = "reserve_violation_outranks_money"
+ECONOMIC_VALUE_UNAVAILABLE_REASONS: Final = (
+    ECONOMIC_VALUE_UNAVAILABLE_NO_PLAN,
+    ECONOMIC_VALUE_UNAVAILABLE_EMPTY_HORIZON,
+    ECONOMIC_VALUE_UNAVAILABLE_NOT_ACTIONABLE,
+    ECONOMIC_VALUE_UNAVAILABLE_VIOLATION,
+)
+
+#: Which basis the per-civil-day figures are on, and it is **not** the sensor
+#: state's.
+#:
+#: The state is the plan measured against one whole-horizon ambient walk
+#: (``hold_cost_eur``), which has no per-interval series and whose trajectory depends
+#: on the whole horizon -- so it cannot be split by day. The per-day figures are the
+#: sum of each interval's own leave-the-battery-alone counterfactual
+#: (``EconomicInterval.marginal_cost_eur``), which is exactly additive. The two are
+#: different measurements of the same plan and do not sum to one another, which is
+#: why the attributes carry ``interval`` in their names.
+DAY_SPLIT_BASIS_INTERVAL_IDLE: Final = "per_interval_idle_counterfactual"
+
+#: Why the optimiser is doing what it is doing, for a dashboard. **Explanatory
+#: only.** Derived from the selected plan, the run covering the horizon head and the
+#: Safety-Buy classification -- never from a comparison of two prices, and never read
+#: by any decision path.
+REASON_CODE_NO_MATERIAL_ACTION: Final = "no_material_economic_action"
+REASON_CODE_PHYSICAL_SAFETY_BUY: Final = "physical_safety_buy"
+REASON_CODE_RETAINED_ABOVE_EXPORT: Final = "retained_value_above_export_now"
+REASON_CODE_EXPORT_NOW_DOMINATES: Final = "export_now_has_highest_marginal_value"
+REASON_CODE_CHEAP_CHARGE_HELPS: Final = "cheap_charge_improves_future_value"
+REASON_CODE_VALUE_UNDEFINED: Final = "value_undefined_at_this_state"
+#: **The plan is idle now and has something material planned later.** Added while
+#: implementing, because the fallback would otherwise have reported
+#: ``no_material_economic_action`` for a horizon worth several euros whose first run
+#: is simply not at the head -- which is the single most common Hold on this
+#: installation and the opposite of "nothing worth doing".
+REASON_CODE_AWAITING_PLANNED_ACTION: Final = "awaiting_planned_action"
+REASON_CODES: Final = (
+    REASON_CODE_NO_MATERIAL_ACTION,
+    REASON_CODE_PHYSICAL_SAFETY_BUY,
+    REASON_CODE_RETAINED_ABOVE_EXPORT,
+    REASON_CODE_EXPORT_NOW_DOMINATES,
+    REASON_CODE_CHEAP_CHARGE_HELPS,
+    REASON_CODE_VALUE_UNDEFINED,
+    REASON_CODE_AWAITING_PLANNED_ACTION,
+)
 
 #: How many buckets of the head value curve reach diagnostics.
 #:
