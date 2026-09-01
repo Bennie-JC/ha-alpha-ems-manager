@@ -2034,6 +2034,7 @@ def carry_forward(
     executable_intents: frozenset[str] = frozenset({EXECUTION_INTENT_GRID_CHARGE}),
     abandoned_admissions: frozenset[str] = frozenset(),
     final_campaigns: frozenset[str] = frozenset(),
+    row_open: bool = False,
 ) -> CarryOutcome:
     """Return the carried run after this refresh's publication.
 
@@ -2055,6 +2056,16 @@ def carry_forward(
     * ``final_campaigns`` -- this *economic campaign* finished. Republication may
       never start it again, which is what stops a completed campaign looping
       through fresh instances for the rest of the day.
+
+    **``row_open`` is the beta.38 addition, and it is passed in rather than
+    derived.** This function knows the carried run's own window, but a window is not
+    an authority: the thing that owns an instant is the *frozen schedule*, and only
+    the caller can see it. Grounding the test there rather than in
+    ``carried.window_start`` is what keeps a run from outliving the plan it was
+    derived from -- a carried run surviving a torn-down schedule is the degraded
+    run-level fallback that cost 9.889 kWh on 2026-08-30, and it must stay
+    unreachable. ``False`` by default, so every existing caller and every direct
+    unit test keeps the pre-beta.38 behaviour exactly.
     """
     published = [
         parsed
@@ -2107,13 +2118,55 @@ def carry_forward(
     if affirming is not None:
         return CarryOutcome(carried=affirm(carried, affirming, now), affirmed=True)
 
+    # **An opened row is not withdrawn by absence. beta.38, and it is the whole
+    # release.**
+    #
+    # Stage A's horizon head is ``elapsed + 1``, so a publication issued at or after
+    # a row opened *structurally cannot describe that row*. Requiring an affirmation
+    # from one is requiring the impossible, and the consequence is not an edge case:
+    # for the **final row of every run** the head has already advanced past
+    # ``window_end``, no publication can ever overlap, and withdrawal-by-absence is
+    # therefore the normal state of every run's last quarter. What kept those runs
+    # alive was the coordinator's suppression -- which on the refresh a row *opens*
+    # cannot prove itself, because the proof it asked for is written later in the
+    # same refresh. On 2026-09-01 a two-row Sell was filed as ``stage_a_hold`` at the
+    # very refresh its first row opened, and the same refresh went on to arm 9.7 kW.
+    #
+    # So the test moves to where the fact lives. ``AdmittedPlan.authority_rule`` has
+    # promised this since beta.29 -- *"withdrawal is never inferred from a horizon
+    # that cannot describe an open quarter"* -- and ``CarriedQuarter`` repeats it;
+    # neither was ever implemented here, in the one function that decides.
+    #
+    # **Bounded twice.** ``now >= carried.window_end`` has already returned, so this
+    # can hold for at most the remainder of the run's own accepted window; and
+    # ``row_open`` is the caller's reading of the *frozen schedule* -- opened, not
+    # ended, a row covering this instant, and that row's run being this one -- so a
+    # run whose schedule has gone is not kept alive by it. Half-open ``[start, end)``
+    # on both sides, and ``>=`` at the start exactly as
+    # :meth:`AdmittedPlan.has_opened` reads it, so the two layers cannot disagree
+    # about which instant a row opens at.
+    #
+    # **It suppresses absence and nothing else.** Safety, a lost marker, a foreign
+    # claim, a stalled dead-man, a failed write, the user's own switch, an unknown
+    # quarter after a restart and a genuinely lost measurement all live in
+    # ``EXECUTION_ABORT_STOP_REASONS``, reach the run by other paths, and are
+    # untouched. Ordinary economic replanning is not a terminal condition for work
+    # that has already begun.
+    #
+    # Placed *after* the affirmation search on purpose: an affirming publication
+    # still re-anchors ``stale_after`` and still refreshes the forward allowance, and
+    # keeping the run here must not cost it either.
+    if row_open:
+        return CarryOutcome(carried=carried)
+
     if carried.stale_at(now):
         return CarryOutcome(
             carried=None, ended=EXECUTION_STOP_STALE_PLAN, ended_run=carried
         )
 
-    # Nothing re-affirmed it. Either Stage A moved this campaign elsewhere or
-    # dropped it; both are a withdrawal, and both are visible within one refresh.
+    # Nothing re-affirmed it, and its window has not opened. Either Stage A moved
+    # this campaign elsewhere or dropped it; both are a withdrawal of work that has
+    # not begun, and both are visible within one refresh.
     return CarryOutcome(
         carried=None, ended=EXECUTION_STOP_STAGE_A_HOLD, ended_run=carried
     )

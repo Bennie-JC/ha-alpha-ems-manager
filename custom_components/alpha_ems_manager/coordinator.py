@@ -183,6 +183,7 @@ from .const import (
     EXECUTION_STOP_QUARTER_TARGET_REACHED,
     EXECUTION_STOP_SAFETY,
     EXECUTION_STOP_SWITCHED_OFF,
+    EXECUTION_STOP_TIMER_NOT_REFRESHED,
     EXECUTION_STOP_WINDOW_ENDED,
     EXECUTION_TARGET_STALE_MINUTES,
     EXECUTION_VERIFY_DISPATCH_INACTIVE,
@@ -198,7 +199,16 @@ from .const import (
     INHIBIT_NO_PLAN,
     INHIBIT_PLAN_UNAVAILABLE,
     INHIBIT_WITHDRAWAL_REASONS,
+    LIFECYCLE_ADMITTED,
+    LIFECYCLE_DEADMAN_EXPIRED,
+    LIFECYCLE_DEGRADED,
+    LIFECYCLE_EXECUTING,
+    LIFECYCLE_FOREIGN,
     LIFECYCLE_IDLE,
+    LIFECYCLE_STARTING,
+    LIFECYCLE_STOPPED,
+    LIFECYCLE_STOPPING,
+    LIFECYCLE_UNPROVEN,
     LOG_THROTTLE_SECONDS,
     MAX_ABORTED_CAMPAIGNS_REMEMBERED,
     MAX_COMPLETED_QUARTERS_REPORTED,
@@ -215,6 +225,7 @@ from .const import (
     OUTCOME_PARTIAL,
     OUTCOME_SUCCESS,
     OWNERSHIP_DEGRADED,
+    OWNERSHIP_FOREIGN,
     OWNERSHIP_NONE,
     OWNERSHIP_OWNED,
     OWNERSHIP_UNPROVEN,
@@ -281,6 +292,7 @@ from .const import (
     TICK_SKIPPED_OWNERSHIP,
     TICK_SKIPPED_STALE_TARGET,
     TICK_SKIPPED_SUB_RESOLUTION,
+    TICK_STOPPED_ORPHAN_DISPATCH,
     TICK_STOPPED_QUARTER_EXPIRED,
     TICK_STOPPED_TARGET_REACHED,
 )
@@ -415,7 +427,12 @@ from .quarter import (
     sanitize_load_w,
     sanitize_pv_w,
 )
-from .realized import realized_window, soc_series_to_energy
+from .realized import (
+    closing_inventory_kwh,
+    opening_inventory_kwh,
+    realized_window,
+    soc_series_to_energy,
+)
 from .reserve import (
     ReserveProjection,
     build_reserve_reachable,
@@ -2150,13 +2167,46 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ``quarter_schedule`` and admits no quarter -- and refusing to correct a
         # run for that reason would take the hardware-proven beta.26 charge path
         # away. So the tick degrades to the run rather than to nothing.
-        if quarter is None and run is None:
-            self._note_tick(now, TICK_SKIPPED_NO_QUARTER)
-            return
+        # **Activity and ownership are asked first. beta.38, and the order is the
+        # fix.**
+        #
+        # Through beta.37 "nothing to execute" returned before either question, so
+        # the one state that must never be left alone -- *we own a dispatch that is
+        # physically moving the battery and nothing authorises it* -- was published
+        # as ``no_admitted_quarter`` and left running. The economic cadence would
+        # eventually reset it fifteen minutes later, and failing that the vendor
+        # dead-man twenty minutes after the arm. Neither is cleanup; both are a
+        # timeout being used as one.
         if not snapshot.dispatch_active:
             self._note_tick(now, TICK_SKIPPED_DISPATCH_INACTIVE)
             return
-        if self._ownership_now(snapshot, now) != OWNERSHIP_OWNED:
+        owned_now = self._ownership_now(snapshot, now) == OWNERSHIP_OWNED
+        if quarter is None and run is None:
+            if owned_now:
+                # **The orphan, stopped on the cadence that found it.** Routed
+                # through the one teardown helper, at abort scope, because an owned
+                # dispatch with no authority is something that happened *to* the
+                # run rather than an ending it earned -- and the admission that
+                # produced it must not re-arm. ``_async_stop_dispatch`` verifies the
+                # stop before it tears anything down, so an unverified attempt keeps
+                # every piece of evidence and the next tick tries again.
+                # **``quarter_progress_unknown``, and it is the exact words.** We
+                # own a dispatch and have no quarter to measure it against, which
+                # is what that reason names -- and it is what the *refresh* files
+                # for the same situation after a restart, so the two cadences
+                # cannot disagree about a terminal. An abort reason, so it is
+                # never suppressed by the opened-row authority.
+                await self._async_stop_dispatch(
+                    now,
+                    snapshot,
+                    EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
+                    scope=STOP_SCOPE_ABORT,
+                )
+                self._note_tick(now, TICK_STOPPED_ORPHAN_DISPATCH, wrote=True)
+                return
+            self._note_tick(now, TICK_SKIPPED_NO_QUARTER)
+            return
+        if not owned_now:
             self._note_tick(now, TICK_SKIPPED_OWNERSHIP)
             return
 
@@ -3053,6 +3103,128 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._lifecycle_at = now
 
     @callback
+    def _note_campaign_started(self, now: datetime) -> None:
+        """Freeze what this campaign promised, at the instant execution began.
+
+        **Idempotent, and called from the transition rather than from the report.
+        beta.38.**
+
+        Through beta.37 this lived inside ``_note_campaign_progress``, gated on
+        ``self.activation_confirmed`` -- a flag set in ``_async_dispatch``, which runs
+        *after* the control report is built. So on the refresh that actually armed the
+        hardware the campaign had not started yet, and the payload said so: the
+        2026-09-01 capture shows ``open_campaign.started: false`` and
+        ``frozen_target_kwh: null`` beside a quarter that was executing. A reader
+        checking "is this campaign under way?" got the wrong answer for exactly the
+        refresh where it began.
+
+        It is now called from the send site the moment an activation write lands, so
+        the freeze and the physical start are one transition. The report-side call
+        remains for every path that reaches a started campaign without passing
+        through that write, and the ``is None`` guard is what makes two callers safe:
+        **the freeze happens once and the frozen target never moves afterwards**,
+        which is what makes a verdict against it meaningful.
+        """
+        if self._campaign_id is None or self._campaign_started_at is not None:
+            return
+        # **Frozen here and nowhere else.** Success is judged against what was
+        # promised when execution began: a campaign that promised 2.65 kWh and
+        # delivered 1.80 because Stage A changed its mind is Partial, not a
+        # retroactively successful 1.80 / 1.80.
+        self._campaign_started_at = now
+        # The live figure where the campaign is still published, and the last
+        # one read while it was, where it is not. Never ``None`` because a
+        # target existed: that is the whole of the beta.34 correction.
+        # **``is not None``, not truthiness. beta.35, and it is a latch
+        # rather than a fix.**
+        #
+        # ``_campaign_objective_kwh`` goes to some trouble to distinguish "this
+        # campaign sells nothing" (``0.0``) from "nobody published it"
+        # (``None``), and ``live or ...`` conflates the two. Today it happens
+        # to be harmless: ``_note_campaign_progress`` has already assigned
+        # ``opening = live`` for every non-``None`` reading, so both spellings
+        # return the same number in every reachable state -- the null target on
+        # 2026-08-29 came from ``_campaign_objective_kwh`` returning ``None``,
+        # not from this line.
+        #
+        # It is written the careful way anyway, because the property is one
+        # move away from mattering: separate the two blocks, or capture the
+        # opening figure anywhere else, and the ``or`` begins discarding
+        # legitimate zeros with nothing to notice it.
+        live = self._campaign_objective_kwh(self._campaign_id)
+        self._campaign_frozen_target_kwh = (
+            live if live is not None else self._campaign_opening_target_kwh
+        )
+
+    @callback
+    def _lifecycle_state_from(
+        self,
+        *,
+        ownership_state: str,
+        stop_reason: str | None,
+        resetting: bool,
+        releasing: bool,
+        arming: bool,
+        sustaining: bool,
+        holding: bool,
+        now: datetime,
+    ) -> str:
+        """Return where the lifecycle is, projected from facts already decided.
+
+        **beta.38, and it exists because the field was a lie.** ``_note_lifecycle``
+        had no callers anywhere in the package, so ``execution.lifecycle.state`` read
+        ``idle`` for the life of the process and the other eleven states were
+        unreachable. On 2026-09-01 a reader looking at a 10 kW export saw
+        ``lifecycle.state: "idle"`` -- and "is the lifecycle terminal while hardware
+        moves?" is precisely the question this release has to answer, from a field
+        that could not answer anything.
+
+        **A projection, not a second state machine.** Every input is a boolean the
+        write boundary has already settled this refresh; nothing new is derived and
+        no branch here can change a command. Order is hazard-first, exactly as the
+        write boundary orders its own branches, so the published state names the
+        thing that actually decided the refresh.
+
+        **A hold reports ``executing``, deliberately.** beta.36 settled that "a hold
+        is a state of a run that is still going" -- it keeps ownership, the claim,
+        the frozen schedule and the campaign, and it keeps re-arming the dead-man.
+        The vocabulary has no ``holding`` member and inventing one would split a
+        single question across two fields, which is the defect this field exists to
+        prevent; ``hold_reason`` is published in the same block and is the
+        discriminator.
+        """
+        if ownership_state == OWNERSHIP_DEGRADED:
+            return LIFECYCLE_DEGRADED
+        if ownership_state == OWNERSHIP_FOREIGN:
+            return LIFECYCLE_FOREIGN
+        if ownership_state == OWNERSHIP_UNPROVEN:
+            return LIFECYCLE_UNPROVEN
+        if stop_reason == EXECUTION_STOP_TIMER_NOT_REFRESHED:
+            return LIFECYCLE_DEADMAN_EXPIRED
+        # **Stopping covers the whole of an unfinished stop.** A reset or a marker
+        # release is in flight; a stop reason with no writes planned is a stop this
+        # refresh could not complete. Either way the answer is not ``idle``, which is
+        # the distinction the no-zombie invariant turns on.
+        if resetting or releasing:
+            return LIFECYCLE_STOPPING
+        if stop_reason is not None and ownership_state == OWNERSHIP_OWNED:
+            return LIFECYCLE_STOPPING
+        if arming:
+            return LIFECYCLE_STARTING
+        if holding or sustaining:
+            return LIFECYCLE_EXECUTING
+        if ownership_state == OWNERSHIP_OWNED:
+            return LIFECYCLE_EXECUTING
+        # Admitted but not yet physical: a frozen schedule exists and either has not
+        # opened or has opened without anything being armed under it yet.
+        plan = self._plan
+        if plan is not None and not self._admission_abandoned(plan):
+            return LIFECYCLE_ADMITTED
+        if self._carried is not None:
+            return LIFECYCLE_ADMITTED
+        return LIFECYCLE_IDLE
+
+    @callback
     def _admission_block(self, now: datetime) -> dict[str, Any]:
         """Return why there is, or is not, an admitted plan and a carried run.
 
@@ -3384,20 +3556,32 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     @callback
-    def _stored_value_eur(self, outcome: Any) -> float | None:
-        """Return what the energy above the floor is worth, from the plan itself.
+    def _position_value_eur(
+        self, outcome: Any, energy_kwh: float | None
+    ) -> float | None:
+        """Return what holding ``energy_kwh`` is worth, on *this refresh's* curve.
 
-        ``V(floor) - V(current)`` at the head of this refresh's solve: how much
-        better off the plan is for standing where it stands rather than at the
-        floor, with the whole horizon still to come. **Planner-derived, and an
-        opportunity value from now** -- never a purchase cost, and never an
-        inventory convention. ``None`` where the optimiser could not state it.
+        ``V(floor) - V(energy)`` from the head layer of the current solve.
+        Planner-derived, an opportunity value from now, never a purchase cost.
+
+        **Extracted in beta.38 so the two ends of the ledger share one curve.** The
+        realised position identity is ``realised + closing - opening``, and that
+        subtraction only means anything if both terms come from the same value
+        function. Differencing two *different* curves would fold a revaluation --
+        prices moved, the forecast moved, the horizon shortened -- into a figure
+        labelled as what operating the battery achieved. Valuing both ends here, on
+        the curve this refresh has already computed, makes the difference purely
+        operational and costs no solve at all.
+
+        ``None`` where the optimiser could not state it, never zero.
         """
         if not isinstance(outcome, EconomicOutcome) or not outcome.available:
             return None
+        if energy_kwh is None:
+            return None
         plan = outcome.desired
         bucket_kwh = outcome.bucket_kwh
-        if not bucket_kwh or not plan.intervals:
+        if not bucket_kwh:
             return None
         # Against the floor the plan is actually held to, which is the only
         # reference point that makes "above the floor" mean anything.
@@ -3410,11 +3594,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         floor_bucket = bucket_at_or_below_kwh(
             plan.terminal_floor_kwh, bucket_kwh=bucket_kwh
         )
-        current_bucket = bucket_at_or_below_kwh(
-            plan.intervals[0].start_energy_dc_kwh, bucket_kwh=bucket_kwh
-        )
+        bucket = bucket_at_or_below_kwh(energy_kwh, bucket_kwh=bucket_kwh)
         value, _reason = plan.stored_value_eur(
-            floor_bucket=floor_bucket, current_bucket=current_bucket
+            floor_bucket=floor_bucket, current_bucket=bucket
         )
         return value
 
@@ -4657,35 +4839,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if live is not None:
                 self._campaign_opening_target_kwh = live
 
-        if self._campaign_started_at is None and self.activation_confirmed:
-            # **Frozen here and nowhere else.** Success is judged against what was
-            # promised when execution began: a campaign that promised 2.65 kWh and
-            # delivered 1.80 because Stage A changed its mind is Partial, not a
-            # retroactively successful 1.80 / 1.80.
-            self._campaign_started_at = now
-            # The live figure where the campaign is still published, and the last
-            # one read while it was, where it is not. Never ``None`` because a
-            # target existed: that is the whole of the beta.34 correction.
-            # **``is not None``, not truthiness. beta.35, and it is a latch
-            # rather than a fix.**
-            #
-            # ``_campaign_objective_kwh`` goes to some trouble to distinguish "this
-            # campaign sells nothing" (``0.0``) from "nobody published it"
-            # (``None``), and ``live or ...`` conflates the two. Today it happens
-            # to be harmless: the block directly above has already assigned
-            # ``opening = live`` for every non-``None`` reading, so both spellings
-            # return the same number in every reachable state -- the null target on
-            # 2026-08-29 came from ``_campaign_objective_kwh`` returning ``None``,
-            # not from this line.
-            #
-            # It is written the careful way anyway, because the property is one
-            # move away from mattering: separate the two blocks, or capture the
-            # opening figure anywhere else, and the ``or`` begins discarding
-            # legitimate zeros with nothing to notice it.
-            live = self._campaign_objective_kwh(self._campaign_id)
-            self._campaign_frozen_target_kwh = (
-                live if live is not None else self._campaign_opening_target_kwh
-            )
+        if self.activation_confirmed:
+            self._note_campaign_started(now)
 
         still_planned = self._campaign_still_published()
         if quarter is None and not still_planned:
@@ -5384,6 +5539,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             return
         await self._async_send_locked(plan_dispatch_cleanup(), now=now, verify=None)
+        # Stop verified inactive, cleanup sent. Every scope reaches here the same
+        # way, which is why the transition is recorded once, here, rather than in
+        # each of the three teardowns below.
+        self._note_lifecycle(LIFECYCLE_STOPPED, now)
 
         if scope == STOP_SCOPE_ABORT:
             # One teardown, and this is the whole of it.
@@ -7006,6 +7165,44 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return None if plan is None else plan.run_id
 
     @callback
+    def _opened_row_owns(self, now: datetime, carried: Any) -> bool:
+        """Return whether a frozen row of *this run's* schedule is open at ``now``.
+
+        **The fact ``carry_forward`` cannot compute, and beta.38's whole premise.**
+        Stage A's horizon head is ``elapsed + 1``, so no publication issued once a
+        row has opened can describe it; asking one to affirm it is asking the
+        impossible, and for a run's final row it is impossible by construction. The
+        answer therefore has to come from the frozen schedule instead.
+
+        **Read from the plan, never from ``carried.window_start``.** A run whose
+        schedule has been torn down must not keep itself alive on its own window:
+        that is the degraded run-level fallback -- no admitted quarter, no per-row
+        grid ceiling, no completed-row record -- which cost 9.889 of 16.11 kWh on
+        2026-08-30. So this asks the schedule, and it asks whether the schedule is
+        *this* run's.
+
+        Called before ``carry_plan_verbose`` re-derives the plan, which is correct
+        rather than merely tolerable: an opened plan is immutable and
+        ``carry_plan_verbose`` returns it unchanged, so the object read here is the
+        object that will still be there afterwards.
+
+        Every clause is a bound: a plan, belonging to this run, not abandoned,
+        opened, not ended, and covering this instant with a row.
+        """
+        if carried is None:
+            return False
+        plan = self._plan
+        if plan is None or plan.run_id != carried.run_id:
+            return False
+        if self._admission_abandoned(plan):
+            return False
+        return bool(
+            plan.has_opened(now)
+            and now < plan.ends_at
+            and plan.row_covering(now) is not None
+        )
+
+    @callback
     def _plan_authority_holds(self, now: datetime) -> bool:
         """Return whether the frozen schedule still owns this instant.
 
@@ -7024,19 +7221,46 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         once more from outside, because it is re-armed only while the sustain
         actually runs.
 
-        **What "already executing" is read from, and what it deliberately is not.**
-        A draft of this asked ``self._campaign_started_at is not None``, which is
-        wrong by one refresh in the worst possible place: the campaign lifecycle is
-        advanced at the *end* of the report (``_note_campaign_progress``) and the
-        stop is decided in the middle of it, so on the first refresh after an arm
-        the campaign has not started yet -- and that refresh is precisely the
-        exposed one. Measured: the arm succeeded, the very next refresh read
-        ``stage_a_hold``, found no authority to outrank it, and tore the campaign
-        down before it had ever started.
+        **The clause that asked the impossible, and what replaced it. beta.38.**
 
-        The persisted record is the honest test and it is available here: it exists
-        only because a claim was written for this plan's run, so it says *this
-        schedule has armed something* as a fact rather than as bookkeeping.
+        Two drafts got this wrong in the same way, one refresh apart, and the
+        history is worth keeping because the shape recurs.
+
+        A first draft asked ``self._campaign_started_at is not None``. That is wrong
+        by one refresh: the campaign lifecycle is advanced at the *end* of the report
+        (``_note_campaign_progress``) and the stop is decided in the middle of it, so
+        on the first refresh *after* an arm the campaign had not started yet.
+
+        beta.29 replaced it with the persisted claim -- ``recorded == authority``,
+        read as *"this schedule has armed something"*. That is wrong by one refresh
+        in a **worse** place: the claim is written **by** an arm, at the write
+        boundary, *after* the stop is decided in the same refresh. So on the refresh
+        a row **opens** -- the first refresh that can arm anything -- no claim exists,
+        the frozen schedule had no authority at all, and the withdrawal stood.
+        Measured on 2026-09-01: ``record_present: false``, ``record_matches: false``,
+        ``plan_authority_holds: false``, a ``stage_a_hold`` terminal filed against a
+        4.53 kWh Sell, and 9.7 kW armed by the same refresh. A reset was avoided only
+        because ``ownership_of`` answers ``none`` while the dispatch is still
+        inactive -- with the marker already on it would have torn the campaign down.
+
+        **So the question changed.** "Has this schedule already armed something?"
+        cannot be answered on the refresh that arms. "Has something else been armed
+        under a *different* authority?" can, always, and it is the question that
+        actually matters: a record naming another run means this plan is not what is
+        running and must not speak for it. No record at all means nothing else owns
+        anything, and the opened frozen row is the only authority there is.
+
+        Nothing is weakened. A foreign claim still refuses. And a plan with no claim
+        can only ever *withhold* a withdrawal: ``resetting`` requires ``owned``, which
+        requires ``record_matches``, so an authority proven this way can never itself
+        stop a dispatch.
+
+        Every clause is a bound, and together they are why this cannot become
+        indefinite execution: the plan must have opened, it must not have ended, it
+        must actually cover this instant with a row, a quarter must be derived from
+        it, nothing else may be armed under another identity, and the campaign must
+        not already have been abandoned. The vendor dead-man bounds it once more from
+        outside, because it is re-armed only while the sustain actually runs.
         """
         plan = self._plan
         if plan is None or self._quarter is None:
@@ -7048,12 +7272,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ownership.
         recorded = self._owned_run_id()
         authority = self._authority_run_id()
-        armed_under_this_plan = recorded is not None and recorded == authority
+        not_armed_under_another = recorded is None or recorded == authority
         return bool(
             plan.has_opened(now)
             and now < plan.ends_at
             and plan.row_covering(now) is not None
-            and armed_under_this_plan
+            and not_armed_under_another
             and not self._admission_abandoned(plan)
         )
 
@@ -7608,6 +7832,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             executable_intents=CONTROL_LIVE_DISPATCH_INTENTS,
             abandoned_admissions=frozenset(self._abandoned_admissions),
             final_campaigns=frozenset(self._final_campaigns),
+            # **beta.38.** An opened frozen row is not withdrawn because Stage A's
+            # new horizon cannot describe it. Computed here because only this layer
+            # can see the schedule; see :meth:`_opened_row_owns`.
+            row_open=self._opened_row_owns(now, self._carried),
         )
         self._carried = outcome.carried
         self._carry_refusal = outcome.refused
@@ -8204,7 +8432,35 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
             battery_charge_kwh=series["battery_charge_kwh"],
             battery_discharge_kwh=series["battery_discharge_kwh"],
-            closing_inventory_value_eur=self._stored_value_eur(outcome),
+            # **Valued at the level the ledger itself reports, not at the plan
+            # head. beta.38.** Through beta.37 this was ``_stored_value_eur`` -- the
+            # *head* position -- while the kWh beside it was the last recorded
+            # level. In production the two are within a bucket of each other and the
+            # discrepancy was invisible; inside an identity it is not, and a
+            # difference between two ends priced at two different energies is not a
+            # position change at all. Both ends now use one rule and one curve.
+            closing_inventory_value_eur=self._position_value_eur(
+                outcome, closing_inventory_kwh(series["stored_energy_kwh"])
+            ),
+            # **The term that was simply never passed. beta.38.**
+            #
+            # ``realized_window`` has accepted it since beta.35 and no caller ever
+            # supplied one, so ``opening_inventory_value_eur`` was ``None`` in
+            # production and ``realised_plus_remaining_value_eur`` was ``None`` with
+            # it -- a total missing one of its terms, which is a different number
+            # wearing the same name. Nothing was wrong with the arithmetic; the
+            # caller was the incomplete half.
+            #
+            # Valued on **this refresh's curve**, the same one the closing figure
+            # uses, so their difference is what operating the battery achieved and
+            # carries no revaluation. And valued at the energy the ledger itself
+            # reports, through the one shared rule, so the number priced is provably
+            # the number published. Revaluation -- what the *opening* position was
+            # worth under the curve that existed *then* -- needs a persisted historic
+            # value and is beta.39 work. It is not approximated here.
+            opening_inventory_value_eur=self._position_value_eur(
+                outcome, opening_inventory_kwh(series["stored_energy_kwh"])
+            ),
             model_switching_cost_eur=(
                 None
                 if not isinstance(outcome, EconomicOutcome)
@@ -9597,6 +9853,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # nothing -- which is the one claim a release that writes must not get
             # wrong.
             self._activation_confirmed = self._pending_activates
+            if self._pending_activates:
+                # **The freeze happens in the same transition as the write. beta.38.**
+                # The report that ran a moment ago could not have known this: it is
+                # built before the send, so gating the freeze on
+                # ``activation_confirmed`` alone put it a whole refresh late and
+                # published ``started: false`` beside an executing quarter.
+                # Idempotent, so the report-side call for every other path is safe.
+                self._note_campaign_started(now)
+            if self._pending_is_reset:
+                # A verified stop *and* its cleanup both landed. Naming it is what
+                # keeps ``idle`` from being the only thing a reader ever sees after
+                # a run, and it is a transition rather than an inference.
+                self._note_lifecycle(LIFECYCLE_STOPPED, now)
             if any(step.entity_id == DISPATCH_DURATION for step in commands):
                 # **Recorded on the re-arm, not on the activation.**
                 #
@@ -10198,6 +10467,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             snapshot, now, cadence=CADENCE_QUARTER_REFRESH
         )
         stage_b["quarter"] = self._quarter_block(now)
+        self._note_lifecycle(
+            self._lifecycle_state_from(
+                ownership_state=ownership_state,
+                stop_reason=stop_reason,
+                resetting=resetting,
+                releasing=releasing,
+                arming=arming,
+                sustaining=sustaining,
+                holding=holding,
+                now=now,
+            ),
+            now,
+        )
         stage_b["lifecycle"] = self._lifecycle_block()
         stage_b["admission"] = self._admission_block(now)
         stage_b["dispatch_start_probe"] = list(self._dispatch_start_samples)

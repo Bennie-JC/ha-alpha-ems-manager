@@ -390,7 +390,15 @@ def test_no_decision_path_reads_the_stored_value() -> None:
     permitted = {
         "economic.py:_stored_value_as_dict",
         "economic.py:_value_curve",
-        "coordinator.py:_stored_value_eur",
+        # **beta.38 renamed this one, and by name.** ``_stored_value_eur`` valued
+        # exactly one position -- the plan head -- and the realised ledger needs two,
+        # the window's opening and closing levels, on the *same* curve: without that
+        # the difference in ``realised + closing - opening`` would come from two
+        # value functions and would silently carry a revaluation. So it takes the
+        # energy as an argument. It reads the curve and returns a number, touches no
+        # state, and is called only from the publish-only ledger path. The
+        # ``forbidden`` set below is what holds the invariant, and it is unchanged.
+        "coordinator.py:_position_value_eur",
         # **beta.37, extended deliberately and by name.** The Economic Value sensor
         # publishes the retention-side marginal value, so one more function reads
         # the curve. It is a pure summariser whose entire job is to build a payload:

@@ -541,17 +541,35 @@ async def test_a_stage_a_hold_is_withheld_while_the_row_is_executing(
     live_surface: LiveSurface,
     monkeypatch,
 ) -> None:
-    """**S5. beta.35 built this suppression and then made it unreachable.**
+    """**S5, strengthened by beta.38: the withdrawal no longer even arises.**
 
+    beta.35 built a suppression and made it unreachable --
     ``_plan_authority_holds`` returns ``False`` whenever ``self._plan is None``, so
-    once the completion latch had nulled the schedule the withdrawal at 12:45:06Z had
-    nothing to outrank. With the schedule intact it is withheld, published, and the
-    dispatch keeps running.
+    once the completion latch had nulled the schedule the withdrawal at 12:45:06Z
+    had nothing to outrank. beta.36 restored the schedule and the stop was
+    *withheld*: raised, outranked, and published beside the authority that outranked
+    it.
+
+    **beta.38 moved the fix one layer earlier and this test moved with it.**
+    ``carry_forward`` no longer withdraws a run whose frozen row is open, so there is
+    no ``stage_a_hold`` to withhold and ``withheld_stop_reason`` is legitimately
+    ``None``. That is strictly better than suppression: the run is never nominally
+    ended, so no terminal is filed against it and its realised figures are never
+    restated as a shortfall. The assertion therefore inverts -- from *"a withdrawal
+    happened and was outranked"* to *"no withdrawal happened"* -- and gains the two
+    facts that beta.37 could not have asserted.
+
+    The suppression clause itself is still load-bearing and still guarded, by
+    ``test_stage_a_publishing_no_battery_plan_is_withheld_not_fatal``: that stop
+    arrives from the *inhibit* ladder rather than from ``carry_forward``, so beta.38
+    does not touch it.
     """
     coordinator = await start_the_charge_campaign(
         hass, config_data, frank, live_surface, monkeypatch
     )
     await drive_quarter(hass, coordinator, live_surface, 0)
+    carried_before = coordinator._carried
+    assert carried_before is not None
 
     assert coordinator._plan_authority_holds(opens_at(1)) is True
     monkeypatch.setattr(
@@ -559,9 +577,16 @@ async def test_a_stage_a_hold_is_withheld_while_the_row_is_executing(
     )
     report = await step_once(hass, coordinator, live_surface, **step_clock(1))
     authority = boundary_of(report).get("authority") or {}
+    carried_block = (report.get("execution") or {}).get("carried") or {}
+
+    # **The withdrawal never happened.** Not raised, not withheld, not recorded.
+    assert carried_block.get("ended_reason") is None, carried_block
+    assert carried_block.get("last_ended") is None, "no terminal for a running row"
+    assert coordinator._carried is not None
+    assert coordinator._carried.run_id == carried_before.run_id, "the same run"
 
     assert authority.get("plan_authority_holds") is True, authority
-    assert authority.get("withheld_stop_reason") == EXECUTION_STOP_STAGE_A_HOLD
+    assert authority.get("withheld_stop_reason") is None
     assert boundary_of(report).get("stop_reason") is None
     assert coordinator._plan is not None
     assert coordinator._campaign_id == CAMPAIGN_ID

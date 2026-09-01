@@ -345,6 +345,45 @@ def _finite(value: float | None) -> float | None:
     return number if number == number and abs(number) != float("inf") else None
 
 
+def opening_inventory_kwh(
+    stored_energy_kwh: Sequence[float | None] | None,
+) -> float | None:
+    """Return the pack level the window opened at, or ``None``.
+
+    The first reading the window has, which is what an opening inventory means.
+
+    **Extracted in beta.38 so two callers cannot disagree.** The ledger reports
+    this figure and the coordinator has to *value* it, and those are different
+    modules -- this one may not import the solver, and the solver's value curve
+    lives on the other side of that line. Two independent readings of the same
+    series is exactly how a value comes to describe an energy nobody reported, so
+    there is one rule and both sides call it.
+    """
+    if not stored_energy_kwh:
+        return None
+    for value in stored_energy_kwh:
+        opening = _finite(value)
+        if opening is not None:
+            return opening
+    return None
+
+
+def closing_inventory_kwh(stored_energy_kwh):
+    """Return the pack level the window closed at, or ``None``.
+
+    The last reading the window has, which is where the position stands now.
+    Measured, like the opening figure, and priced by nobody here -- the caller
+    values it, and calls this so the energy it prices is the energy published.
+    """
+    if not stored_energy_kwh:
+        return None
+    for value in reversed(stored_energy_kwh):
+        closing = _finite(value)
+        if closing is not None:
+            return closing
+    return None
+
+
 def realized_window(
     *,
     grid_import_kwh: Sequence[float | None],
@@ -481,21 +520,9 @@ def realized_window(
         discharge_efficiency=discharge_efficiency,
     )
 
-    opening = None
-    if stored_energy_kwh:
-        for value in stored_energy_kwh:
-            opening = _finite(value)
-            if opening is not None:
-                break
+    opening = opening_inventory_kwh(stored_energy_kwh)
 
-    # The last level the pack was recorded at, which is where the position stands
-    # now. Measured, like the opening figure, and priced by nobody here.
-    closing = None
-    if stored_energy_kwh:
-        for value in reversed(stored_energy_kwh):
-            closing = _finite(value)
-            if closing is not None:
-                break
+    closing = closing_inventory_kwh(stored_energy_kwh)
 
     # **Estimated, and labelled so.** One round-trip figure split symmetrically is
     # what the model has; a real inverter's loss varies with power in ways it
@@ -550,8 +577,20 @@ def realized_window(
         closing_inventory_kwh=(
             round(closing, _KWH_DECIMALS) if closing is not None else None
         ),
-        opening_inventory_value_eur=opening_inventory_value_eur,
-        closing_inventory_value_eur=closing_inventory_value_eur,
+        # **Rounded here, at four decimals, like every other euro figure.** The
+        # planner hands over a raw float and beta.37 published it whole --
+        # ``3.871514669200126`` beside a sensor showing ``3.8715`` for the same
+        # quantity. Same number, two spellings, and a reader has to work out which.
+        opening_inventory_value_eur=(
+            None
+            if opening_inventory_value_eur is None
+            else round(opening_inventory_value_eur, _EUR_DECIMALS)
+        ),
+        closing_inventory_value_eur=(
+            None
+            if closing_inventory_value_eur is None
+            else round(closing_inventory_value_eur, _EUR_DECIMALS)
+        ),
         model_switching_cost_eur=model_switching_cost_eur,
         model_grid_charge_margin_eur=model_grid_charge_margin_eur,
         model_throughput_cost_eur=model_throughput_cost_eur,
@@ -628,6 +667,8 @@ __all__ = [
     "BATTERY_BASIS_UNAVAILABLE",
     "PROVENANCE_UNKNOWN",
     "RealizedWindow",
+    "closing_inventory_kwh",
+    "opening_inventory_kwh",
     "realized_window",
     "soc_series_to_energy",
 ]

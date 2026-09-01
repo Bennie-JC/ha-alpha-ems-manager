@@ -37,6 +37,7 @@ from custom_components.alpha_ems_manager.const import (
     TICK_SKIPPED_DISPATCH_INACTIVE,
     TICK_SKIPPED_NO_QUARTER,
     TICK_SKIPPED_OWNERSHIP,
+    TICK_STOPPED_ORPHAN_DISPATCH,
 )
 
 from .forecast_helpers import NORMAL, local
@@ -114,26 +115,28 @@ async def test_a_stale_reason_cannot_survive_beside_a_later_write(
     """
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
 
-    # First a refusal: no carrier at all.
-    # **The schedule too, since beta.30.** The executing quarter is derived at
-    # the top of every tick and refresh, so clearing the derived value alone
-    # would be undone immediately -- which is exactly the property that makes a
-    # skipped boundary impossible.
-    coordinator._plan = None
-    coordinator._quarter = None
-    coordinator._carried = None
+    # First a refusal. **The marker, not the carrier, since beta.38.** Clearing the
+    # carrier while a dispatch of ours is running is no longer a refusal at all --
+    # it is the orphan the tick now stops -- so a test that wanted "some refusal,
+    # then a write" has to ask for one that is still a refusal. Dropping the marker
+    # is the natural one: nothing is written and the reason is unmistakable.
+    hass.states.async_set(BOOLEAN_EXECUTION_OWNER, "off")
+    await hass.async_block_till_done()
+    install(coordinator, quarter_at(10, 45, battery=2.0, authorised=2.0))
     await coordinator._async_physical_tick(local(NORMAL, 10, 46))
-    assert coordinator._tick_outcome.reason == TICK_SKIPPED_NO_QUARTER
+    assert coordinator._tick_outcome.reason == TICK_SKIPPED_OWNERSHIP
     assert coordinator._tick_outcome.wrote is False
 
     # Then a real correction, on the next tick.
+    hass.states.async_set(BOOLEAN_EXECUTION_OWNER, "on")
+    await hass.async_block_till_done()
     coordinator._carried = None
     install(coordinator, quarter_at(10, 45, battery=2.0, authorised=2.0))
     coordinator._applied_setpoint_kw = 0.0
     await coordinator._async_physical_tick(local(NORMAL, 10, 47))
 
     assert coordinator._tick_outcome.at == local(NORMAL, 10, 47)
-    assert coordinator._tick_outcome.reason != TICK_SKIPPED_NO_QUARTER
+    assert coordinator._tick_outcome.reason != TICK_SKIPPED_OWNERSHIP
 
 
 async def test_a_write_is_recorded_as_a_write(
@@ -158,7 +161,12 @@ async def test_a_write_is_recorded_as_a_write(
 async def test_no_carrier_at_all_reports_no_admitted_quarter(
     hass: HomeAssistant, config_data: dict, source_entities: None, frank, live_surface
 ) -> None:
-    """Cause one of the three beta.26 conflated."""
+    """Cause one of the three beta.26 conflated -- **when nothing of ours runs**.
+
+    beta.38 split this in two. "No authority" is only a *skip* while the inverter
+    is not moving under our claim; with an owned dispatch running it is an orphan,
+    and the sibling test below is what proves it is stopped rather than reported.
+    """
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
     # **The schedule too, since beta.30.** The executing quarter is derived at
     # the top of every tick and refresh, so clearing the derived value alone
@@ -167,10 +175,54 @@ async def test_no_carrier_at_all_reports_no_admitted_quarter(
     coordinator._plan = None
     coordinator._quarter = None
     coordinator._carried = None
+    # Not ours, so there is nothing to stop and the skip is the honest answer.
+    hass.states.async_set(BOOLEAN_EXECUTION_OWNER, "off")
+    await hass.async_block_till_done()
 
     await coordinator._async_physical_tick(local(NORMAL, 10, 46))
 
     assert coordinator._tick_outcome.reason == TICK_SKIPPED_NO_QUARTER
+    assert coordinator._tick_outcome.wrote is False
+
+
+async def test_an_owned_dispatch_with_no_authority_is_stopped_not_reported(
+    hass: HomeAssistant, config_data: dict, source_entities: None, frank, live_surface
+) -> None:
+    """**beta.38: the sixty-second cadence may not leave an orphan running.**
+
+    An owned, physically running dispatch that nothing authorises is the one state
+    the tick must never merely describe. Through beta.37 the "nothing to execute"
+    question was asked *before* activity and ownership, so this returned
+    ``no_admitted_quarter``, wrote nothing, and left the battery moving until the
+    economic cadence reset it fifteen minutes later or the vendor dead-man expired
+    twenty minutes after the arm. A timeout is not cleanup.
+
+    *Mutation: restore the ``no_quarter`` return ahead of the activity check and
+    this fails.*
+    """
+    from custom_components.alpha_ems_manager.alphaess_device import (
+        DISPATCH_ENABLE,
+    )
+
+    coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
+    assert hass.states.get(BOOLEAN_EXECUTION_OWNER).state == "on"
+    coordinator._plan = None
+    coordinator._quarter = None
+    coordinator._carried = None
+    live_surface.calls.clear()
+
+    await coordinator._async_physical_tick(local(NORMAL, 10, 46))
+
+    assert coordinator._tick_outcome.reason == TICK_STOPPED_ORPHAN_DISPATCH
+    assert coordinator._tick_outcome.wrote is True
+    # The stop was positively performed, in the documented order, and the marker
+    # was released -- not left for the dead-man.
+    written = [call.data["entity_id"] for call in live_surface.calls]
+    assert DISPATCH_ENABLE in written, written
+    assert BOOLEAN_EXECUTION_OWNER in written, written
+    assert written.index(DISPATCH_ENABLE) < written.index(BOOLEAN_EXECUTION_OWNER)
+    # And it is an abort, so the attempt behind it can never re-arm.
+    assert coordinator.store.execution_record is None
 
 
 async def test_nothing_armed_reports_dispatch_not_active(
@@ -223,9 +275,11 @@ def test_the_three_reasons_are_distinct_strings() -> None:
                 TICK_SKIPPED_NO_QUARTER,
                 TICK_SKIPPED_DISPATCH_INACTIVE,
                 TICK_SKIPPED_OWNERSHIP,
+                # beta.38: a fourth outcome, and it is a *stop* rather than a skip.
+                TICK_STOPPED_ORPHAN_DISPATCH,
             }
         )
-        == 3
+        == 4
     )
     assert TICK_SKIPPED_NO_QUARTER != "no_owned_run"
 

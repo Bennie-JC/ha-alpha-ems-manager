@@ -9,6 +9,151 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.38] - 2026-09-01
+
+**An opened row is not withdrawn by absence.** On 2026-09-01 at 20:30:05, on the
+supervised Live installation, a frozen two-row `net_export` run was recorded as
+*ended* on the very refresh its first row opened — and the same refresh armed 9.7 kW.
+A terminal was filed against a run the software then started. This release fixes the
+two independent defects behind that contradiction, plus three ordering and
+observability faults the trace exposed, and closes a one-line gap in the position
+accounting.
+
+Nothing about the economics moves. Stage A's chosen plan, its per-interval actions and
+energies, its published execution targets and its solve count are byte-identical to
+`beta.37` across four horizon shapes.
+
+### The incident
+
+Stage A's horizon head is `elapsed + 1` — the *next* interval, never the one in
+progress. Affirmation requires a publication whose window starts at or before the
+carried run's end, so **no publication issued after a row opens can describe it**, and
+every run's final row is unaffirmable by construction. Withdrawal-by-absence was
+therefore the normal state of every run's last quarter, and the suppression downstream
+was load-bearing on every single run rather than on an edge case.
+
+Two defects, either sufficient alone:
+
+1. `carry_forward`'s withdrawal-by-absence was an unguarded terminal `return` with no
+   way to see that the row was open. `AdmittedPlan.authority_rule` had promised the
+   opposite since `beta.29` — *"withdrawal is never inferred from a horizon that cannot
+   describe an open quarter"* — and the pure function never implemented it.
+2. `_plan_authority_holds` demanded a persisted arm claim as proof of authority. The
+   claim is written **by** an arm, at the write boundary, *after* the stop is decided
+   in the same refresh. On the refresh a row opens — the first refresh that can arm
+   anything — the proof it asked for cannot exist. Measured: `record_present: false`,
+   `plan_authority_holds: false`, a `stage_a_hold` terminal against a 4.53 kWh Sell
+   with `remaining_battery_kwh: 4.827`.
+
+No reset followed only because `ownership_of` answers `none` while the dispatch is
+still inactive. With the marker already on — the second row, or a back-to-back
+campaign — the same path would have torn the campaign down.
+
+### Fixed: an opened frozen row has execution authority
+
+`carry_forward` takes `row_open` and keeps a run whose row has opened rather than
+withdrawing it for want of an affirming publication. The flag is read from the *frozen
+schedule* by the caller, never from the run's own window, so a run whose schedule has
+gone is not kept alive by it. Bounded by the run's own `window_end`, the plan's
+`ends_at`, a row covering this instant, the abandonment latch and the vendor dead-man
+— and placed *after* the window test, so it can never outlive the work it protects.
+
+It suppresses absence and nothing else. Safety, a lost marker, a foreign claim, a
+stalled dead-man, a failed write, the user's own switch and an unknown quarter after a
+restart all reach the run by other paths and are untouched.
+
+### Fixed: authority no longer asks for proof it cannot have yet
+
+The claim test inverts from *"this schedule has armed something"* to *"nothing has
+been armed under a different authority"*. A foreign claim still refuses. A plan with
+no claim can only ever *withhold* a withdrawal — `resetting` requires `owned`, which
+requires `record_matches` — so an authority proven this way can never itself stop a
+dispatch.
+
+Two drafts got this wrong in the same way one refresh apart, and both are recorded at
+the predicate: a first asked `_campaign_started_at is not None`, which is wrong by one
+refresh because the campaign lifecycle advances at the *end* of the report; `beta.29`
+replaced it with the persisted claim, which is wrong by one refresh in a worse place.
+
+### Fixed: `execution.lifecycle.state` is no longer dead
+
+It had zero callers anywhere in the package, so it read `idle` permanently and the
+other eleven states were unreachable — including on refreshes where the battery was
+executing. It is now a hazard-first projection of booleans the report already
+computes, and the projection is proven **exhaustively over its whole input space**: no
+combination in which anything is owned can produce `idle`.
+
+### Fixed: the campaign start-freeze is one transition with the physical start
+
+`open_campaign.started` read `false` and `frozen_target_kwh` `null` on the refresh that
+armed the hardware, because the freeze ran one refresh later. Both are now set where
+the activation write lands, idempotently, and no refresh reporting an armed dispatch
+may report an unstarted campaign.
+
+### Fixed: the 60-second tick stops an orphan instead of returning silently
+
+It returned `skipped_no_quarter` before it looked at whether a dispatch was active, so
+an armed dispatch whose plan had been nulled got no stop from the physical cadence for
+up to a refresh interval. Ownership and activity are read first, and an owned active
+dispatch with no authority is routed to the existing abort teardown as
+`stopped_orphan_dispatch`.
+
+### Fixed: the opening position value is no longer null
+
+The parameter existed and the caller simply never supplied it, which was the sole
+cause of both nulls. Both ends of the position are now valued on **one curve — this
+refresh's** — and each at its own reported energy, so
+
+```
+realised_plus_remaining = realised_net + closing_inventory − opening_inventory
+```
+
+reconciles and carries no revaluation. Both figures are rounded like every other euro
+the ledger publishes; the closing value previously escaped as a raw 15-decimal float.
+
+### Deliberately not changed
+
+- **A restart still stops a started run.** The frozen schedule and the quarter's
+  measured progress are not persisted, so a restart cannot know how much of the row is
+  already delivered and continuing would execute against an unknown remainder. No
+  *"started, therefore immune"* flag was added: it would survive while the schedule it
+  refers to would not.
+- **No schema version moves.** Storage stays at 2/6, config entry at 2, the ownership
+  claim at 2, forecast storage at 8. No new persisted field is required by any of the
+  above, and that is a finding rather than a convenience.
+- **Safety Buy is untouched and still price-blind.** Proven on a horizon that actually
+  issues one, at 2 c/kWh and at 90 c/kWh.
+- **No cross-quarter catch-up.** Keeping a run alive is not permission to make up a
+  shortfall; a missed quarter stays missed.
+- **No new ledger basis word, no new sensor, no forecast revaluation term.** An honest
+  revaluation needs the opening value *as it was believed then* — a new persisted key
+  and a new basis name. Both are additive and neither is a one-line gap; shipping them
+  under time pressure from a live defect is how the wrong basis gets frozen into a
+  name. Deferred.
+- **`_terminal_value`'s horizon offset and `ForecastRisk.today_interval_count`** remain
+  as they were. The first reaches a priced quantity and fixing it would change the DP
+  objective; the live evidence implicates neither.
+
+### Verified
+
+4395 automated tests. Four mutation harnesses report **zero survivors and zero lost
+anchors**: `beta.38` (44 mutations), `beta.37` (43), `beta.36` (35), `beta.35` (19).
+
+Every `beta.38` scenario is replayed in **both** economic directions, because a Sell's
+objective is metered export with battery discharge as a ceiling while a Buy's is
+battery charge with grid import as a ceiling — the lifecycle is shared, the objectives
+are not, and free production must keep paying toward a Buy.
+
+Three `beta.35`/`beta.36` mutations stopped failing because this release added a guard
+*in front of* the layer they attack. None was retired or weakened: two were re-pointed
+at the layer that now decides, one at a witness that constructs the state directly.
+
+**Hardware validation is outstanding.** The next supervised Live day must show, at the
+refresh a frozen row opens: `ended_reason: null`, `plan_authority_holds: true`,
+`started: true` with `frozen_target_kwh` populated on that same refresh, and
+`lifecycle.state` walking `admitted → starting → executing` — never `idle` with the
+dispatch armed.
+
 ## [1.0.0-beta.37] - 2026-09-01
 
 **Economic Value observability.** `beta.36` made the execution lifecycle correct;
@@ -5938,7 +6083,10 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.35...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.38...HEAD
+[1.0.0-beta.38]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.37...v1.0.0-beta.38
+[1.0.0-beta.37]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.36...v1.0.0-beta.37
+[1.0.0-beta.36]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.35...v1.0.0-beta.36
 [1.0.0-beta.35]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.34...v1.0.0-beta.35
 [1.0.0-beta.34]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.33...v1.0.0-beta.34
 [1.0.0-beta.33]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.32...v1.0.0-beta.33

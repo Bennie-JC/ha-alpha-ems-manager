@@ -2939,6 +2939,15 @@ TICK_SKIPPED_DISPATCH_INACTIVE: Final = "dispatch_not_active"
 TICK_SKIPPED_OWNERSHIP: Final = "ownership_not_owned"
 TICK_STOPPED_TARGET_REACHED: Final = "stopped_target_reached"
 TICK_STOPPED_QUARTER_EXPIRED: Final = "stopped_quarter_expired"
+#: The tick found an owned, running dispatch that nothing authorises. **beta.38.**
+#:
+#: Diagnostics only, and it names a *stop the tick performed* rather than a reason
+#: it skipped. Through beta.37 this state returned ``no_admitted_quarter`` and
+#: nothing else: the ownership and activity questions were asked *after* it, so an
+#: owned dispatch whose authority had gone was left running to the vendor dead-man
+#: -- up to twenty minutes of unauthorised battery movement, on a cadence that runs
+#: every sixty seconds and could have stopped it.
+TICK_STOPPED_ORPHAN_DISPATCH: Final = "stopped_orphan_dispatch"
 #: The tick held an armed dispatch at zero. **beta.36.**
 #:
 #: Two reasons, kept apart because one is terminal for the row and the other is

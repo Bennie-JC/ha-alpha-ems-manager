@@ -265,6 +265,13 @@ async def test_the_tick_writes_nothing_while_waiting_for_a_quarter(
     """And says so, rather than being silently idle."""
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
     hass.states.async_set(DISPATCH_ENABLE, "off")
+    # **The register too. beta.38.** ``dispatch_active`` is read from the
+    # dispatch-start register, never from the enable helper, so switching the helper
+    # off alone left the snapshot reporting a *running* dispatch -- and this test
+    # was quietly describing an owned orphan rather than an idle controller. The
+    # tick now stops that, correctly, so the fixture is made to say what the test
+    # has always claimed.
+    hass.states.async_set(SENSOR_DISPATCH_START, "unknown")
     await hass.async_block_till_done()
     simulate_restart(coordinator)
     live_surface.calls.clear()

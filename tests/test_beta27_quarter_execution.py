@@ -149,6 +149,13 @@ async def test_a_quarter_with_nothing_admitted_writes_nothing(
     coordinator._plan = None
     coordinator._quarter = None
     coordinator._carried = None
+    # **And nothing of ours is running. beta.38.** Clearing the carriers alone left
+    # an owned, physically active dispatch that nothing authorised, which the tick
+    # now stops rather than reports -- see
+    # ``test_an_owned_dispatch_with_no_authority_is_stopped_not_reported``. The
+    # refusal this test names is the one where there is genuinely nothing to stop.
+    hass.states.async_set(BOOLEAN_EXECUTION_OWNER, "off")
+    await hass.async_block_till_done()
     live_surface.calls.clear()
 
     await coordinator._async_physical_tick(local(NORMAL, 10, 46))

@@ -272,11 +272,20 @@ async def test_the_campaign_survives_both_boundaries(
 
     report = await step_once(hass, coordinator, live_surface, **step_clock(1))
 
-    # The withdrawal happened, and was outranked rather than ignored.
+    # **beta.38: the withdrawal no longer arises at all.** Through beta.37 it was
+    # raised by ``carry_forward`` and then outranked here, which left a terminal
+    # filed against a running run. ``carry_forward`` now keeps a run whose frozen
+    # row is open, so there is nothing to outrank -- and the run is never nominally
+    # ended. Both facts are asserted, because "nothing was withheld" alone would
+    # also be satisfied by the suppression silently disappearing.
     execution = report.get("execution") or {}
     authority = (execution.get("write_boundary") or {}).get("authority") or {}
+    carried_block = execution.get("carried") or {}
     assert authority.get("plan_authority_holds") is True
-    assert authority.get("withheld_stop_reason") in EXECUTION_WITHDRAWAL_STOP_REASONS
+    assert authority.get("withheld_stop_reason") is None
+    assert carried_block.get("ended_reason") is None, carried_block
+    assert carried_block.get("last_ended") is None, "no terminal for a running row"
+    assert EXECUTION_STOP_STAGE_A_HOLD in EXECUTION_WITHDRAWAL_STOP_REASONS
 
     # **A continuation, named as one.** "not a reset" would also be satisfied by
     # doing nothing at all, which is the state quarter two actually spent fifteen
