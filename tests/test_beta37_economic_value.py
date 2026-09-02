@@ -745,4 +745,15 @@ async def test_the_entity_declares_no_state_class(
     assert state.attributes.get("device_class") == "monetary"
     assert state.attributes.get("unit_of_measurement") == "\u20ac"
     # And the basis is on the entity, so a reader never has to guess what it means.
-    assert "doing nothing economically active" in state.attributes["basis"]
+    #
+    # **The phrase moved in beta.39 and the reason is a contradiction this file
+    # already proved.** The old string said "on the exact basis the optimiser
+    # minimised" in the same sentence as "both sides are metered cash", and
+    # ``test_the_state_is_none_of_the_other_euro_figures`` in this same file has
+    # asserted the state is *not* ``objective_eur`` since beta.37 -- so the prose
+    # was already refuted by a test above it.
+    # What is pinned here is the half that was always true.
+    basis = state.attributes["basis"]
+    assert "passive ambient-walk comparator" in basis, basis
+    assert "both sides are metered cash" in basis, basis
+    assert "the basis the optimiser minimised" not in basis, basis

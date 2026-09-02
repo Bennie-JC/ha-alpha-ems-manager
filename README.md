@@ -19,7 +19,7 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.38` — a public beta.**
+> **Current release: `1.0.0-beta.39` — a public beta.**
 >
 > Stage A is feature-complete. Stage B — the physical execution controller — is
 > wired end to end and, from beta.24, **can charge your battery**. From beta.27 it
@@ -180,7 +180,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.38` is not offered.
+     dialog if `1.0.0-beta.39` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -822,6 +822,94 @@ buried the log in near-identical lines for a run already under way.
 Nothing reads those lines back. Since `beta.32` a line carries the `Advisory`
 marker only when the action genuinely has no actuator — a Live sale is executed, and
 marking it advisory was a false claim on a line a command was about to be sent for.
+
+### What today earned, and what is still coming (new in beta.39)
+
+Through `beta.38` the Economic Value sensor could tell you what the *plan* was worth
+against doing nothing. It could not tell you what the day had actually done — and
+the two figures that looked closest to an answer were the two it would have been
+most wrong to use. `decision_advantage_eur` is a from-now comparison against a
+counterfactual, not a realised quantity. `net_cash_flow_eur` is import less export,
+so a **negative** value means money arrived. Neither is a profit, and adding one to
+the other rests on neither.
+
+Four attributes now answer it, on the same entity, and they add up:
+
+```
+realised_today_eur              what the closed part of today realised
++ in_progress_interval_eur      what the quarter in flight has realised so far
++ remaining_expected_today_eur  what the plan still expects before midnight
++ forecast_revaluation_eur      what the energy today opened with has been revalued by
+= total_economic_value_today_eur
+```
+
+The total telescopes to one sentence: **today's cash, plus what the pack is worth
+now, less what it was worth when the day opened.** It is an economic *position*, not
+money in the bank — the remaining term is a forecast and two of the terms are
+planner valuations — and `accounting_basis` says so on the entity.
+
+Three properties are worth knowing:
+
+- **One counterfactual throughout.** Every avoidance figure, realised and planned
+  alike, is measured against a household with no battery at all. The planner's own
+  `avoided_import_eur` uses a different and smaller baseline — leaving the battery
+  alone *this* interval, which includes the inverter serving residual load by itself
+  — and the two are never added.
+- **The quarter in flight is a separate term** and joins realised history only when
+  its measurement closes, so `realised_today_eur` can never go down.
+- **Any missing addend takes the total with it.** `accounting_unavailable_reason`
+  names which, and there is never a zero standing in for an unknown. The reasons you
+  are most likely to see are `no_opening_valuation` (the first day after upgrading,
+  until the next local midnight) and `horizon_short_of_midnight` (Home Assistant
+  running outside the market's timezone with only one price day published, so part
+  of the local civil day is unpriced — publish tomorrow's prices as well and it
+  resolves).
+
+The attribute names are English because Home Assistant does not translate attribute
+*names* at all; the labels belong to your dashboard. A Dutch card:
+
+```yaml
+type: entities
+title: Economische waarde
+entities:
+  - entity: sensor.alpha_ems_economic_value
+    type: attribute
+    attribute: realised_today_eur
+    name: Gerealiseerd vandaag
+    suffix: " EUR"
+  - entity: sensor.alpha_ems_economic_value
+    type: attribute
+    attribute: in_progress_interval_eur
+    name: Lopend kwartier
+    suffix: " EUR"
+  - entity: sensor.alpha_ems_economic_value
+    type: attribute
+    attribute: remaining_expected_today_eur
+    name: Nog verwacht
+    suffix: " EUR"
+  - entity: sensor.alpha_ems_economic_value
+    type: attribute
+    attribute: forecast_revaluation_eur
+    name: Herwaardering
+    suffix: " EUR"
+  - entity: sensor.alpha_ems_economic_value
+    type: attribute
+    attribute: total_economic_value_today_eur
+    name: Totaal
+    suffix: " EUR"
+  - entity: sensor.alpha_ems_economic_value
+    type: attribute
+    attribute: accounting_unavailable_reason
+    name: Reden onbekend
+```
+
+Replace `sensor.alpha_ems_economic_value` with your own entity id if Home Assistant
+gave it a different one — check **Developer tools → States** for the entity whose
+`device_class` is `monetary`.
+
+The full audit trail is in the nested `today_accounting` attribute: the day's
+interval partition, both ends of the position, where the opening valuation came from
+and when, and the reconciliation error. It is also in the diagnostics download.
 
 ### Export safety, and why a discharge gets smaller (changed in beta.15)
 

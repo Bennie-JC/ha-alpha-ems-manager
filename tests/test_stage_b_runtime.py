@@ -403,7 +403,13 @@ async def test_the_document_declares_the_new_minor_and_stays_readable(
     document = hass_storage[f"alpha_ems_manager.{setup_integration.entry_id}.learning"]
 
     assert document["version"] == 2
-    assert document["minor_version"] == STORAGE_MINOR_VERSION == 6
+    # **7 since beta.39**, which adds one optional per-day dict: what the energy
+    # the day opened with was worth on the value curve that existed then. It is the
+    # one datum a forecast revaluation needs and the one datum nothing retained.
+    # Additive like every bump before it -- a beta.38 document reads back with the
+    # key absent, which is a defined state with its own published reason -- so the
+    # major staying at 2 is still the load-bearing half.
+    assert document["minor_version"] == STORAGE_MINOR_VERSION == 7
     # The learning history is untouched by any of this.
     assert "days" in document["data"]
 

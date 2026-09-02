@@ -31,8 +31,11 @@ from custom_components.alpha_ems_manager.const import (
     BOOLEAN_EXECUTION_OWNER,
     EXECUTION_ABORT_STOP_REASONS,
     EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
+    LIFECYCLE_ADMITTED,
+    LIFECYCLE_CLEANUP_COMPLETE,
     LIFECYCLE_EXECUTING,
     LIFECYCLE_IDLE,
+    LIFECYCLE_STARTING,
     LIFECYCLE_STOPPED,
     LIFECYCLE_STOPPING,
     OWNERSHIP_DEGRADED,
@@ -105,10 +108,20 @@ def test_idle_is_unreachable_while_anything_is_owned() -> None:
         OWNERSHIP_UNPROVEN,
     )
     reasons = (None, "safety", "deadman_not_refreshed", "stage_a_hold")
-    flags = list(product((False, True), repeat=5))
+    # **Three flags since beta.39, not five, and the sweep is no weaker for it.**
+    #
+    # ``holding`` and ``sustaining`` are gone from the projection's signature
+    # because they were never independent inputs: both are computed with ``owned``
+    # conjoined at the call site, so neither can be true while ownership is
+    # anything else, and both reached ``executing`` -- which ownership alone
+    # already reaches. Keeping them gave the field three criteria where the design
+    # calls for one, and made the predicate answer ``executing`` for
+    # ``holding=True, ownership=none`` when asked directly. The input space this
+    # walks is still the projection's whole input space.
+    flags = list(product((False, True), repeat=3))
 
     seen = set()
-    for ownership, reason, (resetting, releasing, arming, sustaining, holding) in (
+    for ownership, reason, (resetting, releasing, arming) in (
         (o, r, f) for o in states for r in reasons for f in flags
     ):
         state = AlphaEmsCoordinator._lifecycle_state_from(
@@ -118,8 +131,6 @@ def test_idle_is_unreachable_while_anything_is_owned() -> None:
             resetting=resetting,
             releasing=releasing,
             arming=arming,
-            sustaining=sustaining,
-            holding=holding,
             now=now,
         )
         seen.add(state)
@@ -282,11 +293,31 @@ async def test_every_refresh_that_owns_the_battery_says_so(
         if ownership == OWNERSHIP_OWNED:
             owned_refreshes += 1
             assert state != LIFECYCLE_IDLE, (index, state, ownership)
+            # **The two terminal notes joined this list in beta.39, and the reason
+            # is the same publish-ordering fact the release is about.**
+            #
+            # ``ownership`` here is the *pre-write* reading -- the report is built
+            # a frame before the write boundary -- so a refresh that resets the
+            # dispatch reads ``owned`` in this block and ``stopped`` /
+            # ``cleanup_complete`` in the lifecycle beside it. Both are true of
+            # the same refresh, at two different instants of it.
+            #
+            # The invariant itself is not touched: ``idle`` while owned is still
+            # refused above, and ``admitted`` -- a claim that nothing physical is
+            # under way -- is refused below. What is enumerated here is only which
+            # words a live refresh may use, and a verified ending is one of them.
             assert state in (
                 LIFECYCLE_EXECUTING,
                 LIFECYCLE_STOPPING,
-                "starting",
+                LIFECYCLE_STARTING,
+                LIFECYCLE_STOPPED,
+                LIFECYCLE_CLEANUP_COMPLETE,
             ), state
+            assert state != LIFECYCLE_ADMITTED, (index, state, ownership)
+            if state in (LIFECYCLE_STOPPED, LIFECYCLE_CLEANUP_COMPLETE):
+                # Not merely a permitted word: the run genuinely ended on this
+                # refresh, so the claim it was executing under has been released.
+                assert coordinator.store.execution_record is None, (index, state)
 
     assert owned_refreshes > 0, "the witness: the replay must own a dispatch"
 
@@ -342,6 +373,16 @@ async def test_a_restart_mid_run_produces_a_verified_stop(
     assert BOOLEAN_EXECUTION_OWNER in written, written
     assert hass.states.get(BOOLEAN_EXECUTION_OWNER).state == "off"
     assert coordinator.store.execution_record is None
-    assert coordinator._lifecycle in (LIFECYCLE_STOPPED, LIFECYCLE_IDLE), (
-        coordinator._lifecycle
-    )
+    # **``cleanup_complete`` joined this list in beta.39.** The stop and the
+    # cleanup are two verified events and this path performs both, so the last
+    # word is the later one. What is asserted has not changed: the run is over by
+    # a positive act, not by a dead-man, and none of the three words permitted
+    # here can be reached without one.
+    assert coordinator._lifecycle in (
+        LIFECYCLE_STOPPED,
+        LIFECYCLE_CLEANUP_COMPLETE,
+        LIFECYCLE_IDLE,
+    ), coordinator._lifecycle
+    # And the sequence is inspectable rather than inferred from the last word.
+    trail = [entry["state"] for entry in coordinator._lifecycle_trail]
+    assert LIFECYCLE_STOPPED in trail, trail

@@ -298,19 +298,34 @@ async def test_realised_and_the_decision_advantage_are_not_added(
     )
 
 
-def test_no_new_ledger_basis_word_was_invented() -> None:
-    """The position values were already ``planner_derived``, and still are.
+def test_the_position_values_are_still_planner_derived() -> None:
+    """The two inventory values were ``planner_derived`` in beta.38, and still are.
 
-    A revaluation term would need a basis of its own, and inventing one under time
-    pressure is how the wrong name gets frozen into a payload. beta.39 work.
+    **The count moved deliberately in beta.39, and this is the note that says so
+    rather than a diff nobody read.** beta.38 asserted ``len(LEDGER_BASES) == 5``
+    and gave the reason: a revaluation term needs a basis of its own, and inventing
+    one under time pressure from a live defect is how the wrong name gets frozen
+    into a payload. beta.39 is the release that adds the term, so it is the release
+    that adds the word -- ``revalued``, for the *same* energy valued on two
+    different curves, which is neither a measurement nor a single-instant planner
+    figure.
+
+    What this test actually protects is unchanged and is the part that matters: the
+    two figures whose difference beta.38's identity rests on are read off **one**
+    curve at **one** instant, and if either were ever relabelled ``revalued`` that
+    subtraction would stop meaning "what operating the battery achieved".
     """
+    from custom_components.alpha_ems_manager.const import LEDGER_BASIS_REVALUED
     from custom_components.alpha_ems_manager.realized import _basis_map
 
     basis = _basis_map()
     assert basis["opening_inventory_value_eur"] == LEDGER_BASIS_PLANNER_DERIVED
     assert basis["closing_inventory_value_eur"] == LEDGER_BASIS_PLANNER_DERIVED
-    assert len(LEDGER_BASES) == 5, "no sixth basis word in beta.38"
-    assert not any("revaluation" in name for name in basis)
+    assert len(LEDGER_BASES) == 6, "the sixth word is beta.39's revaluation basis"
+    assert LEDGER_BASIS_REVALUED in LEDGER_BASES
+    # Exactly one figure wears it, and it is the revaluation.
+    revalued = [name for name, word in basis.items() if word == LEDGER_BASIS_REVALUED]
+    assert revalued == ["today_accounting.forecast_revaluation_eur"], revalued
 
 
 def test_the_accounting_change_adds_no_solve() -> None:

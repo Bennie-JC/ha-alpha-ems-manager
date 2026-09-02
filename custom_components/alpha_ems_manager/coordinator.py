@@ -75,6 +75,17 @@ from .api import load_forecast_from
 from .battery import INTERVAL_HOURS, BatteryLimits, sanitize_soc_percent
 from .confidence import ConfidenceBreakdown, compute_confidence
 from .const import (
+    ACCOUNTING_OPENING_ENERGY_TOLERANCE_KWH,
+    ACCOUNTING_UNAVAILABLE_AVOIDANCE_BASIS,
+    ACCOUNTING_UNAVAILABLE_HORIZON_SHORT_OF_MIDNIGHT,
+    ACCOUNTING_UNAVAILABLE_NO_DAY_RECORD,
+    ACCOUNTING_UNAVAILABLE_NO_OPEN_QUARTER_MEASUREMENT,
+    ACCOUNTING_UNAVAILABLE_NO_OPENING_VALUATION,
+    ACCOUNTING_UNAVAILABLE_NO_PLAN,
+    ACCOUNTING_UNAVAILABLE_NO_POSITION_VALUE,
+    ACCOUNTING_UNAVAILABLE_NO_STORED_PRICES,
+    ACCOUNTING_UNAVAILABLE_OPENING_ENERGY_MISMATCH,
+    ACCOUNTING_UNAVAILABLE_VALUATION_REFERENCE_MOVED,
     ACTION_DISCHARGE,
     AMBIENT_SELF_CONSUMPTION_NO_SUPPRESSING_FEATURE,
     AMBIENT_SELF_CONSUMPTION_PEAK_SHAVING,
@@ -83,6 +94,7 @@ from .const import (
     AUTHORITY_BASIS_ADMITTED_PLAN,
     AUTHORITY_BASIS_CARRIED_RUN,
     AUTHORITY_BASIS_NONE,
+    AVOIDANCE_BASIS_NO_BATTERY,
     BALANCE_MAX_SOURCE_AGE_SECONDS,
     BATTERY_MAX_SOC_PERCENT,
     CADENCE_PHYSICAL_TICK,
@@ -200,14 +212,17 @@ from .const import (
     INHIBIT_PLAN_UNAVAILABLE,
     INHIBIT_WITHDRAWAL_REASONS,
     LIFECYCLE_ADMITTED,
+    LIFECYCLE_CLEANUP_COMPLETE,
     LIFECYCLE_DEADMAN_EXPIRED,
     LIFECYCLE_DEGRADED,
     LIFECYCLE_EXECUTING,
     LIFECYCLE_FOREIGN,
     LIFECYCLE_IDLE,
     LIFECYCLE_STARTING,
+    LIFECYCLE_STATES,
     LIFECYCLE_STOPPED,
     LIFECYCLE_STOPPING,
+    LIFECYCLE_TRAIL_LIMIT,
     LIFECYCLE_UNPROVEN,
     LOG_THROTTLE_SECONDS,
     MAX_ABORTED_CAMPAIGNS_REMEMBERED,
@@ -321,6 +336,7 @@ from .economic import (
     build_physics_table,
     campaign_identity,
     campaign_instance_identity,
+    day_block_for,
     desired_grid_kw_at,
     economic_value_summary,
     edge_creditable_energy_kwh,
@@ -429,6 +445,9 @@ from .quarter import (
 )
 from .realized import (
     closing_inventory_kwh,
+    day_accounting,
+    day_partition,
+    open_quarter_value_eur,
     opening_inventory_kwh,
     realized_window,
     soc_series_to_energy,
@@ -1719,6 +1738,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._lifecycle: str = LIFECYCLE_IDLE
         self._lifecycle_at: datetime | None = None
         self._lifecycle_previous: str | None = None
+        #: Every transition, in order, bounded. **beta.39.** The lifecycle advances
+        #: on three cadences and only one of them publishes a control report, so a
+        #: single state field structurally cannot answer "did it reach
+        #: ``executing``?" -- see ``LIFECYCLE_TRAIL_LIMIT``.
+        self._lifecycle_trail: deque[dict[str, Any]] = deque(
+            maxlen=LIFECYCLE_TRAIL_LIMIT
+        )
         #: When tomorrow's prices were first observed to be available, this session.
         #:
         #: **A measurement nobody has taken.** The unknown-price policy turns on how
@@ -2181,6 +2207,38 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._note_tick(now, TICK_SKIPPED_DISPATCH_INACTIVE)
             return
         owned_now = self._ownership_now(snapshot, now) == OWNERSHIP_OWNED
+        # **The cadence that can see a run happen. beta.39.**
+        #
+        # Placed here, immediately after activity and ownership are read, and
+        # deliberately *ahead* of the guards below rather than behind them.
+        # ``snapshot.dispatch_active`` has already been proven true above, so
+        # ``ownership_of`` cannot answer ``none`` and this projection can never
+        # produce ``idle`` or ``admitted`` -- it can only report what is running
+        # and under whose authority.
+        #
+        # Behind the guards it would have been silent on exactly the cases a
+        # reader most needs: a marker deleted mid-run leaves the tick returning
+        # early, and the lifecycle would have gone on reading ``executing`` from
+        # what it believed a minute earlier until the next quarter refresh came
+        # round. Reporting a hazard is not the same as acting on one, and the
+        # actions below are unchanged.
+        #
+        # Projected through the same function the report uses, so there is one
+        # criterion and not two. ``stop_reason`` is ``None`` because every stop
+        # this tick can decide is taken below and notes its own transition, and
+        # ``arming`` is ``False`` because a tick never arms -- it corrects a
+        # dispatch that is already running.
+        self._note_lifecycle(
+            self._lifecycle_state_from(
+                ownership_state=self._ownership_now(snapshot, now),
+                stop_reason=None,
+                resetting=False,
+                releasing=False,
+                arming=False,
+                now=now,
+            ),
+            now,
+        )
         if quarter is None and run is None:
             if owned_now:
                 # **The orphan, stopped on the cadence that found it.** Routed
@@ -3095,12 +3153,31 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @callback
     def _note_lifecycle(self, state: str, now: datetime) -> None:
-        """Record a lifecycle transition. One field, one question."""
+        """Record a lifecycle transition. One field, one question.
+
+        **The vocabulary is checked, since beta.39.** The argument was a bare
+        string with nothing to compare it against, so a typo at a call site would
+        have published a state no reader can interpret -- and the field's whole
+        purpose is that a reader never has to guess. A wrong word fails loudly
+        here rather than quietly in a payload.
+
+        **And every transition is appended to a bounded trail.** The lifecycle
+        advances on three cadences -- the quarter refresh, the write boundary and
+        the sixty-second physical tick -- and only the first of them publishes a
+        control report. So on 2026-09-02 a Sell that ran for fifteen minutes at
+        7.4 kW published ``admitted -> starting -> stopping``: the state field
+        showed the latest answer at each publication and ``executing`` fell
+        between two of them. A sequence answers the question a single field
+        cannot, and it costs one bounded list.
+        """
+        if state not in LIFECYCLE_STATES:  # pragma: no cover - programming error
+            raise ValueError(f"unknown lifecycle state: {state}")
         if state == self._lifecycle:
             return
         self._lifecycle_previous = self._lifecycle
         self._lifecycle = state
         self._lifecycle_at = now
+        self._lifecycle_trail.append({"state": state, "at": now.isoformat()})
 
     @callback
     def _note_campaign_started(self, now: datetime) -> None:
@@ -3165,8 +3242,6 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         resetting: bool,
         releasing: bool,
         arming: bool,
-        sustaining: bool,
-        holding: bool,
         now: datetime,
     ) -> str:
         """Return where the lifecycle is, projected from facts already decided.
@@ -3185,9 +3260,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         write boundary orders its own branches, so the published state names the
         thing that actually decided the refresh.
 
-        **A hold reports ``executing``, deliberately.** beta.36 settled that "a hold
-        is a state of a run that is still going" -- it keeps ownership, the claim,
-        the frozen schedule and the campaign, and it keeps re-arming the dead-man.
+        **A hold reports ``executing``, deliberately.** It keeps ownership, so it
+        reaches the one criterion by the same door a moving run does. beta.36
+        settled that "a hold is a state of a run that is still going" -- it keeps
+        ownership, the claim, the frozen schedule and the campaign, and it keeps
+        re-arming the dead-man.
         The vocabulary has no ``holding`` member and inventing one would split a
         single question across two fields, which is the defect this field exists to
         prevent; ``hold_reason`` is published in the same block and is the
@@ -3209,12 +3286,45 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return LIFECYCLE_STOPPING
         if stop_reason is not None and ownership_state == OWNERSHIP_OWNED:
             return LIFECYCLE_STOPPING
-        if arming:
-            return LIFECYCLE_STARTING
-        if holding or sustaining:
-            return LIFECYCLE_EXECUTING
+        # **Confirmed execution outranks a start in progress. beta.39, and the
+        # order is the whole of the fix.**
+        #
+        # ``arming`` used to be tested first, and it is the weaker fact: it says a
+        # write carrying an activation is *planned this refresh*, which is a
+        # statement about our own intention. ``OWNERSHIP_OWNED`` is a statement
+        # about the plant -- the vendor register reports ``dispatch_active``, our
+        # persisted claim matches this run, and the owner marker is on -- and
+        # ``ownership_of`` returns ``NONE`` the instant activity is false, so it
+        # cannot be reached before execution really began.
+        #
+        # With ``arming`` first, a refresh that re-armed a run already confirmed
+        # running published ``starting``; and because the projection runs once, in
+        # a pure report built one frame *before* the write, a run whose only arm
+        # was its own first refresh could never be seen owned by it at all.
+        # ``executing`` needed a second quarter refresh inside the same run, which
+        # a single-row campaign does not have. That is exactly what 2026-09-02
+        # produced.
+        #
+        # Nothing here manufactures the state from the command just sent: this
+        # branch fires only on evidence that the dispatch is already active and
+        # provably ours. An arm with no such evidence yet stays ``starting``,
+        # truthfully, until a later observation proves otherwise.
+        #
+        # **And it is the *only* route to ``executing``. beta.39.** beta.38 had
+        # three: ``holding``, ``sustaining``, or ownership. The first two are
+        # subsumed by the third -- both are computed with ``owned`` conjoined, so
+        # neither can be true while ownership is anything else -- so they added no
+        # reachable state and cost the field its single criterion. Written as a
+        # disjunction the projection would answer ``executing`` for
+        # ``holding=True, ownership=none``: unreachable in production, and a
+        # predicate that will answer a question wrongly when asked directly is a
+        # predicate nobody can reason about. ``hold_reason`` remains the
+        # discriminator between a run that is resting and one that is moving, in
+        # the same block, which is where beta.36 put it.
         if ownership_state == OWNERSHIP_OWNED:
             return LIFECYCLE_EXECUTING
+        if arming:
+            return LIFECYCLE_STARTING
         # Admitted but not yet physical: a frozen schedule exists and either has not
         # opened or has opened without anything being armed under it yet.
         plan = self._plan
@@ -3266,18 +3376,110 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @callback
     def _lifecycle_block(self) -> dict[str, Any]:
-        """Return where the execution lifecycle is, and when it got there."""
+        """Return where the execution lifecycle is, when it got there, and how.
+
+        **``transitions`` is the beta.39 addition and it is the load-bearing
+        one.** ``state`` can only ever report the latest answer, and two of the
+        three cadences that advance the lifecycle publish no report -- so a run
+        that started and finished between two publications left no trace of having
+        executed at all. The trail is bounded, append-only within a session, and
+        nothing decides on it.
+        """
         return {
             "state": self._lifecycle,
             "entered_at": (
                 None if self._lifecycle_at is None else self._lifecycle_at.isoformat()
             ),
             "previous_state": self._lifecycle_previous,
+            "transitions": list(self._lifecycle_trail),
             "rule": (
-                "one field for one question. before beta.30 a reader had to infer "
-                "the state from four others computed at different instants"
+                "one field for one question. the state is projected from facts the "
+                "write boundary has already settled, and executing means the "
+                "vendor register reports an active dispatch that our own claim and "
+                "marker prove is ours -- never merely that a command was sent. "
+                "transitions carries every change this session, bounded, because "
+                "the lifecycle also advances at the write boundary and on the "
+                "sixty-second tick, neither of which publishes a report"
             ),
         }
+
+    @callback
+    def _open_campaign_block(self) -> dict[str, Any] | None:
+        """Return the open campaign as the payload states it, or ``None``.
+
+        **Extracted in beta.39 for one reason: it has to be renderable twice.**
+        ``started`` and ``frozen_target_kwh`` are settled at the write boundary,
+        which runs a frame *after* the report is built, so the 2026-09-01 capture
+        published ``started: false`` and ``frozen_target_kwh: null`` beside a
+        ``completed_campaign`` whose ``started_at`` was that very refresh. beta.38
+        moved the freeze to the correct instant and the payload still lied, because
+        the payload was already written. See ``_settle_execution_payload``.
+        """
+        if self._campaign_id is None:
+            return None
+        return {
+            "campaign_id": self._campaign_id,
+            "objective_boundary": self._campaign_boundary,
+            "started": self._campaign_started_at is not None,
+            "frozen_target_kwh": (
+                None
+                if self._campaign_frozen_target_kwh is None
+                else round(self._campaign_frozen_target_kwh, 3)
+            ),
+            # **Committed plus the quarter in flight.** The committed sum
+            # advances only on a completed quarter, so quoting it alone would
+            # show a campaign frozen at its last boundary while energy was
+            # visibly moving.
+            "campaign_realized_kwh": round(self._campaign_realized_now(), 3),
+            "campaign_committed_kwh": round(self._campaign_realized_kwh, 3),
+            "quarters_admitted": self._campaign_quarters_admitted,
+            "rule": (
+                "the realised figure accumulates across segments and holds "
+                "across serve_load gaps; it is reset only when the campaign "
+                "closes. the target is frozen at the first confirmed "
+                "activation and may never shrink"
+            ),
+        }
+
+    @callback
+    def _settle_execution_payload(self, report: dict[str, Any] | None) -> None:
+        """Re-publish the two blocks the write boundary settles after the report.
+
+        **beta.39, and it is a publish-ordering fix rather than a control change.**
+        ``_build_control_report`` is pure and runs one call frame before
+        ``_async_dispatch``; three facts are therefore decided *after* the payload
+        describing them has been assembled:
+
+        * whether the campaign started, and what target was frozen at that instant;
+        * whether a stop and its cleanup landed;
+        * whether fresh evidence now proves the dispatch is ours and active.
+
+        The dict is still mutable here -- ``control_report`` is
+        ``self.data["control"]``, and ``self.data`` is assigned from the mapping
+        this refresh returns -- so the two blocks are simply re-rendered from state
+        that has since advanced. **Nothing is recomputed and no command is
+        reachable from here.**
+
+        **What it does not do is promote ``starting`` to ``executing``.** A write
+        that landed is not evidence that a dispatch is running, and reading the
+        vendor register microseconds after our own write reads an echo rather than
+        a confirmation -- the live probe of 2026-09-02 dates the register going
+        active at 20:45:49, 44.7 seconds after the claim was written. So an arming
+        refresh publishes ``starting``, truthfully, and the first *observation*
+        that satisfies ``ownership_of`` -- the physical tick, or a later refresh --
+        is what records ``executing``. This helper only re-renders; it decides
+        nothing and reads no register -- which is also why it takes no instant:
+        both blocks it re-renders read the coordinator's own state, and inventing
+        a second timestamp for a re-render would invite exactly the confusion the
+        original ordering caused.
+        """
+        if report is None:
+            return
+        execution = report.get("execution")
+        if not isinstance(execution, dict):  # pragma: no cover - defensive
+            return
+        execution["lifecycle"] = self._lifecycle_block()
+        execution["open_campaign"] = self._open_campaign_block()
 
     @callback
     def _record_decision(
@@ -3704,6 +3906,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         summary["horizon_from"] = instant(summary["first_interval_index"])
         # The instant the horizon stops covering, not the start of its last quarter.
         summary["horizon_to"] = instant(summary["last_interval_index"] + 1)
+        # **The civil day's position, on the same entity. beta.39.** Assembled here
+        # rather than in the pure layer for the same reason the instants are: it
+        # needs the calendar, the persisted history and the stored prices, and none
+        # of those belong to the solver.
+        summary["today_accounting"] = self._today_accounting(outcome, plan, moment)
         return summary
 
     @callback
@@ -5538,11 +5745,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 reason,
             )
             return
-        await self._async_send_locked(plan_dispatch_cleanup(), now=now, verify=None)
-        # Stop verified inactive, cleanup sent. Every scope reaches here the same
-        # way, which is why the transition is recorded once, here, rather than in
-        # each of the three teardowns below.
+        # **Two transitions, because they are two verified events. beta.39.**
+        # The stop is verified inactive by the send above; the cleanup is what
+        # returns the resting values and releases the marker. This method already
+        # made the distinction -- it withholds the cleanup on an unverified stop
+        # precisely because the two are not the same thing -- and then published
+        # one word for both. ``cleanup_complete`` was a constant with no writer.
         self._note_lifecycle(LIFECYCLE_STOPPED, now)
+        await self._async_send_locked(plan_dispatch_cleanup(), now=now, verify=None)
+        self._note_lifecycle(LIFECYCLE_CLEANUP_COMPLETE, now)
 
         if scope == STOP_SCOPE_ABORT:
             # One teardown, and this is the whole of it.
@@ -6555,6 +6766,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             tz=tz,
         )
 
+        # **Written once per civil day, and only here. beta.39.**
+        #
+        # The one datum a forecast revaluation needs is what the energy the day
+        # opened with was worth *on the curve that existed then*, and nothing
+        # retained it. It is written from the refresh rather than from the
+        # publishing path on purpose: an entity read must never write storage, and
+        # the Economic Value attributes are read on every state update.
+        self._note_opening_valuation(outcome=economic, plan=plan, now=now, today=today)
+
         # Derived from runs already solved, so this costs no extra search.
         #
         # **Before the control report, and that ordering is load-bearing.** The
@@ -6584,6 +6804,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Refuses on every path in this release. Called unconditionally so the
         # refusal is exercised rather than merely assumed.
         await self._async_dispatch(control, now)
+        # **Publish-ordering, not control. beta.39.** Two blocks of the report above
+        # describe facts the write boundary has only just settled; this re-renders
+        # them into the same dict before it becomes ``self.data``.
+        self._settle_execution_payload(control)
 
         return {
             "today": adapted,
@@ -8414,6 +8638,381 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
 
     @callback
+    def _note_opening_valuation(
+        self, *, outcome: Any, plan: Any, now: datetime, today: date
+    ) -> bool:
+        """Value the energy this civil day opened with, once. Returns whether it wrote.
+
+        **beta.39, and it is the only new persistence in the release.**
+
+        Timing is the whole of the design. The opening energy the ledger reports is
+        ``opening_inventory_kwh`` -- the *first recorded* state of charge of the day
+        -- and a state of charge is sampled when a quarter closes, so at 00:00 there
+        is nothing to value. This therefore fires at the first refresh of the day
+        that has a recorded level, which is normally 00:15 or 00:30, and
+        ``valued_at`` records exactly when. Valuing the live head energy at midnight
+        instead would have been available sooner and wrong: the revaluation is a
+        difference between two valuations of **one** energy, and that energy has to
+        be the one the ledger publishes.
+
+        Idempotent through ``DayRecord.note_opening_valuation``, whose guard is the
+        field's own absence -- so a reload, a restart or an extra refresh cannot
+        re-open a day and move the reference the whole day is measured from.
+
+        **The write-once rule lives in exactly one place, deliberately.** An early
+        return here as well would read as defence in depth and behave as a
+        blindfold: with two guards in series, breaking either one on purpose
+        changes nothing observable, so neither can be tested and both rot. The
+        guard is on the record, where the field is.
+
+        The floor and the bucket pitch are stored beside the value because
+        ``V(floor) - V(e)`` is only comparable across refreshes if the lattice it
+        was integrated over is the same one; see ``_forecast_revaluation_eur``.
+        """
+        record = self.store.days.get(today)
+        if record is None:
+            return False
+        if not isinstance(outcome, EconomicOutcome) or not outcome.available:
+            return False
+        bucket_kwh = outcome.bucket_kwh
+        if not bucket_kwh:
+            return False
+        limits = (
+            plan.state.limits if plan is not None and plan.state is not None else None
+        )
+        energies = soc_series_to_energy(
+            [record.soc_at(index) for index in range(record.interval_count)],
+            capacity_kwh=None if limits is None else limits.capacity_kwh,
+        )
+        opening = opening_inventory_kwh(list(energies))
+        if opening is None:
+            return False
+        value = self._position_value_eur(outcome, opening)
+        if value is None:
+            return False
+        wrote = record.note_opening_valuation(
+            valued_at=now.isoformat(),
+            stored_energy_kwh=opening,
+            position_value_eur=value,
+            floor_kwh=outcome.desired.terminal_floor_kwh,
+            bucket_kwh=bucket_kwh,
+        )
+        if wrote:
+            self.store.schedule_save()
+        return wrote
+
+    @callback
+    def _forecast_revaluation_eur(
+        self, *, outcome: Any, record: Any, opening_kwh: float | None
+    ) -> tuple[float | None, str | None, float | None, str | None]:
+        """Return the revaluation, why not, and the persisted valuation behind it.
+
+        ``V[now](e_open) - V[open](e_open)``: what the energy the day opened with is
+        worth on this refresh's curve, less what it was worth on the curve that
+        existed when the day opened. **Required rather than convenient**, and the
+        proof is a subtraction: the position total less beta.38's operational
+        identity is exactly this quantity, so without it forecast movement is
+        silently attributed to today's operation. On the 2026-09-02 captures the
+        *same* 12.269 kWh was worth 2.3001 EUR at 20:45 and 2.3659 EUR at 21:00 --
+        6.6 cents of pure curve movement in one quarter.
+
+        It is read from persistence and never reconstructed. The tempting shortcut
+        -- marginal value times stored energy -- is a slope where this is an
+        integral, over a curve the model itself reports as kinked, and on the same
+        capture it gives 2.30 EUR against an actual 3.0942 EUR.
+
+        Three refusals, each with its own reason and never a zero:
+
+        * no record for the day yet, a day whose first refresh had no usable level,
+          or a session in which writes are suspended -- ``no_opening_valuation``;
+        * the bucket pitch has moved, so the two integrals were taken over
+          different lattices and their difference is not a revaluation --
+          ``valuation_reference_moved``;
+        * the persisted energy and the level the ledger now reports disagree by
+          more than one state-of-charge quantum, so the two valuations are not of
+          the same energy -- ``opening_energy_mismatch``.
+
+        **The reserve floor is deliberately not a refusal.** It moves with the load
+        and production forecasts, and its effect on what the position is worth is
+        forecast revaluation in the plainest sense. Both floors are published
+        beside the figure so a reader can see how much of the movement is which.
+        """
+        stored = None if record is None else record.open_value
+        if not isinstance(stored, dict):
+            return None, ACCOUNTING_UNAVAILABLE_NO_OPENING_VALUATION, None, None
+        valued_at = stored.get("at")
+        persisted = stored.get("v")
+        if persisted is None:  # pragma: no cover - validated on load
+            return None, ACCOUNTING_UNAVAILABLE_NO_OPENING_VALUATION, None, None
+        if not isinstance(outcome, EconomicOutcome) or not outcome.available:
+            return None, ACCOUNTING_UNAVAILABLE_NO_PLAN, persisted, valued_at
+        bucket_kwh = outcome.bucket_kwh
+        # **Compared at the precision it is stored at, not at float precision.**
+        # The document rounds to six decimals for compactness, so an exact test
+        # against the live figure fails by ~3e-7 on an entirely unchanged lattice --
+        # and did, publishing ``valuation_reference_moved`` on every refresh of a
+        # stable installation. The pitch is ``quarter_dc / k`` for integer ``k`` and
+        # depends only on the configured limits, so at six decimals a difference is
+        # a genuinely different lattice: a reconfigured pack, a changed power limit,
+        # or a state budget that flipped ``k``. Across one of those the two value
+        # functions are not valuations of the same system.
+        if not bucket_kwh or round(bucket_kwh, 6) != round(float(stored["b"]), 6):
+            return (
+                None,
+                ACCOUNTING_UNAVAILABLE_VALUATION_REFERENCE_MOVED,
+                persisted,
+                valued_at,
+            )
+        if opening_kwh is None:
+            return None, ACCOUNTING_UNAVAILABLE_NO_POSITION_VALUE, persisted, valued_at
+        if (
+            abs(float(stored["e"]) - opening_kwh)
+            > ACCOUNTING_OPENING_ENERGY_TOLERANCE_KWH
+        ):
+            return (
+                None,
+                ACCOUNTING_UNAVAILABLE_OPENING_ENERGY_MISMATCH,
+                persisted,
+                valued_at,
+            )
+        # **Valued at the persisted energy, not at the level read again here.** The
+        # two agree within a quantum by the guard above, and using the persisted
+        # figure is what makes the subtraction a difference of one energy on two
+        # curves rather than of two energies on two curves.
+        current = self._position_value_eur(outcome, float(stored["e"]))
+        if current is None:
+            return None, ACCOUNTING_UNAVAILABLE_NO_POSITION_VALUE, persisted, valued_at
+        return current - float(persisted), None, persisted, valued_at
+
+    @callback
+    def _open_quarter_value_eur(
+        self, now: datetime
+    ) -> tuple[float | None, float | None]:
+        """Return what the quarter in flight has realised so far, and its coverage.
+
+        **Measured, from the live integrators, and it has to be.** Storage does not
+        hold this interval: a quarter is persisted when it closes, so the realised
+        slice structurally cannot contain it -- which is why the 2026-09-02 captures
+        had one quarter in neither the realised window nor the plan's remaining
+        slice, and at 20:45 the missing index was the Sell row that delivered the
+        1.437 kWh.
+
+        The arithmetic is :func:`realized.open_quarter_value_eur`, shared with the
+        closed intervals so a partial quarter and the history it becomes cannot rest
+        on different rules. Coverage is published beside it because a term computed
+        two seconds into a quarter is honestly near zero and a reader has to be able
+        to tell that from nothing having happened.
+        """
+        if (
+            self._grid_import_accumulator is None
+            or self._grid_export_accumulator is None
+            or self._pv_accumulator is None
+        ):
+            return None, None
+        buy, sell = self.current_prices(now)
+        house = self._accumulator.open_energy_kwh
+        flexible = (
+            0.0
+            if self._ev_accumulator is None
+            else self._ev_accumulator.open_energy_kwh
+        )
+        # The same baseline the ledger prices: house load less the flexible load,
+        # never the raw meter reading. ``DayRecord.baseline_at`` subtracts it for
+        # every closed interval and an open one must not be the exception.
+        value = open_quarter_value_eur(
+            grid_import_kwh=self._grid_import_accumulator.open_energy_kwh,
+            grid_export_kwh=self._grid_export_accumulator.open_energy_kwh,
+            load_kwh=max(0.0, house - flexible),
+            production_kwh=self._pv_accumulator.open_energy_kwh,
+            import_price_eur_kwh=buy,
+            export_price_eur_kwh=sell,
+        )
+        return value, round(self._accumulator.open_coverage, 4)
+
+    @callback
+    def _sliced_series(
+        self, series: dict[str, list[Any]], stop: int
+    ) -> dict[str, list[Any]]:
+        """Return the same series truncated to the first ``stop`` intervals.
+
+        **Truncated rather than blanked.** Setting the excluded intervals to
+        ``None`` would count every one of them in ``intervals_skipped``, and a
+        reader comparing that against the partition would see a day full of gaps
+        that are simply the future.
+        """
+        limit = max(0, stop)
+        return {key: list(values)[:limit] for key, values in series.items()}
+
+    @callback
+    def _today_accounting(
+        self, outcome: Any, plan: Any, now: datetime
+    ) -> dict[str, Any]:
+        """Return the civil day's economic position, as four terms and a total.
+
+        **Publish-only and diagnostic-only.** Nothing here solves, nothing here
+        writes, and no optimiser, reserve, policy, safety or control path reads it.
+        The one write the release adds is ``_note_opening_valuation``, which runs on
+        the refresh and not on this path.
+
+        The partition is the plan's own: ``h`` is ``plan.intervals[0].index`` -- the
+        first interval Stage A is still planning -- so the closed part of the day is
+        ``[0, h-1)``, the quarter in flight is ``h-1`` and what remains is
+        ``[h, N)``. Disjoint and exhaustive by construction on a 92, 96 or
+        100-interval day, because it is defined by ``h`` and not by which intervals
+        happen to carry data.
+        """
+        if plan is None or plan.target_day is None:
+            return day_accounting(
+                realised=None,
+                in_progress_eur=None,
+                in_progress_index=None,
+                in_progress_coverage=None,
+                remaining_expected_eur=None,
+                forecast_revaluation_eur=None,
+                unavailable_reason=ACCOUNTING_UNAVAILABLE_NO_PLAN,
+            ).as_dict()
+        record = self.store.days.get(plan.target_day)
+        if record is None:
+            return day_accounting(
+                realised=None,
+                in_progress_eur=None,
+                in_progress_index=None,
+                in_progress_coverage=None,
+                remaining_expected_eur=None,
+                forecast_revaluation_eur=None,
+                unavailable_reason=ACCOUNTING_UNAVAILABLE_NO_DAY_RECORD,
+            ).as_dict()
+        forecast = (self.price_forecasts or {}).get(plan.target_day)
+        if forecast is None:
+            return day_accounting(
+                realised=None,
+                in_progress_eur=None,
+                in_progress_index=None,
+                in_progress_coverage=None,
+                remaining_expected_eur=None,
+                forecast_revaluation_eur=None,
+                unavailable_reason=ACCOUNTING_UNAVAILABLE_NO_STORED_PRICES,
+            ).as_dict()
+
+        count = record.interval_count
+        head = count
+        if isinstance(outcome, EconomicOutcome) and outcome.desired.intervals:
+            head = outcome.desired.intervals[0].index
+        # **One rule, and it lives in the pure layer.** See ``day_partition``: the
+        # three slices are defined by the plan's own head index and not by which
+        # intervals happen to carry data, which is what makes them exhaustive on a
+        # 92, 96 or 100-interval day.
+        closed, in_progress_index, remaining_slice = day_partition(
+            head=head, interval_count=count
+        )
+
+        limits = plan.state.limits if plan.state is not None else None
+        series = self._realized_series(record, forecast, limits)
+        realised = self._realized_window_for(
+            self._sliced_series(series, len(closed)), limits
+        )
+
+        in_progress, coverage = (
+            self._open_quarter_value_eur(now)
+            if in_progress_index is not None
+            else (0.0, None)
+        )
+
+        remaining, remaining_count, remaining_reason = self._remaining_expected_eur(
+            outcome, count
+        )
+        # **A day with a hole in it has no day total.**
+        #
+        # The plan's priced horizon is not guaranteed to reach local midnight: the
+        # source publishes a *market* day and the plan is a local civil day, and on
+        # a household whose Home Assistant runs outside the market's timezone one
+        # published day cannot span the other -- the documented partial-coverage
+        # case. Those intervals are then neither realised nor planned, and adding
+        # up what is left would publish a figure that looks like the day and is not.
+        # Counted in the partition and named, never quietly dropped.
+        if remaining_count is not None and remaining_count != len(remaining_slice):
+            remaining = None
+            remaining_reason = ACCOUNTING_UNAVAILABLE_HORIZON_SHORT_OF_MIDNIGHT
+        revaluation, reval_reason, persisted, valued_at = (
+            self._forecast_revaluation_eur(
+                outcome=outcome,
+                record=record,
+                opening_kwh=realised.opening_inventory_kwh,
+            )
+        )
+        reason = remaining_reason or reval_reason
+        if in_progress is None and reason is None:
+            reason = ACCOUNTING_UNAVAILABLE_NO_OPEN_QUARTER_MEASUREMENT
+        return day_accounting(
+            realised=realised,
+            in_progress_eur=in_progress,
+            in_progress_index=in_progress_index,
+            in_progress_coverage=coverage,
+            remaining_expected_eur=remaining,
+            forecast_revaluation_eur=revaluation,
+            opening_valuation_eur=persisted,
+            opening_valued_at=valued_at,
+            opening_floor_kwh=(record.open_value or {}).get("f"),
+            opening_bucket_kwh=(record.open_value or {}).get("b"),
+            current_floor_kwh=(
+                outcome.desired.terminal_floor_kwh
+                if isinstance(outcome, EconomicOutcome) and outcome.desired.available
+                else None
+            ),
+            current_bucket_kwh=(
+                outcome.bucket_kwh if isinstance(outcome, EconomicOutcome) else None
+            ),
+            interval_count=count,
+            realised_interval_count=len(closed),
+            remaining_interval_count=len(remaining_slice),
+            remaining_planned_interval_count=remaining_count,
+            unavailable_reason=reason,
+        ).as_dict()
+
+    @callback
+    def _remaining_expected_eur(
+        self, outcome: Any, today_interval_count: int
+    ) -> tuple[float | None, int | None, str | None]:
+        """Return what the plan still expects today, on the **no-battery** basis.
+
+        ``export_revenue - grid_import_cost + avoided_import_no_battery``, summed
+        over the plan's own today slice. Term for term the construction
+        ``realized.realized_net_value_eur`` uses on measured flows, which is what
+        makes the two addable -- and the reason the avoidance is recomputed rather
+        than taken from ``avoided_import_eur``, which rests on the per-interval idle
+        counterfactual and is a different and smaller number wherever the inverter
+        would have served the house by itself.
+
+        ``switching_cost_eur`` is excluded. It is a hurdle rate with
+        ``is_cash: False``, and the four model terms and the terminal credit are not
+        in ``cost_eur`` either. Neither ``decision_advantage_eur`` nor
+        ``today_interval_value_eur`` is used: the first is the plan against one
+        whole-horizon ambient walk and the second is each interval against its own
+        idle baseline, and the project already asserts that neither may be added to
+        a realised figure.
+
+        An empty slice returns ``0.0`` and not ``None``: late in the evening there
+        genuinely is nothing left to expect, and that is an answer.
+        """
+        if not isinstance(outcome, EconomicOutcome) or not outcome.desired.available:
+            return None, None, ACCOUNTING_UNAVAILABLE_NO_PLAN
+        block = day_block_for(
+            outcome.desired, today_interval_count=today_interval_count
+        )
+        intervals = block.get("intervals") or 0
+        if not intervals:
+            return 0.0, 0, None
+        value = block.get("no_battery_value_eur")
+        if value is None:  # pragma: no cover - the block computes it whenever priced
+            return None, intervals, ACCOUNTING_UNAVAILABLE_AVOIDANCE_BASIS
+        if block.get("avoidance_basis") != AVOIDANCE_BASIS_NO_BATTERY:
+            # **Fail closed on a basis change.** If a later release re-bases the
+            # day block, this figure stops being addable to a measured one and the
+            # honest answer is no total rather than a mixed one.
+            return None, intervals, ACCOUNTING_UNAVAILABLE_AVOIDANCE_BASIS
+        return float(value), intervals, None
+
+    @callback
     def _realized_window_for(self, series: dict[str, list[Any]], limits: Any) -> Any:
         """Price an assembled set of series, with this refresh's planner terms."""
         outcome = (self.data or {}).get("economic")
@@ -9865,7 +10464,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # A verified stop *and* its cleanup both landed. Naming it is what
                 # keeps ``idle`` from being the only thing a reader ever sees after
                 # a run, and it is a transition rather than an inference.
+                #
+                # **Both words, since beta.39.** ``plan_reset`` is one staged
+                # sequence carrying the stop, the resting values and the marker
+                # release, so reaching this line means the cleanup landed too --
+                # and a reader tracing a terminal needs the same two transitions
+                # the tick path publishes, not a shorter sequence because a
+                # different cadence found the ending.
                 self._note_lifecycle(LIFECYCLE_STOPPED, now)
+                self._note_lifecycle(LIFECYCLE_CLEANUP_COMPLETE, now)
             if any(step.entity_id == DISPATCH_DURATION for step in commands):
                 # **Recorded on the re-arm, not on the activation.**
                 #
@@ -10474,8 +11081,6 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 resetting=resetting,
                 releasing=releasing,
                 arming=arming,
-                sustaining=sustaining,
-                holding=holding,
                 now=now,
             ),
             now,
@@ -10526,33 +11131,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # the incident's 17:45 refresh speak at all.
         self._note_campaign_progress(now, stop_reason)
         stage_b["completed_campaign"] = self._closed_campaign
-        stage_b["open_campaign"] = (
-            None
-            if self._campaign_id is None
-            else {
-                "campaign_id": self._campaign_id,
-                "objective_boundary": self._campaign_boundary,
-                "started": self._campaign_started_at is not None,
-                "frozen_target_kwh": (
-                    None
-                    if self._campaign_frozen_target_kwh is None
-                    else round(self._campaign_frozen_target_kwh, 3)
-                ),
-                # **Committed plus the quarter in flight.** The committed sum
-                # advances only on a completed quarter, so quoting it alone would
-                # show a campaign frozen at its last boundary while energy was
-                # visibly moving.
-                "campaign_realized_kwh": round(self._campaign_realized_now(), 3),
-                "campaign_committed_kwh": round(self._campaign_realized_kwh, 3),
-                "quarters_admitted": self._campaign_quarters_admitted,
-                "rule": (
-                    "the realised figure accumulates across segments and holds "
-                    "across serve_load gaps; it is reset only when the campaign "
-                    "closes. the target is frozen at the first confirmed "
-                    "activation and may never shrink"
-                ),
-            }
-        )
+        stage_b["open_campaign"] = self._open_campaign_block()
         stage_b["admitted_plan"] = None if self._plan is None else self._plan.as_dict()
         stage_b["physical_decisions"] = list(self._physical_decisions)
         stage_b["write_boundary"] = {

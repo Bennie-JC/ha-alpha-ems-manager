@@ -9,6 +9,211 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.39] - 2026-09-02
+
+**The lifecycle says what the battery is doing, and the day says what it earned.**
+`beta.38` passed its first real Sell on the production installation -- run
+`0492b715ccf76ce0`, 1.701 of 1.75 kWh at the pack and 1.437 of 1.49 kWh at the
+meter, one terminal, marker released, no reopen. The opened row held its authority
+through Stage-A replanning, which is the release `beta.38` was.
+
+Two things the day exposed, and both are observability. `execution.lifecycle.state`
+walked `admitted → starting → stopping` while 7.4 kW was demonstrably crossing the
+meter. And the Economic Value sensor could not answer *"what has today earned, what
+is still coming, and what is the honest total?"* -- while its own basis string
+contradicted itself in a single sentence.
+
+**No economic decision moves.** Stage A's chosen plan, its per-interval actions,
+both counterfactual baselines, the ambient term, the published execution targets,
+the Stage-B wire traffic and the solve count are byte-identical to `beta.38` across
+seven horizon shapes.
+
+### Fixed: `executing` was structurally unreachable
+
+Not a control fault -- a publish-ordering one, in four parts. `_lifecycle_state_from`
+has exactly one call site, inside the *pure* `_build_control_report`, which runs one
+call frame **before** the write boundary. So the ownership it projects from is the
+pre-arm reading: the 20:45 payload shows `ownership.state: "none"` beside
+`power.executed: true, applied_kw: 6.9`. `arming` was tested *ahead* of
+`OWNERSHIP_OWNED`. Together those meant `executing` needed a second quarter refresh
+inside the same run -- which a single-row campaign does not have. And the
+sixty-second tick never projected at all, so through fifteen ticks the field was
+frozen.
+
+The criterion is the one that was already there and only its timing moves:
+
+> A run is `executing` **iff `ownership_of(evidence) == OWNED`** -- the vendor
+> register reports `dispatch_active`, our persisted claim matches this run, and the
+> owner marker is on.
+
+It is emphatically **not** "the arm write landed". The live probe dates the register
+going active at 20:45:49, 44.7 seconds after the claim, so on the refresh that arms
+`starting` is the truthful answer and the first *observation* that satisfies
+`ownership_of` records `executing`. Nothing here manufactures vendor state from a
+command just sent.
+
+Three mechanisms, and no second state machine: the `OWNED` test moves above the
+`arming` test in the same projection; the sixty-second tick projects through that
+same function once it has read an active dispatch; and the write boundary
+re-publishes the block it already built.
+
+**`executing` now has exactly one route.** `beta.38` had three -- `holding`,
+`sustaining` or ownership -- and the first two are computed with `owned` conjoined,
+so they reached no state ownership did not while leaving the predicate able to
+answer `executing` for `holding=True, ownership=none` when asked directly. One
+criterion is what the field is for.
+
+### Fixed: two of the three cadences published nothing
+
+`lifecycle.state` can only ever show the latest answer, and the lifecycle advances
+at the write boundary and on the physical tick as well as on the quarter refresh --
+neither of which publishes a report. A run that started and finished between two
+publications therefore left **no trace of having executed at all**, which is
+exactly what the incident produced.
+
+Every transition is now appended to a bounded trail and published beside the state.
+`stopped` and `cleanup_complete` are two verified events rather than one word for
+both -- a distinction `_async_stop_dispatch` already made and threw away -- and
+`cleanup_complete` had no writer anywhere in the package. Neither is sticky: the
+projection cannot return either, so the next ordinary refresh reads `idle` and the
+trail keeps the fact.
+
+`LIFECYCLE_UPDATING` stays deliberately unused, and now says why: a setpoint
+correction is not a state of the run, and `tick.reason` already names which
+correction happened.
+
+### Fixed: the payload said a started campaign had not started
+
+`open_campaign.started` read `false` and `frozen_target_kwh` `null` on the very
+refresh a campaign began, beside a `completed_campaign` whose `started_at` was that
+same instant. `beta.38` moved the freeze to the correct instant -- and asserted it
+on coordinator state *after* the refresh, which is why that test passed and the
+payload went on lying. Same cause, same fix, one extra line.
+
+### Added: Gerealiseerd vandaag, Nog verwacht, Totaal
+
+On the **existing** `Economic Value` entity, whose state is unchanged, so no history
+breaks. Four figures and a published total:
+
+```
+realised_today_eur
++ in_progress_interval_eur
++ remaining_expected_today_eur
++ forecast_revaluation_eur
+= total_economic_value_today_eur
+```
+
+and it telescopes to something a person can state in one sentence: **the civil day's
+cash, plus what the pack is worth now, less what it was worth when the day opened.**
+Every intermediate term cancels, so no residual is hidden inside any addend -- and
+if the four ever fail to sum, the total is withheld and the error is published.
+
+Four things had to be proven before any of it could be published.
+
+**One counterfactual, and it was the release's declared blocker.** Realised load
+avoidance is measured against a household with *no battery*; the plan's
+`avoided_import_eur` is measured against leaving the battery alone this interval,
+which since `beta.31` includes the inverter serving residual load unbidden. Adding
+one to the other was the single dishonest move available here. The no-battery
+residual turns out to be exactly recoverable from the solved plan --
+`idle_import_kwh + ambient_self_consumption_ac_kwh` -- with **zero error over 380
+intervals including 55 on the ambient branch**, and no second solve.
+
+**The day's three slices are disjoint and exhaustive by construction**, at 92, 96
+and 100 intervals alike, because they are defined by the plan's own head index and
+not by which intervals happen to have data. That is what closes the gap the live
+captures showed: at 21:00 the realised window covered 0–83 and the plan's remaining
+slice covered 85–95, and index 84 -- the Sell row itself, one quarter earlier -- was
+in neither.
+
+**The quarter in flight is its own named term**, measured from the live
+integrators with its coverage beside it, and it becomes part of realised history
+only when its measurement closes. A partial quarter folded into history is a figure
+that can go down.
+
+**Forecast revaluation is required, not useful.** Subtract `beta.38`'s operational
+identity from the position total and what is left is exactly
+`V[now](e_open) − V[open](e_open)`. Without it, forecast movement is attributed to
+today's operation under a name that says operation -- and it is material: the same
+12.269 kWh was worth 2.3001 € at 20:45 and 2.3659 € at 21:00, six and a half cents
+of pure curve movement in one quarter on unchanged energy. It is also **not**
+reconstructible from anything already persisted: the marginal value is a slope where
+the position is an integral over a curve the model itself reports as kinked, and on
+the same capture the product gives 2.30 € against an actual 3.0942 €.
+
+Every figure fails honest rather than fails silent. No opening valuation, a moved
+lattice, an opening energy that does not match, a day block on another basis, or a
+priced horizon that does not reach local midnight each yield `None` with a named
+reason. **Never a zero.**
+
+### Fixed: the basis string contradicted itself
+
+It said *"on the exact basis the optimiser minimised"* and, four words later,
+*"both sides are metered cash"*. Those cannot both be true: the scalar the dynamic
+programme minimises is `objective_eur`, which carries the minimum trade gain, the
+grid-charge margin, the throughput cost and the terminal credit; the state carries
+none of them. A `beta.37` test had asserted `state != objective_eur` since the day
+the prose was written. The cash half was the true half and is what is kept.
+
+### Deliberately not changed
+
+- **No second economic sensor.** A family of them is how two come to disagree.
+- **No Dutch attribute keys.** Home Assistant does not translate attribute *names*,
+  so "Gerealiseerd vandaag / Lopend kwartier / Nog verwacht / Herwaardering /
+  Totaal" are Lovelace card labels over correctly-named English keys. A card
+  snippet is in the release notes.
+- **No FIFO, no acquisition cost, no invented purchase price** for stored energy.
+  The position is priced from now forward, at the margin, exactly as it has been
+  since `beta.18`.
+- **`net_cash_flow_eur` is still not called profit.** Its sign convention is import
+  less export, so a negative value means money arrived.
+- **The reserve floor moving is not a refusal.** It moves with the load and
+  production forecasts, and its effect on what the position is worth *is* forecast
+  revaluation. Both floors are published beside the figure. The lattice pitch is
+  different in kind and is refused.
+- **`_terminal_value`'s horizon offset and `ForecastRisk.today_interval_count`**
+  remain as they were. Both change economics; the live evidence implicates neither.
+  They shift the value curve and therefore the *magnitude* of the revaluation, not
+  its definition.
+
+### Schema
+
+`STORAGE_MINOR_VERSION` 2.6 → **2.7**, and it is the only movement: one optional
+nested dict per civil day, holding what the energy the day opened with was worth on
+the curve that existed then. Additive -- a `beta.38` document reads back with the
+key absent, which is a defined state with its own published reason -- so there is no
+migration and no reset. `LEDGER_BASES` gains a sixth word, `revalued`, for the same
+energy valued on two different curves: neither a measurement nor a single-instant
+planner figure, and calling it `planner_derived` would let a reader difference it
+against one.
+
+### Verified
+
+4517 automated tests. Five mutation harnesses report **zero survivors and zero lost
+anchors**: `beta.39` (64 mutations), `beta.38` (44), `beta.37` (43), `beta.36` (35),
+`beta.35` (19).
+
+Decision neutrality is proven **cross-commit** against `ff3e912` in a detached
+worktree under `PYTHONHASHSEED=0`: seven horizon shapes, a canonical per-interval
+digest over eighteen named fields, and the published execution targets plus the
+Stage-B wire traffic from the same replay in both economic directions --
+byte-identical, 13601 and 8687 bytes respectively. Solve counts unchanged at
+4/5/5/4/5/5/5.
+
+Two `beta.38` mutation anchors were repaired because this release moved the lines
+they pointed at, and one of them had become a false pass: with a second
+`_note_lifecycle` call site in the file, the harness's first-occurrence replacement
+was silently disabling the *tick's* projection while the test read the report.
+Neither mutation was weakened; both were re-anchored on the narrowest text that
+still identifies the layer they attack.
+
+**Hardware validation is outstanding.** The next supervised Live day must show
+`lifecycle.state` reaching `executing` in the *payload* and holding it through every
+tick of the row; `stopped` then `cleanup_complete` at the terminal; the four euro
+figures summing to the published total with `accounting_reconciliation_error_eur` at
+`0.0`; `forecast_revaluation_eur` non-zero and drifting; and, across local midnight,
+yesterday's realised unchanged with no double count after a reload.
+
 ## [1.0.0-beta.38] - 2026-09-01
 
 **An opened row is not withdrawn by absence.** On 2026-09-01 at 20:30:05, on the
@@ -6083,7 +6288,8 @@ The following were found and fixed during the pre-release audit of this beta:
 
 - AlphaESS write commands are intentionally **not** implemented in this release.
 
-[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.38...HEAD
+[Unreleased]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.39...HEAD
+[1.0.0-beta.39]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.38...v1.0.0-beta.39
 [1.0.0-beta.38]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.37...v1.0.0-beta.38
 [1.0.0-beta.37]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.36...v1.0.0-beta.37
 [1.0.0-beta.36]: https://github.com/Bennie-JC/ha-alpha-ems-manager/compare/v1.0.0-beta.35...v1.0.0-beta.36

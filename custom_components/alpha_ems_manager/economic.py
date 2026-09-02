@@ -118,6 +118,7 @@ from .battery import (
 from .const import (
     ADAPT_PROTECTION_CEILING,
     ADVANTAGE_BASIS_METERED_CASH,
+    AVOIDANCE_BASIS_NO_BATTERY,
     BATTERY_KWH_PRECISION,
     BUY_REASON_ARBITRAGE,
     BUY_REASON_FUTURE_SELF_USE,
@@ -869,6 +870,51 @@ class EconomicInterval:
     def marginal_grid_export_kwh(self) -> float:
         """Return the grid export the battery caused, signed."""
         return self.grid_export_kwh - self.idle_export_kwh
+
+    @property
+    def no_battery_import_kwh(self) -> float:
+        """Return the import a household with **no battery at all** would make.
+
+        ``max(0, load - pv)`` for this interval, recovered exactly rather than
+        estimated. **beta.39, and it exists to stop two counterfactuals being
+        added together.**
+
+        Realised load avoidance (see ``realized.realized_window``) is measured
+        against no battery: ``max(0, max(0, load - pv) - import)``, both sides at
+        the meter. The plan's ``avoided_import_eur`` is measured against leaving
+        the battery alone *this* interval, which since beta.31 includes the
+        inverter serving the residual load from the pack by itself. Those are
+        different alternatives, and a day total that added one to the other would
+        rest on neither.
+
+        Two cases, and the identity is exact in both:
+
+        * ``counterfactual_basis == idle_import`` -- ``idle_import_kwh`` is
+          literally ``split_grid_energy(load, pv, 0, 0).import_kwh``, which *is*
+          ``max(0, load - pv)``. Nothing to add: ambient self-consumption is zero
+          on such an interval.
+        * ``counterfactual_basis == ambient_self_consumption`` -- the baseline was
+          replaced by the ambient one, so ``idle_import_kwh`` is
+          ``max(0, load - pv) - served`` and ``ambient_self_consumption_ac_kwh`` is
+          ``served``. The ambient discharge is clamped by the residual load and
+          never creates one, so the subtraction cannot have hit the ``max`` and the
+          sum restores the residual exactly.
+
+        No new field and no solve: both terms are already on the interval.
+        """
+        return self.idle_import_kwh + self.ambient_self_consumption_ac_kwh
+
+    @property
+    def avoided_import_no_battery_kwh(self) -> float:
+        """Return the import this interval avoided, against having no battery.
+
+        Clamped at zero, exactly as the realised figure is: an interval that
+        imports *more* than a battery-less household would has avoided nothing,
+        and reporting a negative avoidance would net a purchase against a saving
+        under a name that says saving. The purchase is already in
+        ``grid_import_kwh`` and priced there.
+        """
+        return max(0.0, self.no_battery_import_kwh - self.grid_import_kwh)
 
     @property
     def marginal_cost_eur(self) -> float:
@@ -5154,6 +5200,10 @@ def _day_block(
             "grid_import_cost_eur": None,
             "export_revenue_eur": None,
             "avoided_import_eur": None,
+            "avoided_import_no_battery_kwh": None,
+            "avoided_import_no_battery_eur": None,
+            "no_battery_value_eur": None,
+            "avoidance_basis": AVOIDANCE_BASIS_NO_BATTERY,
             "switching_cost_eur": None,
             "grid_import_kwh": None,
             "grid_export_kwh": None,
@@ -5174,6 +5224,17 @@ def _day_block(
         -entry.marginal_grid_import_kwh * (entry.import_price_eur_kwh or 0.0)
         for entry in entries
     )
+    # **The same quantity on the counterfactual the *realised* ledger uses.**
+    # beta.39. Not a replacement for the line above -- both are published, with
+    # their bases named -- because the two answer different questions and only one
+    # of them can be added to a measured figure.
+    avoided_no_battery_kwh = sum(
+        entry.avoided_import_no_battery_kwh for entry in entries
+    )
+    avoided_no_battery = sum(
+        entry.avoided_import_no_battery_kwh * (entry.import_price_eur_kwh or 0.0)
+        for entry in entries
+    )
     return {
         "intervals": len(entries),
         # The per-interval idle counterfactual, sign-flipped so positive is money
@@ -5184,6 +5245,17 @@ def _day_block(
         "grid_import_cost_eur": _round_eur(imports),
         "export_revenue_eur": _round_eur(exports),
         "avoided_import_eur": _round_eur(avoided),
+        "avoided_import_no_battery_kwh": _round_kwh(avoided_no_battery_kwh),
+        "avoided_import_no_battery_eur": _round_eur(avoided_no_battery),
+        # **The figure the day accounting adds, and the only one it may.**
+        #
+        # ``export_revenue - grid_import_cost + avoided_no_battery`` is term for
+        # term the construction ``realized.realized_net_value_eur`` uses on
+        # measured flows, so the two are addable. ``switching_cost_eur`` is
+        # deliberately absent: it is a hurdle rate, ``is_cash: False``, and no
+        # cash total in this project has ever contained one.
+        "no_battery_value_eur": _round_eur(exports - imports + avoided_no_battery),
+        "avoidance_basis": AVOIDANCE_BASIS_NO_BATTERY,
         # A model term, apportioned to the day a run *starts* in. Not cash.
         "switching_cost_eur": _round_eur(
             fee_per_start_eur * sum(1 for entry in entries if entry.run_start)
@@ -5197,6 +5269,24 @@ def _day_block(
             sum(e.battery_discharge_ac_kwh for e in entries)
         ),
     }
+
+
+def day_block_for(
+    plan: EconomicPlan, *, today_interval_count: int, tomorrow: bool = False
+) -> dict[str, Any]:
+    """Return one civil day's cash decomposition for a solved plan.
+
+    **The public door onto** :func:`_day_block`, added in beta.39 because the day
+    accounting needs the same figures the Economic Value sensor already publishes
+    and a second slice-and-sum would be a second derivation of one quantity. The
+    slicing rule and the per-start fee are computed here exactly as
+    :func:`economic_value_summary` computes them, so the two cannot drift.
+    """
+    fee_per_start = plan.switching_cost_eur / max(1, plan.direction_changes)
+    entries = _day_slice(
+        plan, today_interval_count=today_interval_count, tomorrow=tomorrow
+    )
+    return _day_block(entries, fee_per_start_eur=fee_per_start)
 
 
 def _next_planned_charge_price(plan: EconomicPlan) -> float | None:

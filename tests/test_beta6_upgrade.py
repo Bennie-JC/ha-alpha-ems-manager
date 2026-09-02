@@ -560,12 +560,14 @@ async def test_the_storage_minor_version_moved_and_the_major_did_not(
     from custom_components.alpha_ems_manager.const import STORAGE_MINOR_VERSION
 
     assert STORAGE_VERSION == 2
-    # 2.6 as of beta.24, which widened the causal ownership record so a restart
-    # can reconstruct the run a live dispatch belongs to. The *major* staying at 2
-    # is the load-bearing half of this assertion: it is what guarantees a beta.6
-    # document is read rather than discarded, and every minor bump so far has been
-    # additive for exactly that reason.
-    assert STORAGE_MINOR_VERSION == 6
+    # 2.7 as of beta.39, which adds one optional per-day dict: what the energy the
+    # day opened with was worth on the value curve that existed then. 2.6 was
+    # beta.24's widened causal ownership record. The *major* staying at 2 is the
+    # load-bearing half of this assertion: it is what guarantees a beta.6 document
+    # is read rather than discarded, and every minor bump so far has been additive
+    # for exactly that reason -- this one included, since a document without the
+    # key reads back as having no opening valuation, which is a defined state.
+    assert STORAGE_MINOR_VERSION == 7
 
     coordinator = upgraded.runtime_data
     assert coordinator.store.reset_by_migration is False
@@ -574,8 +576,8 @@ async def test_the_storage_minor_version_moved_and_the_major_did_not(
     document = hass_storage[f"alpha_ems_manager.{upgraded.entry_id}.learning"]
     assert document["version"] == 2
     # Rewritten at the current minor, which is what an additive bump does: read
-    # the old document unchanged, write the new one back.
-    assert document["minor_version"] == 6
+    # the old document unchanged, write the new one back. 7 since beta.39.
+    assert document["minor_version"] == STORAGE_MINOR_VERSION == 7
     # The six days beta.6 wrote are all still there.
     assert len(document["data"]["days"]) == 6
     # And nothing was invented. A beta.6 installation has armed nothing, so the

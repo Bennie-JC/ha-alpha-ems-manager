@@ -1262,12 +1262,46 @@ def _control_state_attributes(
 
 
 #: What the Economic Value sensor's state is, in one sentence a person can read.
+#:
+#: **Corrected in beta.39, and the old wording contradicted itself in one
+#: sentence.** It said "on the exact basis the optimiser minimised" and, four
+#: words later, "both sides are metered cash". Those cannot both be true: the
+#: scalar the dynamic programme minimises is ``objective_eur``, which carries the
+#: minimum trade gain, the grid-charge margin, the throughput cost and the
+#: terminal credit; the state is ``hold_cost_eur - cost_eur``, which carries none
+#: of them. ``test_beta37_economic_value.py`` has asserted ``state !=
+#: objective_eur`` since beta.37, so the code was already contradicting its own
+#: prose. The cash half was the true half and is what is kept.
 _ECONOMIC_VALUE_BASIS = (
-    "expected advantage of the selected plan over doing nothing economically "
-    "active, over the horizon that is currently known, on the exact basis the "
-    "optimiser minimised. both sides are metered cash, so no notional term is in "
-    "it. a forecast, not money earned: unknown means no valid comparison could be "
-    "formed, and 0.00 means a valid comparison that came out equal"
+    "expected CASH advantage of the selected plan over the passive ambient-walk "
+    "comparator, over the horizon currently known. both sides are metered cash: "
+    "the four model terms and the terminal credit live in objective_eur, which is "
+    "the scalar the plan was chosen to minimise, and are NOT in this figure. a "
+    "forecast, not money earned -- see realised_today_eur for what has actually "
+    "happened. unknown means no valid comparison could be formed, and 0.00 means "
+    "a valid comparison that came out equal"
+)
+
+#: What the four day-accounting attributes are, and how they add up.
+#:
+#: **beta.39.** The sensor could not answer "what has today earned, what is still
+#: coming, and what is the honest total" -- and the figures that looked closest
+#: were the ones it would have been most wrong to add. ``decision_advantage_eur``
+#: is a from-now comparison against a counterfactual and is not a realised
+#: quantity; ``net_cash_flow_eur`` is import less export, so a negative value
+#: means money *arrived*. Neither is a profit and neither may be summed with the
+#: other.
+_ECONOMIC_VALUE_ACCOUNTING_BASIS = (
+    "realised_today_eur + in_progress_interval_eur + "
+    "remaining_expected_today_eur + forecast_revaluation_eur = "
+    "total_economic_value_today_eur, and the total telescopes to the civil day's "
+    "cash plus what the pack is worth now less what it was worth when the day "
+    "opened. one counterfactual throughout: every avoidance term is measured "
+    "against a household with no battery. an economic POSITION, not money in the "
+    "bank -- the remaining term is a forecast and two terms are planner "
+    "valuations. any addend unknown makes the total unknown, and "
+    "accounting_unavailable_reason says which. no residual is absorbed into an "
+    "addend to make it balance"
 )
 
 #: The flat attributes a dashboard card reads, in the order a person would.
@@ -1275,6 +1309,21 @@ _ECONOMIC_VALUE_BASIS = (
 _ECONOMIC_VALUE_FLAT = (
     "current_action",
     "reason_code",
+    # **The day accounting first, because it is the question people actually
+    # ask.** Dutch labels belong to the dashboard: Home Assistant does not
+    # translate attribute *names*, and this entity has no translation entry, so
+    # "Gerealiseerd vandaag / Lopend kwartier / Nog verwacht / Herwaardering /
+    # Totaal" are Lovelace card labels over these five keys. Adding Dutch keys
+    # here would put presentation in the payload.
+    "realised_today_eur",
+    "in_progress_interval_eur",
+    "in_progress_interval_index",
+    "remaining_expected_today_eur",
+    "forecast_revaluation_eur",
+    "total_economic_value_today_eur",
+    "accounting_basis",
+    "accounting_reconciliation_error_eur",
+    "accounting_unavailable_reason",
     "decision_advantage_eur",
     "advantage_cash_eur",
     "advantage_basis",
@@ -1341,13 +1390,45 @@ def _economic_value_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, An
     if not payload.get("available"):
         attributes["unavailable_reason"] = payload.get("unavailable_reason")
         return attributes
+    accounting = payload.get("today_accounting")
+    if isinstance(accounting, dict):
+        # **Flattened by projection, not by a second derivation.** The nested block
+        # stays alongside, carrying the interval partition, the two ends of the
+        # position and the provenance of the opening valuation -- so a reader who
+        # wants to check the identity can, and a card that only wants five numbers
+        # does not have to walk into it.
+        for name in (
+            "realised_today_eur",
+            "in_progress_interval_eur",
+            "remaining_expected_today_eur",
+            "forecast_revaluation_eur",
+            "total_economic_value_today_eur",
+        ):
+            payload[name] = accounting.get(name)
+        partition = accounting.get("partition")
+        if isinstance(partition, dict):
+            payload["in_progress_interval_index"] = partition.get("in_progress_index")
+        payload["accounting_basis"] = accounting.get("accounting_basis")
+        payload["accounting_reconciliation_error_eur"] = accounting.get(
+            "reconciliation_error_eur"
+        )
+        payload["accounting_unavailable_reason"] = accounting.get("unavailable_reason")
+
     for name in _ECONOMIC_VALUE_FLAT:
         if name in payload:
             attributes[name] = payload[name]
-    for block in ("stored_value", "plan", "energy", "today", "tomorrow"):
+    for block in (
+        "stored_value",
+        "plan",
+        "energy",
+        "today",
+        "tomorrow",
+        "today_accounting",
+    ):
         if isinstance(payload.get(block), dict):
             attributes[block] = payload[block]
     attributes["day_split_rule"] = payload.get("day_split_rule")
+    attributes["accounting_rule"] = _ECONOMIC_VALUE_ACCOUNTING_BASIS
     return attributes
 
 

@@ -86,7 +86,13 @@ def test_only_the_evidence_store_minor_version_moved() -> None:
     which is the additive kind that reads every earlier document unchanged.
     """
     assert STORAGE_VERSION == 2
-    assert STORAGE_MINOR_VERSION == 6
+    # **7 since beta.39**, which adds one optional per-day dict: what the energy
+    # the day opened with was worth on the value curve that existed then. It is the
+    # one datum a forecast revaluation needs and the one datum nothing retained.
+    # Additive like every bump before it -- a beta.38 document reads back with the
+    # key absent, which is a defined state with its own published reason -- so the
+    # major staying at 2 is still the load-bearing half.
+    assert STORAGE_MINOR_VERSION == 7
     assert FORECAST_STORAGE_VERSION == 1
     assert FORECAST_STORAGE_MINOR_VERSION == 8
 

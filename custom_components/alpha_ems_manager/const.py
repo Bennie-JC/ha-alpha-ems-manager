@@ -190,7 +190,17 @@ STORAGE_VERSION: Final = 2
 #:   one must be distinguishable from one that predates the fields. A record
 #:   without them is read as insufficient evidence, which is a defined state
 #:   rather than an error -- see the restart rule in ``coordinator``.
-STORAGE_MINOR_VERSION: Final = 6
+#:   v1.0.0-beta.39 adds one optional nested dict per day, ``ov``: what the
+#:   energy the day opened with was worth **on the curve that existed then**. It
+#:   is the one datum a forecast revaluation needs and the one datum nothing
+#:   retained -- ``EconomicSnapshot`` keeps the marginal value and the stored
+#:   energy, and the marginal value is a slope where the position value is an
+#:   integral over a curve the model itself reports as kinked, so multiplying the
+#:   two is wrong by a third on live figures. Additive: a document written by
+#:   beta.38 reads back with the key absent, which is a defined state -- the
+#:   revaluation publishes ``None`` with ``no_opening_valuation`` until the next
+#:   civil day writes one. No migration and no reset.
+STORAGE_MINOR_VERSION: Final = 7
 STORAGE_KEY_TEMPLATE: Final = f"{DOMAIN}.{{entry_id}}.learning"
 
 #: Config-entry schema version. v1 was the previous integration's source model,
@@ -2177,15 +2187,123 @@ SENSOR_ECONOMIC_ACTION: Final = "economic_action"
 #: the run it describes is routinely on the following day.
 SENSOR_NEXT_PLANNED_ACTION: Final = "next_planned_action"
 
-#: Entity key. **The only EUR-valued entity in the integration.** beta.37.
+#: Entity key. **The only EUR-valued entity in the integration, and it stays the
+#: only one.** beta.37.
 #:
-#: Its state is the expected advantage of the selected plan over the passive
-#: counterfactual, on the exact basis the dynamic programme minimised -- so a reader
-#: is looking at the quantity the optimiser actually chose on, not a cash summary
-#: that can move the opposite way. Everything a person needs to audit that number is
-#: an attribute of the same entity, because a family of economic sensors would let
-#: two of them disagree.
+#: Its state is the expected **cash** advantage of the selected plan over the
+#: passive ambient-walk comparator: ``hold_cost_eur - cost_eur``, both sides
+#: metered cash. **Corrected in beta.39**, because this said "on the exact basis
+#: the dynamic programme minimised" and that is a different number -- the scalar
+#: the programme minimises is ``objective_eur``, which carries the minimum trade
+#: gain, the grid-charge margin, the throughput cost and the terminal credit, none
+#: of which are in the state. Both claims were published side by side, here and on
+#: the entity, while a beta.37 test asserted the state is not ``objective_eur``.
+#:
+#: **beta.39 also makes it answer what the day has actually done.** Realised
+#: today, the quarter in flight, what is still expected before midnight and the
+#: revaluation of the energy the day opened with are four attributes that sum to a
+#: published total -- on this entity and not a second one, because a family of
+#: economic sensors is exactly how two of them come to disagree. Everything needed
+#: to audit any of those numbers is an attribute of the same entity.
 SENSOR_ECONOMIC_VALUE: Final = "economic_value"
+
+#: The counterfactual every avoidance figure in the day accounting rests on.
+#:
+#: **Two different counterfactuals were already in the codebase and adding them
+#: would have been the one dishonest move available here.** Realised load
+#: avoidance is measured against *no battery at all*:
+#: ``max(0, max(0, load - pv) - import)``. The plan's ``avoided_import_eur`` is
+#: measured against *leaving the battery alone this interval*,
+#: ``-marginal_grid_import_kwh``, which on a hold interval where the inverter
+#: serves the house by itself is a different and smaller number. A total that
+#: added one to the other would straddle both and mean nothing.
+#:
+#: So the accounting recomputes the remaining-today avoidance on the **no-battery**
+#: basis, exactly, from fields the solved plan already carries -- see
+#: ``EconomicInterval.no_battery_import_kwh``. Both sides of the identity then rest
+#: on one counterfactual, and the basis is published so a reader never has to
+#: infer which.
+AVOIDANCE_BASIS_NO_BATTERY: Final = "no_battery"
+AVOIDANCE_BASIS_INTERVAL_IDLE: Final = "interval_idle"
+
+#: What ``total_economic_value_today_eur`` is a total *of*.
+#:
+#: Not same-day cash. It is the household's economic **position** for the civil
+#: day: what the closed part of the day realised, what the quarter in flight has
+#: realised so far, what the plan still expects before midnight, and what the
+#: energy the day opened with has been revalued by since. Three of those four are
+#: forecasts or planner valuations, and the word says so.
+ACCOUNTING_BASIS_POSITION: Final = "economic_position_no_battery_counterfactual"
+
+#: Why the day accounting cannot state a figure. **Never a zero instead.**
+#:
+#: ``avoidance_basis_unavailable`` is the one that would matter most: it fires
+#: only if the solved plan stops carrying enough to rebuild a no-battery
+#: counterfactual, and rather than mix bases the remaining and total terms go
+#: ``None``. It is verified reachable by construction rather than assumed absent.
+ACCOUNTING_UNAVAILABLE_NO_PLAN: Final = "no_plan"
+ACCOUNTING_UNAVAILABLE_NO_DAY_RECORD: Final = "no_day_record"
+ACCOUNTING_UNAVAILABLE_NO_STORED_PRICES: Final = "no_stored_prices"
+ACCOUNTING_UNAVAILABLE_NO_OPENING_VALUATION: Final = "no_opening_valuation"
+ACCOUNTING_UNAVAILABLE_VALUATION_REFERENCE_MOVED: Final = "valuation_reference_moved"
+ACCOUNTING_UNAVAILABLE_OPENING_ENERGY_MISMATCH: Final = "opening_energy_mismatch"
+ACCOUNTING_UNAVAILABLE_AVOIDANCE_BASIS: Final = "avoidance_basis_unavailable"
+ACCOUNTING_UNAVAILABLE_NO_POSITION_VALUE: Final = "no_position_value"
+ACCOUNTING_UNAVAILABLE_NO_OPEN_QUARTER_MEASUREMENT: Final = (
+    "no_open_quarter_measurement"
+)
+#: The plan's priced horizon stops before local midnight, so part of the civil day
+#: is neither realised nor planned. **A total over a day with a hole in it is not a
+#: day total**, so it is withheld and the hole is counted in the partition.
+#:
+#: Normal on a household whose Home Assistant runs outside the market's own
+#: timezone: the source publishes a *market* day and the plan is a local civil day,
+#: and where those spans differ one published day cannot cover the other. With both
+#: days published, or with Home Assistant in the market's zone, it does.
+ACCOUNTING_UNAVAILABLE_HORIZON_SHORT_OF_MIDNIGHT: Final = "horizon_short_of_midnight"
+
+ACCOUNTING_UNAVAILABLE_REASONS: Final = (
+    ACCOUNTING_UNAVAILABLE_NO_PLAN,
+    ACCOUNTING_UNAVAILABLE_NO_DAY_RECORD,
+    ACCOUNTING_UNAVAILABLE_NO_STORED_PRICES,
+    ACCOUNTING_UNAVAILABLE_NO_OPENING_VALUATION,
+    ACCOUNTING_UNAVAILABLE_VALUATION_REFERENCE_MOVED,
+    ACCOUNTING_UNAVAILABLE_OPENING_ENERGY_MISMATCH,
+    ACCOUNTING_UNAVAILABLE_AVOIDANCE_BASIS,
+    ACCOUNTING_UNAVAILABLE_NO_POSITION_VALUE,
+    ACCOUNTING_UNAVAILABLE_NO_OPEN_QUARTER_MEASUREMENT,
+    ACCOUNTING_UNAVAILABLE_HORIZON_SHORT_OF_MIDNIGHT,
+)
+
+#: How far the four addends may miss the published total before it is refused.
+#:
+#: **Derived, not chosen.** The total is the sum of the raw terms rounded once;
+#: each addend is published rounded to four decimals as well. Four independent
+#: roundings at four decimals can each move a term by up to 5 e-5, and the sum's
+#: own rounding can move the other way by another 5 e-5, so a *correct*
+#: reconciliation can show up to 2.5 e-4 of pure rounding. The bound has to sit
+#: above that or it would fire on arithmetic that is right; 5 e-4 is a twentieth
+#: of a cent, which no reader can see and no rounding can reach.
+#:
+#: What it therefore catches is an addend that is not a number the identity can
+#: carry -- a non-finite term, or one outside the band four decimals can
+#: represent. In either case the total goes ``None`` and the residual is
+#: **published**, because hiding a residual inside one of the addends to make the
+#: equation balance is the one thing this block must never do. No path here
+#: adjusts an addend, and ``test_no_addend_is_ever_a_plug`` is what keeps that
+#: true.
+ACCOUNTING_RECONCILIATION_TOLERANCE_EUR: Final = 5e-4
+
+#: How far the persisted opening energy may differ from the level the ledger
+#: reports before the revaluation refuses to use it.
+#:
+#: The two come from different places and always will: the opening valuation is
+#: taken from the live snapshot at the first refresh that has a recorded level,
+#: and the ledger reads the persisted state-of-charge series, which is stored to
+#: 0.4 % of capacity. One quantum of that, on a 21.5 kWh pack, is 0.086 kWh.
+#: Anything larger means the two are not describing the same energy and the
+#: revaluation would be a difference of two different positions.
+ACCOUNTING_OPENING_ENERGY_TOLERANCE_KWH: Final = 0.1
 
 #: The **target** state-space bucket, and the fallback when no better lattice
 #: qualifies. Until beta.17 this was the bucket, full stop; it is now the figure
@@ -3035,6 +3153,13 @@ LIFECYCLE_IDLE: Final = "idle"
 LIFECYCLE_ADMITTED: Final = "admitted"
 LIFECYCLE_STARTING: Final = "starting"
 LIFECYCLE_EXECUTING: Final = "executing"
+#: **Deliberately unused, and it stays that way.** A setpoint correction inside a
+#: run is not a state of the run: the run is executing before it, during it and
+#: after it, and the only thing that changed is one helper value. Publishing
+#: ``updating`` would split "is the battery running?" across two words and force
+#: every reader to know that one of them means the other -- which is the exact
+#: defect ``lifecycle.state`` exists to prevent. What a reader actually wants
+#: there is *which* correction happened, and ``tick.reason`` already says.
 LIFECYCLE_UPDATING: Final = "updating"
 LIFECYCLE_STOPPING: Final = "stopping"
 LIFECYCLE_STOPPED: Final = "stopped"
@@ -3043,6 +3168,50 @@ LIFECYCLE_CLEANUP_COMPLETE: Final = "cleanup_complete"
 LIFECYCLE_FOREIGN: Final = "foreign"
 LIFECYCLE_UNPROVEN: Final = "unproven"
 LIFECYCLE_DEGRADED: Final = "degraded"
+
+#: Every state the field may hold. **beta.39, and it exists because nothing
+#: validated the vocabulary**: ``_note_lifecycle`` took a bare string, so a typo
+#: at a call site would have published a state no reader could interpret and no
+#: test would have noticed.
+LIFECYCLE_STATES: Final = (
+    LIFECYCLE_IDLE,
+    LIFECYCLE_ADMITTED,
+    LIFECYCLE_STARTING,
+    LIFECYCLE_EXECUTING,
+    LIFECYCLE_UPDATING,
+    LIFECYCLE_STOPPING,
+    LIFECYCLE_STOPPED,
+    LIFECYCLE_DEADMAN_EXPIRED,
+    LIFECYCLE_CLEANUP_COMPLETE,
+    LIFECYCLE_FOREIGN,
+    LIFECYCLE_UNPROVEN,
+    LIFECYCLE_DEGRADED,
+)
+
+#: The two states a *projection* can never reach, because they are notes about a
+#: transition that has already completed rather than descriptions of a standing
+#: situation. ``_lifecycle_state_from`` must never return either: that is what
+#: makes them bounded -- the next ordinary refresh projects ``idle`` and the trail
+#: keeps the fact.
+LIFECYCLE_TERMINAL_NOTES: Final = (
+    LIFECYCLE_STOPPED,
+    LIFECYCLE_CLEANUP_COMPLETE,
+)
+
+#: How many lifecycle transitions the published trail retains.
+#:
+#: **The trail is the beta.39 fix for observability across cadences.** The
+#: lifecycle advances on the sixty-second physical tick and at the write boundary,
+#: neither of which publishes a control report -- so on 2026-09-02 a single-row
+#: Sell that demonstrably executed for fifteen minutes at 7.4 kW published
+#: ``admitted -> starting -> stopping`` and the word ``executing`` appeared
+#: nowhere. One state field can only ever show the latest answer; the question a
+#: reader has is *"did it ever get there?"*, and that needs a sequence.
+#:
+#: Twenty-four is four ordinary campaigns' worth of transitions, which is more
+#: than any one diagnostics download has ever needed and small enough to carry in
+#: every payload.
+LIFECYCLE_TRAIL_LIMIT: Final = 24
 
 #: Where a probe sample sits in the physical lifecycle, derived from observable
 #: transitions only. Diagnostics; nothing decides on it.
@@ -3896,6 +4065,17 @@ LEDGER_BASIS_ATTRIBUTED: Final = "attributed"
 LEDGER_BASIS_ESTIMATED: Final = "estimated"
 LEDGER_BASIS_PLANNER_DERIVED: Final = "planner_derived"
 LEDGER_BASIS_MODEL_TERM: Final = "model_term"
+#: **The sixth word, added in beta.39, and it names a kind of number the other
+#: five cannot.**
+#:
+#: ``planner_derived`` means "the optimiser's value function said so", and every
+#: figure wearing it is read off **one** curve at **one** instant -- which is what
+#: makes ``closing - opening`` a movement of the position rather than a mixture of
+#: two forecasts. A revaluation is the other thing: the *same* stored energy valued
+#: on two different curves, a quarter or a day apart. It is not measured, not
+#: attributed, and not a single-instant planner figure, and calling it
+#: ``planner_derived`` would let a reader difference it against one.
+LEDGER_BASIS_REVALUED: Final = "revalued"
 
 LEDGER_BASES: Final = (
     LEDGER_BASIS_MEASURED,
@@ -3903,6 +4083,7 @@ LEDGER_BASES: Final = (
     LEDGER_BASIS_ESTIMATED,
     LEDGER_BASIS_PLANNER_DERIVED,
     LEDGER_BASIS_MODEL_TERM,
+    LEDGER_BASIS_REVALUED,
 )
 
 #: How many civil days the cross-midnight ledger view spans by default.

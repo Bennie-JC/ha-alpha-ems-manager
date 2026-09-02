@@ -239,6 +239,30 @@ class DayRecord:
     #: and are subject to the same coverage threshold.
     grid_import: list[float | None] = field(default_factory=list)
     grid_export: list[float | None] = field(default_factory=list)
+    #: What the energy this civil day opened with was worth, **on the value curve
+    #: that existed then**. Written once per day and never revised. beta.39.
+    #:
+    #: Not a parallel array: a revaluation only ever needs the day's boundary, and
+    #: one scalar per day is what makes it survive a gap. Decorating the bounded
+    #: decision records instead would have stopped answering after roughly
+    #: forty-eight hours, which is when a reader most wants it.
+    #:
+    #: **It is the one datum nothing retained, and that was a finding rather than
+    #: an oversight.** ``EconomicSnapshot`` keeps the marginal value in EUR/kWh and
+    #: the stored energy in kWh, and multiplying them looks like the position
+    #: value. It is not: the marginal figure is the slope at the head bucket while
+    #: the position is the integral of that slope from the floor upward, over a
+    #: curve the model itself reports as kinked at every switching-fee boundary. On
+    #: the 2026-09-02 capture the product gives 2.30 EUR against an actual
+    #: 3.0942 EUR -- a third out -- so the shortcut is not an approximation of this
+    #: field, it is a different number.
+    #:
+    #: Additive and optional. Absent on every document written before beta.39, and
+    #: on any day whose first refresh landed before the day had a usable
+    #: state-of-charge reading; the revaluation then publishes ``None`` with a
+    #: reason, never zero. Keyed by the civil date the record already is, so the
+    #: 92/96/100-interval machinery is untouched by it.
+    open_value: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         """Size the parallel lists to the day's real interval count."""
@@ -426,6 +450,35 @@ class DayRecord:
             self.grid_export[index] = round(grid_export_kwh, _KWH_PRECISION)
         return True
 
+    def note_opening_valuation(
+        self,
+        *,
+        valued_at: str,
+        stored_energy_kwh: float,
+        position_value_eur: float,
+        floor_kwh: float,
+        bucket_kwh: float,
+    ) -> bool:
+        """Record what this day opened holding, once. Returns whether it wrote.
+
+        **Idempotent, and that is the whole of its correctness.** A Home Assistant
+        reload, a coordinator restart or an extra refresh must not be able to
+        re-open a civil day: the second write would move the reference the whole
+        day's revaluation is measured from, and the figure would silently reset
+        mid-day. The guard is the field's own absence, so it holds across a
+        restart without anything else being remembered.
+        """
+        if self.open_value is not None:
+            return False
+        self.open_value = {
+            "at": valued_at,
+            "e": round(float(stored_energy_kwh), _KWH_PRECISION),
+            "v": round(float(position_value_eur), 6),
+            "f": round(float(floor_kwh), _KWH_PRECISION),
+            "b": round(float(bucket_kwh), 6),
+        }
+        return True
+
     # -- serialisation ---------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
@@ -460,6 +513,11 @@ class DayRecord:
             payload["gi"] = self.grid_import
         if any(value is not None for value in self.grid_export):
             payload["gx"] = self.grid_export
+        if self.open_value is not None:
+            # Omitted while absent, exactly as the five arrays above are, so a
+            # document from a day that never had a usable opening reading is
+            # byte-identical to a beta.38 one.
+            payload["ov"] = dict(self.open_value)
         return payload
 
     @classmethod
@@ -520,6 +578,12 @@ class DayRecord:
         # dataset a later phase will price.
         record.grid_import = _numeric_list(raw.get("gi"), count)
         record.grid_export = _numeric_list(raw.get("gx"), count)
+        # Absent on every document written before beta.39. **Validated rather than
+        # trusted**: it is read back as a divisor and a subtrahend inside a
+        # published accounting identity, so a partial or non-numeric entry has to
+        # degrade to "no opening valuation" -- which is a defined state with its
+        # own published reason -- rather than to a plausible-looking zero.
+        record.open_value = _opening_valuation(raw.get("ov"))
         flags_raw = raw.get("x")
         if isinstance(flags_raw, list):
             record.ev_expected = [bool(flag) for flag in flags_raw[:count]] + [
@@ -528,6 +592,31 @@ class DayRecord:
         else:
             record.ev_expected = [False] * count
         return record
+
+
+def _opening_valuation(raw: Any) -> dict[str, Any] | None:
+    """Return a usable opening valuation, or ``None``.
+
+    All five numbers or none of them. A revaluation is a difference between two
+    valuations of the same energy against the same lattice, so a record missing
+    the energy it valued, or the floor and bucket it was measured against, cannot
+    be compared with anything -- and half a valuation is not a smaller one.
+    """
+    if not isinstance(raw, dict):
+        return None
+    at = raw.get("at")
+    if not isinstance(at, str) or not at:
+        return None
+    values: dict[str, Any] = {"at": at}
+    for key in ("e", "v", "f", "b"):
+        number = raw.get(key)
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            return None
+        number = float(number)
+        if number != number or abs(number) == float("inf"):
+            return None
+        values[key] = number
+    return values
 
 
 def _numeric_list(raw: Any, count: int) -> list[float | None]:

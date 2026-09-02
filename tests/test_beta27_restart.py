@@ -287,13 +287,21 @@ async def test_the_tick_writes_nothing_while_waiting_for_a_quarter(
 
 
 def test_the_storage_version_is_unchanged() -> None:
-    """Nothing new is persisted, so nothing needs migrating.
+    """Nothing about the *restart* is persisted, so nothing needs migrating.
 
     ``CarriedQuarter`` is in-memory by design: persisting it would create exactly
     the situation this file exists to avoid -- an envelope restored without the
-    measured progress that gives it meaning.
+    measured progress that gives it meaning. beta.39's opening valuation is a
+    civil-day boundary figure and carries no execution state, so it changes
+    nothing about what this file pins.
     """
-    assert STORAGE_MINOR_VERSION == 6
+    # **7 since beta.39**, which adds one optional per-day dict: what the energy
+    # the day opened with was worth on the value curve that existed then. It is the
+    # one datum a forecast revaluation needs and the one datum nothing retained.
+    # Additive like every bump before it -- a beta.38 document reads back with the
+    # key absent, which is a defined state with its own published reason -- so the
+    # major staying at 2 is still the load-bearing half.
+    assert STORAGE_MINOR_VERSION == 7
 
 
 def test_the_quarter_is_not_written_to_the_store() -> None:

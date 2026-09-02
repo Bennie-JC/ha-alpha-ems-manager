@@ -60,11 +60,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .const import (
+    ACCOUNTING_BASIS_POSITION,
+    ACCOUNTING_RECONCILIATION_TOLERANCE_EUR,
+    AVOIDANCE_BASIS_NO_BATTERY,
     LEDGER_BASIS_ATTRIBUTED,
     LEDGER_BASIS_ESTIMATED,
     LEDGER_BASIS_MEASURED,
     LEDGER_BASIS_MODEL_TERM,
     LEDGER_BASIS_PLANNER_DERIVED,
+    LEDGER_BASIS_REVALUED,
 )
 
 #: Rounding for published energies and euro figures, matching the rest of Phase 8.
@@ -328,10 +332,391 @@ def _basis_map() -> dict[str, str]:
         "closing_inventory_value_eur": LEDGER_BASIS_PLANNER_DERIVED,
         "realised_net_value_eur": LEDGER_BASIS_MEASURED,
         "realised_plus_remaining_value_eur": LEDGER_BASIS_PLANNER_DERIVED,
+        # beta.39, and the reason the vocabulary grew a sixth word: these four
+        # are not all the same kind of number. Two are measured, one is a
+        # forecast of the rest of the day, and one is the same energy valued on
+        # two different curves -- and a reader who cannot tell them apart will
+        # eventually difference the last one against the first.
+        "today_accounting.realised_today_eur": LEDGER_BASIS_PLANNER_DERIVED,
+        "today_accounting.in_progress_interval_eur": LEDGER_BASIS_MEASURED,
+        "today_accounting.remaining_expected_today_eur": LEDGER_BASIS_PLANNER_DERIVED,
+        "today_accounting.forecast_revaluation_eur": LEDGER_BASIS_REVALUED,
+        "today_accounting.total_economic_value_today_eur": LEDGER_BASIS_PLANNER_DERIVED,
         "model_terms.switching_cost_eur": LEDGER_BASIS_MODEL_TERM,
         "model_terms.grid_charge_margin_eur": LEDGER_BASIS_MODEL_TERM,
         "model_terms.throughput_cost_eur": LEDGER_BASIS_MODEL_TERM,
     }
+
+
+def day_partition(*, head: int, interval_count: int) -> tuple[range, int | None, range]:
+    """Return the civil day's three slices: closed, in flight, still to come.
+
+    ``head`` is the solved plan's own first interval index -- the next interval,
+    never the one in progress -- so the closed part of the day is ``[0, head-1)``,
+    the quarter in flight is ``head-1`` and what remains is ``[head, N)``.
+
+    **Defined by ``head`` and not by which intervals have data**, which is what
+    makes the three provably disjoint and provably exhaustive on a 92, 96 or
+    100-interval day alike. A partition inferred from the persisted record instead
+    would silently drop a quarter whenever a sample was missing, and it is exactly
+    that one missing quarter -- index 84 at 21:00 on 2026-09-02, in neither the
+    realised window nor the plan's remaining slice -- that this exists to close.
+
+    Clamped at both ends. ``head`` at or below zero leaves nothing closed and no
+    quarter in flight, which is the shape of the first refresh after midnight.
+    """
+    count = max(0, interval_count)
+    clamped = max(0, min(head, count))
+    return (
+        range(0, max(0, clamped - 1)),
+        clamped - 1 if clamped >= 1 else None,
+        range(clamped, count),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DayAccounting:
+    """One civil day's economic position, as five terms that sum to a total.
+
+    **The identity is the deliverable, not the total.** Published so it can be
+    checked from the payload alone:
+
+    .. code-block:: text
+
+        realised_today_eur
+        + in_progress_interval_eur
+        + remaining_expected_today_eur
+        + forecast_revaluation_eur
+        = total_economic_value_today_eur
+
+    and it telescopes to something a person can state in one sentence. Writing
+    ``R`` for cash realised in the closed part of the day, ``G`` for cash
+    realised so far in the quarter in flight, ``P`` for cash the plan still
+    expects before midnight, ``V[now]`` for this refresh's value curve and
+    ``V[open]`` for the curve as it stood when the day opened:
+
+    .. code-block:: text
+
+        realised_today_eur       = R + V[now](e_close) - V[now](e_open)
+        in_progress_interval_eur = G
+        remaining_expected_eur   = P
+        forecast_revaluation_eur = V[now](e_open) - V[open](e_open)
+        -------------------------------------------------------------
+        total                    = R + G + P + V[now](e_close) - V[open](e_open)
+
+    -- the day's cash, plus what the pack is worth now, less what it was worth
+    when the day began. Every term cancels except the two ends of the position,
+    so **no residual is hidden inside any addend**: if the five do not sum to the
+    total within :data:`ACCOUNTING_RECONCILIATION_TOLERANCE_EUR`, the total is
+    withheld and the error is published.
+
+    **One counterfactual throughout.** ``R`` and ``G`` are measured against a
+    household with no battery, and ``P`` is recomputed on the same basis from the
+    solved plan rather than taken from the planner's per-interval idle figure.
+    Mixing the two would have been the one dishonest move available here; see
+    ``AVOIDANCE_BASIS_NO_BATTERY``.
+
+    **The quarter in flight is its own term and never joins history.** It becomes
+    part of ``realised_today_eur`` when the quarter closes and its measurement is
+    persisted, and until then it is separately inspectable with its own coverage
+    beside it -- because a partial quarter folded into realised history is a
+    figure that can go down.
+
+    ``None`` propagates. A total missing one of its terms is not a smaller total,
+    it is a different number wearing the same name, so a missing addend takes the
+    total with it and ``unavailable_reason`` says which.
+    """
+
+    realised_today_eur: float | None
+    in_progress_interval_eur: float | None
+    remaining_expected_today_eur: float | None
+    forecast_revaluation_eur: float | None
+    total_economic_value_today_eur: float | None
+    reconciliation_error_eur: float | None
+    unavailable_reason: str | None
+
+    #: The day's interval partition, published so exhaustiveness and disjointness
+    #: are checkable rather than asserted. ``realised`` covers ``[0, h-1)``, the
+    #: quarter in flight is ``h-1``, and ``remaining`` covers ``[h, N)`` -- where
+    #: ``h`` is the solved plan's own first index. The three are disjoint and
+    #: cover the whole civil day by construction, at 92, 96 and 100 intervals
+    #: alike, because the partition is defined by ``h`` and not by which
+    #: intervals happen to have data.
+    interval_count: int | None = None
+    realised_interval_count: int | None = None
+    in_progress_interval_index: int | None = None
+    remaining_interval_count: int | None = None
+    #: How many of ``[h, N)`` the plan's priced horizon actually reaches. Equal to
+    #: ``remaining_interval_count`` on a fully priced civil day; smaller where the
+    #: source's market day does not span the local one, and then the total is
+    #: withheld rather than published over a day with a hole in it.
+    remaining_planned_interval_count: int | None = None
+    realised_intervals_priced: int | None = None
+    realised_intervals_skipped: int | None = None
+    in_progress_coverage: float | None = None
+
+    #: The two ends of the position, and the provenance of the opening valuation.
+    opening_inventory_kwh: float | None = None
+    opening_inventory_value_eur: float | None = None
+    opening_valuation_eur: float | None = None
+    opening_valued_at: str | None = None
+    #: The reference each end of the position was measured against. Published
+    #: rather than checked: the reserve floor moves with the load and production
+    #: forecasts, and its effect on what the position is worth is forecast
+    #: revaluation in the plainest sense -- so it is reported, not refused. The
+    #: lattice pitch is the one that *is* refused, because a different pitch means
+    #: a different configuration rather than a different forecast.
+    opening_floor_kwh: float | None = None
+    opening_bucket_kwh: float | None = None
+    current_floor_kwh: float | None = None
+    current_bucket_kwh: float | None = None
+    closing_inventory_kwh: float | None = None
+    closing_inventory_value_eur: float | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        """Return the published block, with its own rule attached."""
+        return {
+            "realised_today_eur": self.realised_today_eur,
+            "in_progress_interval_eur": self.in_progress_interval_eur,
+            "remaining_expected_today_eur": self.remaining_expected_today_eur,
+            "forecast_revaluation_eur": self.forecast_revaluation_eur,
+            "total_economic_value_today_eur": self.total_economic_value_today_eur,
+            "reconciliation_error_eur": self.reconciliation_error_eur,
+            "unavailable_reason": self.unavailable_reason,
+            "accounting_basis": ACCOUNTING_BASIS_POSITION,
+            "avoidance_basis": AVOIDANCE_BASIS_NO_BATTERY,
+            "partition": {
+                "interval_count": self.interval_count,
+                "realised_intervals": self.realised_interval_count,
+                "in_progress_index": self.in_progress_interval_index,
+                "remaining_intervals": self.remaining_interval_count,
+                "remaining_planned_intervals": self.remaining_planned_interval_count,
+                "remaining_unpriced_intervals": (
+                    None
+                    if self.remaining_interval_count is None
+                    or self.remaining_planned_interval_count is None
+                    else self.remaining_interval_count
+                    - self.remaining_planned_interval_count
+                ),
+                "realised_intervals_priced": self.realised_intervals_priced,
+                "realised_intervals_skipped": self.realised_intervals_skipped,
+                "in_progress_coverage": self.in_progress_coverage,
+                "rule": (
+                    "realised covers [0, h-1), the quarter in flight is h-1 and "
+                    "remaining covers [h, N), where h is the solved plan's own "
+                    "first index and N the civil day's real interval count. "
+                    "disjoint and exhaustive by construction on a 92, 96 or "
+                    "100-interval day: the partition is defined by h, not by "
+                    "which intervals have data. skipped intervals are reported "
+                    "rather than assumed absent"
+                ),
+            },
+            "position": {
+                "opening_inventory_kwh": self.opening_inventory_kwh,
+                "opening_inventory_value_eur": self.opening_inventory_value_eur,
+                "opening_valuation_eur": self.opening_valuation_eur,
+                "opening_valued_at": self.opening_valued_at,
+                "opening_floor_kwh": self.opening_floor_kwh,
+                "opening_bucket_kwh": self.opening_bucket_kwh,
+                "current_floor_kwh": self.current_floor_kwh,
+                "current_bucket_kwh": self.current_bucket_kwh,
+                "closing_inventory_kwh": self.closing_inventory_kwh,
+                "closing_inventory_value_eur": self.closing_inventory_value_eur,
+                "rule": (
+                    "both inventory values are this refresh's curve, so their "
+                    "difference is what operating the battery achieved and "
+                    "carries no revaluation. opening_valuation_eur is the same "
+                    "opening energy valued on the curve that existed when the "
+                    "day opened, persisted once, and the revaluation is the "
+                    "difference of the two. the two floors are published rather "
+                    "than checked: the reserve floor moves with the load and "
+                    "production forecasts and its effect on the position's worth "
+                    "IS forecast revaluation. the lattice pitch is checked, "
+                    "because a different pitch is a different configuration. no "
+                    "purchase cost and no inventory convention is involved in "
+                    "any of them"
+                ),
+            },
+            "rule": (
+                "realised + in_progress + remaining + revaluation = total, and "
+                "the total telescopes to the day's cash plus what the pack is "
+                "worth now less what it was worth when the day opened. this is "
+                "an economic position, not money in the bank: two of the terms "
+                "are planner valuations and one is a forecast. no residual is "
+                "absorbed into any addend -- if the five do not sum, the total "
+                "is withheld and reconciliation_error_eur says by how much"
+            ),
+        }
+
+
+def day_accounting(
+    *,
+    realised: RealizedWindow | None,
+    in_progress_eur: float | None,
+    in_progress_index: int | None,
+    in_progress_coverage: float | None,
+    remaining_expected_eur: float | None,
+    forecast_revaluation_eur: float | None,
+    opening_valuation_eur: float | None = None,
+    opening_valued_at: str | None = None,
+    opening_floor_kwh: float | None = None,
+    opening_bucket_kwh: float | None = None,
+    current_floor_kwh: float | None = None,
+    current_bucket_kwh: float | None = None,
+    interval_count: int | None = None,
+    realised_interval_count: int | None = None,
+    remaining_interval_count: int | None = None,
+    remaining_planned_interval_count: int | None = None,
+    unavailable_reason: str | None = None,
+) -> DayAccounting:
+    """Assemble the four terms into a total, or refuse to.
+
+    Pure arithmetic over figures computed elsewhere: this module may not import
+    the solver, and the value curve lives on the other side of that line. What it
+    owns is the *addition* -- which terms may be added, in what order, and when
+    the answer must be withheld -- because that is the part that has to be
+    reviewable in one place.
+
+    ``realised_today_eur`` is taken from ``realized_plus_remaining_value_eur``
+    and not recomputed. That figure is already ``R + V[now](close) - V[now](open)``,
+    it is the identity beta.38 shipped, and a second derivation of the same thing
+    is how two published numbers come to disagree.
+    """
+    realised_today = (
+        None if realised is None else realised.realized_plus_remaining_value_eur
+    )
+    reason = unavailable_reason
+    addends = (
+        realised_today,
+        in_progress_eur,
+        remaining_expected_eur,
+        forecast_revaluation_eur,
+    )
+    total: float | None = None
+    error: float | None = None
+    # **Finite, not merely present.** A ``nan`` addend propagates through the sum
+    # and through the tolerance test too -- ``abs(nan) > tol`` is false -- so a
+    # single non-finite term would have published a total reading ``nan`` and
+    # passed its own reconciliation check.
+    if reason is None and all(
+        value is not None
+        and float(value) == float(value)
+        and abs(float(value)) != float("inf")
+        for value in addends
+    ):
+        raw = sum(float(value) for value in addends)  # type: ignore[arg-type]
+        total = round(raw, _EUR_DECIMALS)
+        # **Checked against the rounded addends a reader can actually add up**,
+        # not against the raw sum, because the published figures are what anybody
+        # will reconcile and four-decimal rounding is exactly what makes five of
+        # them miss their own total.
+        error = round(
+            total - sum(round(float(value), _EUR_DECIMALS) for value in addends),
+            _EUR_DECIMALS + 4,
+        )
+        if abs(error) > ACCOUNTING_RECONCILIATION_TOLERANCE_EUR:
+            # **Withheld, never patched.** Absorbing the residual into one of the
+            # addends would make the equation balance and the figure a lie.
+            total = None
+    return DayAccounting(
+        realised_today_eur=(
+            None if realised_today is None else round(realised_today, _EUR_DECIMALS)
+        ),
+        in_progress_interval_eur=(
+            None if in_progress_eur is None else round(in_progress_eur, _EUR_DECIMALS)
+        ),
+        remaining_expected_today_eur=(
+            None
+            if remaining_expected_eur is None
+            else round(remaining_expected_eur, _EUR_DECIMALS)
+        ),
+        forecast_revaluation_eur=(
+            None
+            if forecast_revaluation_eur is None
+            else round(forecast_revaluation_eur, _EUR_DECIMALS)
+        ),
+        total_economic_value_today_eur=total,
+        reconciliation_error_eur=error,
+        unavailable_reason=reason,
+        interval_count=interval_count,
+        realised_interval_count=realised_interval_count,
+        in_progress_interval_index=in_progress_index,
+        remaining_interval_count=remaining_interval_count,
+        remaining_planned_interval_count=remaining_planned_interval_count,
+        realised_intervals_priced=(
+            None if realised is None else realised.intervals_priced
+        ),
+        realised_intervals_skipped=(
+            None if realised is None else realised.intervals_skipped
+        ),
+        in_progress_coverage=in_progress_coverage,
+        opening_inventory_kwh=(
+            None if realised is None else realised.opening_inventory_kwh
+        ),
+        opening_inventory_value_eur=(
+            None if realised is None else realised.opening_inventory_value_eur
+        ),
+        opening_valuation_eur=(
+            None if opening_valuation_eur is None else round(opening_valuation_eur, 6)
+        ),
+        opening_valued_at=opening_valued_at,
+        opening_floor_kwh=opening_floor_kwh,
+        opening_bucket_kwh=opening_bucket_kwh,
+        current_floor_kwh=current_floor_kwh,
+        current_bucket_kwh=current_bucket_kwh,
+        closing_inventory_kwh=(
+            None if realised is None else realised.closing_inventory_kwh
+        ),
+        closing_inventory_value_eur=(
+            None if realised is None else realised.closing_inventory_value_eur
+        ),
+    )
+
+
+def open_quarter_value_eur(
+    *,
+    grid_import_kwh: float | None,
+    grid_export_kwh: float | None,
+    load_kwh: float | None,
+    production_kwh: float | None,
+    import_price_eur_kwh: float | None,
+    export_price_eur_kwh: float | None,
+) -> float | None:
+    """Return what the quarter in flight has realised so far, or ``None``.
+
+    **The same construction as one interval of** :func:`realized_window`, and
+    that is the point: ``avoided + export_revenue - import_cost``, with the
+    avoidance measured against a household that has no battery at all. Written
+    once, here, so the open quarter and the closed ones cannot come to rest on
+    different arithmetic -- which is precisely how a partial term ends up
+    double-counting or contradicting the history it will become part of.
+
+    Fed from the live per-quarter integrators rather than from storage, because
+    storage does not have this interval yet: a quarter is persisted when it
+    closes. That is also why it cannot double-count -- at the instant the
+    measurement lands, the interval leaves this term and enters the realised
+    slice, and the two are indexed by the same ``h``.
+
+    ``None`` rather than zero wherever a flow exists that cannot be priced, on
+    exactly the rule :func:`realized_window` applies per interval.
+    """
+    imported = _finite(grid_import_kwh)
+    exported = _finite(grid_export_kwh)
+    buy = _finite(import_price_eur_kwh)
+    sell = _finite(export_price_eur_kwh)
+    if imported is None or exported is None or buy is None or sell is None:
+        return None
+    load = _finite(load_kwh)
+    produced = _finite(production_kwh)
+    if load is None or produced is None:
+        return None
+    # ``max(0, max(0, load - pv) - import)``: what the meter would have shown with
+    # no battery, less what it did show. Measured on both sides.
+    avoided = max(0.0, max(0.0, load - produced) - max(0.0, imported))
+    return round(
+        avoided * buy + max(0.0, exported) * sell - max(0.0, imported) * buy,
+        _EUR_DECIMALS,
+    )
 
 
 def _finite(value: float | None) -> float | None:
