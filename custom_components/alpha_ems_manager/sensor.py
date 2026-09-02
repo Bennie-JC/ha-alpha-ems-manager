@@ -86,6 +86,7 @@ from .const import (
     ECONOMIC_ACTION_CHARGE,
     ECONOMIC_ACTION_EXPORT,
     ECONOMIC_ACTION_IDLE,
+    ECONOMIC_ACTION_MIXED_BUY,
     ECONOMIC_ACTION_OPTIONS,
     ECONOMIC_ACTION_SAFETY_BUY,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
@@ -607,11 +608,19 @@ def _executing_action(view: dict[str, Any]) -> str:
     ``execution_target`` already sets from the solve's safety attribution -- so the
     entity and the diagnostics cannot disagree about which purchases were
     compelled.
+
+    **``mixed_buy`` reaches the entity the same way, since beta.39.** A charge
+    campaign with a compulsory *and* a discretionary component read as
+    ``safety_buy`` here, so the 7.22 discretionary kilowatt-hours of the live
+    8.06 kWh campaign were presented to the user as compelled survival energy.
+    Relayed rather than re-derived: the split is the solve's own attribution and
+    this reads the word it produced.
     """
     if not view:
         return ECONOMIC_ACTION_IDLE
-    if view.get("purpose") == ECONOMIC_ACTION_SAFETY_BUY:
-        return ECONOMIC_ACTION_SAFETY_BUY
+    purpose = view.get("purpose")
+    if purpose in (ECONOMIC_ACTION_SAFETY_BUY, ECONOMIC_ACTION_MIXED_BUY):
+        return purpose
     intent = view.get("intent")
     if intent == EXECUTION_INTENT_GRID_CHARGE:
         return ECONOMIC_ACTION_CHARGE
@@ -760,8 +769,13 @@ def _next_planned_action_value(coordinator: AlphaEmsCoordinator) -> str | None:
     if run is None:
         return ECONOMIC_ACTION_IDLE
     purpose = target.get("purpose")
-    if purpose == ECONOMIC_ACTION_SAFETY_BUY:
-        return ECONOMIC_ACTION_SAFETY_BUY
+    # **The target's own purpose first, and it may say ``mixed_buy``. beta.39.**
+    # The fallback below is deliberately *second*: it knows only whether the run
+    # is in the Safety-Buy set, which is true of a mixed run too, so consulting it
+    # first would overwrite a truthful ``mixed_buy`` with ``safety_buy`` and
+    # reinstate the defect on the planned-action entity alone.
+    if purpose in (ECONOMIC_ACTION_SAFETY_BUY, ECONOMIC_ACTION_MIXED_BUY):
+        return purpose
     if run.start_index in outcome.safety_buy_runs:
         return ECONOMIC_ACTION_SAFETY_BUY
     action = run.action

@@ -269,6 +269,7 @@
           "discharge": "Ontladen",
           "export": "Terugleveren",
           "safety_buy": "Reserve-inkoop",
+            "mixed_buy": "Gemengde inkoop",
           "curtail_pv": "Afregelen",
           "idle": "Inactief"
         }
@@ -281,6 +282,7 @@
           "discharge": "Ontladen",
           "export": "Terugleveren",
           "safety_buy": "Reserve-inkoop",
+            "mixed_buy": "Gemengde inkoop",
           "curtail_pv": "Afregelen",
           "idle": "Inactief"
         }

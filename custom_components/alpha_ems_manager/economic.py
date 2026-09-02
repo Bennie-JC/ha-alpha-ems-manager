@@ -141,6 +141,7 @@ from .const import (
     ECONOMIC_ACTION_EXPORT,
     ECONOMIC_ACTION_HOLD,
     ECONOMIC_ACTION_IDLE,
+    ECONOMIC_ACTION_MIXED_BUY,
     ECONOMIC_ACTION_SAFETY_BUY,
     ECONOMIC_BUCKET_BAND_KWH,
     ECONOMIC_BUCKET_KWH,
@@ -5893,6 +5894,56 @@ def intent_for_action(action: str) -> str:
     return EXECUTION_INTENT_HOLD
 
 
+def purchase_purpose(
+    action: str,
+    *,
+    safety_buy: bool,
+    safety_buy_kwh: float | None,
+    economic_buy_kwh: float | None,
+) -> str:
+    """Return what a run is *for*, from the attribution and nothing else.
+
+    **beta.39, and it is observability only.** Three answers for a charge:
+
+    * ``safety_buy`` -- compulsory energy and no discretionary energy;
+    * ``mixed_buy`` -- both, which is one run with two reasons;
+    * the run's own action -- no compulsory energy at all.
+
+    Derived strictly *after* the economic plan and its purchase attribution have
+    been computed, from the two figures they produced, and read by nothing that
+    decides. It cannot reach Stage-A optimisation, trade admission, the reserve,
+    Safety-Buy triggering, the charge quantity, the campaign window, Stage-B
+    execution, authority or the frozen schedule -- the ``intent`` beside it in
+    :func:`execution_target` is what carries execution meaning, and this release
+    does not touch it.
+
+    **What it does not mean.** A mixed run is *not* a Safety Buy that grew.
+    Physical reachability made a compulsory component exist; the optimiser then
+    found additional charging worth doing in the same window, independently and
+    on price. The economic component never becomes safety energy, and only
+    physical reachability may initiate a compulsory purchase.
+
+    **``None`` is not zero.** Where the attribution could not be formed -- no
+    reachability this refresh, or a pre-beta.32 record -- the answer falls back to
+    the binary beta.38 behaviour. "We cannot tell how this run splits" must not
+    render as "it is mixed", which would be an invention, nor as a discretionary
+    charge, which would hide a compulsion.
+
+    The same predicate lives in :func:`activity.category_of`, which cannot call
+    this one: ``activity`` imports only ``const``, deliberately, so that the
+    surface a user reads cannot reach the optimiser. The two are held to one
+    answer by ``test_beta39_mixed_buy`` over all four quadrants rather than by a
+    shared import.
+    """
+    if not safety_buy:
+        return action
+    if safety_buy_kwh is None or economic_buy_kwh is None:
+        return ECONOMIC_ACTION_SAFETY_BUY
+    if safety_buy_kwh > 0.0 and economic_buy_kwh > 0.0:
+        return ECONOMIC_ACTION_MIXED_BUY
+    return ECONOMIC_ACTION_SAFETY_BUY
+
+
 def execution_target(
     run: EconomicRun,
     *,
@@ -5986,7 +6037,16 @@ def execution_target(
         "campaign_id": campaign_id,
         "campaign_end": None if campaign_end is None else campaign_end.isoformat(),
         "intent": intent,
-        "purpose": ECONOMIC_ACTION_SAFETY_BUY if safety_buy else run.action,
+        # **What the run is for, and since beta.39 it may say "both".** The
+        # ``intent`` above is unchanged and is what carries execution meaning; this
+        # is read by the two economic entities and by Activity, and by nothing that
+        # decides. See :func:`purchase_purpose`.
+        "purpose": purchase_purpose(
+            run.action,
+            safety_buy=safety_buy,
+            safety_buy_kwh=safety_buy_kwh,
+            economic_buy_kwh=economic_buy_kwh,
+        ),
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
         # When this was said, and how long it may be believed. Independent of the

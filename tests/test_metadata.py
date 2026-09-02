@@ -257,6 +257,65 @@ def test_no_tracked_file_credits_an_assistant_instead_of_the_author() -> None:
     assert offenders == [], offenders
 
 
+def test_no_commit_message_credits_an_assistant_instead_of_the_author() -> None:
+    """**The gap the tracked-file scan above could not see.**
+
+    That test reads file *contents*. A ``Co-Authored-By`` trailer lives in the
+    commit object, which no tracked file contains -- so a trailer could land in
+    every commit of a release and the suite would stay green. It did: the first
+    beta.39 commit carried one, and nothing failed.
+
+    Scanned over the **whole published line** -- every commit reachable from the
+    current branch or from any tag -- rather than the last few commits, because
+    "we cleaned the ones we remembered" is how the next one gets missed. Author
+    and committer identity are checked as well: the credit can be in the header as
+    easily as in the body.
+
+    ``--all`` is deliberately *not* used. This repository keeps local
+    ``refs/backup/*``, ``refs/original/*`` and ``backup/pre-rewrite-*`` refs from
+    an earlier history cleanup, whose entire purpose is to preserve the state
+    before that cleanup. Six of those commits carry trailers; none is reachable
+    from a tag or from ``main``, and none was ever pushed. Failing on them would
+    only make the guard something a maintainer has to argue with, and the pressure
+    would be to loosen the markers rather than to keep the published history
+    clean.
+    """
+    log = subprocess.run(
+        [
+            "git",
+            "log",
+            "HEAD",
+            "--tags",
+            "--format=%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%B%x1e",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+    offenders: list[str] = []
+    for record in log.split("\x1e"):
+        if not record.strip():
+            continue
+        sha, author, author_email, committer, committer_email, body = (
+            record.strip().split("\x1f", 5)
+        )
+        haystack = " ".join(
+            (author, author_email, committer, committer_email, body)
+        ).lower()
+        offenders.extend(
+            f"{sha[:12]}: {marker}"
+            for marker in _ATTRIBUTION_MARKERS
+            if marker in haystack
+        )
+        # Any co-author trailer at all, whoever it names: this is a single-author
+        # project, and a trailer here is a tool's footer rather than a person.
+        if "co-authored-by:" in body.lower():
+            offenders.append(f"{sha[:12]}: co-authored-by trailer")
+
+    assert offenders == [], offenders
+
+
 def test_the_declared_author_is_the_maintainer() -> None:
     """The manifest names a human code owner and nothing else."""
     manifest = read_json(COMPONENT / "manifest.json")

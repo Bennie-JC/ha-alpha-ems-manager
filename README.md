@@ -911,6 +911,31 @@ The full audit trail is in the nested `today_accounting` attribute: the day's
 interval partition, both ends of the position, where the opening valuation came from
 and when, and the reconciliation error. It is also in the diagnostics download.
 
+### Safety, economics, or both (new in beta.39)
+
+A charge campaign can have two reasons at once, and until `beta.39` it could only
+report one of them. `Economic Action` and `Next Planned Action` now distinguish
+three:
+
+| State | What it means |
+|---|---|
+| `Safety Buy` | Physical reachability compelled the purchase, and nothing more was bought. |
+| `Charge` | Nothing was compelled. The whole purchase is a trade the optimiser chose. |
+| `Mixed Buy` | Reachability compelled part of it, **and** the optimiser independently found further charging worth doing in the same window. |
+
+The live campaign that prompted this bought 8.06 kWh of which 0.83 was compelled
+and 7.22 was chosen, and reported `Safety Buy` — so seven of its eight
+kilowatt-hours looked like energy the battery had no choice about. The two figures
+were always published and always correct; what was missing was a word that matched
+them. They are in the diagnostics download as `safety_buy_kwh` and
+`economic_buy_kwh` on the run's execution target, and `purchase.classification`
+beside them, and none of the three changed.
+
+**A Mixed Buy is not a Safety Buy that grew.** Only physical reachability can
+compel a purchase — that has been true since `beta.14` and is unchanged. A run
+with nothing compelled cannot acquire a compulsory component by being
+economically attractive, however attractive.
+
 ### Export safety, and why a discharge gets smaller (changed in beta.15)
 
 A forced discharge sets the **battery's** rate, so whatever the house cannot use

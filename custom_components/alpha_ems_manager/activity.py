@@ -87,12 +87,14 @@ from .const import (
     ACTIVITY_CATEGORY_MIXED_BUY,
     ACTIVITY_CATEGORY_SAFETY_BUY,
     ACTIVITY_PURPOSE_ECONOMIC,
+    ACTIVITY_PURPOSE_MIXED,
     ACTIVITY_PURPOSE_SAFETY,
     CONTROL_EXECUTION_AVAILABLE,
     ECONOMIC_ACTION_CHARGE,
     ECONOMIC_ACTION_CURTAIL,
     ECONOMIC_ACTION_DISCHARGE,
     ECONOMIC_ACTION_EXPORT,
+    ECONOMIC_ACTION_MIXED_BUY,
     ECONOMIC_ACTION_SAFETY_BUY,
     ECONOMIC_ANNOUNCE_LEAD_MINUTES,
     ECONOMIC_DEADBAND_ENERGY_KWH,
@@ -1434,19 +1436,24 @@ def _campaign_data(terminal: TerminalView, *, now: datetime) -> dict[str, Any]:
 
 
 def _purpose_for(category: str) -> str | None:
-    """Return ``safety`` or ``economic`` for a lifecycle's category.
+    """Return ``safety``, ``economic`` or ``mixed`` for a lifecycle's category.
 
     ``None`` for the adopted lifecycle, whose category is genuinely unknown -- see
     :func:`_adopted`. Guessing ``economic`` there would be a claim about why the
     user's money was spent.
+
+    **``mixed`` since beta.39, and its absence was the same claim.**
+    ``ACTIVITY_CATEGORY_MIXED_BUY`` has existed since beta.32; this collapsed it
+    to ``economic``, so a campaign whose compulsory component was real reported a
+    purpose that said the purchase was entirely a choice.
     """
     if not category:
         return None
-    return (
-        ACTIVITY_PURPOSE_SAFETY
-        if category == ACTIVITY_CATEGORY_SAFETY_BUY
-        else ACTIVITY_PURPOSE_ECONOMIC
-    )
+    if category == ACTIVITY_CATEGORY_SAFETY_BUY:
+        return ACTIVITY_PURPOSE_SAFETY
+    if category == ACTIVITY_CATEGORY_MIXED_BUY:
+        return ACTIVITY_PURPOSE_MIXED
+    return ACTIVITY_PURPOSE_ECONOMIC
 
 
 def direction_of(action: str) -> str:
@@ -1454,7 +1461,15 @@ def direction_of(action: str) -> str:
 
     The label is what a run is *called*; the direction is what the battery does.
     """
-    if action in (ECONOMIC_ACTION_CHARGE, ECONOMIC_ACTION_SAFETY_BUY):
+    # ``mixed_buy`` since beta.39, and it is a charge like the two beside it: a
+    # run with a compulsory *and* a discretionary component still moves energy one
+    # way. Omitting it here would have returned the label itself as a direction,
+    # and the Battery Recommendation entity reads this.
+    if action in (
+        ECONOMIC_ACTION_CHARGE,
+        ECONOMIC_ACTION_SAFETY_BUY,
+        ECONOMIC_ACTION_MIXED_BUY,
+    ):
         return ECONOMIC_DIRECTION_CHARGE
     if action in (ECONOMIC_ACTION_DISCHARGE, ECONOMIC_ACTION_EXPORT):
         return ECONOMIC_DIRECTION_DISCHARGE

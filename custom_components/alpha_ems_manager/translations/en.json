@@ -269,6 +269,7 @@
           "discharge": "Discharge",
           "export": "Export",
           "safety_buy": "Safety Buy",
+            "mixed_buy": "Mixed Buy",
           "curtail_pv": "Curtail",
           "idle": "Idle"
         }
@@ -281,6 +282,7 @@
           "discharge": "Discharge",
           "export": "Export",
           "safety_buy": "Safety Buy",
+            "mixed_buy": "Mixed Buy",
           "curtail_pv": "Curtail",
           "idle": "Idle"
         }

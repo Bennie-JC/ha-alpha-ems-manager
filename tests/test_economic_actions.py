@@ -24,6 +24,7 @@ from custom_components.alpha_ems_manager.const import (
     ECONOMIC_ACTION_EXPORT,
     ECONOMIC_ACTION_HOLD,
     ECONOMIC_ACTION_IDLE,
+    ECONOMIC_ACTION_MIXED_BUY,
     ECONOMIC_ACTION_OPTIONS,
     ECONOMIC_ACTION_SAFETY_BUY,
     ECONOMIC_GAP_FORECAST_INFEASIBLE,
@@ -224,7 +225,12 @@ def test_the_value_forgone_is_zero_when_every_wanted_action_has_an_actuator() ->
 
 
 def test_every_published_action_is_in_the_declared_option_set() -> None:
-    """The entity's enum and the model's vocabulary are the same six words."""
+    """The entity's enum and the model's vocabulary are the same words.
+
+    Enumerated rather than counted, so a value can only be added here by somebody
+    writing down what it means -- which is the whole reason this test has grown
+    twice rather than been loosened.
+    """
     assert set(ECONOMIC_ACTION_OPTIONS) == {
         ECONOMIC_ACTION_HOLD,
         ECONOMIC_ACTION_CHARGE,
@@ -237,6 +243,14 @@ def test_every_published_action_is_in_the_declared_option_set() -> None:
         # by ``Economic Action`` once it stopped reaching forward to a run that
         # could be a day and a half away.
         ECONOMIC_ACTION_IDLE,
+        # beta.39. One charge run with a compulsory *and* a discretionary
+        # component. Not a third kind of purchase: physical reachability made some
+        # energy compulsory and the optimiser independently found more charging
+        # worth doing in the same window. The live campaign that named it split
+        # 8.06 kWh as 0.83 compelled and 7.22 discretionary and published
+        # ``safety_buy``, so seven of its eight kilowatt-hours read to a user as
+        # compelled survival energy.
+        ECONOMIC_ACTION_MIXED_BUY,
     }
 
 

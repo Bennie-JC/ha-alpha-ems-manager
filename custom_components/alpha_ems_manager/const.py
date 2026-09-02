@@ -1958,6 +1958,23 @@ ECONOMIC_ACTION_DISCHARGE: Final = "discharge"
 ECONOMIC_ACTION_EXPORT: Final = "export"
 ECONOMIC_ACTION_CURTAIL: Final = "curtail_pv"
 ECONOMIC_ACTION_SAFETY_BUY: Final = "safety_buy"
+#: **One charge run with both a compulsory and a discretionary component.**
+#: beta.39.
+#:
+#: Not a third kind of purchase and not a weakening of either word beside it.
+#: Physical reachability made some energy compulsory; the optimiser then found
+#: *additional* charging worth doing in the same run, independently and on price.
+#: The live evidence that named it: a campaign with ``battery_target_kwh: 8.06``,
+#: ``safety_buy_kwh: 0.83`` and ``economic_buy_kwh: 7.22``, published as
+#: ``purpose: safety_buy`` -- so seven of its eight kilowatt-hours read to a user
+#: as compelled survival energy when they were a deliberate trade.
+#:
+#: It changes no quantity and initiates nothing. ``safety_buy_kwh`` and
+#: ``economic_buy_kwh`` remain the numerical source of truth and are unchanged;
+#: this is the word that stops one of them being invisible. The **economic
+#: component can never become safety energy**: only physical reachability may
+#: initiate a compulsory purchase, and that rule is untouched.
+ECONOMIC_ACTION_MIXED_BUY: Final = "mixed_buy"
 #: Nothing is happening in the interval that is happening.
 #:
 #: **beta.34, and it is not a synonym for ``hold``.** ``hold`` is an economic
@@ -1984,6 +2001,11 @@ ECONOMIC_ACTION_OPTIONS: Final = (
     # beta.34. Additive: every value beta.33 could publish is still above it, and
     # ``hold`` keeps its own meaning on the planned-action entity.
     ECONOMIC_ACTION_IDLE,
+    # beta.39. Additive again, and it makes a run that was always mixed *say* so.
+    # ``activity.category_of`` has classified this shape as ``mixed_buy`` since
+    # beta.32 from the same attribution pair; the run's own ``purpose`` was the
+    # one surface still collapsing it to ``safety_buy``.
+    ECONOMIC_ACTION_MIXED_BUY,
 )
 
 #: Why the optimiser wants what it wants. A bounded vocabulary, like every other
@@ -4095,10 +4117,20 @@ LEDGER_DEFAULT_WINDOW_DAYS: Final = 2
 
 ACTIVITY_PURPOSE_SAFETY: Final = "safety"
 ACTIVITY_PURPOSE_ECONOMIC: Final = "economic"
+#: **Both, in one run.** beta.39.
+#:
+#: ``ACTIVITY_CATEGORY_MIXED_BUY`` has existed since beta.32 and the purpose it
+#: mapped to did not: ``_purpose_for`` special-cased only the pure Safety Buy, so
+#: a mixed run reported ``economic`` and the compulsory component vanished from
+#: the surface a user reads. Answering "why was my money spent?" with one of two
+#: words, where the honest answer is genuinely both, is a claim rather than a
+#: simplification.
+ACTIVITY_PURPOSE_MIXED: Final = "mixed"
 
 ACTIVITY_PURPOSES: Final = (
     ACTIVITY_PURPOSE_SAFETY,
     ACTIVITY_PURPOSE_ECONOMIC,
+    ACTIVITY_PURPOSE_MIXED,
 )
 
 ACTIVITY_CATEGORIES: Final = (

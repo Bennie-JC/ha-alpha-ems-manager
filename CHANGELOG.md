@@ -146,6 +146,46 @@ lattice, an opening energy that does not match, a day block on another basis, or
 priced horizon that does not reach local midnight each yield `None` with a named
 reason. **Never a zero.**
 
+### Added: a charge campaign can now say it has two reasons
+
+A planned charge with `battery_target_kwh: 8.06`, `safety_buy_kwh: 0.83` and
+`economic_buy_kwh: 7.22` published `purchase.classification: mixed` — correctly,
+since `beta.32` — beside a run-level `purpose: safety_buy`. So the figures a reader
+audits said one thing and the word a *user* reads said another: seven of the
+campaign's eight kilowatt-hours were presented as compelled survival energy when
+they were a deliberate trade the optimiser chose on price.
+
+There is now a third word, `mixed_buy`, on the run's purpose and on both economic
+entities:
+
+- **Safety Buy** — reachability compelled the purchase, and nothing more was
+  bought.
+- **Charge** — nothing was compelled; the whole purchase is a trade.
+- **Mixed Buy** — reachability compelled a component *and* the optimiser
+  independently found further charging worth doing in the same window.
+
+**It is not a third kind of purchase and it weakens neither word beside it.** The
+economic component never becomes safety energy, and **only physical reachability
+may initiate a compulsory purchase** — that rule is untouched and is asserted on a
+horizon that buys hard on price alone and is still classified as an ordinary
+charge. `safety_buy_kwh`, `economic_buy_kwh` and `purchase.classification` remain
+the numerical source of truth and are unchanged.
+
+The classification is derived strictly *after* the plan and its purchase
+attribution, from the two figures they produced, and it reaches nothing that
+decides: two targets built from one run and one window, differing only in the
+split, are asserted identical in intent, plan id, campaign, both instants, the
+battery target, the grid target, the quarter schedule, the headroom constraint and
+every power figure. A mixed campaign is admitted exactly as the equivalent charge
+campaign is, because admission keys on the intent and never on the purpose.
+
+`Activity` has classified this shape as `Mixed Buy` since `beta.32` from the same
+attribution pair; what it lacked was a purpose to map it to, so a mixed run
+reported `economic` and the compulsory component vanished from the line a user
+reads. It now reports `mixed`. `0.83 + 7.22` is `8.05` against a target of `8.06`,
+and that centilitre of kilowatt-hour is the display rounding that was already
+there: the energy arithmetic was **not** changed to make rounded figures add up.
+
 ### Fixed: the basis string contradicted itself
 
 It said *"on the exact basis the optimiser minimised"* and, four words later,
@@ -158,6 +198,8 @@ the prose was written. The cash half was the true half and is what is kept.
 ### Deliberately not changed
 
 - **No second economic sensor.** A family of them is how two come to disagree.
+- **No new schema for Mixed Buy.** A word on a published target is not persisted
+  state, and the storage minor bump below is the release's only schema movement.
 - **No Dutch attribute keys.** Home Assistant does not translate attribute *names*,
   so "Gerealiseerd vandaag / Lopend kwartier / Nog verwacht / Herwaardering /
   Totaal" are Lovelace card labels over correctly-named English keys. A card
@@ -189,8 +231,8 @@ against one.
 
 ### Verified
 
-4517 automated tests. Five mutation harnesses report **zero survivors and zero lost
-anchors**: `beta.39` (64 mutations), `beta.38` (44), `beta.37` (43), `beta.36` (35),
+4542 automated tests. Five mutation harnesses report **zero survivors and zero lost
+anchors**: `beta.39` (79 mutations), `beta.38` (44), `beta.37` (43), `beta.36` (35),
 `beta.35` (19).
 
 Decision neutrality is proven **cross-commit** against `ff3e912` in a detached
