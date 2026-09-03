@@ -51,6 +51,7 @@ from .const import (
     DISPATCH_LIMIT_DIRECTION_GATE,
     DISPATCH_LIMIT_DYNAMIC_RESERVE,
     DISPATCH_LIMIT_EXPORT_SAFETY,
+    DISPATCH_LIMIT_FREE_PV_ABSORPTION,
     DISPATCH_LIMIT_GRID_LIMIT,
     DISPATCH_LIMIT_HEADROOM,
     DISPATCH_LIMIT_INVERTER_POWER,
@@ -525,10 +526,22 @@ class QuarterProgress:
     seconds_remaining: float
     #: Battery-side AC energy still to deliver. Objective for a charge, ceiling for
     #: an export.
+    #:
+    #: **Objective-attributed, since beta.40.** Free production stored above the
+    #: objective does not reduce it, because the objective is what the row promised
+    #: and absorbing more than that is not progress against a smaller promise.
     battery_remaining_kwh: float
     #: Grid-side energy still authorised. Ceiling for a charge (import it may
     #: cause), objective for an export (meter export it must realise).
     grid_remaining_kwh: float
+    #: Whether Stage A authorised **keeping** measured free production in this
+    #: row rather than exporting it. beta.40.
+    #:
+    #: A verdict, because the magnitude is physical and :func:`clamp_charge_kw`
+    #: already owns every physical bound. ``False`` is the inert value and is what
+    #: every pre-beta.40 plan yields, so a :class:`QuarterProgress` built without
+    #: it behaves exactly as beta.39 did.
+    retention_authorised: bool = False
 
     @property
     def hours(self) -> float:
@@ -614,6 +627,26 @@ def decide_charge(
 
     **The economics never changed; the ceiling was simply being charged to the wrong
     meter.**
+
+    **beta.40 adds the second domain, and it is the first term here that may raise a
+    command.** beta.36 let production *substitute* for planned grid energy inside the
+    row objective; it still could not let production *exceed* it, because
+    ``applied_kw`` is seeded from the objective and every line after it only reduces.
+    So a row sized to a forecast surplus caps the live response to forecast error.
+
+    Measured on the reference inverter on 2026-09-03, mid-campaign, owned and
+    executing: PV 3.309 kW against a 0.792 kW house -- 2.517 kW of free surplus --
+    with 12.61 kWh of pack headroom and 8.527 kWh of grid authorisation still
+    unspent. The row's objective had 0.037 kWh left over a floored 0.025 h, so
+    ``battery_rate_kw`` was 1.490 kW, ``battery_cap_kw`` was 2.517 and never bound,
+    and this function's own ``desired_grid_kw`` came out **-1.027**: it predicted
+    exporting a kilowatt of production the plan had already decided was worth
+    storing. The meter measured 0.942 kW going out.
+
+    ``retention_authorised`` is Stage A's answer to that, frozen onto the row before
+    opened. Same row, same objective, same authorisation: ``absorb_kw`` is 2.517,
+    ``applied_kw`` becomes 2.500 after quantisation and ``desired_grid_kw`` becomes
+    **-0.017**. Nothing was bought -- see the proof beside the branch.
     """
     pv_surplus_kw = max(0.0, pv_kw - house_load_kw)
     required_battery_kw = progress.battery_rate_kw
@@ -636,6 +669,41 @@ def decide_charge(
         applied_kw = battery_cap_kw
         reason = DISPATCH_LIMIT_REMAINING_GRID_ENERGY
 
+    # **beta.40, the second domain: free production, and only free production.**
+    #
+    # Everything above resolves the row's *objective* and is unchanged. This is
+    # the one term in this function that may **raise** a command, and it is
+    # bounded by the measured surplus alone -- never by the grid authorisation,
+    # which is the beta.36 invariant read the other way round: a ceiling on
+    # buying is not a ceiling on storing something nobody bought.
+    #
+    # It is a ``max`` and never a ``min``. The objective may legitimately exceed
+    # the surplus because the objective may be grid-fed; applying this as a
+    # ``min`` would cap total battery power by a free-production figure and
+    # re-break beta.36 in mirror image.
+    #
+    # **How much is not decided here.** Stage A says only whether the tariff
+    # prefers keeping this energy to selling it; inverter power and pack headroom
+    # bound the result through :func:`clamp_charge_kw` below, exactly as they
+    # bound every other charge this function commands. One clamp, one copy.
+    #
+    # **Why it cannot buy a watt**, for every input rather than for one capture:
+    #
+    #     delta = max(objective, surplus) - objective = max(0, surplus - objective)
+    #           <= surplus = pv - house
+    #
+    # so when this branch is what bound, ``applied == surplus <= pv - house`` and
+    #
+    #     desired_grid = house - pv + applied <= house - pv + (pv - house) = 0
+    #
+    # -- export or zero, never import. And an unauthorised row leaves
+    # ``absorb_kw`` at zero, so it is bit-for-bit beta.39.
+    absorb_kw = pv_surplus_kw if progress.retention_authorised else 0.0
+    absorbing = absorb_kw > applied_kw + 1e-9
+    if absorbing:
+        applied_kw = absorb_kw
+        reason = DISPATCH_LIMIT_FREE_PV_ABSORPTION
+
     # **The physical clamps, with the grid authorisation withheld from them.**
     # Unchanged in meaning and order otherwise, and the reported vocabulary is
     # unchanged too: the branch above still names ``remaining_grid_energy`` when the
@@ -652,8 +720,24 @@ def decide_charge(
     else:
         applied_kw = clamped_kw
 
-    # The overshoot guard, against the battery objective.
-    tick_cap_kw = tick_energy_cap_kw(progress.battery_remaining_kwh)
+    # **The overshoot guard, against whichever remainder this tick is spending.**
+    #
+    # The guard's job is "never ask for more than the energy that is actually left",
+    # and against the objective remainder alone it would clamp an absorbing tick to
+    # nothing the moment the objective was met -- reintroducing the exported
+    # production one line after removing it. A tick storing free production is not
+    # spending the objective's remainder at all, and the energy it *is* spending is
+    # bounded by the pack, which ``headroom_kw`` above has already applied.
+    #
+    # **Keyed on ``absorbing`` and not on ``reason``**, because a clamp overwrites
+    # ``reason``. Reading the token here meant a *clamped* absorbing tick lost the
+    # widened guard and was then zeroed by it: 2.5 kW of surplus under a 1.0 kW
+    # inverter limit came out at 1.0 and then at 0.0, with ``tick_energy_horizon``
+    # printed beside it. Caught by the beta.40 Gate 1 sweep.
+    spendable_kwh = progress.battery_remaining_kwh
+    if absorbing:
+        spendable_kwh = max(spendable_kwh, applied_kw * progress.hours)
+    tick_cap_kw = tick_energy_cap_kw(spendable_kwh)
     if tick_cap_kw < applied_kw - 1e-9:
         applied_kw, reason = tick_cap_kw, DISPATCH_LIMIT_TICK_HORIZON
 

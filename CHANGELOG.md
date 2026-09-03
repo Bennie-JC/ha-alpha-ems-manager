@@ -9,6 +9,220 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.40] - 2026-09-03
+
+**Free production stopped going to the meter while the pack had room for it.** On
+2026-09-03 at 12:14, mid-campaign and working exactly as designed, the reference
+installation had PV at 3.309 kW against a 0.792 kW house -- 2.517 kW of surplus --
+with 12.61 kWh of pack headroom, `lifecycle.state: executing`, `ownership: owned`,
+25 of 25 safety checks passing, and **8.527 kWh of grid authorisation still unspent
+and still intended to be bought later at 0.1745 EUR/kWh**. The battery was taking
+1.490 kW of the surplus and **0.942 kW was crossing the meter outward**.
+
+Nothing had malfunctioned. `decide_charge` seeds its command from the frozen row's
+objective and every line after the seed only reduces, so the row's objective was
+also the ceiling on storing production nobody had to buy. Its own `desired_grid_kw`
+came out **-1.027** -- the controller predicted the export in watts before anybody
+measured it, which is the same signature `beta.36` was diagnosed from with the
+binding term the other way round.
+
+**The plan was not the problem, and that finding narrowed the fix.** The schedule's
+three 2.50 kWh rows are exactly the three cheapest quarters in the window: the
+optimiser already concentrates its purchase at full inverter power. The fifteen
+0.28 kWh rows are one lattice bucket each (`10.0 * 0.25 / 9`, the 1.111 kW the
+payload publishes three times), sized to the *forecast* surplus -- 0.22 kWh of
+production against 0.06 kWh of grid at interval 49, i.e. 0.88 kW. Reality delivered
+2.517 kW. The row was right about the forecast; a frozen row turns a forecast into
+a hard cap.
+
+### Added: Stage A says whether keeping free production beats selling it
+
+One economic question, asked per interval and answered from the optimiser's own
+dual:
+
+    keep beats sell   <=>   eta_charge * eta_discharge * V  >  export_price
+
+`V` is the gradient of the cost-to-go table across one bucket -- the figure the
+Economic Value sensor already publishes as
+`stored_energy_marginal_value_eur_kwh`. On the capture that is
+`0.90 * 0.2237 = 0.2013` against `0.10134`, so keeping wins by **0.0999 EUR/kWh**.
+Priced against the purchase it would displace instead
+(`0.90 * 0.1745 - 0.10134`) the same decision is worth **0.0557 EUR/kWh**. Both are
+published; neither is averaged into the other, and neither is extrapolated to a
+day.
+
+The verdict travels as `retention_authorised` on each published quarter row, with
+`retention_gate` saying why. **The refusals are the load-bearing half**:
+`refused_export_superior` is the tariff answering that selling wins, which is why
+this is an economic preference and not a zero-export rule. `refused_value_undefined`
+and `refused_no_export_price` are the honest answers where the lattice or the source
+cannot price the question, and both refuse rather than granting.
+
+### Added: Stage B may raise a charge, up to the measured surplus and no further
+
+`decide_charge` gains the first term in its history that may *increase* a command:
+
+    absorb_kw  = pv_surplus_kw if retention_authorised else 0.0
+    applied_kw = max(applied_kw, absorb_kw)
+
+A `max`, never a `min` -- the objective may legitimately exceed the surplus because
+the objective may be grid-fed, and applying this as a `min` would cap total battery
+power by a free-production figure and re-break `beta.36` in mirror image.
+
+**It cannot buy a watt, for every input rather than for one capture:**
+
+    delta = max(objective, surplus) - objective = max(0, surplus - objective)
+          <= surplus = pv - house
+    =>  desired_grid = house - pv + applied <= 0
+
+Same row, same objective, same authorisation, on the capture's own numbers:
+`applied_kw` **1.490 -> 2.500 kW** and `achievable_grid_kw` **-1.027 -> -0.017**.
+The residual is the actuator's own floor-toward-zero quantisation.
+
+**How much is not Stage A's question and it does not ask it.** Inverter power and
+pack headroom are bounds this integration keeps in exactly one clamp, and Stage B
+already applies both to every charge it commands -- so the published row carries a
+verdict and not a kilowatt-hour. A second copy of a physical limit is a second
+thing to keep in step, and the first time the two disagreed it would be the copy
+that got believed.
+
+### Added: a satisfied row can go on storing free production
+
+The third outcome, and the release exists for it. A row whose objective is met took
+one of two paths before: hold at zero, or end the quarter. Both stop the battery --
+and `beta.36` *measured* Mode 2 at 0 kW to be a **total** hold that suppresses
+charging as well as discharging. The satisfied row is therefore precisely where
+free production is guaranteed to leak.
+
+A satisfied objective with the verdict on the row and measured surplus present now
+falls through to the ordinary setpoint path. The target-reached latch stays set, so
+the moment production goes the next tick takes the `beta.39` path and the row is
+satisfied and held exactly as before: no new lifecycle state, and no recovery path
+to invent. Absorption stops when the surplus goes, the pack fills, a clamp binds,
+or the quarter ends.
+
+Two conditions are load-bearing rather than defensive. The surplus must clear
+`CONTROL_MIN_POWER_KW`, because the below-resolution hold is guarded on the latch
+and would otherwise leave the tick writing a trickle the device cannot express. And
+the pack's room is read **live** from the state of charge rather than from
+`battery_plan`, whose state is rebuilt on the economic cadence -- a quarter of an
+hour at the surplus this branch will command is long enough to fill the room a
+stale figure is still reporting.
+
+### Fixed: objective and absorbed are separate, and a campaign is judged on one
+
+`_completion_scope` ends a campaign when its realised total reaches the target
+frozen at first activation, summed from each row's *objective*. Counting free
+production stored above a row's objective into that total would end a campaign that
+had not finished buying. The capture's frozen target was 13.1 kWh against
+12.6144 kWh of pack headroom, so the pack ceiling happens to sit half a
+kilowatt-hour below the trip point -- which is why this is closed by construction
+rather than left to a coincidence.
+
+    objective = min(total, allowance)      absorbed = total - objective
+
+Derived rather than integrated, and that is a proof rather than a shortcut:
+crediting the objective first and capping it hard gives `min(T, A)` for any sequence
+of increments, and an opened quarter's allowance cannot move. So there is no second
+accumulator to reset, capture, restore or lose across a stop -- and the capture
+tuples in the coordinator are positional. A row's shortfall is judged on the
+objective too: absorbed production must not paper over a promise the row missed.
+
+### Fixed: a clamped absorbing tick is no longer zeroed by its own guard
+
+Found by the Gate 1 sweep rather than by reading. The overshoot guard was widened to
+the absorbing branch by reading the reported clamp token -- but a physical clamp
+overwrites that token, so 2.5 kW of surplus under a 1.0 kW inverter limit came out
+at 1.0 kW and then at 0.0 with `tick_energy_horizon` printed beside it. The guard is
+now keyed on whether the branch bound, which a clamp cannot rewrite.
+
+### Deliberately not changed
+
+- **No tie-break, no objective term, no `minimum_trade_gain_eur` change.** The
+  0.28 kWh rows are one lattice bucket, and in a genuinely flat window the choice
+  between spreading and concentrating is a tie the enumeration order resolves
+  arbitrarily. That is real, and its correct direction is *undetermined*:
+  front-loading concentrates cheaply and destroys the capacity headroom free
+  production needs, deferring preserves it and pays the run fee again. Shipping a
+  guess would trade a proven gain for an unproven one. The envelope makes the
+  smeared shape harmless, which is the right order of operations.
+- **No zero-export rule.** The gate refuses whenever `eta_rt * V <= export_price`,
+  and a full pack, a spent inverter or a vanished surplus each end absorption on
+  their own terms. Some export on the capture's own day is unavoidable: the reserve
+  layer already reports `surplus_beyond_headroom_kwh: 4.01`.
+- **No new public sensor.** Diagnostics only, on the existing quarter block.
+- **No `realized.py` change.** Absorbing instead of exporting *lowers*
+  `in_progress_interval_eur` for the duration of a row, because
+  `open_quarter_value_eur` is pure cash with no inventory term; the value returns
+  through inventory revaluation at quarter close. The five terms still reconcile
+  exactly and no residual is absorbed into an addend -- so the only valid measure of
+  this release is `total_economic_value_today_eur`, never realised cash alone.
+- **No Safety Buy change.** Only physical reachability may initiate a purchase. The
+  verdict may sit on a compulsory row -- keeping free production strictly reduces
+  what must be bought -- and it cannot change what is compelled, because it can
+  only ever command energy nobody bought.
+- **No grid-ceiling change.** `grid_authorised_kwh` bounds the grid and not the
+  battery. `beta.40` is that invariant read the other way round: a ceiling on
+  buying is not a ceiling on storing something nobody bought.
+- **The forward-authorisation machinery is not inherited.** It bounds grid
+  purchase. Applying it to a verdict over free production would let an ordinary
+  replan silently revoke an open row's authority, which is the class of defect
+  `beta.38` closed.
+
+### Schema
+
+**No schema version moves, and that is argued rather than skipped.**
+`STORAGE_MINOR_VERSION` stays at **2.7** and `CLAIM_SCHEMA_VERSION` at **2**. The
+verdict is two additive keys on a published quarter row: the publication is rebuilt
+from the solve every refresh, and where it *is* persisted -- inside the claim
+record's round-tripped `target` -- absence reads back as a refusal, which is
+`beta.39` behaviour. A `beta.39` record read by `beta.40` authorises nothing new; a
+`beta.40` record read by `beta.39` ignores two keys. No compatibility boundary is
+crossed in either direction, and `beta.20` set the precedent for exactly this
+situation: *"bumping the version would claim a compatibility boundary that was
+never crossed."* `ECONOMIC_MODEL_VERSION` and `RESERVE_MODEL_VERSION` are unchanged;
+no term entered the objective.
+
+### Verified
+
+4621 automated tests, serial and under twelve workers with identical results
+(7:41 against 2:36). Six mutation harnesses report **zero survivors and zero lost
+anchors**: `beta.40` (37 mutations), `beta.39` (79), `beta.38` (44), `beta.37` (43),
+`beta.36` (35), `beta.35` (19) -- 257 in total. Three `beta.36` anchors were
+repaired because this release moved the lines they pointed at; neither mutation was
+weakened, and both were re-anchored on the narrowest text that still identifies the
+layer they attack. Two proposed `beta.40` mutations were *removed* rather than
+weakened, each with the reason recorded in the table: the shortfall expression and
+the satisfied row's early return are both provably equivalent to what they were
+changed to, so neither described a defect.
+
+**One decision moved and it is named.** The seven horizon shapes and their canonical
+per-interval digests -- recorded against `ff3e912` in a detached worktree under
+`PYTHONHASHSEED=0` and reproduced at `508c18a` -- hold unchanged for a third
+release: the optimiser chose nothing differently, and solve counts stay at
+4/5/5/4/5/5/5. The published contract gains exactly two additive row keys and
+changes no other byte. On a row Stage A did not authorise, `decide_charge` is
+field-for-field the `beta.39` decision across 180 swept live conditions, including
+the reported clamp token.
+
+`test_beta35_stored_value.py` was amended rather than widened: through `beta.39` it
+claimed the marginal value was an observation and that a release making it an input
+would have changed. `beta.40` is that release, so the claim is restated and the new
+reader carries its argument. The `forbidden` set that actually holds the invariant
+is unmoved -- nothing in the recursion, the outcome build, the policy or the safety
+evaluation reads the curve.
+
+**Hardware validation is outstanding.** The next supervised Live day must show a
+quarter with measured surplus above its row objective reporting
+`battery_absorbed_extra_this_quarter_kwh > 0`; `desired_grid_kw <= 0` on **every**
+tick where `dispatch_limited_by` is `free_pv_absorption`, a single positive watt
+being cause to revert; a satisfied row with surplus present still charging and never
+writing 0 kW, with `hold_reason` never `quarter_satisfied` while absorbing;
+`objective + absorbed == realised` to three decimals on every completed row;
+`remaining_grid_authorisation_kwh` unconsumed by any absorbing tick; exactly one
+campaign terminal, at the frozen objective and not early; and the five euro figures
+summing to the published total with `accounting_reconciliation_error_eur` at `0.0`.
+
 ## [1.0.0-beta.39] - 2026-09-02
 
 **The lifecycle says what the battery is doing, and the day says what it earned.**

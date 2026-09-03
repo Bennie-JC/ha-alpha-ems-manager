@@ -363,7 +363,20 @@ def test_the_stored_value_prices_the_position_and_not_its_history() -> None:
 
 
 def test_no_decision_path_reads_the_stored_value() -> None:
-    """It is an observation. If it ever became an input, this release changed.
+    """Every reader is named, and since beta.40 one of them decides something.
+
+    **Through beta.39 this test said the curve was an observation and that a release
+    making it an input would have changed.** beta.40 is that release, and rather than
+    quietly widening the allow-list the claim is restated: the marginal value is now
+    read by exactly one decision -- the retention gate, which asks whether keeping a
+    kWh of free production beats selling it -- and by four publishers. The entry for
+    it below carries the argument.
+
+    The invariant this test actually holds is the ``forbidden`` set, and it has not
+    moved: nothing in the recursion, the outcome build, the policy or the safety
+    evaluation may read the curve. A gate that consulted it *inside* ``solve`` would
+    be a plan reading its own dual mid-solve, and that is a fixed point rather than a
+    plan.
 
     *Mutation: use ``stored_value_eur`` anywhere in the recursion or in Stage B and
     this fails.*
@@ -407,6 +420,25 @@ def test_no_decision_path_reads_the_stored_value() -> None:
         # ``forbidden`` set below is what actually holds the invariant, and it is
         # unchanged.
         "economic.py:economic_value_summary",
+        # **beta.40, and this one is not a publisher. Argued rather than added.**
+        #
+        # This is the first entry that reads the curve in order to *decide*
+        # something, so the claim in this test's own title changed with it and the
+        # docstring above says so. The decision is the retention gate: whether
+        # keeping one more kWh of free production beats selling it, which is
+        # ``eta_rt * marginal_value > export_price`` and cannot be answered without
+        # the dual. Using anything else -- a configured threshold, the edge value
+        # alone, a hand-rolled "cheapest future price" -- would be a second model of
+        # a quantity the optimiser already computes exactly, and the two would drift.
+        #
+        # What bounds it: the verdict travels as a frozen boolean on a published row,
+        # it authorises raising the battery only up to the *measured* production
+        # surplus, and it therefore cannot buy energy or move a euro of the plan.
+        # ``_execution_targets`` builds the Stage-A publication and adds no solve --
+        # ``test_stage_a_contract_inertness`` holds the solve count -- so the curve is
+        # still read exactly once per refresh, after the plan exists, and nothing in
+        # the recursion consults it.
+        "coordinator.py:_execution_targets",
     }
     assert set(readers) <= permitted, sorted(set(readers) - permitted)
     # And none of them is a decision path. Named individually rather than inferred,

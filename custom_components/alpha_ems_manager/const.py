@@ -2876,6 +2876,16 @@ DISPATCH_LIMIT_STALE_TARGET: Final = "stale_target"
 DISPATCH_LIMIT_OWNERSHIP: Final = "ownership"
 DISPATCH_LIMIT_SENSOR_COHERENCE: Final = "sensor_coherence"
 
+#: The free-production branch **raised** the charge above the frozen row objective.
+#:
+#: **Not a clamp, and deliberately absent from** :data:`DISPATCH_CLAMP_ORDER`.
+#: Every other token in this family names something that *reduced* a command; this
+#: one names the only term in ``decide_charge`` that may increase one, and it can
+#: only ever do so up to the measured production surplus. A reader seeing it knows
+#: the battery was asked for more than the row's own objective and that not one
+#: watt of it was bought -- see ``beta.40``.
+DISPATCH_LIMIT_FREE_PV_ABSORPTION: Final = "free_pv_absorption"
+
 #: The clamp order, and the order is contractual.
 #:
 #: Clamp four is the **grid**-energy cap, not the battery remainder, and that
@@ -3037,7 +3047,48 @@ SHORTFALL_WRITE_FAILURE: Final = "hardware_write_failure"
 SHORTFALL_DEADMAN_FAILURE: Final = "deadman_failure"
 SHORTFALL_DIRECTION_GATE: Final = "direction_gate"
 SHORTFALL_TICK_HORIZON: Final = "tick_energy_horizon"
+#: The row's own objective was met and it went on storing measured free
+#: production under the envelope Stage A froze onto it. **Not a shortfall** -- it is
+#: recorded in the same set because that set is what a completed row reports as
+#: having shaped it, and a reader needs to see that the row did more than its
+#: objective without concluding that it missed one. ``beta.40``.
+SHORTFALL_ABSORBING_FREE_PV: Final = "absorbing_free_pv"
 SHORTFALL_NONE: Final = "none"
+
+#: Stage A's verdict on whether keeping one more free kWh beats selling it, and
+#: why. **A pure price-and-value comparison** -- ``eta_rt * V > export_price`` --
+#: which is why it is named for retention rather than for absorption: the
+#: optimiser answers whether the energy is worth keeping and never how much of it
+#: the plant can physically take. That second question is Stage B's, and it is
+#: already answered by the one clamp that owns every physical limit.
+#:
+#: The refusals are as load-bearing as the grant: ``refused_export_superior`` is
+#: the tariff saying selling wins, which is the reason beta.40 is an economic
+#: preference and not a zero-export rule.
+#: row's own objective. **One published word per row**, and the refusals are as
+#: load-bearing as the grant: ``refused_export_superior`` is the tariff saying
+#: exporting is worth more than storing, which is a real economic answer and the
+#: reason ``beta.40`` is not a zero-export rule.
+RETENTION_GATE_AUTHORISED: Final = "authorised"
+RETENTION_GATE_EXPORT_SUPERIOR: Final = "refused_export_superior"
+RETENTION_GATE_VALUE_UNDEFINED: Final = "refused_value_undefined"
+RETENTION_GATE_NOT_A_CHARGE: Final = "refused_not_a_charge"
+RETENTION_GATE_NO_PRICE: Final = "refused_no_export_price"
+#: Live-side answer, and it is not Stage A's: no usable production reading means no
+#: measured surplus, so nothing can be earned. Fail-safe by arithmetic rather than
+#: by a special case -- the accrual already attributes an unreadable charge wholly
+#: to the grid.
+RETENTION_GATE_NO_PV: Final = "unavailable_no_pv"
+RETENTION_GATES: Final = frozenset(
+    {
+        RETENTION_GATE_AUTHORISED,
+        RETENTION_GATE_EXPORT_SUPERIOR,
+        RETENTION_GATE_VALUE_UNDEFINED,
+        RETENTION_GATE_NOT_A_CHARGE,
+        RETENTION_GATE_NO_PRICE,
+        RETENTION_GATE_NO_PV,
+    }
+)
 
 #: Stop reasons beta.27 adds. The quarter is the entitlement; the dead-man lease is
 #: not, and these exist so a stop can say which of the two ended the run.

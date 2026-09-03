@@ -19,7 +19,7 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.39` — a public beta.**
+> **Current release: `1.0.0-beta.40` — a public beta.**
 >
 > Stage A is feature-complete. Stage B — the physical execution controller — is
 > wired end to end and, from beta.24, **can charge your battery**. From beta.27 it
@@ -180,7 +180,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.39` is not offered.
+     dialog if `1.0.0-beta.40` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -910,6 +910,68 @@ gave it a different one — check **Developer tools → States** for the entity 
 The full audit trail is in the nested `today_accounting` attribute: the day's
 interval partition, both ends of the position, where the opening valuation came from
 and when, and the reconciliation error. It is also in the diagnostics download.
+
+### Keeping your own production instead of selling it (new in beta.40)
+
+On a sunny afternoon during a cheap-grid charge, the battery used to take only what
+its plan had asked for and let the rest of your production go to the meter. The
+plan was not wrong: it sized each quarter to the production it *forecast*, and when
+more sun arrived than forecast there was nowhere for it to go.
+
+Measured on the reference installation on 2026-09-03 at 12:14 — mid-campaign,
+everything working:
+
+| | |
+|---|---|
+| Production | 3.309 kW |
+| House | 0.792 kW |
+| **Spare production** | **2.517 kW** |
+| Going into the battery | 1.490 kW |
+| **Going out to the grid** | **0.942 kW** |
+
+with 12.6 kWh of room left in the pack, and 8.5 kWh of grid energy the same
+campaign still intended to *buy* later at 0.1745 EUR/kWh.
+
+`beta.40` lets the controller take that spare production instead, and the decision
+is a comparison rather than a rule. For each quarter the optimiser asks whether a
+kilowatt-hour is worth more kept than sold:
+
+    round-trip efficiency × what a stored kWh is worth  >  the export price
+
+On that quarter: `0.90 × 0.2237 = 0.2013` against an export price of `0.1013`, so
+keeping won by **0.10 EUR/kWh**. The battery went from 1.49 kW to 2.50 kW and the
+export went to almost nothing.
+
+**Where selling genuinely pays more, it sells.** There is no zero-export rule here.
+The comparison uses your own tariff, and on a quarter where the export price beats
+the round-tripped value of holding, the answer is to export — and the diagnostics
+say so, as `retention_gate: refused_export_superior`.
+
+**It can never buy anything.** The extra charging is capped at the production
+actually measured spare at that instant, so the meter can only ever move toward
+zero. Grid energy is still bought only where the plan authorised buying it, and the
+grid budget is untouched by this.
+
+Absorption also stops on its own terms: a full pack, the inverter's power limit, the
+production going away, or the quarter ending. Some export stays unavoidable — on
+that same day the reserve layer reported about 4 kWh of forecast surplus that simply
+would not fit.
+
+Nothing new appears on the two public sensors. The evidence is in the diagnostics
+download, on the executing quarter:
+
+| Field | What it says |
+|---|---|
+| `retention_authorised_this_quarter` | whether keeping spare production was worth it |
+| `absorption_gate` | why, in one word |
+| `battery_objective_realized_this_quarter_kwh` | what the plan asked for and got |
+| `battery_absorbed_extra_this_quarter_kwh` | spare production kept on top of it |
+| `battery_realized_this_quarter_kwh` | the two above, added |
+
+**A campaign is still judged on what it promised.** Spare production kept beyond a
+quarter's objective is real energy in the pack, and it is deliberately not counted
+as progress towards the campaign's target — otherwise a sunny afternoon would make a
+campaign report itself finished while it still had energy to buy.
 
 ### Safety, economics, or both (new in beta.39)
 

@@ -204,6 +204,11 @@ from .const import (
     REASON_CODE_PHYSICAL_SAFETY_BUY,
     REASON_CODE_RETAINED_ABOVE_EXPORT,
     REASON_CODE_VALUE_UNDEFINED,
+    RETENTION_GATE_AUTHORISED,
+    RETENTION_GATE_EXPORT_SUPERIOR,
+    RETENTION_GATE_NO_PRICE,
+    RETENTION_GATE_NOT_A_CHARGE,
+    RETENTION_GATE_VALUE_UNDEFINED,
     STORED_VALUE_UNDEFINED_BOTTOM_BUCKET,
     STORED_VALUE_UNDEFINED_NO_CURVE,
     STORED_VALUE_UNDEFINED_TOP_BUCKET,
@@ -4431,6 +4436,68 @@ def _safety_buy_runs(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class RetentionGate:
+    """Whether keeping one more free kWh beats selling it. **beta.40.**
+
+    **The economic half of the beta.40 envelope, and deliberately the whole of
+    Stage A's share of it.** The product goal is to stop exporting production the
+    household would rather keep -- but "would rather keep" is a comparison against
+    the tariff, not a preference, and on an interval where selling genuinely pays
+    more than storing, selling is the right answer and this gate says so.
+
+    The comparison, per interval:
+
+        keep beats sell   <=>   eta_charge * eta_discharge * V  >  export_price
+
+    ``V`` is the optimiser's **own dual** -- the gradient of its cost-to-go table
+    across one bucket, which is exactly "what is one more stored kWh worth to this
+    plan". Nothing is invented and no second model is introduced: it is the figure
+    the Economic Value sensor already publishes as
+    ``stored_energy_marginal_value_eur_kwh``, and it arrives as ``None`` with a
+    reason rather than a zero when the lattice cannot answer -- which becomes a
+    published refusal instead of a silent grant.
+
+    **It answers whether, never how much, and that boundary is the design.** How
+    much free production the plant can actually take is a question about inverter
+    power and pack headroom, and this module is forbidden to hold either: every
+    physical bound in this integration comes out of one clamp, because a second
+    copy is a second thing to keep in step and the first time the two disagreed it
+    would be the copy that got believed. Stage B already applies both bounds to
+    every charge it commands, so the magnitude needs no term here at all -- which
+    is why the published row carries a verdict and not a kilowatt-hour.
+
+    **The one approximation, stated rather than hidden.** ``V`` is read from the
+    *head* layer of the solve -- the worth of standing at this energy with the
+    whole horizon ahead -- so it is a single number applied to every row of the
+    schedule, while the export price it is compared against is per-interval and is
+    where the variation actually is. Stage A republishes every quarter and Stage B
+    freezes a row one refresh before it opens, so the row that ever executes is at
+    most one refresh stale -- the same staleness its objective already carries. A
+    per-interval dual would mean retaining every layer of the value table, and the
+    recursion discards them by design.
+    """
+
+    #: The optimiser's marginal worth of one stored kWh, EUR/kWh, or ``None`` when
+    #: the lattice cannot define it. ``None`` refuses; it never grants.
+    marginal_value_eur_kwh: float | None
+    #: Round-trip efficiency, applied once to the value side. A stored kWh comes
+    #: back smaller, and pretending otherwise would over-authorise every interval.
+    round_trip_efficiency: float
+
+    def verdict(self, export_price: float | None) -> tuple[bool, str]:
+        """Return whether this interval may keep free production, and why."""
+        if export_price is None:
+            return False, RETENTION_GATE_NO_PRICE
+        value = self.marginal_value_eur_kwh
+        if value is None:
+            return False, RETENTION_GATE_VALUE_UNDEFINED
+        if self.round_trip_efficiency * value <= export_price:
+            # The tariff's own answer: this kWh is worth more sold than kept.
+            return False, RETENTION_GATE_EXPORT_SUPERIOR
+        return True, RETENTION_GATE_AUTHORISED
+
+
 def quarter_schedule_for(
     intervals: tuple[EconomicInterval, ...],
     *,
@@ -4438,6 +4505,7 @@ def quarter_schedule_for(
     end_index: int,
     intent: str,
     moment: Any,
+    retention: RetentionGate | None = None,
 ) -> list[dict[str, Any]]:
     """Return the per-quarter execution rows for one run. **No new solve.**
 
@@ -4457,6 +4525,19 @@ def quarter_schedule_for(
     * ``grid_export_caused_kwh`` -- :attr:`marginal_grid_export_kwh`, attribution
       and diagnostics only. Using it as the objective would under-export by exactly
       the production the site was exporting anyway.
+
+    **A verdict since beta.40, and deliberately not a fourth quantity.**
+    ``retention_authorised`` says whether the tariff prefers *keeping* one more
+    free kWh this interval to selling it -- ``eta_rt * marginal_value >
+    export_price``, read off the optimiser's own dual. It authorises the
+    controller to raise the battery up to the **measured** production surplus and
+    no further, so it can never cause grid import.
+
+    How much the plant can physically take is not answered here and must not be:
+    inverter power and pack headroom are bounds this module is forbidden to hold,
+    because every physical limit in this integration comes out of one clamp.
+    ``retention == None`` publishes the pre-beta.40 shape exactly, which is what
+    makes a release that adds this provably move no decision on a plan without it.
     """
     rows: list[dict[str, Any]] = []
     for entry in intervals:
@@ -4505,24 +4586,43 @@ def quarter_schedule_for(
             not_executable = QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE
         elif objective_kwh < MIN_EXECUTABLE_QUARTER_KWH:
             not_executable = QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION
-        rows.append(
-            {
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-                "not_executable": not_executable,
-                "battery_kwh": _round_kwh(battery_kwh),
-                "grid_authorised_kwh": _round_kwh(
-                    max(0.0, entry.marginal_grid_import_kwh)
-                ),
-                "grid_export_target_kwh": _round_kwh(entry.grid_export_kwh),
-                "grid_export_caused_kwh": _round_kwh(
-                    max(0.0, entry.marginal_grid_export_kwh)
-                ),
-                "desired_grid_kw": _round_kw(
-                    (entry.grid_import_kwh - entry.grid_export_kwh) / INTERVAL_HOURS
-                ),
-            }
-        )
+        # **The economic verdict, and nothing physical.** A refusal publishes
+        # ``False``, which is what a pre-beta.40 row reads back as, so Stage B's
+        # free-production branch cannot fire on it. The verdict is frozen onto
+        # the row with everything else, so once a row opens no later publication
+        # can re-decide it.
+        retention_ok = False
+        retention_gate: str | None = None
+        if retention is not None:
+            if intent != EXECUTION_INTENT_GRID_CHARGE or not_executable is not None:
+                retention_gate = RETENTION_GATE_NOT_A_CHARGE
+            else:
+                retention_ok, retention_gate = retention.verdict(
+                    entry.export_price_eur_kwh
+                )
+        row: dict[str, Any] = {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "not_executable": not_executable,
+            "battery_kwh": _round_kwh(battery_kwh),
+            "grid_authorised_kwh": _round_kwh(max(0.0, entry.marginal_grid_import_kwh)),
+            "grid_export_target_kwh": _round_kwh(entry.grid_export_kwh),
+            "grid_export_caused_kwh": _round_kwh(
+                max(0.0, entry.marginal_grid_export_kwh)
+            ),
+            "desired_grid_kw": _round_kw(
+                (entry.grid_import_kwh - entry.grid_export_kwh) / INTERVAL_HOURS
+            ),
+        }
+        # **Omitted entirely without an envelope, not published as zero.** A caller
+        # that supplies no envelope gets the pre-beta.40 row shape byte for byte,
+        # which is what lets the whole beta.39 test surface keep asserting on these
+        # rows unchanged -- and absent is already the value ``_quarter_rows`` reads
+        # as "objective only".
+        if retention_gate is not None:
+            row["retention_authorised"] = retention_ok
+            row["retention_gate"] = retention_gate
+        rows.append(row)
     return rows
 
 
@@ -5966,6 +6066,7 @@ def execution_target(
     moment: Any = None,
     campaign_id: str | None = None,
     campaign_end: datetime | None = None,
+    retention: RetentionGate | None = None,
 ) -> dict[str, Any]:
     """Return the machine-readable target a future Stage B would consume.
 
@@ -6022,6 +6123,7 @@ def execution_target(
             end_index=run.end_index,
             intent=intent,
             moment=moment,
+            retention=retention,
         )
         if intervals and moment is not None
         else []
@@ -6097,6 +6199,20 @@ def execution_target(
         # the source.
         "quarter_schedule_source": (
             "solved_intervals" if intervals else "no_intervals_supplied"
+        ),
+        "retention_rule": (
+            "retention_authorised is Stage A's answer to one economic question: "
+            "is keeping one more kWh of free production worth more than selling "
+            "it, i.e. eta_rt * marginal_value_of_stored_energy > export_price. it "
+            "authorises Stage B to raise the battery up to the MEASURED "
+            "production surplus and no further, so it can never cause grid "
+            "import, and it bounds nothing physical -- inverter power and pack "
+            "headroom are applied by the single clamp that owns them. frozen "
+            "with the row: once a row opens the verdict is not re-decided, and a "
+            "later publication reaches only rows that have not opened. "
+            "retention_gate says why -- refused_export_superior is the tariff "
+            "answering that selling beats keeping, which is why this is an "
+            "economic preference and not a zero-export rule"
         ),
         "quarter_schedule_rule": (
             "one row per solved interval of this run. battery_kwh is the "

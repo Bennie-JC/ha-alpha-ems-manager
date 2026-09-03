@@ -283,8 +283,10 @@ from .const import (
     REASON_VOCABULARY_QUARTER_COMPLETION,
     REASON_VOCABULARY_RUN_STOP,
     REFUSE_MODE_NOT_ACTIVE,
+    RETENTION_GATE_NO_PV,
     SAFETY_SAMPLE_SECONDS,
     SELECT_INVERTER_AC_LIMIT,
+    SHORTFALL_ABSORBING_FREE_PV,
     SHORTFALL_NONE,
     SHORTFALL_QUARTER_EXPIRED,
     SHORTFALL_SENSOR_INCOHERENCE,
@@ -327,6 +329,7 @@ from .economic import (
     EconomicOutcome,
     ForecastRisk,
     IntervalPrice,
+    RetentionGate,
     TerminalValue,
     actionable_intervals,
     bucket_at_or_below_kwh,
@@ -2322,30 +2325,27 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self._quarter_target_reached_at is None:
                 self._quarter_target_reached_at = now
                 self._note_quarter_clamp(SHORTFALL_TARGET_REACHED)
-            scope = self._completion_scope(now)
-            if scope is None:
-                await self._async_hold_at_zero(
-                    now, snapshot, HOLD_REASON_QUARTER_SATISFIED
-                )
+            # **The third outcome, and beta.40 exists because of it.**
+            #
+            # A satisfied row is exactly where free production is guaranteed to
+            # leak: both outcomes below stop the battery, and beta.36 measured
+            # what Mode 2 at 0 kW actually does -- it is a *total* hold that
+            # suppresses charging as well as discharging, so 1.3 kW of
+            # production went to the meter while the pack had room. That is the
+            # right command for a row with nothing left to do and an
+            # indefensible one for a row still authorised to store free energy.
+            #
+            # So a satisfied objective with envelope left and surplus measured
+            # falls through to the ordinary setpoint path, where the absorption
+            # branch commands the surplus. Nothing else changes: the latch stays
+            # set, so the moment the surplus goes the next tick takes the
+            # beta.39 path and the row is satisfied and held exactly as before.
+            # No new lifecycle state, and no recovery path to invent.
+            if self._absorption_live(progress):
+                self._note_quarter_clamp(SHORTFALL_ABSORBING_FREE_PV)
+            else:
+                await self._async_finish_satisfied_row(now, snapshot)
                 return
-            await self._async_end_quarter(
-                now,
-                snapshot,
-                QUARTER_END_TARGET_REACHED,
-                SHORTFALL_TARGET_REACHED,
-                # **Name what is ending, not what scope it has.** With no campaign
-                # open -- an ordinary single-run charge -- "campaign objective
-                # reached" would be a claim about a thing that does not exist, and
-                # the surfaces would render a campaign success for a run.
-                stop_reason=(
-                    EXECUTION_STOP_CAMPAIGN_COMPLETE
-                    if self._campaign_id is not None
-                    else EXECUTION_STOP_QUARTER_TARGET_REACHED
-                ),
-                scope=scope,
-            )
-            self._note_tick(now, TICK_STOPPED_TARGET_REACHED, wrote=True)
-            return
 
         decision = self._dispatch_setpoint(now)
         if decision is None:
@@ -2369,6 +2369,25 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 now, snapshot, HOLD_REASON_RATE_BELOW_RESOLUTION
             )
             return
+        # **The absorbing row's own floor, and it is the safety net beta.40
+        # needs rather than a second policy.** The clause above is guarded on
+        # the latch, so once a row is satisfied it can no longer route a
+        # sub-resolution figure to a rest -- and a satisfied row that fell
+        # through to absorb can still arrive here at nearly zero, because a
+        # physical clamp it could not see took the command after
+        # ``_absorption_live`` said yes: headroom collapsing, the inverter
+        # limit, or the surplus going between the two reads.
+        #
+        # Whatever the cause, there is nothing left to absorb, so the row is
+        # finished on exactly the beta.39 path. Writing the trickle instead
+        # would command a figure the device cannot express.
+        if (
+            self._quarter is not None
+            and abs(decision.applied_kw) < CONTROL_MIN_POWER_KW
+            and self._quarter_target_reached_at is not None
+        ):
+            await self._async_finish_satisfied_row(now, snapshot)
+            return
         self._record_physical_decision(now, decision, coherence)
         if not decision.update_needed:
             self._note_tick(now, decision.update_reason)
@@ -2380,6 +2399,36 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._applied_setpoint_kw = decision.applied_kw
         self._note_tick(now, TICK_APPLIED, wrote=True)
+
+    async def _async_finish_satisfied_row(self, now: datetime, snapshot: Any) -> None:
+        """Hold or end a row whose own objective is met. **Unchanged beta.39.**
+
+        Extracted so beta.40's third outcome is a branch *around* this rather
+        than an edit *inside* it: the satisfied-row behaviour a reader has been
+        able to rely on since beta.36 is this function, byte for byte, and the
+        only new thing is that it is now reached one condition later.
+        """
+        scope = self._completion_scope(now)
+        if scope is None:
+            await self._async_hold_at_zero(now, snapshot, HOLD_REASON_QUARTER_SATISFIED)
+            return
+        await self._async_end_quarter(
+            now,
+            snapshot,
+            QUARTER_END_TARGET_REACHED,
+            SHORTFALL_TARGET_REACHED,
+            # **Name what is ending, not what scope it has.** With no campaign
+            # open -- an ordinary single-run charge -- "campaign objective
+            # reached" would be a claim about a thing that does not exist, and
+            # the surfaces would render a campaign success for a run.
+            stop_reason=(
+                EXECUTION_STOP_CAMPAIGN_COMPLETE
+                if self._campaign_id is not None
+                else EXECUTION_STOP_QUARTER_TARGET_REACHED
+            ),
+            scope=scope,
+        )
+        self._note_tick(now, TICK_STOPPED_TARGET_REACHED, wrote=True)
 
     async def _async_end_row(
         self,
@@ -2700,6 +2749,30 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "battery_realized_this_quarter_kwh": round(self._quarter_battery_kwh, 3),
             "battery_remaining_this_quarter_kwh": (
                 None if progress is None else round(progress.battery_remaining_kwh, 3)
+            ),
+            # **The split, beta.40.** The realised figure above is every kWh
+            # the pack took; these two say how much of it the row promised and
+            # how much was free production stored under its envelope. They sum
+            # to it exactly, which is the invariant a reader can check.
+            "battery_objective_realized_this_quarter_kwh": round(
+                self._quarter_objective_kwh, 3
+            ),
+            "battery_absorbed_extra_this_quarter_kwh": round(
+                self._quarter_absorbed_kwh, 3
+            ),
+            "retention_authorised_this_quarter": (
+                None if quarter is None else quarter.absorption_authorised()
+            ),
+            "absorption_gate": self._absorption_gate_now(quarter),
+            "absorption_rule": (
+                "objective and absorbed sum to realised. the objective is "
+                "what the row promised and is the only figure a campaign is "
+                "judged on; absorbed is free production kept under Stage A's "
+                "retention verdict, which is real energy and is not progress "
+                "against a promise the row never made. the verdict is economic "
+                "only -- eta_rt * marginal_value > export_price -- and the "
+                "controller bounds it by the measured surplus, so it can never "
+                "cause grid import"
             ),
             "grid_target_this_quarter_kwh": (
                 None
@@ -4323,6 +4396,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if pv_w is None or load_w is None:
                 # Conservative: attribute the whole charge to the grid, so the
                 # ceiling binds earlier. A budget exists to bound buying.
+                #
+                # **beta.40 leans on this rather than special-casing it.** With
+                # no readable surplus the grid share is the whole charge and the
+                # absorption branch has nothing to earn, so a site without a
+                # usable production entity gets no opportunistic absorption --
+                # by arithmetic rather than by a special case.
                 surplus_kw = 0.0
             else:
                 surplus_kw = max(0.0, (pv_w - load_w) / 1000.0)
@@ -4349,10 +4428,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             grid_remaining = quarter.grid_authorised_kwh - self._quarter_grid_import_kwh
         return QuarterProgress(
             seconds_remaining=quarter.seconds_remaining(now),
+            # **Objective-attributed, beta.40.** Free production stored above
+            # the objective must not reduce what the objective still owes, or a
+            # row would report itself finished on energy it never promised.
             battery_remaining_kwh=max(
-                0.0, quarter.battery_allowance_kwh() - self._quarter_battery_kwh
+                0.0, quarter.battery_allowance_kwh() - self._quarter_objective_kwh
             ),
             grid_remaining_kwh=max(0.0, grid_remaining),
+            # **Stage A's frozen verdict, beta.40.** Whether the tariff prefers
+            # keeping free production to selling it. How much of it the plant can
+            # take is bounded by the physical clamps, not from here.
+            retention_authorised=quarter.absorption_authorised(),
         )
 
     @callback
@@ -4448,7 +4534,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return 0.0
         if row.intent == EXECUTION_INTENT_NET_EXPORT:
             return self._quarter_grid_export_kwh
-        return self._quarter_battery_kwh
+        # **The objective's share, not the whole charge. beta.40.** Absorbed
+        # free production is real energy in the pack and is reported as such,
+        # but it is not progress against this row's promise -- and this figure
+        # is what a campaign's realised total is summed from.
+        return self._quarter_objective_kwh
 
     @callback
     def _campaign_row_is_final(
@@ -4528,10 +4618,136 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return STOP_SCOPE_CAMPAIGN
         return None
 
+    @property
+    def _quarter_objective_kwh(self) -> float:
+        """Return the open row's realised **objective**. beta.40.
+
+        ``_quarter_battery_kwh`` is every kWh the pack took. This is the part of
+        it the row promised, and :attr:`_quarter_absorbed_kwh` is the rest --
+        free production stored under the row's envelope, which is real energy
+        and is *not* progress against a promise the row never made. The two sum
+        to the total exactly, by construction.
+
+        **Derived rather than integrated, and that is a proof rather than a
+        shortcut.** Crediting the objective first and capping it hard gives, for
+        a total ``T`` and a frozen allowance ``A``:
+
+            obj(0) = 0,  obj(n+1) = obj(n) + min(step, A - obj(n))
+                    =>  obj = min(T, A)
+
+        so a running sum would hold nothing this expression does not, and the
+        equality needs only that ``A`` not move while the row is open. It cannot:
+        an opened quarter's allowance is frozen at admission and no later
+        publication can enlarge or reduce it -- the beta.27 invariant, held by
+        ``test_beta27_quarter_authority``.
+
+        Deriving it therefore buys the same semantics with no second accumulator
+        to reset, capture, restore or lose across a stop -- and the capture
+        tuples this class holds are positional.
+        """
+        quarter = self._quarter
+        if quarter is None:
+            return self._quarter_battery_kwh
+        if quarter.intent == EXECUTION_INTENT_NET_EXPORT:
+            # An export has no absorption envelope -- there is no such thing as
+            # free production to discharge -- so its whole movement is objective.
+            return self._quarter_battery_kwh
+        return min(self._quarter_battery_kwh, quarter.battery_allowance_kwh())
+
+    @property
+    def _quarter_absorbed_kwh(self) -> float:
+        """Return free production stored above the row's objective. beta.40."""
+        return max(0.0, self._quarter_battery_kwh - self._quarter_objective_kwh)
+
     @callback
-    def _quarter_is_satisfied(self) -> bool:
-        """Return whether the open row's own objective has already been met."""
-        return self._quarter is not None and self._quarter_target_reached_at is not None
+    def _measured_pv_surplus_kw(self) -> float | None:
+        """Return measured production above the house, or ``None`` if unknown.
+
+        **The authoritative reading for beta.40, and it is deliberately the
+        entity one.** ``_live_kw`` treats an absent production sensor as zero,
+        which is right for a controller correcting a *commanded* figure and
+        wrong for granting authority: a zero-filled surplus would look like a
+        measurement. Here absent is ``None`` and ``None`` earns nothing, on the
+        same terms the accrual already attributes an unreadable charge wholly to
+        the grid.
+
+        Open-loop by construction: production less house load, never the meter.
+        The meter would be the tighter signal and is unusable -- absorbing
+        reduces the export that authorised it, so the authority would chase its
+        own effect.
+        """
+        pv_w = self._read_pv_power_w()
+        load_w = self._read_house_load_w()
+        if pv_w is None or load_w is None:
+            return None
+        return max(0.0, (pv_w - load_w) / 1000.0)
+
+    @callback
+    def _absorption_gate_now(self, quarter: CarriedQuarter | None) -> str | None:
+        """Return the gate word for the open row, live reading included.
+
+        Stage A's frozen verdict, except where the live side has already overruled
+        it: with no readable production there is no measured surplus to earn
+        anything, whatever the plan authorised. Reported rather than inferred, so
+        a reader never has to work out from a zero whether the tariff refused or
+        the sensor did.
+        """
+        if quarter is None:
+            return None
+        if self._measured_pv_surplus_kw() is None:
+            return RETENTION_GATE_NO_PV
+        return quarter.retention_gate
+
+    @callback
+    def _absorption_live(self, progress: QuarterProgress) -> bool:
+        """Return whether free production may still be stored under this row.
+
+        The condition that keeps a satisfied row charging instead of holding at
+        zero. Every clause is necessary and one of them is subtle:
+
+        * Stage A must have authorised keeping it, on this row, before it opened;
+        * production must be *measured*, not assumed. ``None`` is a refusal;
+        * the surplus must clear the actuator's own minimum. Without this clause
+          the target-reached latch would suppress the below-resolution hold and
+          leave the tick writing a command the device cannot express -- a trickle
+          instead of a rest;
+        * the pack must have somewhere to put it, **read live**.
+
+        The last clause is measured rather than taken from ``battery_plan``, and
+        that is deliberate. The plan's state is rebuilt on the economic cadence, so
+        on the physical one it can be a quarter of an hour old -- and a quarter of
+        an hour at the surplus this branch is willing to command is exactly long
+        enough to fill the room the stale figure is reporting. The state of charge
+        is read every tick anyway, and it is the pack's own physical state.
+        """
+        quarter = self._quarter
+        if quarter is None or quarter.intent == EXECUTION_INTENT_NET_EXPORT:
+            return False
+        if not progress.retention_authorised:
+            return False
+        surplus_kw = self._measured_pv_surplus_kw()
+        if surplus_kw is None or surplus_kw < CONTROL_MIN_POWER_KW:
+            return False
+        soc_percent = self._read_soc_percent()
+        if soc_percent is None:
+            # An unknown pack is not an empty one. No reading, no absorption.
+            return False
+        return soc_percent < BATTERY_MAX_SOC_PERCENT
+
+    @callback
+    def _quarter_is_satisfied(self, now: datetime) -> bool:
+        """Return whether the open row is done and has nothing left to do.
+
+        **Satisfied *and* not absorbing, since beta.40.** The refresh path reads
+        this to command zero, and a row whose objective is met while it is still
+        storing free production is not finished -- answering ``True`` there would
+        write a zero straight over a live absorption on the economic cadence,
+        undoing on the quarter boundary exactly what the tick had just done.
+        """
+        if self._quarter is None or self._quarter_target_reached_at is None:
+            return False
+        progress = self._quarter_progress(now)
+        return progress is None or not self._absorption_live(progress)
 
     @callback
     def _row_provenance(self, row_start: datetime | None) -> dict[str, Any] | None:
@@ -4696,7 +4912,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Against the objective, never the ceiling: unspent grid authorisation on a
         # charge is not a shortfall, it is production having paid for the charge.
         planned = planned_grid if export else planned_battery
-        realised = realised_grid if export else self._quarter_battery_kwh
+        # **The objective's share, beta.40.** Judging a row's shortfall against
+        # every kWh the pack took would let absorbed free production paper over
+        # an objective the row genuinely missed -- and this same figure is what
+        # the campaign accumulator below is advanced by.
+        realised = realised_grid if export else self._quarter_objective_kwh
         shortfall = max(0.0, planned - realised)
         mean_kw = (
             0.0
@@ -4722,6 +4942,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "intent": quarter.intent,
                 "planned_battery_kwh": round(planned_battery, 3),
                 "realized_battery_kwh": round(self._quarter_battery_kwh, 3),
+                # beta.40: the split of the figure above. They sum to it.
+                "objective_battery_kwh": round(self._quarter_objective_kwh, 3),
+                "absorbed_extra_kwh": round(self._quarter_absorbed_kwh, 3),
+                "retention_authorised": quarter.retention_authorised,
+                "absorption_gate": quarter.retention_gate,
                 "planned_grid_kwh": round(planned_grid, 3),
                 "realized_grid_kwh": round(realised_grid, 3),
                 "shortfall_kwh": round(shortfall, 3),
@@ -4845,7 +5070,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return 0.0
         if quarter.intent == EXECUTION_INTENT_NET_EXPORT:
             return self._quarter_grid_export_kwh
-        return self._quarter_battery_kwh
+        # Objective-attributed, beta.40: see ``_row_objective_kwh``. A campaign
+        # counting absorbed production towards its frozen target would read
+        # itself complete while it still had energy to buy, and terminate.
+        return self._quarter_objective_kwh
 
     @callback
     def _campaign_realized_now(self) -> float:
@@ -7114,7 +7342,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # ``setpoint.applied_kw`` on a satisfied row would pick up the
             # deadband-substituted *held* value, so a "hold" could arrive carrying
             # 0.1 kW and keep charging a met objective for the rest of the quarter.
-            satisfied = self._quarter_is_satisfied()
+            satisfied = self._quarter_is_satisfied(now)
             if satisfied:
                 setpoint = None
             rate_kw = 0.0 if setpoint is None else abs(setpoint.applied_kw)
@@ -8424,6 +8652,40 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return None, None, None
             return max(0.0, ceiling - end_energy), end_energy, absorbs_at
 
+        # **The retention gate, built once per refresh. beta.40.**
+        #
+        # Purely economic: does the tariff prefer keeping one more free kWh to
+        # selling it. Nothing physical enters it, because how much production the
+        # plant can take is bounded by the one clamp that owns every physical
+        # limit, and Stage B applies that clamp to every charge it commands.
+        #
+        # ``None`` publishes the pre-beta.40 row shape and is what a site with no
+        # readable limits or no value curve gets -- absent rather than zero, on
+        # the same terms as every other optional figure in this contract.
+        retention: RetentionGate | None = None
+        limits = None if plan is None or plan.state is None else plan.state.limits
+        if (
+            limits is not None
+            and outcome.bucket_kwh > 0.0
+            and outcome.desired.intervals
+        ):
+            # The optimiser's own dual at the head of this solve, which is the
+            # layer whose value has the whole horizon still ahead. ``None`` with a
+            # reason is a defined answer and becomes a published refusal.
+            marginal, _reason = outcome.desired.marginal_value_eur_per_kwh(
+                bucket_at_or_below_kwh(
+                    outcome.desired.intervals[0].start_energy_dc_kwh,
+                    bucket_kwh=outcome.bucket_kwh,
+                ),
+                bucket_kwh=outcome.bucket_kwh,
+            )
+            retention = RetentionGate(
+                marginal_value_eur_kwh=marginal,
+                round_trip_efficiency=(
+                    limits.charge_efficiency * limits.discharge_efficiency
+                ),
+            )
+
         # **Which campaign each run belongs to, resolved to absolute time here.**
         #
         # This is the wiring beta.32 shipped without, and its absence starved the
@@ -8507,6 +8769,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 moment=moment,
                 campaign_id=campaign_of.get(run.start_index, (None, None))[0],
                 campaign_end=campaign_of.get(run.start_index, (None, None))[1],
+                retention=retention,
             )
             target["revision"] = execution_revision(
                 previous.get(target["plan_id"]), target

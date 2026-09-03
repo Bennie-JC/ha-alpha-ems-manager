@@ -712,6 +712,22 @@ class QuarterRow:
     #: against a 0.025 kWh minimum delivery. Such a row stays visible in the
     #: economics and is never armed.
     not_executable: str | None = None
+    #: Whether Stage A's tariff comparison authorised **keeping** free production
+    #: this interval rather than exporting it. beta.40.
+    #:
+    #: A verdict and not a magnitude, because the magnitude is a question about
+    #: inverter power and pack headroom and Stage B already bounds every charge by
+    #: both. Authorising it lets the controller raise the battery **up to the
+    #: measured production surplus and no further**, so it can never cause a watt
+    #: of grid import.
+    #:
+    #: ``False`` is the inert value and is what every pre-beta.40 publication
+    #: reads back as, which is what makes a plan carrying no verdict behave
+    #: exactly as beta.39 did.
+    retention_authorised: bool = False
+    #: Why, from :data:`RETENTION_GATES`. Diagnostics only -- the authority is the
+    #: flag above, frozen onto the row with everything else.
+    retention_gate: str | None = None
 
     def objective_kwh(self, intent: str) -> float:
         """Return the figure this row is trying to realise, per intent.
@@ -744,6 +760,13 @@ class QuarterRow:
             "desired_grid_kw": round(self.desired_grid_kw, 3),
             "executable": self.executable,
             "not_executable": self.not_executable,
+            # **Part of the round trip, not decoration.** ``target_as_published``
+            # feeds this dict into the persisted claim record, and its own
+            # docstring asserts ``parse_target(target_as_published(t)) == t`` -- a
+            # serialiser that dropped the verdict would restore a row that had
+            # lost its authority to keep free production across a restart.
+            "retention_authorised": self.retention_authorised,
+            "retention_gate": self.retention_gate,
         }
 
 
@@ -785,6 +808,17 @@ def _quarter_rows(raw: Any) -> tuple[QuarterRow, ...]:
                 not_executable=(
                     reason
                     if isinstance(reason := entry.get("not_executable"), str) and reason
+                    else None
+                ),
+                # **Absent means unauthorised, which is beta.39 behaviour.** A
+                # beta.39 publication and a beta.39 claim record both lack the
+                # key, and both must read back as a refusal rather than as a
+                # grant -- the conservative direction, and the only one that
+                # keeps an upgrade from changing what a stored row authorises.
+                retention_authorised=entry.get("retention_authorised") is True,
+                retention_gate=(
+                    gate
+                    if isinstance(gate := entry.get("retention_gate"), str) and gate
                     else None
                 ),
             )
@@ -856,6 +890,11 @@ class CarriedQuarter:
     #: The campaign this quarter belongs to, frozen at admission with everything
     #: else. ``None`` on a pre-beta.32 record; absent means run-level behaviour.
     campaign_id: str | None = None
+    #: Whether Stage A authorised keeping free production in this quarter rather
+    #: than exporting it, frozen at admission with everything else. beta.40.
+    retention_authorised: bool = False
+    #: Stage A's frozen reason. Diagnostics only.
+    retention_gate: str | None = None
 
     def covers(self, moment: datetime) -> bool:
         """Return whether this quarter is the one in progress at ``moment``."""
@@ -891,6 +930,34 @@ class CarriedQuarter:
             allowance = min(allowance, max(0.0, self.frozen_remaining_at_admission_kwh))
         return allowance
 
+    def absorption_authorised(self) -> bool:
+        """Return whether this quarter may keep free production. **beta.40.**
+
+        **Stage A's frozen verdict, bounded by nothing else here** -- and the
+        second half is the decision, not an omission.
+
+        :attr:`frozen_remaining_at_admission_kwh` and the run-level forward
+        allowance both exist to bound **grid purchase**: to stop a later
+        publication growing a buy, and to let a replan shrink one that has not
+        happened yet. Neither applies to this. The authority granted here is over
+        production that is free by measurement, and the controller bounds it by the
+        measured surplus, so it provably causes no import -- there is nothing to
+        bound, reducing it cannot save a cent, and it can only throw away energy
+        the tariff already said was worth keeping.
+
+        Applying that machinery would also break the beta.38 invariant outright: an
+        ordinary rolling replan carrying a slightly different production forecast
+        would silently revoke an open row's authority, which is the class of defect
+        beta.38 was released to close. So an opened row keeps the verdict it opened
+        with, and a later publication reaches only rows not yet open.
+
+        **How much** is not asked here and never was: inverter power and pack
+        headroom are physical bounds, they are applied to every charge Stage B
+        commands by the one clamp that owns them, and a second copy would be a
+        second thing to keep in step.
+        """
+        return self.retention_authorised
+
     def as_dict(self) -> dict[str, Any]:
         """Return the bounded diagnostics form."""
         return {
@@ -906,6 +973,8 @@ class CarriedQuarter:
             "revision": self.revision,
             "admitted_at": self.admitted_at.isoformat(),
             "frozen_remaining_at_admission_kwh": self.frozen_remaining_at_admission_kwh,
+            "retention_authorised": self.retention_authorised,
+            "retention_gate": self.retention_gate,
             "authority_rule": (
                 "frozen before the quarter opens and economically immutable once "
                 "it has. a parent run ending or rolling does not cancel it; only "
@@ -1057,6 +1126,8 @@ class AdmittedPlan:
             admitted_at=self.admitted_at,
             frozen_remaining_at_admission_kwh=(self.frozen_remaining_at_admission_kwh),
             campaign_id=self.campaign_id,
+            retention_authorised=row.retention_authorised,
+            retention_gate=row.retention_gate,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -1258,6 +1329,8 @@ def admit_quarter(
         admitted_at=now,
         frozen_remaining_at_admission_kwh=frozen_remaining_kwh,
         campaign_id=campaign_id,
+        retention_authorised=row.retention_authorised,
+        retention_gate=row.retention_gate,
     )
 
 
