@@ -194,6 +194,8 @@ from .const import (
     MODE_CHARGE,
     MODE_DISCHARGE,
     MODE_IDLE,
+    PLAN_END_ENERGY_BASIS_AMBIENT_WALK,
+    PLAN_END_ENERGY_BASIS_LATTICE_STATE,
     QUARTER_NOT_EXECUTABLE_INTENT,
     QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE,
     QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION,
@@ -1356,7 +1358,29 @@ class EconomicPlan:
 
     @property
     def end_energy_dc_kwh(self) -> float:
-        """Return the stored energy the plan ends at."""
+        """Return where the **reported** walk ends. Not the decided state.
+
+        **Two different quantities, and beta.40 is the release that says so.**
+
+        ``start_energy_dc_kwh`` is the ambient-corrected continuous walk: it is
+        reduced every interval by ``ambient_self_consumption_ac_kwh``, the pack
+        feeding the house with no decision involved. ``battery_delta_dc_kwh`` is
+        the *lattice* move the recursion actually chose. The two live in different
+        resolutions on purpose -- 0.105 kWh of ambient discharge against a
+        0.264 kWh bucket is not representable, which is the deferred limitation
+        the reserve block has recorded since beta.31 -- so this sum is a
+        **diagnostic projection**, never the trajectory the optimiser decided.
+
+        The gap is not small. On a no-production horizon the recursion holds one
+        bucket for 76 intervals while this figure walks 5.7975 down to 1.5421,
+        below the configured hard floor, with ``violation_kwh`` correctly 0.0:
+        violations are evaluated on the lattice state, which never moved.
+
+        **The decided endpoint is :attr:`edge_energy_kwh`**, which is a lattice
+        energy by construction and is what the terminal credit was priced on. Use
+        that to ask where the plan ends; ``tests/test_beta40_hard_floor.py``
+        asserts the identity and the ordering between the two.
+        """
         if not self.intervals:
             return 0.0
         last = self.intervals[-1]
@@ -6014,7 +6038,28 @@ def _plan_totals(plan: EconomicPlan) -> dict[str, Any]:
         # between discharge and export under a varying house load, so the run
         # count is an upper bound on switches and never the switches themselves.
         "direction_changes": plan.direction_changes,
+        # **A projection, and named as one. beta.40.** Ambient self-consumption is
+        # applied to the reported walk but is not a lattice transition, so this
+        # figure can sit below the configured hard floor while the plan's own
+        # decisions never do -- and ``reserve_violation_kwh`` is 0.0 in that case
+        # because violations are evaluated on the decided state. The endpoint the
+        # optimiser actually chose is ``planned_end_energy_dc_kwh``.
         "end_energy_dc_kwh": _round_kwh(plan.end_energy_dc_kwh),
+        "end_energy_basis": PLAN_END_ENERGY_BASIS_AMBIENT_WALK,
+        "planned_end_energy_dc_kwh": _round_kwh(plan.edge_energy_kwh),
+        "planned_end_energy_basis": PLAN_END_ENERGY_BASIS_LATTICE_STATE,
+        "end_energy_rule": (
+            "end_energy_dc_kwh is the ambient-corrected reported walk and is a "
+            "diagnostic projection: it is reduced every interval by ambient "
+            "self-consumption, which is real discharge but is not a lattice "
+            "transition, so it can fall below the configured hard floor while the "
+            "plan decided nothing of the kind. planned_end_energy_dc_kwh is the "
+            "energy the recursion actually ends on, is a lattice level by "
+            "construction, and is the figure the terminal credit was priced on. "
+            "reserve_violation_kwh is measured against the decided state, which "
+            "is why it is 0.0 while the projection sits lower. neither figure is "
+            "an executable target -- Stage B executes the quarter schedule"
+        ),
     }
 
 

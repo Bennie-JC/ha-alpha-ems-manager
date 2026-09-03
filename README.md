@@ -973,6 +973,36 @@ quarter's objective is real energy in the pack, and it is deliberately not count
 as progress towards the campaign's target — otherwise a sunny afternoon would make a
 campaign report itself finished while it still had energy to buy.
 
+### Buying at the pace the plan chose (new in beta.40)
+
+When the optimiser decides to buy cheap grid energy, it concentrates that
+purchase into the cheapest quarters of the window and asks for full charging
+power there. Until `beta.40` the controller quietly spread the run's remaining
+grid budget as a flat average over the rest of the run, and that average then
+capped the battery in every quarter — including the ones the plan had sized for
+full power.
+
+Measured on the reference installation on 2026-09-03: a campaign planned for
+13.10 kWh delivered 5.94 kWh, and finished with **5.08 kWh of grid energy it was
+authorised to buy and never bought**. The three quarters the plan had sized at
+10 kW ran at 3.4–4.4 kW.
+
+Each quarter now charges at the rate its own authorisation permits, still bounded
+by the run's total budget. **Nothing catches up**: energy missed in a quarter that
+has closed is never bought later — each quarter is limited by the figure frozen
+for it, and that figure never changes.
+
+### Campaigns that fall short now say so (new in beta.40)
+
+A charge campaign that ran to the end of its window without delivering its target
+used to report `campaign_objective_reached`, beside an outcome of `Partial` that
+was correct. The two disagreed, and the reason was the one you would have
+believed.
+
+A campaign now reports `campaign_objective_reached` only when the target really
+was met, and `window_ended` when the window simply ran out. The outcome, the
+figures and the tolerance are all unchanged.
+
 ### Safety, economics, or both (new in beta.39)
 
 A charge campaign can have two reasons at once, and until `beta.39` it could only

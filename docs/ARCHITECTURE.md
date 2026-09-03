@@ -3486,6 +3486,60 @@ the tick writing a trickle the device cannot express. And the pack's room is rea
 rebuilt on the economic cadence — a quarter of an hour at the surplus this branch
 will command is long enough to fill the room a stale figure still reports.
 
+### The run budget is an energy, not a pace
+
+`grid_authorised_kwh` on the row is Stage A's per-row grid budget and paces the row
+through `progress.grid_rate_kw`. The *run's* remaining budget exists to stop the
+total being exceeded — and until `beta.40` `_charge_limits` expressed it as
+`remaining / run_remaining_hours`, a flat average, which `decide_charge` then folded
+into `battery_cap_kw` and applied as an instantaneous cap.
+
+That is the `beta.36` defect one level up. `beta.36` stopped the row's own grid
+authorisation capping battery power; the run's average was still doing it. Measured
+on 2026-09-03 it throttled the three rows Stage A had sized at full inverter power to
+34–44 % of the power they needed, each predicted by `pace + measured surplus` to
+within 0.5–2.8 %, and left 5.076 kWh of authorised purchase unspent on a campaign
+that delivered 5.939 of 13.100 kWh.
+
+The run figure is now expressed at the **open row's** clock, so it permits at most its
+remaining budget across that row and binds only when the budget is genuinely nearly
+spent. The total is unchanged — `revised` is recomputed every tick from measured
+`grid_charged_kwh` — and it is not catch-up, because each row is bounded by its own
+frozen authorisation first.
+
+### A campaign scope is not a campaign reason
+
+`_completion_scope` answers "what does this stop end?" and returns `campaign` for two
+different endings: the objective was delivered, or the last planned row closed without
+it. One scope is right for both — the same dispatch stops — but
+`campaign_objective_reached` is a claim about the objective, and only one ending
+supports it.
+
+`_campaign_stop_reason` now decides from the energy, at the same tolerance the terminal
+verdict and the scope test use, and returns `window_ended` for a short window. That
+reason already existed and is already a completion reason, so the outcome mapping is
+untouched: a short campaign is `partial`, never `canceled`.
+
+### Two plan endpoints, and only one is a decision
+
+`end_energy_dc_kwh` is the ambient-corrected reported walk. `start_energy_dc_kwh` is
+reduced every interval by `ambient_self_consumption_ac_kwh`, while
+`battery_delta_dc_kwh` — the lattice move the recursion chose — is not. The two are
+in different resolutions deliberately: 0.105 kWh of ambient discharge against a
+0.264 kWh bucket is not representable.
+
+So the projection can sit below the configured hard floor while the plan decided
+nothing of the kind, and `violation_kwh` is correctly 0.0 because violations are
+evaluated on the decided state. `edge_energy_kwh` **is** that decided state — proven
+equal to the lattice walk's endpoint in all seven horizon shapes — and it is the
+figure the terminal credit was priced on.
+
+Swept over 250 solves, the decided trajectory never discharges below the configured
+floor and never below where it started. The only sub-floor levels are the seed's own
+downward quantisation (`bucket_at_or_below` models a measured 4.32 kWh as 4.2164), and
+the plan holds there rather than digging deeper. Both endpoints are now published with
+their basis named.
+
 ### Known open items — Phase 8 Stage B
 
 **The dual is read at the head layer only.** `V` is the worth of standing at this

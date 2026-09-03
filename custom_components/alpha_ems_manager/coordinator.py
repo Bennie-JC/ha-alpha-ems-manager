@@ -156,6 +156,7 @@ from .const import (
     CONTROL_STATE_IDLE,
     CONTROL_STATE_INHIBITED,
     CONTROL_STATE_OFF,
+    CONTROL_TICK_ENERGY_HORIZON_SECONDS,
     DEFAULT_ALLOW_BATTERY_EXPORT,
     DEFAULT_ALLOW_GRID_CHARGING,
     DEFAULT_BATTERY_MIN_SOC_PERCENT,
@@ -2421,10 +2422,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # open -- an ordinary single-run charge -- "campaign objective
             # reached" would be a claim about a thing that does not exist, and
             # the surfaces would render a campaign success for a run.
-            stop_reason=(
-                EXECUTION_STOP_CAMPAIGN_COMPLETE
-                if self._campaign_id is not None
-                else EXECUTION_STOP_QUARTER_TARGET_REACHED
+            stop_reason=self._campaign_stop_reason(
+                EXECUTION_STOP_QUARTER_TARGET_REACHED
             ),
             scope=scope,
         )
@@ -2469,8 +2468,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 now,
                 snapshot,
                 (
-                    EXECUTION_STOP_CAMPAIGN_COMPLETE
-                    if scope == STOP_SCOPE_CAMPAIGN and self._campaign_id is not None
+                    self._campaign_stop_reason(EXECUTION_STOP_QUARTER_EXPIRED)
+                    if scope == STOP_SCOPE_CAMPAIGN
                     else EXECUTION_STOP_QUARTER_EXPIRED
                 ),
                 scope=scope or STOP_SCOPE_ROW,
@@ -4611,6 +4610,63 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return True
 
     @callback
+    @callback
+    def _campaign_stop_reason(self, row_reason: str) -> str:
+        """Return the truthful reason a campaign-scoped stop should carry. beta.40.
+
+        Three outcomes, and each names what actually happened:
+
+        * no campaign open -- the row's own reason. "Campaign objective reached"
+          would be a claim about a thing that does not exist, and the surfaces
+          would render a campaign success for a single-run charge;
+        * campaign open and the objective satisfied within tolerance --
+          ``campaign_objective_reached``, which is then true;
+        * campaign open and the window ended short -- ``window_ended``, which
+          already exists, already means exactly this, and is already in
+          :data:`EXECUTION_COMPLETION_STOP_REASONS`, so the outcome mapping in
+          :meth:`_close_campaign` is unchanged and a short campaign still files
+          ``partial`` rather than ``canceled``.
+
+        No new vocabulary: a synonym for a reason the codebase already has would
+        be a sixth alias for a reader to disambiguate.
+        """
+        if self._campaign_id is None:
+            return row_reason
+        if self._campaign_objective_met():
+            return EXECUTION_STOP_CAMPAIGN_COMPLETE
+        return EXECUTION_STOP_WINDOW_ENDED
+
+    @callback
+    def _campaign_objective_met(self) -> bool:
+        """Return whether the frozen campaign objective is actually satisfied.
+
+        **The question ``_completion_scope`` answers with a shrug. beta.40.**
+
+        A campaign-scoped stop has two entirely different causes: the objective was
+        delivered, or the last planned row closed without it. Both are legitimate
+        endings and both stop the same dispatch, so the *scope* is rightly the same
+        -- but the published *reason* is a claim about the objective, and until
+        beta.40 both causes published ``campaign_objective_reached``.
+
+        The 2026-09-03 campaign is what that looks like: 23 of 23 rows completed,
+        so the schedule was final and the scope was correct, while the objective
+        stood at **5.939 of 13.100 kWh**. ``outcome`` said ``partial`` -- it is
+        computed here from the energy and was always right -- and ``reason`` said
+        the objective had been reached. A reader trusting the reason would have
+        recorded a 45 %-delivered campaign as a success.
+
+        Same tolerance as the terminal verdict and the scope test, deliberately:
+        three places asking one question must not each pick their own answer.
+        """
+        frozen = self._campaign_frozen_target_kwh
+        if frozen is None or frozen <= 0.0:
+            # No objective was ever published, so none can have been reached.
+            return False
+        tolerance = self._completion_tolerance_kwh(
+            frozen, self._campaign_quarters_admitted
+        )
+        return self._campaign_realized_now() >= frozen - tolerance
+
     def _completion_scope(
         self, now: datetime, *, ending: CarriedQuarter | None = None
     ) -> str | None:
@@ -5792,7 +5848,52 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 frozen_remaining_kwh=remaining_kwh,
                 forward=self._forward,
             )
+            # **An energy ceiling, expressed at the row's own clock -- not a pace
+            # across the whole run. beta.40, and this one cost 5.076 kWh.**
+            #
+            # Dividing the run's remaining budget by the *run's* remaining time
+            # makes it a flat average rate, and that rate then caps the battery
+            # through ``battery_cap_kw`` in every individual row. On the
+            # 2026-09-03 campaign it throttled exactly the three rows Stage A had
+            # deliberately sized at full inverter power:
+            #
+            #     row 11:45  needed 10.00 kW, row authorised 9.08, pace 2.73
+            #                -> observed mean 3.40 kW, delivered 0.795 of 2.50
+            #     row 12:15  needed 10.00 kW, row authorised 9.28, pace 2.99
+            #                -> observed mean 3.46 kW, delivered 0.808 of 2.50
+            #     row 13:00  needed 10.00 kW, row authorised 9.84, pace 3.78
+            #                -> observed mean 4.38 kW, delivered 1.021 of 2.50
+            #
+            # each predicted from ``pace + measured surplus`` to within 0.5-2.8 %.
+            # The campaign realised 5.939 of 13.100 kWh and left **5.076 kWh of
+            # authorised grid purchase unspent** -- the budget was never the
+            # binding constraint, its pace was.
+            #
+            # **It is the beta.36 defect one level up.** beta.36 stopped the
+            # *row's* grid authorisation capping battery power; the *run's*
+            # remaining budget was still doing it, as an average. A budget is an
+            # energy, and the honest rate it permits is the rate that would spend
+            # it inside the row now executing -- which is exactly the shape the
+            # other two remainders already have, and Stage A's own per-row
+            # ``grid_authorised_kwh`` still paces each row through
+            # ``progress.grid_rate_kw``.
+            #
+            # The total stays bounded exactly: across the open row this permits at
+            # most ``revised`` kWh, and ``revised`` is recomputed every tick from
+            # measured ``grid_charged_kwh``. It is emphatically **not** catch-up --
+            # energy missed in an expired quarter never becomes available in a
+            # later one, because each row is bounded by its own frozen
+            # authorisation first and that figure never moves.
             minutes = max(1.0, demand.remaining_minutes)
+            row = self._quarter
+            if row is not None:
+                minutes = min(
+                    minutes,
+                    max(
+                        CONTROL_TICK_ENERGY_HORIZON_SECONDS / 60.0,
+                        row.seconds_remaining(now) / 60.0,
+                    ),
+                )
             grid_kw = revised / (minutes / 60.0)
 
         return ChargeLimits(

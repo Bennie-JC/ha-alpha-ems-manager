@@ -190,6 +190,114 @@ overwrites that token, so 2.5 kW of surplus under a 1.0 kW inverter limit came o
 at 1.0 kW and then at 0.0 with `tick_energy_horizon` printed beside it. The guard is
 now keyed on whether the branch bound, which a clamp cannot rewrite.
 
+### Fixed: the run's grid budget was a pace, and it throttled the plan
+
+**The largest single finding of this release, and it is not about production at
+all.** The same 2026-09-03 campaign that motivated the retention work also
+under-delivered badly: **13.100 kWh planned, 5.939 kWh realised**, a 7.161 kWh
+miss over 23 completed rows, with `outcome: partial`.
+
+`_charge_limits` turned the run's remaining grid authorisation into a rate by
+dividing it by the *run's* remaining time — a flat average pace — and that rate
+then capped the battery through `battery_cap_kw` in every individual row. It
+throttled precisely the three rows Stage A had deliberately sized at full
+inverter power:
+
+| row | needed | row authorised | flat pace | observed mean | delivered |
+|---|---|---|---|---|---|
+| 11:45 | 10.00 kW | 9.08 kW | 2.73 kW | 3.40 kW | 0.795 of 2.50 |
+| 12:15 | 10.00 kW | 9.28 kW | 2.99 kW | 3.46 kW | 0.808 of 2.50 |
+| 13:00 | 10.00 kW | 9.84 kW | 3.78 kW | 4.38 kW | 1.021 of 2.50 |
+
+Each observed mean is predicted by `pace + measured surplus` to within
+**0.5–2.8 %**, on three independent rows. Those three rows carry **4.876 kWh —
+68 % — of the whole shortfall**, and the campaign finished with **5.076 kWh of
+authorised grid purchase unspent**. The budget was never the binding constraint;
+its pace was.
+
+**It is the `beta.36` defect one level up.** `beta.36` stopped the *row's* grid
+authorisation capping battery power. The *run's* remaining budget was still doing
+it, as an average. A budget is an energy, and the honest rate it permits is the
+rate that would spend it inside the row now executing — which is the shape the
+other two remainders already have. Stage A's own per-row `grid_authorised_kwh`
+still paces each row, tick by tick, through `progress.grid_rate_kw`.
+
+The total stays bounded exactly: across the open row the run figure permits at
+most its remaining budget, recomputed every tick from measured
+`grid_charged_kwh`. **It is emphatically not catch-up** — energy missed in an
+expired quarter never becomes available in a later one, because each row is
+bounded by its own frozen authorisation first and that figure never moves.
+
+### Fixed: a campaign terminal could claim an objective it never reached
+
+The same campaign filed:
+
+```
+objective_target_kwh     13.100
+objective_realized_kwh    5.939      45 % delivered
+outcome                 partial      correct
+reason   campaign_objective_reached  a claim about the objective, and false
+```
+
+`outcome` was never wrong — it is computed from the measurement — but the two
+fields sat side by side and a reader trusting `reason` would have recorded a
+45 %-delivered campaign as a success.
+
+**A scope was standing in for a reason.** `_completion_scope` returns one
+`campaign` scope for two entirely different endings: the objective was delivered,
+or the last planned row closed without it. Both are legitimate and both stop the
+same dispatch, so one scope is right — but both call sites then published
+`campaign_objective_reached`, and only one of the two endings supports that
+claim. With 23 of 23 rows closed the schedule was final, so the scope was correct
+and the reason was not.
+
+The reason is now decided by the energy, at the same tolerance the terminal
+verdict and the scope test already use. **No new vocabulary**: `window_ended`
+already exists, already means exactly "the last planned quarter closed", and is
+already a completion reason — so the outcome mapping is untouched and a short
+campaign still files `partial`, never `canceled`.
+
+### Fixed: two plan endpoints, one name
+
+The `beta.39` diagnostic carried three figures that could not all describe one
+trajectory: a configured hard floor of **4.32 kWh**, an economic-plan
+`end_energy_dc_kwh` of **3.51 kWh** *below* it, a terminal energy of **4.74 kWh**
+*above* it, and `violation_kwh` of **0.00**.
+
+They describe two different quantities, and only one is a decision.
+`end_energy_dc_kwh` is the **ambient-corrected reported walk**:
+`start_energy_dc_kwh` is reduced every interval by
+`ambient_self_consumption_ac_kwh` — the pack feeding the house, no decision
+involved — while `battery_delta_dc_kwh`, the lattice move the recursion chose,
+stays put. The two live in different resolutions on purpose; 0.105 kWh of ambient
+discharge against a 0.264 kWh bucket is not representable, which the reserve
+block has recorded as deferred since `beta.31`.
+
+`edge_energy_kwh` is the **decided lattice state**, and it is now proven to equal
+the lattice walk's endpoint exactly in all seven horizon shapes. So 4.74 kWh was
+the real planned endpoint all along, comfortably above the floor, and the
+violation of 0.00 was correct — violations are evaluated on the decided state,
+which never went below the reserve.
+
+**The planner was never at fault, and that was established by sweep rather than
+by argument.** Across 250 solves spanning five horizon shapes, ten starting
+energies and five price/production variants, the decided trajectory **never
+discharges below the configured hard floor and never below where it started**.
+The deepest level that appears anywhere is the *seed* — `bucket_at_or_below`
+models a measured 4.32 kWh as 4.2164 kWh, one bucket down, which is the
+conservative direction for an amount you have — and the plan then holds there
+rather than digging deeper. The only shapes whose decided state sits under the
+floor are the ones that *start* under it, at 0.3 and 1.2 kWh, and each reports a
+non-zero violation honestly.
+
+What was wrong was the diagnostic. Both endpoints are now published with their
+basis named from a closed vocabulary —
+`end_energy_basis: ambient_corrected_reported_walk` beside
+`planned_end_energy_dc_kwh` and `planned_end_energy_basis: decided_lattice_state`
+— with a rule stating that the projection is not an executable target and that
+Stage B executes the quarter schedule. The counterfactual `capability` plan, where
+the live 3.51 was read, carries the same distinction.
+
 ### Deliberately not changed
 
 - **No tie-break, no objective term, no `minimum_trade_gain_eur` change.** The
@@ -239,10 +347,10 @@ no term entered the objective.
 
 ### Verified
 
-4650 automated tests, serial and under sixteen workers with identical results
-(8:25 against 2:25). Six mutation harnesses report **zero survivors and zero lost
-anchors**: `beta.40` (46 mutations), `beta.39` (79), `beta.38` (44), `beta.37` (43),
-`beta.36` (35), `beta.35` (19) -- 266 in total. Three `beta.36` anchors were
+4698 automated tests, serial and under sixteen workers with identical results
+(10:22 against 4:09). Six mutation harnesses report **zero survivors and zero lost
+anchors**: `beta.40` (58 mutations), `beta.39` (79), `beta.38` (44), `beta.37` (43),
+`beta.36` (35), `beta.35` (19) -- 278 in total. Three `beta.36` anchors were
 repaired because this release moved the lines they pointed at; neither mutation was
 weakened, and both were re-anchored on the narrowest text that still identifies the
 layer they attack. Two proposed `beta.40` mutations were *removed* rather than
@@ -277,7 +385,10 @@ writing 0 kW, with `hold_reason` never `quarter_satisfied` while absorbing;
 `objective + absorbed == realised` to three decimals on every completed row;
 `retainable_now_kwh` falling as the pack fills and absorption stopping when it
 reaches zero **with room still in the pack**, which is the ceiling doing its job;
-`remaining_grid_authorisation_kwh` unconsumed by any absorbing tick; exactly one
+`remaining_grid_authorisation_kwh` unconsumed by any absorbing tick, and a
+concentrated row reaching the power its own authorisation permits rather than a
+flat pace; a campaign that ends short reporting `window_ended` and never
+`campaign_objective_reached`; exactly one
 campaign terminal, at the frozen objective and not early; and the five euro figures
 summing to the published total with `accounting_reconciliation_error_eur` at `0.0`.
 

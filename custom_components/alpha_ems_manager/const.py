@@ -3767,6 +3767,24 @@ CAMPAIGN_OUTCOMES: Final = (
 #: reader can tell which of the five aliases they are looking at without inferring
 #: it from context. ``tests/test_const_vocabularies.py`` allows exactly those five
 #: collisions and fails the build on a sixth.
+#: Which energy an ``end_energy`` figure is measured on. **beta.40.**
+#:
+#: The economic plan publishes two endpoints and they are different quantities.
+#: One is the ambient-corrected reported walk, which is reduced every interval by
+#: self-consumption the recursion does not model as a state transition; the other
+#: is the lattice level the recursion actually ends on. The first can sit below the
+#: configured hard floor while the plan decided nothing of the kind, so a reader
+#: must be able to tell them apart without inferring it from the field name.
+PLAN_END_ENERGY_BASIS_AMBIENT_WALK: Final = "ambient_corrected_reported_walk"
+PLAN_END_ENERGY_BASIS_LATTICE_STATE: Final = "decided_lattice_state"
+
+PLAN_END_ENERGY_BASES: Final = frozenset(
+    {
+        PLAN_END_ENERGY_BASIS_AMBIENT_WALK,
+        PLAN_END_ENERGY_BASIS_LATTICE_STATE,
+    }
+)
+
 REASON_VOCABULARY_QUARTER_COMPLETION: Final = "quarter_completion"
 REASON_VOCABULARY_BINDING_CLAMP: Final = "binding_clamp"
 REASON_VOCABULARY_RUN_STOP: Final = "run_stop"
