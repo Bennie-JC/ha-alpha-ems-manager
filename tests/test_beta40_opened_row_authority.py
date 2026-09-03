@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
+
 from custom_components.alpha_ems_manager.const import (
     EXECUTION_INTENT_GRID_CHARGE,
     RETENTION_GATE_AUTHORISED,
@@ -47,7 +49,13 @@ from .forecast_helpers import NORMAL, local
 OPENS = local(NORMAL, 12, 0)
 
 
-def row_at(minute: int, *, authorised: bool, gate: str | None = None) -> QuarterRow:
+def row_at(
+    minute: int,
+    *,
+    authorised: bool,
+    gate: str | None = None,
+    until: float | None = None,
+) -> QuarterRow:
     """Return one published row, with or without Stage A's retention verdict."""
     start = local(NORMAL, 12, minute)
     return QuarterRow(
@@ -68,6 +76,7 @@ def row_at(minute: int, *, authorised: bool, gate: str | None = None) -> Quarter
                 else RETENTION_GATE_EXPORT_SUPERIOR
             )
         ),
+        retention_until_dc_kwh=until,
     )
 
 
@@ -303,3 +312,152 @@ def test_the_carried_quarter_publishes_its_frozen_verdict() -> None:
 
     assert payload["retention_authorised"] is True
     assert payload["retention_gate"] == RETENTION_GATE_AUTHORISED
+
+
+# == 4. the restart, end to end ===========================================
+
+
+def test_the_verdict_and_its_ceiling_survive_a_restart() -> None:
+    """**The persistence claim, walked rather than inferred.**
+
+    A restart discards the carried run and keeps the causal record, so the run a
+    live dispatch belongs to is rebuilt from ``record["target"]`` by
+    ``carried_from_record``. That path is the one a beta.40 verdict has to survive:
+    a restart that lost it would meet a charging battery with a row that no longer
+    authorised keeping production, and start exporting again mid-afternoon.
+
+    Walked here in the order the coordinator walks it -- publish, admit, freeze,
+    persist, reload, re-derive -- rather than asserting the round trip alone.
+
+    *Mutation: drop ``retention_authorised`` from ``target_as_published`` and this
+    fails at the reloaded row.*
+    """
+    from custom_components.alpha_ems_manager.execution import (
+        admit_plan,
+        carried_from_record,
+    )
+
+    published = {
+        "plan_id": "plan-1",
+        "revision": 3,
+        "intent": EXECUTION_INTENT_GRID_CHARGE,
+        "purpose": EXECUTION_INTENT_GRID_CHARGE,
+        "window_start": OPENS.isoformat(),
+        "window_end": (OPENS + timedelta(minutes=30)).isoformat(),
+        "issued_at": (OPENS - timedelta(minutes=15)).isoformat(),
+        "stale_after": (OPENS + timedelta(minutes=15)).isoformat(),
+        "battery_target_kwh": 0.56,
+        "quarter_schedule": [
+            row_at(0, authorised=True, until=12.5).as_dict(),
+            row_at(15, authorised=False).as_dict(),
+        ],
+    }
+    live = parse_target(published)
+    assert live is not None
+
+    # The record the arm persists: the whole publication, round-tripped.
+    record = {
+        "run_id": "run-1",
+        "plan_id": "plan-1",
+        "revision": 3,
+        "admitted_at": (OPENS - timedelta(minutes=15)).isoformat(),
+        "affirmed_at": OPENS.isoformat(),
+        "stale_after": (OPENS + timedelta(minutes=15)).isoformat(),
+        "target": target_as_published(live),
+    }
+
+    # ... and the restart, which has nothing else to go on.
+    adopted = carried_from_record(record)
+    assert adopted is not None
+    reloaded = admit_plan(adopted.target, run=adopted, now=OPENS)
+    assert reloaded is not None
+
+    opened = reloaded.executing_quarter(OPENS + timedelta(minutes=5))
+    assert opened is not None
+    assert opened.absorption_authorised() is True
+    assert opened.retention_gate == RETENTION_GATE_AUTHORISED
+    assert opened.retention_until_dc_kwh == pytest.approx(12.5)
+    # And the row that had not opened is still refused, on the same reload.
+    later = reloaded.executing_quarter(OPENS + timedelta(minutes=20))
+    assert later is not None
+    assert later.absorption_authorised() is False
+
+
+def test_a_beta39_record_reloads_with_no_free_production_authority() -> None:
+    """**The compatibility claim the unmoved schema version rests on.**
+
+    A record written by beta.39 carries rows without either key. beta.40 must read
+    it, adopt the run, and invent no authority: absent is a refusal, and a refused
+    row cannot reach the absorption branch at all.
+    """
+    from custom_components.alpha_ems_manager.execution import (
+        admit_plan,
+        carried_from_record,
+    )
+
+    legacy_row = row_at(0, authorised=True, until=12.5).as_dict()
+    for key in ("retention_authorised", "retention_gate", "retention_until_dc_kwh"):
+        del legacy_row[key]
+
+    record = {
+        "run_id": "run-1",
+        "plan_id": "plan-1",
+        "revision": 1,
+        "admitted_at": (OPENS - timedelta(minutes=15)).isoformat(),
+        "affirmed_at": OPENS.isoformat(),
+        "stale_after": (OPENS + timedelta(minutes=15)).isoformat(),
+        "target": {
+            "plan_id": "plan-1",
+            "revision": 1,
+            "intent": EXECUTION_INTENT_GRID_CHARGE,
+            "window_start": OPENS.isoformat(),
+            "window_end": (OPENS + timedelta(minutes=15)).isoformat(),
+            "issued_at": OPENS.isoformat(),
+            "stale_after": (OPENS + timedelta(minutes=15)).isoformat(),
+            "battery_target_kwh": ROW_BATTERY_KWH,
+            "quarter_schedule": [legacy_row],
+        },
+    }
+
+    adopted = carried_from_record(record)
+    assert adopted is not None
+    plan = admit_plan(adopted.target, run=adopted, now=OPENS)
+    assert plan is not None
+    opened = plan.executing_quarter(OPENS + timedelta(minutes=5))
+    assert opened is not None
+
+    assert opened.absorption_authorised() is False
+    assert opened.retention_gate is None
+    assert opened.retention_until_dc_kwh is None
+    # The objective and the ceiling it does carry are untouched.
+    assert opened.battery_target_kwh == pytest.approx(ROW_BATTERY_KWH)
+
+
+def test_a_malformed_persisted_ceiling_is_unbounded_and_never_zero() -> None:
+    """Nonsense in the ceiling must not forbid what the verdict permitted.
+
+    Absent and unreadable both mean "no economic bound", and the physical clamps
+    still apply. Reading either as zero would silently disable the feature on a
+    record nobody could see was broken.
+    """
+    for value in ("lots", None, float("inf"), float("nan"), [], {}):
+        raw = row_at(0, authorised=True, until=12.5).as_dict()
+        raw["retention_until_dc_kwh"] = value
+        target = parse_target(
+            {
+                "plan_id": "plan-1",
+                "revision": 1,
+                "intent": EXECUTION_INTENT_GRID_CHARGE,
+                "window_start": OPENS.isoformat(),
+                "window_end": (OPENS + timedelta(minutes=15)).isoformat(),
+                "issued_at": OPENS.isoformat(),
+                "stale_after": (OPENS + timedelta(minutes=15)).isoformat(),
+                "battery_target_kwh": ROW_BATTERY_KWH,
+                "quarter_schedule": [raw],
+            }
+        )
+        assert target is not None
+        row = target.quarter_schedule[0]
+        assert row.retention_until_dc_kwh is None, value
+        # And the verdict itself is unaffected by a broken neighbour.
+        assert row.retention_authorised is True, value

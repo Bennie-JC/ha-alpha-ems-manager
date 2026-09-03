@@ -16,19 +16,22 @@ What is frozen, and proven rather than argued:
    order, no ``minimum_trade_gain_eur``, no reserve, no export gate.
 2. **The solve count**, per shape. The retention gate reads the value table the
    solve already built and adds no dynamic programme.
-3. **The published contract**, which gains exactly two additive row keys and
-   changes no other byte. Absent on a plan with no gate, so a pre-beta.40
-   publication round-trips unchanged.
+3. **The published contract**, which gains three additive row keys -- the verdict,
+   its reason and the energy ceiling the audit added -- and changes no other byte.
+   All absent on a plan with no gate, so a pre-beta.40 publication round-trips
+   unchanged.
 4. **The command**, on a row Stage A did not authorise: field for field the beta.39
    decision, including the reported clamp token.
 5. **The boundary.** The gate holds no physical limit, so the optimiser still
    constrains by none -- ``test_phase_eight_boundaries`` owns that, and this file
    pins the gate's own shape so it cannot acquire one.
 
-**The one decision that moved** is bounded by arithmetic rather than by care: the
-branch is capped at the measured surplus, so it can never buy a watt, and
-``test_beta40_absorption_arithmetic`` sweeps that. What it cannot do is change what
-Stage A decided to buy -- which is what the digests above establish.
+**The one decision that moved** is bounded twice, by arithmetic rather than by
+care. It is capped at the measured surplus, so it can never buy a watt --
+``test_beta40_absorption_arithmetic`` sweeps that. And it is capped at the energy
+above which the optimiser's own dual stops clearing the export price, so it cannot
+keep a kilowatt-hour the economics would have sold -- ``test_beta40_retention_ceiling``
+sweeps that, and it exists because the first implementation could.
 """
 
 from __future__ import annotations
@@ -99,7 +102,7 @@ def test_beta_forty_adds_no_dynamic_programming_solve(shape: str) -> None:
 # ===========================================================================
 
 
-def test_the_contract_gains_two_keys_and_changes_no_other_byte() -> None:
+def test_the_contract_gains_only_its_own_keys_and_changes_no_other_byte() -> None:
     """Additive, and asserted as a difference rather than by inspection."""
     base = local(NORMAL, 12, 0)
     args = {
@@ -226,7 +229,18 @@ def test_the_gate_holds_no_physical_limit() -> None:
     pins the gate itself so it cannot acquire one later.
     """
     fields = set(RetentionGate.__dataclass_fields__)
-    assert fields == {"marginal_value_eur_kwh", "round_trip_efficiency"}
+    # **Prices, a value curve and the lattice it is indexed on. Nothing physical.**
+    # The corrective added three: the dual at every level, where the pack stands on
+    # that lattice, and the lattice pitch. A pitch is an economic quantisation
+    # chosen by ``select_bucket_kwh``, and a level is a state -- neither is an
+    # inverter rating or a pack ceiling, which is what this test forbids.
+    assert fields == {
+        "marginal_value_eur_kwh",
+        "round_trip_efficiency",
+        "marginal_curve_eur_kwh",
+        "current_bucket",
+        "bucket_dc_kwh",
+    }
 
     # **Identifiers, not prose.** The docstring argues at length about why the
     # inverter rating and the pack ceiling are *absent*, so a substring search over

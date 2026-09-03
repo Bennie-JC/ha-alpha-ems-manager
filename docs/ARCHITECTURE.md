@@ -3416,6 +3416,28 @@ magnitude is then bounded by `inverter_kw` and `headroom_kw` through
 Same row, same objective, same authorisation, on the figures above: `applied_kw`
 **1.490 → 2.500** and `achievable_grid_kw` **−1.027 → −0.017**.
 
+**A verdict alone was too broad, and a pre-release audit proved it.** The
+comparison is made at the level the pack stands at. One quarter at full charge power
+moves the pack several lattice steps, and the dual falls as the pack fills -- so the
+first kilowatt-hour of a row can clear the tariff while a later one in the same row
+does not. Reachable in five of the seven horizon shapes, worst case -0.171 EUR/kWh
+over 2.108 kWh DC. Free production is not exempt from this: it still carries the
+opportunity cost of the export it forgoes, which is what the comparison prices.
+
+So the row also carries `retention_until_dc_kwh` -- the stored energy above which
+keeping stops paying on that interval's own price. It is the **first** crossing
+above the current level, because the curve is not concave: swept at full resolution
+it rises again in places, so the passing levels are not an interval and there is no
+highest-passing level to aim at. Stopping early where the curve later recovers
+forgoes a gain; carrying on past a crossing takes a loss.
+
+Stage B differences that level against a **live** state of charge, together with the
+pack's own ceiling, and bounds the absorption branch by whichever is lower. That
+second half matters on its own: `headroom_kw` is `None` unless Stage A published
+`max_end_energy_kwh`, so before the corrective a charge had no per-tick pack-energy
+clamp in software at all -- at 99.9 % the branch commanded the full inverter limit
+and only the device's charge cutoff and the pack's own management stopped it.
+
 **Invariant: an opened row keeps the verdict it opened with.** The verdict is frozen
 with the rest of the row, so an ordinary replan reaches rows that have not opened
 and nothing else. The two downward-only purchase caps —
@@ -3482,6 +3504,18 @@ concentrates cheaply and destroys the capacity headroom free production needs;
 deferring preserves it and pays the run fee again. `beta.40` deliberately ships no
 change here, because the envelope makes the smeared shape harmless and shipping a
 guess would trade a proven gain for an unproven one.
+
+**The retention ceiling is a level, not a schedule.** It is computed from the head
+layer's curve against one interval's export price, so a row whose price differs from
+the head's is bounded by a curve read at the head. Refreshed every quarter and
+frozen one refresh before a row opens, which is the staleness the objective already
+carries -- but a per-interval curve would be exact.
+
+**The device charge cutoff is the last line, and it is a device promise.** The pack
+cannot be charged past `floor(max_soc_percent)` because the cutoff is written on
+every arm, rest and sustain, and the caller refuses the command when it cannot be
+established. Software now bounds the same thing per tick, so the two agree; the
+cutoff remains what makes a missed tick safe.
 
 **Two readings of production exist in one tick.** The accrual and the retention gate
 read the PV entity (`has_pv`-gated, absent is `None`); `decide_charge` receives

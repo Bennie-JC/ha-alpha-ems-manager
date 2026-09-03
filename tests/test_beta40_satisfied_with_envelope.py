@@ -46,7 +46,13 @@ def live_surface(hass: HomeAssistant, control_surface: None) -> LiveSurface:
     return LiveSurface(hass)
 
 
-def install_row(coordinator, *, battery: float = 0.28, authorised: bool = True):
+def install_row(
+    coordinator,
+    *,
+    battery: float = 0.28,
+    authorised: bool = True,
+    until: float | None = 99.0,
+):
     """Admit one row carrying Stage A's retention verdict.
 
     **The verdict lives on the row and not on the quarter**, which is why this does
@@ -64,9 +70,14 @@ def install_row(coordinator, *, battery: float = 0.28, authorised: bool = True):
     assert plan is not None
     coordinator._plan = replace(
         plan,
-        rows=tuple(replace(row, retention_authorised=authorised) for row in plan.rows),
+        rows=tuple(
+            replace(row, retention_authorised=authorised, retention_until_dc_kwh=until)
+            for row in plan.rows
+        ),
     )
-    coordinator._quarter = replace(quarter, retention_authorised=authorised)
+    coordinator._quarter = replace(
+        quarter, retention_authorised=authorised, retention_until_dc_kwh=until
+    )
 
 
 def site(hass, *, pv_kw: float, house_kw: float, battery_charge_kw: float) -> None:
@@ -490,3 +501,107 @@ async def test_an_absorbing_row_clamped_to_nothing_is_finished_not_left_open(
     # path -- and leaves the row open, asking for an inexpressible figure again on
     # every tick until the quarter runs out.
     assert coordinator._quarter is None, "the row must be closed, not left open"
+
+
+# == 5. the pack's own ceiling, per tick =================================
+
+SOC_ENTITY = "sensor.alphaess_soc_battery"
+
+
+@pytest.mark.parametrize("soc", [95.0, 99.0, 99.5, 99.9, 100.0])
+async def test_absorption_is_bounded_by_the_packs_own_room_at_every_soc(
+    hass: HomeAssistant,
+    config_data: dict,
+    source_entities: None,
+    frank,
+    live_surface,
+    soc: float,
+) -> None:
+    """**The per-tick energy clamp the audit asked for, measured live.**
+
+    Before the beta.40 corrective there was none for a charge: ``headroom_kw`` is
+    ``None`` unless Stage A published ``max_end_energy_kwh``, so at 99.9 % the
+    branch commanded the full inverter limit and only the device cutoff and the
+    pack's own management stopped it. Those are real protections and they are not
+    software bounds.
+
+    ``retention_remaining_kwh`` now carries the pack's room as well as the economic
+    ceiling, differenced against a **live** state of charge, so the command is
+    bounded on every tick by what the pack can actually take.
+    """
+    coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
+    install_row(coordinator)
+    # 10 kW of surplus against a small house: the strongest case there is.
+    site(hass, pv_kw=10.8, house_kw=0.8, battery_charge_kw=0.0)
+    set_sensor(hass, SOC_ENTITY, soc, "%", "battery")
+    satisfy(coordinator, total=0.28)
+    now = local(NORMAL, 10, 46)
+
+    limits = coordinator.battery_plan.state.limits
+    room_dc = max(
+        0.0,
+        limits.energy_for_soc(100.0) - limits.energy_for_soc(soc),
+    )
+    decision = coordinator._dispatch_setpoint(now)
+
+    # Never more than the pack's remaining room, converted once.
+    horizon_h = 90.0 / 3600.0
+    assert (
+        abs(decision.applied_kw) * horizon_h
+        <= room_dc / limits.charge_efficiency + 1e-6
+    )
+    if soc >= 100.0:
+        assert coordinator._absorption_live(coordinator._quarter_progress(now)) is False
+
+
+async def test_a_stale_plan_state_cannot_widen_the_pack_bound(
+    hass: HomeAssistant, config_data: dict, source_entities: None, frank, live_surface
+) -> None:
+    """**Why the bound is differenced against a live reading.**
+
+    ``battery_plan.state`` is rebuilt on the economic cadence, so on the cadence
+    that commands it can be a quarter of an hour old -- long enough at these powers
+    to fill the room it still reports. Here the plan believes there is room and the
+    pack is full; the live reading governs.
+    """
+    coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
+    install_row(coordinator)
+    site(hass, pv_kw=10.8, house_kw=0.8, battery_charge_kw=0.0)
+    satisfy(coordinator, total=0.28)
+    stale = coordinator.battery_plan.state.headroom_energy_kwh
+    assert stale > 1.0, "the fixture must actually have stale room to report"
+
+    set_sensor(hass, SOC_ENTITY, 100.0, "%", "battery")
+    now = local(NORMAL, 10, 46)
+
+    # The plan still says there is room; the live reading says there is none.
+    assert coordinator.battery_plan.state.headroom_energy_kwh == pytest.approx(stale)
+    assert coordinator._retainable_kwh(coordinator._quarter) == pytest.approx(0.0)
+    assert coordinator._absorption_live(coordinator._quarter_progress(now)) is False
+
+
+async def test_an_exhausted_economic_ceiling_stops_absorption_with_room_to_spare(
+    hass: HomeAssistant, config_data: dict, source_entities: None, frank, live_surface
+) -> None:
+    """**The ceiling is not the pack, and this is the case that shows it.**
+
+    Sun shining, pack half empty, verdict granted -- and absorption still stops,
+    because past the published level the optimiser's own dual no longer clears the
+    export price. Selling pays better from here, and the release exists to make
+    that comparison rather than to fill the battery.
+
+    *Mutation: let ``_absorption_live`` ignore the remaining retainable energy and
+    this fails.*
+    """
+    coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
+    # A ceiling already below where the pack stands: nothing left worth keeping.
+    install_row(coordinator, until=0.5)
+    site(hass, pv_kw=PV_KW, house_kw=HOUSE_KW, battery_charge_kw=0.0)
+    set_sensor(hass, SOC_ENTITY, 50.0, "%", "battery")
+    satisfy(coordinator, total=0.28)
+    now = local(NORMAL, 10, 46)
+
+    # The pack has plenty of room, and the economics say stop anyway.
+    assert coordinator.battery_plan.state.headroom_energy_kwh > 1.0
+    assert coordinator._retainable_kwh(coordinator._quarter) == pytest.approx(0.0)
+    assert coordinator._absorption_live(coordinator._quarter_progress(now)) is False

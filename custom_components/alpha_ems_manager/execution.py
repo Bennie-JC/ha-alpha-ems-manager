@@ -728,6 +728,15 @@ class QuarterRow:
     #: Why, from :data:`RETENTION_GATES`. Diagnostics only -- the authority is the
     #: flag above, frozen onto the row with everything else.
     retention_gate: str | None = None
+    #: Stored energy, DC, above which keeping stops paying on this interval's own
+    #: price. beta.40 corrective, and the bound the flag above cannot express: the
+    #: verdict answers for the level the pack stands at, and one quarter at full
+    #: power moves it several levels while the optimiser's dual falls.
+    #:
+    #: ``None`` is **unbounded**, never zero -- a row with a verdict and no ceiling
+    #: is bounded by the physical clamps alone, which is what a site with no value
+    #: curve gets.
+    retention_until_dc_kwh: float | None = None
 
     def objective_kwh(self, intent: str) -> float:
         """Return the figure this row is trying to realise, per intent.
@@ -767,6 +776,7 @@ class QuarterRow:
             # lost its authority to keep free production across a restart.
             "retention_authorised": self.retention_authorised,
             "retention_gate": self.retention_gate,
+            "retention_until_dc_kwh": self.retention_until_dc_kwh,
         }
 
 
@@ -821,6 +831,10 @@ def _quarter_rows(raw: Any) -> tuple[QuarterRow, ...]:
                     if isinstance(gate := entry.get("retention_gate"), str) and gate
                     else None
                 ),
+                # Absent is unbounded, and a malformed figure is too -- the
+                # physical clamps still apply either way. Never read as zero,
+                # which would forbid what the verdict just permitted.
+                retention_until_dc_kwh=_finite(entry.get("retention_until_dc_kwh")),
             )
         )
     # **Not sorted, and deliberately.** ``quarter_schedule_for`` emits one row
@@ -895,6 +909,9 @@ class CarriedQuarter:
     retention_authorised: bool = False
     #: Stage A's frozen reason. Diagnostics only.
     retention_gate: str | None = None
+    #: Stored energy, DC, above which keeping stops paying. Frozen with the rest.
+    #: ``None`` is unbounded.
+    retention_until_dc_kwh: float | None = None
 
     def covers(self, moment: datetime) -> bool:
         """Return whether this quarter is the one in progress at ``moment``."""
@@ -975,6 +992,7 @@ class CarriedQuarter:
             "frozen_remaining_at_admission_kwh": self.frozen_remaining_at_admission_kwh,
             "retention_authorised": self.retention_authorised,
             "retention_gate": self.retention_gate,
+            "retention_until_dc_kwh": self.retention_until_dc_kwh,
             "authority_rule": (
                 "frozen before the quarter opens and economically immutable once "
                 "it has. a parent run ending or rolling does not cancel it; only "
@@ -1128,6 +1146,7 @@ class AdmittedPlan:
             campaign_id=self.campaign_id,
             retention_authorised=row.retention_authorised,
             retention_gate=row.retention_gate,
+            retention_until_dc_kwh=row.retention_until_dc_kwh,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -1331,6 +1350,7 @@ def admit_quarter(
         campaign_id=campaign_id,
         retention_authorised=row.retention_authorised,
         retention_gate=row.retention_gate,
+        retention_until_dc_kwh=row.retention_until_dc_kwh,
     )
 
 

@@ -542,6 +542,12 @@ class QuarterProgress:
     #: every pre-beta.40 plan yields, so a :class:`QuarterProgress` built without
     #: it behaves exactly as beta.39 did.
     retention_authorised: bool = False
+    #: Battery-side AC energy this row may still keep from production before the
+    #: economics stop paying or the pack runs out of room. beta.40 corrective.
+    #:
+    #: ``None`` is unbounded -- no curve and no ceiling, bounded by the physical
+    #: clamps alone. Zero is a real bound and means "no further".
+    retention_remaining_kwh: float | None = None
 
     @property
     def hours(self) -> float:
@@ -557,6 +563,19 @@ class QuarterProgress:
     def grid_rate_kw(self) -> float:
         """Return the average grid rate the remaining authorisation permits."""
         return max(0.0, self.grid_remaining_kwh) / self.hours
+
+    @property
+    def retention_rate_kw(self) -> float | None:
+        """Return the power the remaining retainable energy permits.
+
+        ``None`` when unbounded, which is not the same as a large number: the
+        caller must not compare against it, and the physical clamps still
+        apply. Derived from the same clock as the other two rates, so nothing
+        here can diverge from them near a boundary.
+        """
+        if self.retention_remaining_kwh is None:
+            return None
+        return max(0.0, self.retention_remaining_kwh) / self.hours
 
 
 def decide_charge(
@@ -699,6 +718,15 @@ def decide_charge(
     # -- export or zero, never import. And an unauthorised row leaves
     # ``absorb_kw`` at zero, so it is bit-for-bit beta.39.
     absorb_kw = pv_surplus_kw if progress.retention_authorised else 0.0
+    # **And bounded by what is still worth keeping.** The verdict answers for the
+    # level the pack stood at when the row was frozen; this is the energy above
+    # which the optimiser's own dual no longer clears the export price, and the
+    # room the pack physically has left. Without it a row could keep charging past
+    # the point where keeping stopped paying -- measured at up to 2.108 kWh DC and
+    # 0.36 EUR on one row of the production horizon shapes.
+    retention_rate_kw = progress.retention_rate_kw
+    if retention_rate_kw is not None:
+        absorb_kw = min(absorb_kw, retention_rate_kw)
     absorbing = absorb_kw > applied_kw + 1e-9
     if absorbing:
         applied_kw = absorb_kw

@@ -4478,12 +4478,65 @@ class RetentionGate:
     recursion discards them by design.
     """
 
-    #: The optimiser's marginal worth of one stored kWh, EUR/kWh, or ``None`` when
-    #: the lattice cannot define it. ``None`` refuses; it never grants.
+    #: The optimiser's marginal worth of one stored kWh **at the pack's current
+    #: level**, EUR/kWh, or ``None`` when the lattice cannot define it. ``None``
+    #: refuses; it never grants.
     marginal_value_eur_kwh: float | None
     #: Round-trip efficiency, applied once to the value side. A stored kWh comes
     #: back smaller, and pretending otherwise would over-authorise every interval.
     round_trip_efficiency: float
+    #: The same marginal value at **every** level of the lattice, head layer, or
+    #: empty when there is no curve. beta.40 corrective: the verdict above is a
+    #: statement about one level, and a row may move the pack several levels.
+    marginal_curve_eur_kwh: tuple[float | None, ...] = ()
+    #: Where the pack stands on that lattice now.
+    current_bucket: int = 0
+    #: One lattice step, DC. Zero disables the ceiling, which then reads ``None``
+    #: -- unbounded, on the same terms as every other absent figure here.
+    bucket_dc_kwh: float = 0.0
+
+    def retain_until_dc_kwh(self, export_price: float | None) -> float | None:
+        """Return the stored energy above which keeping stops paying, DC.
+
+        **The bound the boolean verdict was missing, and the audit that found it.**
+        :meth:`verdict` compares the dual *at the level the pack stands at now*.
+        One quarter at full charge power moves the pack several lattice steps, and
+        the dual falls as the pack fills -- so the first kilowatt-hour of a row can
+        clear the tariff comfortably while a later one in the *same* row does not.
+
+        Measured on the production horizon shapes: in five of seven, states exist
+        where the verdict grants at the opening level and the same row reaches a
+        level whose own comparison is negative -- worst case 2.108 kWh DC retained
+        past the crossing at -0.171 EUR/kWh, which is 0.36 EUR on one row and
+        larger than the gain the release was built to capture. A verdict without
+        this ceiling is economic authority the plan never granted.
+
+        **The first crossing, and nothing cleverer.** The curve is *not* concave:
+        swept across the seven shapes it rises again in places, so the set of
+        levels that pass is not an interval and there is no highest-passing level
+        to aim at. Walking up to the first failure is the only bound that cannot
+        over-retain, and stopping early on a curve that later recovers costs a
+        forgone gain rather than an unwanted loss -- the conservative direction.
+
+        ``None`` means unbounded, never zero, on the same terms as every other
+        absent figure in this contract: no curve, or no lattice, is not a
+        prohibition on filling the pack.
+        """
+        if not self.marginal_curve_eur_kwh or self.bucket_dc_kwh <= 0.0:
+            return None
+        if export_price is None:
+            return None
+        # The last step whose own worth clears the tariff. ``current_bucket`` is
+        # the step the verdict already answered for, so the walk starts above it.
+        last = self.current_bucket
+        for bucket in range(self.current_bucket + 1, len(self.marginal_curve_eur_kwh)):
+            value = self.marginal_curve_eur_kwh[bucket]
+            if value is None or self.round_trip_efficiency * value <= export_price:
+                break
+            last = bucket
+        # The energy at the top of that step: a step from ``last`` to ``last + 1``
+        # is worth taking, so the level it lands on is the level to stop at.
+        return (last + 1) * self.bucket_dc_kwh
 
     def verdict(self, export_price: float | None) -> tuple[bool, str]:
         """Return whether this interval may keep free production, and why."""
@@ -4593,6 +4646,7 @@ def quarter_schedule_for(
         # can re-decide it.
         retention_ok = False
         retention_gate: str | None = None
+        retention_until: float | None = None
         if retention is not None:
             if intent != EXECUTION_INTENT_GRID_CHARGE or not_executable is not None:
                 retention_gate = RETENTION_GATE_NOT_A_CHARGE
@@ -4600,6 +4654,10 @@ def quarter_schedule_for(
                 retention_ok, retention_gate = retention.verdict(
                     entry.export_price_eur_kwh
                 )
+                if retention_ok:
+                    retention_until = retention.retain_until_dc_kwh(
+                        entry.export_price_eur_kwh
+                    )
         row: dict[str, Any] = {
             "start": start.isoformat(),
             "end": end.isoformat(),
@@ -4622,6 +4680,7 @@ def quarter_schedule_for(
         if retention_gate is not None:
             row["retention_authorised"] = retention_ok
             row["retention_gate"] = retention_gate
+            row["retention_until_dc_kwh"] = _round_kwh(retention_until)
         rows.append(row)
     return rows
 
@@ -6201,6 +6260,13 @@ def execution_target(
             "solved_intervals" if intervals else "no_intervals_supplied"
         ),
         "retention_rule": (
+            "retention_until_dc_kwh is the stored energy, DC, above which keeping "
+            "stops paying on this interval's own price -- the first level at "
+            "which the optimiser's dual no longer clears it. null means "
+            "unbounded, never zero. it exists because the verdict below is a "
+            "statement about the level the pack stands at now, while one "
+            "quarter at full power moves it several levels and the dual falls "
+            "as the pack fills. "
             "retention_authorised is Stage A's answer to one economic question: "
             "is keeping one more kWh of free production worth more than selling "
             "it, i.e. eta_rt * marginal_value_of_stored_energy > export_price. it "

@@ -52,8 +52,12 @@ LIVE_GATE = RetentionGate(
     round_trip_efficiency=ROUND_TRIP_EFFICIENCY,
 )
 
-#: The two keys the gate adds to a row, and the only difference it may make.
-GATE_KEYS = frozenset({"retention_authorised", "retention_gate"})
+#: The keys the gate adds to a row, and the only difference it may make.
+#: ``retention_until_dc_kwh`` joined them with the beta.40 corrective: the verdict
+#: alone was authority over energy the economics had not priced.
+GATE_KEYS = frozenset(
+    {"retention_authorised", "retention_gate", "retention_until_dc_kwh"}
+)
 
 
 class Interval:
@@ -89,7 +93,7 @@ def rows(
 # == 1. the gate changes nothing but itself ===============================
 
 
-def test_the_gate_adds_two_keys_and_moves_no_other_figure() -> None:
+def test_the_gate_adds_only_its_own_keys_and_moves_no_other_figure() -> None:
     """**The neutrality claim, by difference rather than by inspection.**
 
     Every quantity a Safety Buy is decided from -- the battery objective, the grid

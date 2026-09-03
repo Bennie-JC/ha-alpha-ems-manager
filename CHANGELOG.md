@@ -86,6 +86,60 @@ verdict and not a kilowatt-hour. A second copy of a physical limit is a second
 thing to keep in step, and the first time the two disagreed it would be the copy
 that got believed.
 
+### Added: a ceiling on how much is worth keeping, not just whether
+
+**Found by pre-release audit, and it blocked the release.** The first
+implementation of this release froze a boolean -- *keeping a kilowatt-hour beats
+selling it here* -- and let the controller absorb to the physical limits. That is
+broader than the economics behind it.
+
+The comparison is made at the level the pack stands at. One quarter at full charge
+power moves the pack several lattice steps, and the dual falls as the pack fills, so
+the first kilowatt-hour of a row can clear the tariff comfortably while a later one
+in the *same row* does not. Swept over the seven horizon shapes at their own export
+prices, that state is reachable in **five of them**, worst case bucket 58 to 63 on
+the Sell shape: `V` 0.21196 to 0.01823 against an export price of 0.18788, i.e.
+**-0.171 EUR/kWh over as much as 2.108 kWh DC -- 0.36 EUR on one row**, which is
+larger than the gain the release was built to capture.
+
+"It is free production" is not a defence. Free production still carries the
+opportunity cost of the export it forgoes, and that is exactly what the comparison
+prices.
+
+So the row now also carries `retention_until_dc_kwh`: the stored energy above which
+keeping stops paying on that interval's own price. Stage B differences it against a
+**live** state of charge, together with the pack's own ceiling, and bounds the
+absorption branch by whichever is lower. Re-swept: **zero negative-value steps
+retained, across 2,939 authorised cases in all seven shapes.**
+
+**The first crossing, and nothing cleverer.** The curve is not concave -- swept at
+full resolution it rises again in places -- so the set of passing levels is not an
+interval and there is no highest-passing level to aim at. Walking up to the first
+failure is the only bound that cannot over-retain; stopping early where the curve
+later recovers forgoes a gain rather than taking a loss.
+
+**The acceptance case is unchanged.** On the capture's own curve and price the
+crossing sits at 20.291 kWh DC against 8.986 stored -- 11.9 kWh AC of room where one
+row can take 2.5 -- so the ceiling does not bind, and `applied_kw` is still
+1.490 to **2.500 kW** with `achievable_grid_kw` still **-0.017**. A bound that also
+bounded the case the release exists for would have traded one defect for another.
+
+### Fixed: the charge path had no per-tick pack-energy clamp
+
+`headroom_kw` is `None` unless Stage A published `max_end_energy_kwh`, which it does
+only when a later interval absorbs surplus -- `null` on the live capture. So a
+charge was bounded in software by power and by the row's objective, never by the
+pack's remaining room, and at 99.9 % state of charge the absorption branch commanded
+the full inverter limit. The device's own charge cutoff (written on every arm, rest
+and sustain) and the pack's management stopped it. Those are real protections and
+neither is a software bound.
+
+`retention_until_dc_kwh` carries the pack's ceiling as well as the economic one, so
+the command is now bounded on every tick by what the pack can actually take -- and
+differenced against a live reading, because `battery_plan.state` is rebuilt on the
+economic cadence and would be a quarter of an hour stale on the cadence that
+commands.
+
 ### Added: a satisfied row can go on storing free production
 
 The third outcome, and the release exists for it. A row whose objective is met took
@@ -185,16 +239,18 @@ no term entered the objective.
 
 ### Verified
 
-4621 automated tests, serial and under twelve workers with identical results
-(7:41 against 2:36). Six mutation harnesses report **zero survivors and zero lost
-anchors**: `beta.40` (37 mutations), `beta.39` (79), `beta.38` (44), `beta.37` (43),
-`beta.36` (35), `beta.35` (19) -- 257 in total. Three `beta.36` anchors were
+4650 automated tests, serial and under sixteen workers with identical results
+(8:25 against 2:25). Six mutation harnesses report **zero survivors and zero lost
+anchors**: `beta.40` (46 mutations), `beta.39` (79), `beta.38` (44), `beta.37` (43),
+`beta.36` (35), `beta.35` (19) -- 266 in total. Three `beta.36` anchors were
 repaired because this release moved the lines they pointed at; neither mutation was
 weakened, and both were re-anchored on the narrowest text that still identifies the
 layer they attack. Two proposed `beta.40` mutations were *removed* rather than
 weakened, each with the reason recorded in the table: the shortfall expression and
 the satisfied row's early return are both provably equivalent to what they were
-changed to, so neither described a defect.
+changed to, so neither described a defect. A third was removed after the corrective
+for the same reason -- "a full pack absorbs nothing" is now protected by two
+independent clauses, so no single-edit mutation can break it.
 
 **One decision moved and it is named.** The seven horizon shapes and their canonical
 per-interval digests -- recorded against `ff3e912` in a detached worktree under
@@ -219,6 +275,8 @@ tick where `dispatch_limited_by` is `free_pv_absorption`, a single positive watt
 being cause to revert; a satisfied row with surplus present still charging and never
 writing 0 kW, with `hold_reason` never `quarter_satisfied` while absorbing;
 `objective + absorbed == realised` to three decimals on every completed row;
+`retainable_now_kwh` falling as the pack fills and absorption stopping when it
+reaches zero **with room still in the pack**, which is the ceiling doing its job;
 `remaining_grid_authorisation_kwh` unconsumed by any absorbing tick; exactly one
 campaign terminal, at the frozen objective and not early; and the five euro figures
 summing to the published total with `accounting_reconciliation_error_eur` at `0.0`.

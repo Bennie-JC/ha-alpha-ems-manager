@@ -2764,6 +2764,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 None if quarter is None else quarter.absorption_authorised()
             ),
             "absorption_gate": self._absorption_gate_now(quarter),
+            "retention_until_dc_kwh": (
+                None if quarter is None else quarter.retention_until_dc_kwh
+            ),
+            "retainable_now_kwh": (
+                None
+                if progress is None or progress.retention_remaining_kwh is None
+                else round(progress.retention_remaining_kwh, 3)
+            ),
             "absorption_rule": (
                 "objective and absorbed sum to realised. the objective is "
                 "what the row promised and is the only figure a campaign is "
@@ -4436,9 +4444,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
             grid_remaining_kwh=max(0.0, grid_remaining),
             # **Stage A's frozen verdict, beta.40.** Whether the tariff prefers
-            # keeping free production to selling it. How much of it the plant can
-            # take is bounded by the physical clamps, not from here.
+            # keeping free production to selling it.
             retention_authorised=quarter.absorption_authorised(),
+            # **And how much is still worth keeping, measured now.** Two bounds in
+            # one figure, because they answer the same question: the economic level
+            # above which keeping stops paying, and the room the pack physically
+            # has. Both are compared against a *live* state of charge -- the plan's
+            # own state is rebuilt on the economic cadence and would be a quarter of
+            # an hour stale on the cadence that commands.
+            retention_remaining_kwh=self._retainable_kwh(quarter),
         )
 
     @callback
@@ -4660,6 +4674,45 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return max(0.0, self._quarter_battery_kwh - self._quarter_objective_kwh)
 
     @callback
+    def _retainable_kwh(self, quarter: CarriedQuarter) -> float | None:
+        """Return the AC energy this row may still keep, or ``None``.
+
+        **Two bounds, one figure, because they answer the same question**: how
+        much more free production is worth keeping, and how much the pack can
+        still take. Whichever is lower governs.
+
+        The economic half is Stage A's ``retention_until_dc_kwh`` -- the level at
+        which the optimiser's own dual stops clearing the export price. The
+        physical half is the pack's own ceiling. Both are differenced against a
+        **live** state of charge, and that is the point: ``battery_plan.state`` is
+        rebuilt on the economic cadence, so on the sixty-second cadence that
+        commands it can be a quarter of an hour old -- and a quarter of an hour at
+        the power this branch will command is long enough to fill the room the
+        stale figure still reports.
+
+        ``None`` means unbounded, and is what a site with no readable pack state
+        and no published ceiling gets: the physical clamps still apply, exactly as
+        they do to every other charge.
+        """
+        plan = self.battery_plan
+        if plan is None or plan.state is None:
+            return None
+        limits = plan.state.limits
+        soc_percent = self._read_soc_percent()
+        if soc_percent is None:
+            # No reading, no bound to compute -- and ``_absorption_live`` refuses
+            # on the same absence, so nothing is granted on an unknown pack.
+            return None
+        stored_dc = limits.energy_for_soc(soc_percent)
+        ceiling_dc = limits.energy_for_soc(BATTERY_MAX_SOC_PERCENT)
+        until_dc = quarter.retention_until_dc_kwh
+        cap_dc = ceiling_dc if until_dc is None else min(until_dc, ceiling_dc)
+        room_dc = max(0.0, cap_dc - stored_dc)
+        if limits.charge_efficiency <= 0.0:  # pragma: no cover - defensive
+            return None
+        return room_dc / limits.charge_efficiency
+
+    @callback
     def _measured_pv_surplus_kw(self) -> float | None:
         """Return measured production above the house, or ``None`` if unknown.
 
@@ -4732,7 +4785,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if soc_percent is None:
             # An unknown pack is not an empty one. No reading, no absorption.
             return False
-        return soc_percent < BATTERY_MAX_SOC_PERCENT
+        if soc_percent >= BATTERY_MAX_SOC_PERCENT:
+            return False
+        # **And there must be something left that is worth keeping.** A row whose
+        # economic ceiling has been reached is finished absorbing even though the
+        # sun is still shining and the pack is not full, which is the whole point
+        # of the ceiling: past it, exporting pays better.
+        retainable = progress.retention_remaining_kwh
+        return retainable is None or retainable > QUARTER_TARGET_TOLERANCE_KWH
 
     @callback
     def _quarter_is_satisfied(self, now: datetime) -> bool:
@@ -8679,11 +8739,28 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ),
                 bucket_kwh=outcome.bucket_kwh,
             )
+            # **The whole curve, not just the head value.** The verdict answers
+            # for the level the pack stands at; the ceiling needs every level a row
+            # could reach, because the dual falls as the pack fills and a boolean
+            # cannot express where it stops paying.
+            current = bucket_at_or_below_kwh(
+                outcome.desired.intervals[0].start_energy_dc_kwh,
+                bucket_kwh=outcome.bucket_kwh,
+            )
+            curve = tuple(
+                outcome.desired.marginal_value_eur_per_kwh(
+                    bucket, bucket_kwh=outcome.bucket_kwh
+                )[0]
+                for bucket in range(len(outcome.desired.head_value))
+            )
             retention = RetentionGate(
                 marginal_value_eur_kwh=marginal,
                 round_trip_efficiency=(
                     limits.charge_efficiency * limits.discharge_efficiency
                 ),
+                marginal_curve_eur_kwh=curve,
+                current_bucket=current,
+                bucket_dc_kwh=outcome.bucket_kwh,
             )
 
         # **Which campaign each run belongs to, resolved to absolute time here.**
