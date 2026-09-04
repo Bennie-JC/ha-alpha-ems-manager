@@ -173,6 +173,13 @@ def solve_at(
     #: passed to ``build_outcome``; exposed so the comparator correction can be
     #: measured with it both on and off.
     ambient_self_consumption: bool = True,
+    #: beta.41. The export tariff, as a function of the import price. Defaults to
+    #: the reference installation's own relation, so every existing caller solves
+    #: byte-identically; exposed because that relation can never make in-horizon
+    #: arbitrage pay -- ``0.8265 p - 0.0885 < 0.9 p`` for every positive ``p`` --
+    #: and a fixture that needs export to be the profitable choice cannot be built
+    #: from it.
+    export_fn: Any = None,
 ) -> Solved:
     """Solve one horizon through the production path, at absolute indices.
 
@@ -186,8 +193,11 @@ def solve_at(
         IntervalDemand(index=i, baseline_kwh=load_fn(i), pv_kwh=pv_fn(i))
         for i in range(head, end)
     )
+    export_at = (
+        export_fn if export_fn is not None else lambda index: export_of(price_fn(index))
+    )
     prices = tuple(
-        IntervalPrice(import_eur_kwh=price_fn(i), export_eur_kwh=export_of(price_fn(i)))
+        IntervalPrice(import_eur_kwh=price_fn(i), export_eur_kwh=export_at(i))
         for i in range(head, end)
     )
     bucket, rule = select_bucket_kwh(LIMITS, floor_energy_kwh=FLOOR)

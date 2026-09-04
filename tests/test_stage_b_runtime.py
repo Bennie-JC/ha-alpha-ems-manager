@@ -349,6 +349,16 @@ async def test_no_shadow_line_ever_claims_a_command_was_sent(
         message = entry["message"].lower()
         assert "dispatch started" not in message
         assert "dispatch stopped" not in message
+        # **Plan-lifecycle lines are not claims that anything was sent**, and
+        # they are exempted structurally -- every one carries a plan id -- rather
+        # than by loosening the phrase list. Such a line names a plan, a window
+        # and an energy, or says a plan was replaced; it says nothing about the
+        # actuator, and the assertions above already forbid every phrasing that
+        # would. Before beta.41 this fixture planned nothing on these quarters, so
+        # no lifecycle line was emitted and the blanket requirement held by
+        # accident.
+        if "plan id:" in message:
+            continue
         assert any(
             phrase in message
             for phrase in ("advisory only", "no command sent", "no command was sent")

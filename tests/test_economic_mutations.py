@@ -2243,7 +2243,7 @@ def test_running_a_fourth_solve_to_price_nothing_is_caught() -> None:
     # measured evidence the permission is off, so an ungated pass would be
     # byte-identical to the desired one -- a solve whose difference from another is
     # identically zero by construction, which is the fault beta.18 deleted.
-    assert calls == 7
+    assert calls == 8
 
     # And both extras are genuinely conditional: neither can run unless asked.
     guarded = [
@@ -2283,4 +2283,7 @@ def test_running_a_fourth_solve_to_price_nothing_is_caught() -> None:
     ]
     conditional = [node for node in solves if _is_conditional(node)]
     assert len(conditional) == 4, "exactly four solves may be conditional"
-    assert len(solves) - len(conditional) == 3, "three solves run every refresh"
+    # Four every refresh since beta.41: the coverage counterfactual joined
+    # desired, capability and the reserve-relaxed label. Unconditional on
+    # purpose, and counted here rather than hidden behind a heuristic.
+    assert len(solves) - len(conditional) == 4, "four solves run every refresh"

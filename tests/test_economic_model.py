@@ -323,12 +323,20 @@ def test_a_requirement_already_on_a_boundary_is_left_alone() -> None:
     assert horizon.planning_reserve_kwh == (4.5,)
 
 
-def test_a_requirement_above_the_pack_is_capped_at_the_ceiling() -> None:
-    """Asking for 30 kWh from a 22 kWh pack quantises to 22.0, not 30.0.
+def test_a_requirement_above_the_pack_is_capped_at_what_it_can_reach() -> None:
+    """Asking for 30 kWh from a 22 kWh pack quantises to 21.75, not 30.0.
 
     Capping rather than refusing, because a requirement above the pack is a real
     situation -- a winter evening the battery cannot cover -- and the honest plan
     is "hold everything", not "no plan".
+
+    **One bucket below the ceiling since beta.41, and that is a correction rather
+    than a loosening.** Household service is a state transition now, so a pack
+    that is serving the house is never quite full: a floor demanding a
+    *completely* full pack is one no state can occupy, and it produced a permanent
+    violation that suppressed the published economic value entirely. Capping at
+    the highest level a serving pack can actually reach keeps the requirement as
+    demanding as it can be while remaining a requirement.
     """
     table = reference_table()
     horizon = horizon_for(
@@ -338,7 +346,11 @@ def test_a_requirement_above_the_pack_is_capped_at_the_ceiling() -> None:
         reserve_kwh=[30.0],
     )
 
-    assert horizon.planning_reserve_kwh == (22.0,)
+    ceiling = table.energy(table.buckets)
+    assert horizon.planning_reserve_kwh == (21.75,)
+    # Reachable by construction: a state exists at or above it.
+    assert horizon.planning_reserve_kwh[0] < ceiling
+    assert horizon.planning_reserve_kwh[0] == table.energy(table.buckets - 1)
 
 
 def test_every_violation_is_an_exact_multiple_of_the_bucket() -> None:

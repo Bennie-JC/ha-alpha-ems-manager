@@ -602,9 +602,24 @@ def test_the_flat_terminal_liquidates_the_pack_and_the_new_one_does_not() -> Non
     assert kept.desired.end_energy_dc_kwh > sold.desired.end_energy_dc_kwh + 1.0
     assert kept.desired.planned_grid_export_kwh < (sold.desired.planned_grid_export_kwh)
     # The flat rule liquidates to the floor. That is the number that started this.
-    assert sold.desired.end_energy_dc_kwh == pytest.approx(
-        sold.desired.terminal_floor_kwh, abs=0.05
-    )
+    #
+    # **beta.41 states it as a comparison rather than a landing.** The flat plan
+    # now reports 4.50 kWh against a 4.2164 kWh floor rather than 4.21, because the
+    # reported walk is the lattice level less the self-consumption the recursion
+    # cannot express as a state transition, and bounding that service moved the
+    # figure by a third of a lattice bucket. The claim the test exists for is the
+    # gap between the two rules, and it is now larger, not smaller: 4.50 against
+    # 11.09.
+    floor = sold.desired.terminal_floor_kwh
+    # Stated as the gap between the two rules rather than as a distance from the
+    # floor: what this test is for is that the flat rule liquidates and the
+    # demand-bounded one does not, and that gap is now larger, not smaller.
+    assert sold.desired.end_energy_dc_kwh < floor + 1.0
+    assert kept.desired.end_energy_dc_kwh > sold.desired.end_energy_dc_kwh + 5.0
+    # And the decided endpoint is never below the floor, which the reported walk
+    # may be -- the two endpoints beta.40 published separately for this reason.
+    assert sold.desired.edge_energy_kwh >= floor - 1e-9
+    assert kept.desired.edge_energy_kwh >= floor - 1e-9
 
 
 def test_the_binding_plan_publishes_what_the_old_terminal_would_have_done() -> None:

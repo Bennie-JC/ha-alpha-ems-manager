@@ -239,8 +239,12 @@ def test_the_remaining_figure_carries_no_model_term_and_no_inventory() -> None:
     assert block["switching_cost_eur"] is not None, "the witness: a fee exists"
     assert block["switching_cost_eur"] > 0.0
     cash = block["export_revenue_eur"] - block["grid_import_cost_eur"]
+    # Three independently rounded euro figures, so the identity is checked at the
+    # resolution they are published at rather than tighter than it. It landed
+    # exactly on 1e-4 after beta.41 moved the plan; the relationship is exact in
+    # the unrounded quantities and this is what survives publication.
     assert block["no_battery_value_eur"] == pytest.approx(
-        cash + block["avoided_import_no_battery_eur"], abs=1e-4
+        cash + block["avoided_import_no_battery_eur"], abs=3e-4
     )
     # And it is none of the four figures that would have been tempting.
     for wrong in (

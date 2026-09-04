@@ -343,10 +343,16 @@ def test_the_retention_side_is_discriminable_from_the_upward_side() -> None:
     *Mutation: publish the upward side as the headline and this fails; the version of
     this test that used the reference state did not notice.*
     """
-    # 16.61 rather than 16.6: the latter quantises down to bucket 62, whose two
-    # slopes happen to agree. Measured across the neighbourhood, bucket 63 is the
-    # kinked one -- 0.212 down against 0.018 up.
-    solved = solve_at(head=HEAD, end=END, stored=16.61)
+    # **The witness moved in beta.41, and it had to be found again rather than
+    # assumed.** Bucket 63 was the kinked one while household service moved no
+    # state; with the pack modelled as depleting, the curve there is locally
+    # straight -- its two slopes agree to 9e-16, which is a stronger statement
+    # that the old witness is gone than any tolerance would be.
+    #
+    # Measured across the range, 6.0 kWh is the sharply kinked state now:
+    # bucket 22, 0.204 down against 0.447 up. Relocated rather than relaxed,
+    # because a smaller threshold would have let a genuinely straight curve pass.
+    solved = solve_at(head=HEAD, end=END, stored=6.0)
     plan, bucket_kwh = solved.outcome.desired, solved.outcome.bucket_kwh
     bucket = bucket_at_or_below_kwh(
         plan.intervals[0].start_energy_dc_kwh, bucket_kwh=bucket_kwh

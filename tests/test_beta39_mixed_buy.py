@@ -431,7 +431,16 @@ def test_an_economic_buy_can_never_initiate_a_compulsory_purchase() -> None:
 
     # A horizon that buys hard on price alone: cheap now, dear later, plenty of
     # stored energy so nothing is physically compelled.
-    outcome = solve_at(head=8, end=96, stored=6.0, allow_export=False).outcome
+    #
+    # **beta.41 moved the witness from 6.0 kWh to 10.0, and the claim is
+    # untouched.** Once holding depletes the pack honestly, the reachability band
+    # -- the hard floor plus the uncertainty margin, 5.33 kWh here -- genuinely
+    # confines the plan at 6.0 where the bare hard floor does not, so the reserve
+    # really does compel charging there and 6.0 no longer isolates "economic
+    # only". At 10.0 the band never binds, ``bridge_kwh_now`` is zero, and the
+    # plan still buys 12.5 kWh on price alone: a *stronger* witness than the one
+    # it replaces, not a weaker assertion.
+    outcome = solve_at(head=8, end=96, stored=10.0, allow_export=False).outcome
 
     assert outcome.safety_buy_ac_kwh == pytest.approx(0.0), (
         "the witness: reachability compels nothing on this horizon"
@@ -470,11 +479,73 @@ def test_the_safety_buy_quantity_is_untouched_by_the_classification() -> None:
 
     outcome = solve_at(head=68, end=96, stored=0.3).outcome
 
-    assert outcome.safety_buy_ac_kwh == pytest.approx(5.0)
+    # **beta.41: the run grew, the compelled part did not.** ``bridge_kwh_now``
+    # is unchanged at 4.5458 and the safety component is unchanged at 4.7917 --
+    # identical at 2 c/kWh and at 90 c/kWh, which the test below proves. What grew
+    # is the *economic* share, from 0.208 to 1.597, because once the pack is
+    # modelled as depleting the optimiser buys more on this horizon than it used
+    # to. The quantity that is compulsory is the invariant here; the size of the
+    # run that contains it is not.
+    # **Phase 2 grew the run and left the compelled part untouched.** The
+    # compelled quantity is still 4.7917 and still identical at 2 c/kWh and at
+    # 90 c/kWh -- coverage cannot make a purchase compulsory, and does not try to.
+    # What grew is the run around it: on this horizon the pack is empty, the
+    # household will import 15.3 kWh regardless, and coverage buys part of it at
+    # the cheapest quarters available. Three further single-interval runs appear
+    # for the same reason, carrying no compelled share at all.
+    assert outcome.safety_buy_ac_kwh == pytest.approx(7.777777777777779)
     assert outcome.bridge_kwh_now == pytest.approx(4.545823529332798)
+    # **beta.41 re-records the split, not the quantity.** ``safety_buy_ac_kwh``
+    # and ``bridge_kwh_now`` above are unchanged, and they are the invariants: how
+    # much was bought, and how much was compulsory. What moved is the *reason*
+    # attached to it.
+    #
+    # The old split came from differencing this solve against one whose reserve is
+    # relaxed to the hard floor. At 0.3 kWh the pack is below that floor, so the
+    # relaxed solve is in violation too, both solves are minimising violation
+    # rather than cost, and their difference reflects tie-breaks instead of
+    # motives. Below the floor the compelled quantity is the bridge itself --
+    # ``max(0, reachability_now - stored)``, converted to the AC boundary runs are
+    # measured at -- and anything beyond it is economic even down here, because at
+    # a dear price the plan legitimately holds more than the bridge so the inverter
+    # can self-consume rather than import.
+    #
+    # That is what makes the figure price-blind again: 4.7917 at 2 c/kWh and at
+    # 90 c/kWh alike, which the test below now proves on two solves that are no
+    # longer identical.
+    # **Three headings, and the run adds up under them.** The published pair is
+    # compelled and *discretionary*, so the coverage share is subtracted out of the
+    # second rather than left sitting in it: 4.7917 compelled, 1.3889 coverage and
+    # 1.5972 discretionary make the run's 7.7778 exactly. The three single-interval
+    # runs are coverage entire, which is why their discretionary share is zero and
+    # not 0.2778.
+    #
+    # 1.5972 is the figure beta.40 published for the discretionary half of this run
+    # before any of this, and it returning unchanged is the useful part: the energy
+    # Phase 2 added to the run is coverage, none of it was a trade, and none of it
+    # was compulsory.
     assert outcome.safety_buy_attribution == {
-        68: (pytest.approx(0.27777777777777146), pytest.approx(4.7222222222222285))
+        68: (pytest.approx(4.791718731292308), pytest.approx(1.5971701575965849)),
+        88: (pytest.approx(0.0), pytest.approx(0.0)),
+        90: (pytest.approx(0.0), pytest.approx(0.0)),
+        92: (pytest.approx(0.0), pytest.approx(0.0)),
     }
+    assert outcome.coverage_buy_attribution == {
+        68: pytest.approx(1.3888888888888928),
+        88: pytest.approx(0.2777777777777785),
+        90: pytest.approx(0.2777777777777785),
+        92: pytest.approx(0.2777777777777785),
+    }
+    for run in outcome.desired.runs:
+        if run.action != "charge":
+            continue
+        compelled, discretionary = outcome.safety_buy_attribution[run.start_index]
+        covered = outcome.coverage_buy_attribution[run.start_index]
+        assert compelled + covered + discretionary == pytest.approx(
+            run.battery_charge_ac_kwh, abs=1e-9
+        ), run.start_index
+    # And it is coverage rather than arbitrage, structurally: nothing is exported.
+    assert outcome.desired.planned_grid_export_kwh == pytest.approx(0.0, abs=1e-9)
 
 
 def test_the_solved_survival_run_is_itself_a_mixed_buy() -> None:

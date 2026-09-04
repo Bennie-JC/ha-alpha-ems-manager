@@ -237,11 +237,23 @@ def test_the_hard_floor_survives_ambient_service(stored_kwh: float) -> None:
     plan = outcome.desired
 
     assert min(entry.start_energy_dc_kwh for entry in plan.intervals) >= FLOOR - 1e-6
-    # And the trajectory is coherent: energy discharged is energy the pack lost.
+    # And the trajectory is coherent: energy served is energy the pack lost.
+    #
+    # **Stated as the balance rather than as "the pack ends lower".** Since
+    # beta.41 the recursion can *see* this depletion, so on a dear no-production
+    # horizon it buys from the first interval to stay above the reserve -- the
+    # trajectory rises and a test looking for a fall finds none. What it was
+    # really asserting is that service comes out of the pack rather than out of
+    # nowhere, and that is an identity, so it is checked as one.
     served = sum(entry.ambient_self_consumption_ac_kwh for entry in plan.intervals)
     if served > 0.0:
-        first = plan.intervals[0].start_energy_dc_kwh
-        assert min(entry.start_energy_dc_kwh for entry in plan.intervals) < first
+        moved = sum(entry.battery_state_service_dc_kwh for entry in plan.intervals)
+        assert moved > 0.0, "service that moves no state is the beta.40 defect"
+        decided = sum(entry.battery_delta_dc_kwh for entry in plan.intervals)
+        opening = plan.intervals[0].start_energy_dc_kwh
+        assert opening + decided - moved == pytest.approx(
+            plan.end_energy_dc_kwh, abs=1e-9
+        )
 
 
 def test_import_returns_when_the_pack_genuinely_cannot_serve() -> None:

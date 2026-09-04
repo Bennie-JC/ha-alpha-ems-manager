@@ -254,7 +254,10 @@ def test_beta_thirty_seven_adds_no_dynamic_programming_solve() -> None:
     assert payload["available"] is True
     assert outcome.solve_count == before
     # And the figure a reader would check against the harness's own baseline.
-    assert before == 4, before
+    # Four in beta.37, five since beta.41 added the coverage counterfactual -- which
+    # is the point of pinning it: the summary must add none of its own, whatever the
+    # baseline happens to be.
+    assert before == 5, before
 
 
 def test_the_summary_needs_no_table_and_no_price_series() -> None:

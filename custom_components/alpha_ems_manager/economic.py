@@ -102,7 +102,7 @@ import json
 import math
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from typing import Any
 
@@ -118,6 +118,7 @@ from .battery import (
 from .const import (
     ADAPT_PROTECTION_CEILING,
     ADVANTAGE_BASIS_METERED_CASH,
+    AMBIENT_CARRY_STEPS,
     AVOIDANCE_BASIS_NO_BATTERY,
     BATTERY_KWH_PRECISION,
     BUY_REASON_ARBITRAGE,
@@ -194,8 +195,7 @@ from .const import (
     MODE_CHARGE,
     MODE_DISCHARGE,
     MODE_IDLE,
-    PLAN_END_ENERGY_BASIS_AMBIENT_WALK,
-    PLAN_END_ENERGY_BASIS_LATTICE_STATE,
+    PLAN_END_ENERGY_BASIS_PHYSICAL_STATE,
     QUARTER_NOT_EXECUTABLE_INTENT,
     QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE,
     QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION,
@@ -218,8 +218,18 @@ from .const import (
     STORED_VALUE_UNDEFINED_VIOLATION,
     SURVIVAL_WINDOW_ACTIONABLE_PREFIX,
     SURVIVAL_WINDOW_PLAN_CAMPAIGN,
+    TERMINAL_LOOKAHEAD_INTERVALS,
     TERMINAL_VALUE_BASIS_DEMAND_BOUNDED,
     TERMINAL_VALUE_BASIS_FLAT_EDGE,
+    TERMINAL_WINDOW_CLOCK_MATCHED,
+    TERMINAL_WINDOW_EMPTY,
+    TERMINAL_WINDOW_FORECAST_TAIL,
+    TERMINAL_WINDOW_STOP_LOOKAHEAD,
+    TERMINAL_WINDOW_STOP_NONE,
+    TERMINAL_WINDOW_STOP_PV_BLIND,
+    TERMINAL_WINDOW_STOP_SURPLUS,
+    TERMINAL_WINDOW_STOP_UNFORECAST,
+    TERMINAL_WINDOW_STOP_UNPRICED,
 )
 from .simulation import IntervalDemand
 
@@ -850,10 +860,32 @@ class EconomicInterval:
     #: transparent here, because ``_resolved_run_state`` folds ``_RUN_ABSORB``
     #: into whichever run was in progress.
     run_state: str = ECONOMIC_DIRECTION_IDLE
-    #: AC energy the inverter covered from the battery without being dispatched.
-    #: Non-zero only on a hold interval where ambient self-consumption is modelled
-    #: and the pack had room above the floor to supply it.
+    #: AC energy the inverter covered from the battery without being dispatched,
+    #: **at the meter, exact**. Non-zero only on a hold interval where ambient
+    #: self-consumption is modelled and the pack had room above the floor to
+    #: supply it.
+    #:
+    #: **This is household energy and it is not quantised.** Every grid figure on
+    #: this interval is split against it, so the no-battery counterfactual stays
+    #: exact and the price is the price the household actually pays. The pack's
+    #: *state* moves in whole carry steps, which is a different quantity --
+    #: :attr:`battery_state_service_dc_kwh` -- and conflating the two is what
+    #: beta.41 stopped doing.
     ambient_self_consumption_ac_kwh: float = 0.0
+    #: DC energy the same service moved the **solver's state** by, in whole carry
+    #: steps. This is the figure the energy balance closes on, because it is what
+    #: the recursion actually did.
+    battery_state_service_dc_kwh: float = 0.0
+    #: ``exact - quantised``, in DC kWh: the household service this interval
+    #: incurred that the state could not express and carried to a later one.
+    #:
+    #: **Published rather than absorbed, and bounded by one carry step.** A
+    #: residual that nothing reports is how a solver and its own trajectory drift
+    #: apart -- which is the defect beta.41 exists to remove, so it would be
+    #: perverse to reintroduce a smaller one silently. It reaches no decision:
+    #: nothing in the objective, the reserve, the export permission or Stage B
+    #: reads it.
+    battery_state_quantisation_residual_kwh: float = 0.0
     #: Which counterfactual every marginal figure on this interval rests on. See
     #: ``COUNTERFACTUAL_*``; published so a reader never has to guess.
     counterfactual_basis: str = COUNTERFACTUAL_IDLE_IMPORT
@@ -1085,6 +1117,12 @@ class EconomicPlan:
     #: asset, not a saving.
     edge_energy_kwh: float = 0.0
     edge_value_eur: float = 0.0
+    #: DC energy ambient self-consumption took out of the pack across this plan.
+    #: The exact difference between the two published endpoints -- the decided
+    #: lattice level and the reported walk -- and the amount the terminal credit is
+    #: discounted by. Published so the gap beta.40 had to explain in prose is a
+    #: number a reader can check.
+    ambient_drain_dc_kwh: float = 0.0
     #: How that credit was arrived at. ``None`` on a plan solved by a pre-beta.35
     #: caller, which is the flat rule by definition.
     terminal_value: TerminalValue | None = None
@@ -1358,33 +1396,21 @@ class EconomicPlan:
 
     @property
     def end_energy_dc_kwh(self) -> float:
-        """Return where the **reported** walk ends. Not the decided state.
+        """Return the physical energy the plan ends holding.
 
-        **Two different quantities, and beta.40 is the release that says so.**
+        **One endpoint, and beta.41 is the release that makes it one.** beta.40
+        had to publish two -- the lattice level the recursion decided and the
+        ambient-corrected walk -- because they were genuinely different
+        quantities: 9.75 kWh against 4.32 on the live 2026-09-03 horizon, with a
+        violation of 0.00 that was correct only because violations were evaluated
+        on the level rather than on the energy the pack would hold.
 
-        ``start_energy_dc_kwh`` is the ambient-corrected continuous walk: it is
-        reduced every interval by ``ambient_self_consumption_ac_kwh``, the pack
-        feeding the house with no decision involved. ``battery_delta_dc_kwh`` is
-        the *lattice* move the recursion actually chose. The two live in different
-        resolutions on purpose -- 0.105 kWh of ambient discharge against a
-        0.264 kWh bucket is not representable, which is the deferred limitation
-        the reserve block has recorded since beta.31 -- so this sum is a
-        **diagnostic projection**, never the trajectory the optimiser decided.
-
-        The gap is not small. On a no-production horizon the recursion holds one
-        bucket for 76 intervals while this figure walks 5.7975 down to 1.5421,
-        below the configured hard floor, with ``violation_kwh`` correctly 0.0:
-        violations are evaluated on the lattice state, which never moved.
-
-        **The decided endpoint is :attr:`edge_energy_kwh`**, which is a lattice
-        energy by construction and is what the terminal credit was priced on. Use
-        that to ask where the plan ends; ``tests/test_beta40_hard_floor.py``
-        asserts the identity and the ordering between the two.
+        The recursion now carries household service in its own state, so the level
+        and the energy are the same quantity. This returns
+        :attr:`edge_energy_kwh` exactly. Both names are kept because two names
+        are cheaper than a migration, and a test pins their equality.
         """
-        if not self.intervals:
-            return 0.0
-        last = self.intervals[-1]
-        return last.start_energy_dc_kwh + last.battery_delta_dc_kwh
+        return self.edge_energy_kwh
 
 
 # -- the horizon -------------------------------------------------------------
@@ -1476,7 +1502,22 @@ def build_horizon(
             break
         usable.append(demand)
         priced.append(prices[position])
-        reserve.append(table.energy(min(table.bucket_at_or_above(raw), table.buckets)))
+        # **Capped one bucket below the ceiling, not at it.** A requirement the
+        # pack cannot hold is not a requirement, it is an impossibility, and
+        # beta.41 is where that stopped being merely questionable and became
+        # unsatisfiable: household service is a state transition now, so a pack
+        # that is serving the house is never quite full, and a reserve demanding a
+        # *completely* full pack can never be met. Measured on a fixture whose
+        # requirement exceeded a 10.0 kWh pack: the plan charged to the top and
+        # still reported a 0.47 kWh violation across five intervals, which
+        # suppressed the published economic value entirely.
+        #
+        # One bucket is the room the carry can occupy, so this is the highest
+        # level a serving pack can actually reach. Where the requirement already
+        # sits below it -- every production shape, where it is the floor plus a
+        # margin against a pack four times larger -- this changes nothing.
+        reachable = max(0, table.buckets - 1)
+        reserve.append(table.energy(min(table.bucket_at_or_above(raw), reachable)))
 
     return EconomicHorizon(
         demands=tuple(usable),
@@ -1563,6 +1604,178 @@ def edge_creditable_energy_kwh(
     return max(0.0, ceiling_kwh - max(0.0, forecast_surplus_kwh))
 
 
+@dataclass(frozen=True, slots=True)
+class PostHorizonWindow:
+    """The household demand waiting just past the horizon, and what it costs.
+
+    The two quantities :class:`TerminalValue` needs for its demand-bounded
+    segment, plus the provenance of how they were obtained -- because the failure
+    this class exists to prevent was **silent**. A zero-width window and a genuine
+    forecast of darkness produced identical figures, so a collapse that ran every
+    afternoon looked exactly like a quiet night.
+    """
+
+    demand_ac_kwh: float = 0.0
+    displaced_price_eur_kwh: float = 0.0
+    intervals: int = 0
+    basis: str = TERMINAL_WINDOW_EMPTY
+    stopped_by: str = TERMINAL_WINDOW_STOP_NONE
+
+
+def post_horizon_window(
+    demands: Sequence[IntervalDemand],
+    prices: Sequence[IntervalPrice],
+    *,
+    horizon_intervals: int,
+    today_interval_count: int,
+    lookahead: int = TERMINAL_LOOKAHEAD_INTERVALS,
+) -> PostHorizonWindow:
+    """Return the demand the terminal inventory can still serve, and its price.
+
+    **The window used to be the slice past the horizon and nothing else, and that
+    slice is empty exactly when it matters most.** The priced horizon is the
+    prefix where a known price *and* a demand both exist, and the price series is
+    built one entry per demand -- so the moment tomorrow day-ahead publishes, the
+    two series end at the same instant, the slice is empty, and the demand-bounded
+    segment of the terminal value degenerates to a flat export rate. On the
+    reference installation that fired every afternoon and pinned the worth of
+    stored energy at ``eta_discharge * export_price``, putting the break-even
+    import price below any quarter the market has ever offered.
+
+    So when the real tail runs out, the window is replayed by **clock position**
+    from the intervals the horizon already holds. The post-horizon night begins at
+    the clock position tomorrow night began at, and tomorrow is inside the
+    horizon, carrying its own production forecast at a price that is *known by
+    construction*. Sourcing the estimator only from the priced prefix is therefore
+    a guarantee rather than a hope: every price there passed
+    :attr:`IntervalPrice.known`, so no unknown-price interval can reach a decision
+    through this function.
+
+    It is an estimator and it is bounded like one. Every stopping rule shortens
+    the window, so a missing forecast can only *lower* the worth of stored energy.
+    That asymmetry is deliberate: the terminal value lives in the cost term alone
+    and can never cause a reserve violation, but overstating it licenses real
+    money to be spent against a day nobody has published a price for, while
+    understating it merely forgoes profit down to a floor the reserve protects
+    independently.
+    """
+
+    def clock_slot(index: int) -> int:
+        """Return the civil-day slot for an absolute interval index.
+
+        The same arithmetic the price alignment uses, rather than a modulus: a
+        daylight-saving day has 92 or 100 intervals, and a modulus against 96
+        silently maps tomorrow evening onto today afternoon. ``-1`` is an
+        unmatchable sentinel, so a missing interval count degrades to an empty
+        window instead of raising.
+        """
+        if today_interval_count <= 0:
+            return -1
+        if index < today_interval_count:
+            return index
+        return index - today_interval_count
+
+    head = max(0, min(horizon_intervals, len(demands), len(prices)))
+    if head <= 0:
+        return PostHorizonWindow()
+
+    # The clock-indexed proxies, drawn from the priced prefix only. Later
+    # positions overwrite earlier ones deliberately: today is a *partial* day
+    # whose early slots have already elapsed and are absent from the series, so a
+    # slot taken from tomorrow is both available and the better estimator of the
+    # night after it.
+    by_slot_demand: dict[int, IntervalDemand] = {}
+    by_slot_import: dict[int, float] = {}
+    for position in range(head):
+        key = clock_slot(demands[position].index)
+        if key < 0:
+            continue
+        by_slot_demand[key] = demands[position]
+        import_price = prices[position].import_eur_kwh
+        if import_price is not None:
+            by_slot_import[key] = import_price
+
+    tail = tuple(demands[head:][:lookahead])
+    if tail:
+        window: tuple[IntervalDemand, ...] = tail
+        basis = TERMINAL_WINDOW_FORECAST_TAIL
+        # **The pre-existing fallback, kept deliberately.** A real tail interval
+        # whose clock position the horizon never covered still counts as demand,
+        # priced at the mean of what *is* known rather than dropped -- dropping it
+        # would understate the window, and this branch predates beta.41. It is
+        # reached more often now only because the clock lookup it sits behind
+        # stopped silently returning the *wrong* price: the slot was absolute
+        # while the price array is head-relative, so a 14:00 head priced tomorrow
+        # 02:00 at today 16:15. An honest mean beats a confident wrong number.
+        known = [
+            price.import_eur_kwh
+            for price in prices[:head]
+            if price.import_eur_kwh is not None
+        ]
+        fallback: float | None = sum(known) / len(known) if known else 0.0
+    else:
+        # Walk forward from the clock position the horizon ended on, stopping at
+        # the first slot the horizon never covered. An explicit walk rather than a
+        # comprehension that skips holes: a skipped hole shortens the window
+        # without saying so, which is the class of silence this replaced.
+        start = clock_slot(demands[head - 1].index) + 1
+        span = max(1, today_interval_count)
+        replay: list[IntervalDemand] = []
+        for offset in range(lookahead):
+            proxy = by_slot_demand.get((start + offset) % span)
+            if proxy is None:
+                break
+            replay.append(proxy)
+        window = tuple(replay)
+        basis = TERMINAL_WINDOW_CLOCK_MATCHED
+        # No fallback on the replay branch, and it needs none: every proxy was
+        # drawn from a slot that carried a known price, so the lookup below cannot
+        # miss. The ``None`` makes that a stopping rule rather than an assumption.
+        fallback = None
+
+    demand_kwh = 0.0
+    weighted = 0.0
+    counted = 0
+    stopped = TERMINAL_WINDOW_STOP_LOOKAHEAD
+    for interval in window:
+        # The next free refill ends the window. Physical, price-blind, and the
+        # bound that stops a full pack being credited for the morning sun.
+        if (interval.surplus_kwh or 0.0) > 0.0:
+            stopped = TERMINAL_WINDOW_STOP_SURPLUS
+            break
+        # PV-blind is not a forecast of darkness. Without a production forecast
+        # the next free refill cannot be located at all, so a segment whose whole
+        # definition is "before the next free refill" has no defensible width.
+        if interval.pv_kwh is None:
+            stopped = TERMINAL_WINDOW_STOP_PV_BLIND
+            break
+        net = interval.net_demand_kwh
+        if net is None:
+            stopped = TERMINAL_WINDOW_STOP_UNFORECAST
+            break
+        price = by_slot_import.get(clock_slot(interval.index))
+        if price is None:
+            price = fallback
+        if price is None:
+            stopped = TERMINAL_WINDOW_STOP_UNPRICED
+            break
+        demand_kwh += net
+        weighted += net * price
+        counted += 1
+
+    if counted <= 0 or demand_kwh <= 0.0:
+        return PostHorizonWindow(basis=TERMINAL_WINDOW_EMPTY, stopped_by=stopped)
+    return PostHorizonWindow(
+        demand_ac_kwh=demand_kwh,
+        # Demand-weighted, because the energy is claimed by demand rather than by
+        # time -- the rule ``survival_curves`` already applies to this quantity.
+        displaced_price_eur_kwh=weighted / demand_kwh,
+        intervals=counted,
+        basis=basis,
+        stopped_by=stopped,
+    )
+
+
 # -- the solver --------------------------------------------------------------
 
 
@@ -1602,12 +1815,21 @@ class TerminalValue:
     ``demand_ac_kwh``
         Forecast net household demand after the horizon ends, stopping at the first
         interval that forecasts a production surplus -- the next *free* refill,
-        which is a physical fact and carries no price. The demand forecast already
-        outlives the price horizon by design, so nothing new is forecast here.
+        which is a physical fact and carries no price.
+
+        **beta.41 corrects the claim that used to stand here.** This said the
+        demand forecast "already outlives the price horizon by design". It does
+        not: the price series is built one entry per demand, so once tomorrow
+        day-ahead publishes the two end at the same instant and the window is
+        empty. :func:`post_horizon_window` is the bound now, and it replays the
+        horizon own intervals by clock position when the real tail runs out.
     ``displaced_price_eur_kwh``
-        What that demand would otherwise cost, priced by clock position from the
-        known series: today's 02:00 is the best available estimate of tomorrow's
-        02:00. The same construct the export gate's ``protect_price`` already uses.
+        What that demand would otherwise cost, demand-weighted over clock-matched
+        prices drawn only from the priced prefix -- so an unknown price can never
+        reach a decision through it. Not ``protect_price``, which an earlier
+        version of this docstring claimed: ``survival_curves`` weights known
+        in-horizon prices by demand and does no clock matching at all. The rule it
+        does share is the demand weighting.
     ``export_price_eur_kwh``
         What the spare share could be sold for, or zero where export is not
         permitted.
@@ -1624,6 +1846,13 @@ class TerminalValue:
     edge_value_eur_per_kwh: float = 0.0
     edge_creditable_kwh: float = float("inf")
     basis: str = TERMINAL_VALUE_BASIS_DEMAND_BOUNDED
+    #: How the demand window above was obtained and where it stopped. Provenance
+    #: only -- nothing branches on these. They exist because the beta.40 failure
+    #: was that a *collapsed* window and a genuine forecast of darkness published
+    #: identical figures, so a defect that fired every afternoon was invisible.
+    window_basis: str = TERMINAL_WINDOW_EMPTY
+    window_intervals: int = 0
+    window_stopped_by: str = TERMINAL_WINDOW_STOP_NONE
 
     @property
     def flat(self) -> TerminalValue:
@@ -1689,6 +1918,9 @@ class TerminalValue:
                 if not math.isfinite(self.edge_creditable_kwh)
                 else _round_kwh(self.edge_creditable_kwh)
             ),
+            "post_horizon_window_basis": self.window_basis,
+            "post_horizon_window_intervals": self.window_intervals,
+            "post_horizon_window_stopped_by": self.window_stopped_by,
             "rule": (
                 "energy the household will consume before the next forecast "
                 "production surplus is credited at the import price it displaces; "
@@ -1803,21 +2035,20 @@ def solve(
         if delta < 0 and discharge_ac > 0.0
     ]
     smallest_discharge_ac_kwh = min(discharges) if discharges else 0.0
-    outcomes_per_interval: list[dict[int, _DeltaOutcome]] = [
-        _interval_outcomes(
-            ac_by_delta=ac_by_delta,
-            load_ac_kwh=demand.baseline_kwh or 0.0,
-            pv_ac_kwh=demand.pv_kwh or 0.0,
-            price=horizon.prices[position],
-            permitted=permitted,
-            ambient_self_consumption=ambient_self_consumption,
-            max_discharge_ac_kwh=max_discharge_ac_kwh,
-            discharge_efficiency=table.limits.discharge_efficiency,
-            smallest_discharge_ac_kwh=smallest_discharge_ac_kwh,
-        )
-        for position, demand in enumerate(horizon.demands)
-    ]
-
+    # The carry axis resolution, needed here because household service is rounded
+    # to it *before* its flows are split -- see ``_interval_outcomes``.
+    carry_step_kwh = table.bucket_kwh / AMBIENT_CARRY_STEPS
+    carry_states = AMBIENT_CARRY_STEPS
+    outcomes_per_interval, drain_steps = _outcomes_with_carried_service(
+        horizon=horizon,
+        ac_by_delta=ac_by_delta,
+        permitted=permitted,
+        ambient_self_consumption=ambient_self_consumption,
+        max_discharge_ac_kwh=max_discharge_ac_kwh,
+        discharge_efficiency=table.limits.discharge_efficiency,
+        smallest_discharge_ac_kwh=smallest_discharge_ac_kwh,
+        carry_step_kwh=carry_step_kwh,
+    )
     # ``terminal_floor_kwh`` is a **physical floor the plan must still hold at the
     # end of the horizon**, and since beta.18 its only production value is the
     # user's configured minimum. Down, so the plan never assumes more stored
@@ -1854,13 +2085,32 @@ def solve(
         table.bucket_at_or_below(terminal_floor_kwh),
         ambient[-1] if ambient else start_bucket,
     )
-    enforced_floor_kwh = table.energy(terminal_bucket)
+    # **Clamped to what doing nothing can physically reach, not to the lattice
+    # level it lands on.** The reachability guard has always lowered this floor to
+    # the endpoint of the do-nothing walk, because a floor no state can reach
+    # makes every state infeasible and refuses to plan at all. Since beta.41 that
+    # walk *drains*: its lattice endpoint overstates what the pack will be holding
+    # by the household service taken along the way, so the bound has to be the
+    # physical endpoint or the guard stops guarding.
+    enforced_floor_kwh = min(
+        table.energy(terminal_bucket),
+        _ambient_walk_physical_end_kwh(
+            table=table,
+            outcomes_per_interval=outcomes_per_interval,
+            ambient_walk=ambient,
+            start_bucket=start_bucket,
+            hard_floor_kwh=hard_floor_kwh,
+            carry_step_kwh=carry_step_kwh,
+            drain_steps=drain_steps,
+        ),
+    )
 
     # Value and policy tables. ``value[b][r]`` is the best (violation, cost) from
     # this interval onwards; ``choice`` remembers which move produced it so the
     # plan can be walked forward afterwards.
-    value: list[list[tuple[float, float]]] = [
-        [_UNREACHABLE for _ in _RUN_STATES] for _ in range(buckets + 1)
+    value: list[list[list[tuple[float, float]]]] = [
+        [[_UNREACHABLE for _ in _RUN_STATES] for _ in range(carry_states)]
+        for _ in range(buckets + 1)
     ]
     # **Where the terminal value enters, and it is still one array.** The
     # terminal condition used to be a pure feasibility test carrying no price,
@@ -1872,8 +2122,14 @@ def solve(
     # beta.35 replaces the flat rate with :class:`TerminalValue`, which is concave
     # and bounded by the demand it can actually serve. The seed is the same shape,
     # the same one array, and costs the search nothing: it is a function of the
-    # bucket alone, which is the standing rule for anything that may enter this
+    # state alone, which is the standing rule for anything that may enter this
     # recursion at all.
+    #
+    # **beta.41 widened "state" from the bucket to the bucket and its carry**, and
+    # that is the whole of the correction. The rule was never about
+    # one-dimensionality; it is about the seed not depending on how a state was
+    # reached. Physical energy satisfies it and the lattice level does not, because
+    # the lattice level is not what the pack will be holding.
     #
     # It cannot reintroduce "pay anything": it is finite, non-negative, bounded
     # above by the dearest price seen, and it lives in the second element of the
@@ -1883,136 +2139,209 @@ def solve(
         edge_creditable_kwh=edge_creditable_kwh,
         basis=TERMINAL_VALUE_BASIS_FLAT_EDGE,
     )
+    # **Priced on the energy the pack will actually hold, not on the lattice
+    # level.** The lattice endpoint is the level the recursion decided; ambient
+    # service has been taking energy out of the pack the whole way there without
+    # moving it, so the two differ by the horizon's drain. On the live 2026-09-03
+    # 20:45 horizon that was a 9.75 kWh lattice endpoint credited while the pack
+    # ended at the 4.32 kWh floor -- and crediting inventory that will not be
+    # there is what collapsed the marginal value of storage to the export price.
+    #
+    # Exact for a trajectory that holds, since ``max(0, E - drain)`` is precisely
+    # what :func:`_walk_forward` reports for one, and an over-statement of the
+    # drain for one that acts, which is the conservative direction: it
+    # under-credits. Still a function of the bucket alone -- the drain is a single
+    # scalar here -- so the standing rule for this recursion is intact.
     edge_credit = [
-        terminal.credit_eur(table.energy(bucket), enforced_floor_kwh)
+        [
+            terminal.credit_eur(
+                _physical_energy_kwh(table.energy(bucket), carry, carry_step_kwh),
+                enforced_floor_kwh,
+            )
+            for carry in range(carry_states)
+        ]
+        for bucket in range(buckets + 1)
+    ]
+    energies = [table.energy(bucket) for bucket in range(buckets + 1)]
+    physical = [
+        [
+            _physical_energy_kwh(energies[bucket], carry, carry_step_kwh)
+            for carry in range(carry_states)
+        ]
         for bucket in range(buckets + 1)
     ]
     for bucket in range(buckets + 1):
-        feasible = bucket >= terminal_bucket
-        for run in _RUN_STATES:
-            value[bucket][run] = (
-                (0.0, -edge_credit[bucket]) if feasible else _UNREACHABLE
-            )
+        for carry in range(carry_states):
+            # **The terminal condition, on physical energy.** This is not the
+            # hard floor -- that is a reserve, enforced through ``violations``
+            # inside the horizon -- it is the requirement that the plan *end* at
+            # or above the terminal floor, which is what stops the last interval
+            # dumping the pack. Dropping it was measured to make an
+            # eight-interval fixture discharge from 11.0 to 9.0 kWh against an
+            # 11.0 floor while still reporting no violation.
+            feasible = physical[bucket][carry] >= enforced_floor_kwh - 1e-9
+            for run in _RUN_STATES:
+                value[bucket][carry][run] = (
+                    (0.0, -edge_credit[bucket][carry]) if feasible else _UNREACHABLE
+                )
 
-    choice: list[list[list[int]]] = [
-        [[-1 for _ in _RUN_STATES] for _ in range(buckets + 1)] for _ in range(count)
+    choice: list[list[list[list[int]]]] = [
+        [
+            [[-1 for _ in _RUN_STATES] for _ in range(carry_states)]
+            for _ in range(buckets + 1)
+        ]
+        for _ in range(count)
     ]
-    energies = [table.energy(bucket) for bucket in range(buckets + 1)]
 
     for position in range(count - 1, -1, -1):
         reserve_kwh = horizon.planning_reserve_kwh[position]
         outcomes = outcomes_per_interval[position]
         following = value
-        value = [[_UNREACHABLE for _ in _RUN_STATES] for _ in range(buckets + 1)]
-        # Violation is a property of where the interval *lands*, so it is computed
-        # once per bucket rather than once per transition.
-        violations = [max(0.0, reserve_kwh - energy) for energy in energies]
+        value = [
+            [[_UNREACHABLE for _ in _RUN_STATES] for _ in range(carry_states)]
+            for _ in range(buckets + 1)
+        ]
+        # Violation is a property of where the interval *lands*, and it lands on a
+        # physical energy. Measuring it on the lattice level is what allowed a plan
+        # to publish ``violation_kwh: 0.0`` while its own reconstructed trajectory
+        # ended below zero.
+        violations = [
+            [max(0.0, reserve_kwh - level) for level in row] for row in physical
+        ]
+        steps = drain_steps[position]
 
         for bucket in range(buckets + 1):
             moves = table.moves[bucket]
-            for run in _RUN_STATES:
-                best = _UNREACHABLE
-                best_move = -1
-                for offset, move in enumerate(moves):
-                    outcome = outcomes.get(move.target - bucket)
-                    if outcome is None or not outcome.permitted:
-                        continue
-                    # **The export permission.** Refuse only a move that (a) pushes
-                    # energy across the meter beyond what the site would have
-                    # spilled anyway, (b) at a price that does not beat what that
-                    # energy is worth to the house before the next refill, and (c)
-                    # would leave the pack below what it needs to get there.
-                    #
-                    # All three, because any one alone would be wrong: (a) keeps
-                    # self-consumption untouched, (b) keeps a genuinely good sale
-                    # available, and (c) keeps the protection about *inventory* the
-                    # plan actually needs rather than a blanket reluctance to sell.
-                    if gated and outcome.caused_export and not export_free[position]:
-                        # **(c), and beta.34 states when it is evidence at all.**
+            for carry in range(carry_states):
+                if physical[bucket][carry] < -1e-9:
+                    # **Only the impossible is excluded here, not the
+                    # undesirable.** A pack below the configured floor is a state
+                    # it can genuinely be in -- that is the whole survival case,
+                    # and excluding it made every below-floor horizon report
+                    # ``economic_terminal_unreachable`` and plan nothing, which is
+                    # the beta.31 immobilisation wearing a different name. The
+                    # floor is a *reserve*: it is enforced through ``violations``,
+                    # lexicographically above cost, and negative energy is the
+                    # only thing physics forbids outright.
+                    continue
+                for run in _RUN_STATES:
+                    best = _UNREACHABLE
+                    best_move = -1
+                    for offset, move in enumerate(moves):
+                        outcome = outcomes.get(move.target - bucket)
+                        if outcome is None or not outcome.permitted:
+                            continue
+                        # **The export permission.** Refuse only a move that (a)
+                        # pushes energy across the meter beyond what the site would
+                        # have spilled anyway, (b) at a price that does not beat
+                        # what that energy is worth to the house before the next
+                        # refill, and (c) would leave the pack below what it needs
+                        # to get there.
                         #
-                        # ``energies[-1]`` is the pack's ceiling. A requirement at
-                        # or above it is a test no reachable state can pass, so it
-                        # carries no information about *this* sale -- it says the
-                        # household will be short whatever happens here. The live
-                        # installation published 23.09 kWh against a 21.6 kWh pack
-                        # on 2026-08-29 and read that as "never export".
-                        #
-                        # It is not read that way now. Where the requirement is
-                        # unsatisfiable the price test above decides alone, and it
-                        # is the right test: if the household must buy this energy
-                        # back regardless, a sale below what the buy-back costs is
-                        # a loss and a sale above it is a gain, and (b) is exactly
-                        # that comparison. The refusal that follows is traceable to
-                        # a price rather than to an impossible energy test.
-                        #
-                        # **This deliberately does not loosen the permission.**
-                        # (b) is already required, so the unsatisfiable branch
-                        # refuses precisely what beta.33 refused. What changed is
-                        # that the reason is now sayable, the published floor is
-                        # physical, and the window it was measured over is the
-                        # right one -- see :func:`survival_window_end`.
-                        unsatisfiable = export_floor_kwh[position] >= energies[-1]
-                        if unsatisfiable or (
-                            energies[move.target] < export_floor_kwh[position]
+                        # All three, because any one alone would be wrong: (a)
+                        # keeps self-consumption untouched, (b) keeps a genuinely
+                        # good sale available, and (c) keeps the protection about
+                        # *inventory* the plan actually needs rather than a blanket
+                        # reluctance to sell.
+                        if (
+                            gated
+                            and outcome.caused_export
+                            and not export_free[position]
+                        ):
+                            # **(c), and beta.34 states when it is evidence at
+                            # all.** ``energies[-1]`` is the pack's ceiling. A
+                            # requirement at or above it is a test no reachable
+                            # state can pass, so it carries no information about
+                            # *this* sale -- it says the household will be short
+                            # whatever happens here. The live installation
+                            # published 23.09 kWh against a 21.6 kWh pack on
+                            # 2026-08-29 and read that as "never export".
+                            #
+                            # Where the requirement is unsatisfiable the price test
+                            # decides alone, and it is the right test: if the
+                            # household must buy this energy back regardless, a
+                            # sale below the buy-back cost is a loss and a sale
+                            # above it is a gain, and (b) is exactly that
+                            # comparison.
+                            #
+                            # **beta.41 measures (c) on physical energy**, which is
+                            # the inventory the sale would actually leave behind.
+                            unsatisfiable = export_floor_kwh[position] >= energies[-1]
+                            if unsatisfiable:
+                                continue
+                        # **Household service is part of the transition now.** The
+                        # inverter covers residual load from the pack whenever it
+                        # physically can; it is not a choice the optimiser makes,
+                        # so it is not modelled as one. Serving moves the carry and
+                        # releases whole buckets as it fills; where the pack cannot
+                        # reach the floor and still serve, service stops and the
+                        # interval imports instead -- which is what the hardware
+                        # does.
+                        target = move.target
+                        landed = carry
+                        cost = outcome.cost_eur
+                        if outcome.ambient is not None and steps > 0:
+                            spent = carry + steps
+                            released, landed = divmod(spent, carry_states)
+                            served_target = target - released
+                            if (
+                                served_target >= 0
+                                and physical[served_target][landed]
+                                >= hard_floor_kwh - 1e-9
+                            ):
+                                target = served_target
+                                cost = outcome.ambient.cost_eur
+                            else:
+                                landed = carry
+                        if (
+                            gated
+                            and outcome.caused_export
+                            and not export_free[position]
+                            and physical[target][landed] < export_floor_kwh[position]
                         ):
                             continue
-                    onward_state = _resolved_run_state(outcome.run_state, run)
-                    onward = following[move.target][onward_state]
-                    if onward >= _UNREACHABLE:
-                        continue
-                    cost = outcome.cost_eur
-                    # **Holding does not mean importing.** Where the inverter can
-                    # cover the residual load from the pack, that -- not a full
-                    # purchase -- is what holding costs. Chosen per bucket because
-                    # a pack at the floor cannot serve anything.
-                    if outcome.ambient is not None and _ambient_applies(
-                        outcome,
-                        energy_kwh=energies[bucket],
-                        floor_energy_kwh=hard_floor_kwh,
-                    ):
-                        cost = outcome.ambient.cost_eur
-                    if onward_state != _RUN_IDLE and onward_state != run:
-                        cost += minimum_trade_gain_eur
-                    # The per-kWh margin, charged **locally** on this interval's
-                    # own marginal grid-caused charging. Local is what makes it
-                    # free: the value table is indexed by bucket and run state
-                    # with no accumulated-energy axis, so a cost that depends on
-                    # a whole run's size could not be charged here at all --
-                    # while a cost that depends only on this interval can.
-                    #
-                    # Adding ``margin * kWh`` to the cost is exactly the
-                    # requirement "this energy must earn at least ``margin`` per
-                    # kWh beyond what it costs to buy": the search takes the move
-                    # only when its benefit clears purchase cost plus margin.
-                    if grid_charge_margin_eur_per_kwh > 0.0:
-                        cost += grid_charge_margin_eur_per_kwh * outcome.grid_charge_kwh
-                    # **The only per-kWh cost on the discharge side.** Charged on
-                    # AC throughput in *both* directions, so four shallow cycles
-                    # cost four times what one equivalent cycle does and the
-                    # search prefers the deep one at equal revenue. Local for the
-                    # same reason as the margin above: it depends only on this
-                    # interval's own movement, so it needs no accumulated-energy
-                    # axis and adds no solver dimension.
-                    #
-                    # A different base from the margin, deliberately: that one
-                    # measures *purchased* energy, this one measures *movement*.
-                    # Neither is depreciation, and conflating them would charge
-                    # grid charging twice.
-                    if battery_throughput_cost_eur_per_kwh > 0.0:
-                        cost += battery_throughput_cost_eur_per_kwh * (
-                            outcome.charge_ac_kwh + outcome.discharge_ac_kwh
+                        onward_state = _resolved_run_state(outcome.run_state, run)
+                        onward = following[target][landed][onward_state]
+                        if onward >= _UNREACHABLE:
+                            continue
+                        if onward_state != _RUN_IDLE and onward_state != run:
+                            cost += minimum_trade_gain_eur
+                        # The per-kWh margin, charged **locally** on this interval's
+                        # own marginal grid-caused charging. Local is what makes it
+                        # free: a cost that depends on a whole run's size could not
+                        # be charged here at all, while one that depends only on
+                        # this interval can.
+                        #
+                        # Adding ``margin * kWh`` is exactly "this energy must earn
+                        # at least ``margin`` per kWh beyond what it costs to buy".
+                        if grid_charge_margin_eur_per_kwh > 0.0:
+                            cost += (
+                                grid_charge_margin_eur_per_kwh * outcome.grid_charge_kwh
+                            )
+                        # **The only per-kWh cost on the discharge side.** Charged
+                        # on AC throughput in *both* directions, so four shallow
+                        # cycles cost four times what one equivalent cycle does and
+                        # the search prefers the deep one at equal revenue.
+                        #
+                        # A different base from the margin, deliberately: that one
+                        # measures *purchased* energy, this one measures
+                        # *movement*. Neither is depreciation, and conflating them
+                        # would charge grid charging twice.
+                        if battery_throughput_cost_eur_per_kwh > 0.0:
+                            cost += battery_throughput_cost_eur_per_kwh * (
+                                outcome.charge_ac_kwh + outcome.discharge_ac_kwh
+                            )
+                        candidate = (
+                            onward[0] + violations[target][landed],
+                            onward[1] + cost,
                         )
-                    candidate = (
-                        onward[0] + violations[move.target],
-                        onward[1] + cost,
-                    )
-                    if candidate < best:
-                        best = candidate
-                        best_move = offset
-                value[bucket][run] = best
-                choice[position][bucket][run] = best_move
+                        if candidate < best:
+                            best = candidate
+                            best_move = offset
+                    value[bucket][carry][run] = best
+                    choice[position][bucket][carry][run] = best_move
 
-    if value[start_bucket][head_run_state] >= _UNREACHABLE:  # pragma: no cover
+    if value[start_bucket][0][head_run_state] >= _UNREACHABLE:  # pragma: no cover
         # Note the margin cannot reach this branch. It is a *cost*, and the
         # objective compares ``(violation, cost)`` lexicographically, so no cost
         # can make a state unreachable or outrank reserve feasibility -- it can
@@ -2049,7 +2378,16 @@ def solve(
         # cost-to-go from *now*, per bucket, per run state. That is the marginal
         # value of stored energy, already computed, and beta.34 threw it away every
         # refresh. Retaining it costs one reference and changes no decision.
-        head_value=tuple(tuple(row) for row in value),
+        # **The head layer at carry zero**, which is the only carry the head can
+        # be in: nothing has been drained yet. So the published curve keeps the
+        # shape every reader already expects, and the retention gate and the
+        # marginal-value machinery are untouched by the new axis.
+        head_value=tuple(tuple(row[0]) for row in value),
+        # The carry resolution the recursion used, so the walk replays the same
+        # transition rather than re-deriving one.
+        carry_step_kwh=carry_step_kwh,
+        carry_states=carry_states,
+        drain_steps=drain_steps,
     )
 
 
@@ -2093,6 +2431,113 @@ def _ambient_walk(
         bucket = best
         walk.append(bucket)
     return walk
+
+
+def _outcomes_with_carried_service(
+    *,
+    horizon: EconomicHorizon,
+    ac_by_delta: dict[int, tuple[float, float]],
+    permitted: frozenset[str],
+    ambient_self_consumption: bool,
+    max_discharge_ac_kwh: float,
+    discharge_efficiency: float,
+    smallest_discharge_ac_kwh: float,
+    carry_step_kwh: float,
+) -> tuple[list[dict[int, _DeltaOutcome]], tuple[int, ...]]:
+    """Return the priced intervals and the carry steps each one takes.
+
+    **Two passes, because the quantisation is cumulative and the flows have to
+    agree with it.** The first pass prices every interval with the service
+    unrounded, and is read only to find how much each interval *would* take. The
+    second rebuilds them with the amount the carry axis can actually express, so
+    the meter, the price and the state all come from one figure.
+
+    **The meter is exact and the state is quantised, and that split is the whole
+    design.** The flows and the price come from the residual load the household
+    actually has, so the inverter never gives more than was asked for and no
+    export is fabricated -- quantising the flows too was tried and cost 230
+    failing tests across Stage-B families the change had no business touching,
+    because a fabricated export changes campaign classification and row
+    objectives.
+
+    The *state* moves in whole carry steps, and the remainder is carried rather
+    than discarded, which holds the horizon total to **0.1 %** instead of the
+    ~90 % that flooring each interval independently would give. What remains is a
+    timing discretisation: a fraction of one interval's service is recorded
+    against the next. It is bounded by one step at any moment and nets to nothing
+    across the horizon.
+    """
+    raw = [
+        _interval_outcomes(
+            ac_by_delta=ac_by_delta,
+            load_ac_kwh=demand.baseline_kwh or 0.0,
+            pv_ac_kwh=demand.pv_kwh or 0.0,
+            price=horizon.prices[position],
+            permitted=permitted,
+            ambient_self_consumption=ambient_self_consumption,
+            max_discharge_ac_kwh=max_discharge_ac_kwh,
+            discharge_efficiency=discharge_efficiency,
+            smallest_discharge_ac_kwh=smallest_discharge_ac_kwh,
+        )
+        for position, demand in enumerate(horizon.demands)
+    ]
+    if carry_step_kwh <= 0.0:
+        return raw, tuple(0 for _ in raw)
+
+    steps: list[int] = []
+    owed = 0.0
+    taken = 0
+    for outcomes in raw:
+        hold = outcomes.get(0)
+        if hold is not None and hold.ambient is not None:
+            owed += hold.ambient.dc_kwh
+        whole = int(owed / carry_step_kwh + 1e-12)
+        steps.append(whole - taken)
+        taken = whole
+
+    return raw, tuple(steps)
+
+
+def _ambient_walk_physical_end_kwh(
+    *,
+    table: PhysicsTable,
+    outcomes_per_interval: list[dict[int, _DeltaOutcome]],
+    ambient_walk: list[int],
+    start_bucket: int,
+    hard_floor_kwh: float,
+    carry_step_kwh: float,
+    drain_steps: tuple[int, ...],
+) -> float:
+    """Return the energy the do-nothing trajectory physically ends holding.
+
+    :func:`_ambient_walk` gives the *lattice* level doing nothing lands on, which
+    since beta.41 is no longer the energy the pack will be holding: household
+    service is taken along the way and the carry records it. The terminal
+    reachability guard needs the physical figure, because a floor above what
+    doing nothing can reach is a floor no state can pass.
+
+    Walked with the same rule the recursion and the forward walk use, so all three
+    agree on what "doing nothing" means -- the reason ``_ambient_walk`` is a single
+    definition in the first place.
+    """
+    bucket = start_bucket
+    carry = 0
+    for position, target in enumerate(ambient_walk):
+        outcome = outcomes_per_interval[position].get(target - bucket)
+        landed = target
+        steps = drain_steps[position] if position < len(drain_steps) else 0
+        if outcome is not None and outcome.ambient is not None and steps > 0:
+            released, spent = divmod(carry + steps, max(1, AMBIENT_CARRY_STEPS))
+            served = target - released
+            if (
+                served >= 0
+                and _physical_energy_kwh(table.energy(served), spent, carry_step_kwh)
+                >= hard_floor_kwh - 1e-9
+            ):
+                landed = served
+                carry = spent
+        bucket = landed
+    return _physical_energy_kwh(table.energy(bucket), carry, carry_step_kwh)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2506,6 +2951,45 @@ def _ambient_applies(
     return energy_kwh - ambient.dc_kwh >= floor_energy_kwh - 1e-9
 
 
+def _physical_energy_kwh(energy_kwh: float, carry: int, carry_step_kwh: float) -> float:
+    """Return the energy actually left in the pack for a lattice state.
+
+    **The one physical quantity, and beta.41 exists because there used to be
+    two.** The lattice level is what the recursion can address; ``carry`` is the
+    sub-bucket household service already taken out of it, in
+    :data:`AMBIENT_CARRY_STEPS` steps of one bucket. Every physical constraint --
+    the hard floor, the reserve, reachability, the terminal credit, the marginal
+    worth of storage, the export permission and the forward reconstruction --
+    reads this and nothing else.
+
+    Before this, the recursion measured all of them against the lattice level
+    alone while the forward walk subtracted the drain afterwards. On the live
+    2026-09-03 horizon that left the optimiser believing it held 9.75 kWh where
+    the pack held 4.32, so a terminal credit was paid on energy the household had
+    already consumed and the same kilowatt-hour could be exported twice.
+    """
+    return energy_kwh - carry * carry_step_kwh
+
+
+def _ambient_carry_steps(dc_kwh: float, carry_step_kwh: float) -> int:
+    """Return an interval's household service in whole carry steps.
+
+    **Rounded down, and the direction is a physical constraint rather than a
+    preference.** The inverter covers the residual load and no more; rounding to
+    nearest lets the modelled service exceed it -- 0.125 kWh against a 0.099 kWh
+    residual on a measured interval -- and the surplus then has to leave as export
+    or be spilled, neither of which the hardware does.
+
+    Flooring costs fidelity in the other direction: an interval whose residual is
+    under one step registers no service at all, and the grid covers it. That
+    understates how long the pack lasts, which is the safe way to be wrong about a
+    battery.
+    """
+    if carry_step_kwh <= 0.0 or dc_kwh <= 0.0:
+        return 0
+    return int(dc_kwh / carry_step_kwh)
+
+
 @dataclass(frozen=True, slots=True)
 class _AmbientOutcome:
     """What a hold interval costs when the inverter serves the house itself.
@@ -2782,6 +3266,9 @@ def _walk_forward(
     head_value: tuple[tuple[tuple[float, float], ...], ...] = (),
     hard_floor_kwh: float = 0.0,
     ambient_self_consumption: bool = False,
+    carry_step_kwh: float = 0.0,
+    carry_states: int = 1,
+    drain_steps: tuple[int, ...] = (),
 ) -> EconomicPlan:
     """Replay the chosen moves to produce the plan the caller reads.
 
@@ -2804,6 +3291,9 @@ def _walk_forward(
     # resolution the trajectory already has; and the plan is rebuilt from measured
     # state of charge every quarter, so the accumulation window is one interval.
     ambient_drained_dc_kwh = 0.0
+    # Nothing has been served yet at the head, so the walk starts at carry zero --
+    # the same slice the published ``head_value`` curve is taken from.
+    carry = 0
     total_switching = 0.0
     total_margin = 0.0
     total_grid_charge = 0.0
@@ -2813,27 +3303,55 @@ def _walk_forward(
     first_violation: int | None = None
 
     for position, demand in enumerate(horizon.demands):
-        offset = choice[position][bucket][run]
+        offset = choice[position][bucket][carry][run]
         if offset < 0:  # pragma: no cover - the start state was reachable
             break
         move = table.moves[bucket][offset]
         price = horizon.prices[position]
         outcome = outcomes_per_interval[position][move.target - bucket]
-        # **The report must describe the move the DP priced, not a different
-        # one.** Where the pack could cover the residual load ambiently, the DP
-        # charged the ambient cost for holding, so the published interval carries
-        # the ambient flows too. Same predicate, same floor, one helper -- a second
-        # derivation here is how a plan and its own cost drift apart.
-        # **Measured against the drained pack, not the lattice bucket.** The
-        # ambient discharge is real energy that the bucket cannot represent, so the
-        # forward walk carries it as a running offset. Without it the clamp would
-        # read a state of charge that never falls and keep authorising ambient
-        # service straight through the floor -- the one thing this must not do.
-        energy_now_kwh = max(0.0, table.energy(bucket) - ambient_drained_dc_kwh)
-        serves_ambiently = outcome.ambient is not None and _ambient_applies(
-            outcome, energy_kwh=energy_now_kwh, floor_energy_kwh=hard_floor_kwh
+        # **The report replays the recursion's own transition rather than
+        # re-deriving one.** Physical energy, whether the inverter served, and
+        # where the state lands are all read off the same rule the search used, so
+        # a plan and its own published trajectory cannot drift apart -- which is
+        # exactly what they did while the drain was a reporting correction applied
+        # after the decision.
+        energy_now_kwh = _physical_energy_kwh(
+            table.energy(bucket), carry, carry_step_kwh
         )
-        ambient = outcome.ambient if serves_ambiently else None
+        target_bucket = move.target
+        landed_carry = carry
+        steps = drain_steps[position] if position < len(drain_steps) else 0
+        ambient = None
+        served_dc_kwh = 0.0
+        if outcome.ambient is not None and steps > 0:
+            released, spent_carry = divmod(carry + steps, carry_states)
+            served_target = target_bucket - released
+            if (
+                served_target >= 0
+                and _physical_energy_kwh(
+                    table.energy(served_target), spent_carry, carry_step_kwh
+                )
+                >= hard_floor_kwh - 1e-9
+            ):
+                target_bucket = served_target
+                landed_carry = spent_carry
+                ambient = outcome.ambient
+                # **What the state moved, not what the unrounded model asked
+                # for.** The carry advances in whole steps, so reporting the
+                # unrounded figure would leave the published trajectory failing
+                # its own energy balance by up to half a step.
+                # Differenced from the two states rather than derived from the
+                # step count, because the top of the lattice is clamped to the
+                # pack ceiling and is therefore *not* uniformly spaced. A closed
+                # form assuming uniform buckets was measured 8.9e-03 kWh out on
+                # exactly that interval, at 21.47 kWh against a 21.6 kWh pack.
+                served_dc_kwh = (
+                    energy_now_kwh
+                    + move.delta_dc_kwh
+                    - _physical_energy_kwh(
+                        table.energy(target_bucket), landed_carry, carry_step_kwh
+                    )
+                )
         resolved = _resolved_run_state(outcome.run_state, run)
         run_start = resolved != _RUN_IDLE and resolved != run
         if run_start:
@@ -2848,7 +3366,9 @@ def _walk_forward(
         total_throughput += outcome.charge_ac_kwh + outcome.discharge_ac_kwh
         total_cost += ambient.cost_eur if ambient is not None else outcome.cost_eur
 
-        landed = table.energy(move.target)
+        landed = _physical_energy_kwh(
+            table.energy(target_bucket), landed_carry, carry_step_kwh
+        )
         shortfall = max(0.0, horizon.planning_reserve_kwh[position] - landed)
         if shortfall > 0.0:
             total_violation += shortfall
@@ -2906,6 +3426,10 @@ def _walk_forward(
                 ambient_self_consumption_ac_kwh=(
                     0.0 if ambient is None else ambient.discharge_ac_kwh
                 ),
+                battery_state_service_dc_kwh=served_dc_kwh,
+                battery_state_quantisation_residual_kwh=(
+                    0.0 if ambient is None else ambient.dc_kwh - served_dc_kwh
+                ),
                 counterfactual_basis=(
                     COUNTERFACTUAL_IDLE_IMPORT
                     if ambient is None
@@ -2916,9 +3440,27 @@ def _walk_forward(
             )
         )
         if ambient is not None:
-            ambient_drained_dc_kwh += ambient.dc_kwh
-        bucket = move.target
+            # The *state* movement, because this is what ``end_energy_dc_kwh``
+            # and the reserve are measured against. The exact household figure is
+            # reported per interval and summed by the accounting layer, which is a
+            # different question.
+            ambient_drained_dc_kwh += served_dc_kwh
+        bucket = target_bucket
+        carry = landed_carry
         run = resolved
+
+    # The inventory the terminal credit is priced on, **on the seed's own basis**.
+    # The seed is a function of the bucket alone -- the standing rule for anything
+    # entering this recursion -- so it uses the horizon's drain bound rather than
+    # this trajectory's own accrual. Recomputing the report from the accrual
+    # instead would price one number two ways, which is how a plan and its own
+    # published cost drift apart: measured at 1.34 EUR worst case across the seven
+    # shapes without this line, against 0.78 for the gap that already existed.
+    # The inventory the terminal credit is priced on: the physical energy of the
+    # state the walk landed in, which is the same quantity the seed used for that
+    # state. One endpoint, not two -- the 9.75-against-4.32 split beta.40 had to
+    # publish two fields to explain does not arise.
+    held_end_kwh = _physical_energy_kwh(table.energy(bucket), carry, carry_step_kwh)
 
     return EconomicPlan(
         intervals=tuple(entries),
@@ -2943,14 +3485,27 @@ def _walk_forward(
         battery_throughput_cost_eur=(
             battery_throughput_cost_eur_per_kwh * total_throughput
         ),
-        edge_energy_kwh=table.energy(bucket),
+        # **Physical, and therefore the same number as ``end_energy_dc_kwh``.**
+        # beta.40 had to publish two endpoints with two bases because the lattice
+        # level and the energy the pack would hold were different quantities --
+        # 9.75 against 4.32 on the live horizon. They are one quantity now.
+        edge_energy_kwh=held_end_kwh,
         # Recomputed from the same function the seed used, at the bucket the walk
         # actually landed on. Reporting only -- the policy was already chosen.
+        #
+        # **On the drained endpoint, because that is what the seed priced.** This
+        # is ``end_energy_dc_kwh`` by construction wherever that figure is
+        # non-negative, so the credit and the reported endpoint can no longer
+        # describe different amounts of energy. The seed used the horizon's own
+        # bound; this uses the drain this trajectory actually accrued, which is
+        # the same number for a plan that holds and never larger for one that
+        # acts.
         edge_value_eur=(
-            terminal_value.credit_eur(table.energy(bucket), terminal_floor_kwh)
+            terminal_value.credit_eur(held_end_kwh, terminal_floor_kwh)
             if terminal_value is not None
-            else edge_value_eur_per_kwh * min(table.energy(bucket), edge_creditable_kwh)
+            else edge_value_eur_per_kwh * min(held_end_kwh, edge_creditable_kwh)
         ),
+        ambient_drain_dc_kwh=ambient_drained_dc_kwh,
         terminal_value=terminal_value,
         head_run_state=head_run_state,
         head_value=head_value,
@@ -3018,20 +3573,17 @@ def hold_cost(
         if delta < 0 and discharge_ac > 0.0
     ]
     smallest_discharge_ac_kwh = min(discharges) if discharges else 0.0
-    outcomes_per_interval = [
-        _interval_outcomes(
-            ac_by_delta=ac_by_delta,
-            load_ac_kwh=demand.baseline_kwh or 0.0,
-            pv_ac_kwh=demand.pv_kwh or 0.0,
-            price=horizon.prices[position],
-            permitted=_ALL_ACTIONS,
-            ambient_self_consumption=ambient_self_consumption,
-            max_discharge_ac_kwh=max_discharge_ac_kwh,
-            discharge_efficiency=table.limits.discharge_efficiency,
-            smallest_discharge_ac_kwh=smallest_discharge_ac_kwh,
-        )
-        for position, demand in enumerate(horizon.demands)
-    ]
+    carry_step_kwh = table.bucket_kwh / AMBIENT_CARRY_STEPS
+    outcomes_per_interval, _steps = _outcomes_with_carried_service(
+        horizon=horizon,
+        ac_by_delta=ac_by_delta,
+        permitted=_ALL_ACTIONS,
+        ambient_self_consumption=ambient_self_consumption,
+        max_discharge_ac_kwh=max_discharge_ac_kwh,
+        discharge_efficiency=table.limits.discharge_efficiency,
+        smallest_discharge_ac_kwh=smallest_discharge_ac_kwh,
+        carry_step_kwh=carry_step_kwh,
+    )
     start_bucket = table.bucket_at_or_below(start_energy_kwh)
     ambient = _ambient_walk(
         table=table,
@@ -3041,22 +3593,32 @@ def hold_cost(
 
     total = 0.0
     bucket = start_bucket
-    # **The drained pack, exactly as the forward walk carries it.** Ambient service
-    # is real energy the lattice cannot represent, so without this offset the clamp
-    # would read a state of charge that never falls and authorise ambient service
-    # straight through the floor.
-    ambient_drained_dc_kwh = 0.0
+    # **The same carried state the recursion and the forward walk use.** The
+    # comparator has to be priced under the plan's own model or the difference
+    # between them measures the models rather than the decisions, so household
+    # service moves this trajectory exactly as it moves that one.
+    carry = 0
     for position, target in enumerate(ambient):
         outcome = outcomes_per_interval[position].get(target - bucket)
         if outcome is not None:
-            energy_now_kwh = max(0.0, table.energy(bucket) - ambient_drained_dc_kwh)
-            serves_ambiently = outcome.ambient is not None and _ambient_applies(
-                outcome, energy_kwh=energy_now_kwh, floor_energy_kwh=hard_floor_kwh
-            )
-            if serves_ambiently and outcome.ambient is not None:
-                total += outcome.ambient.cost_eur
-                ambient_drained_dc_kwh += outcome.ambient.dc_kwh
-            else:
+            served = False
+            if outcome.ambient is not None:
+                steps = _ambient_carry_steps(outcome.ambient.dc_kwh, carry_step_kwh)
+                if steps > 0:
+                    released, spent = divmod(carry + steps, AMBIENT_CARRY_STEPS)
+                    landed = target - released
+                    if (
+                        landed >= 0
+                        and _physical_energy_kwh(
+                            table.energy(landed), spent, carry_step_kwh
+                        )
+                        >= hard_floor_kwh - 1e-9
+                    ):
+                        total += outcome.ambient.cost_eur
+                        target = landed
+                        carry = spent
+                        served = True
+            if not served:
                 total += outcome.cost_eur
         bucket = target
     return total
@@ -3711,6 +4273,30 @@ class EconomicOutcome:
     #: ``None`` unless Shadow asked for it. **Temporary**, and flagged as such in
     #: the payload: it doubles the solve to publish something no decision reads.
     legacy: EconomicPlan | None = None
+    #: Per charge run, the AC energy bought because the household will otherwise
+    #: import it later at a dearer price. Keyed by start index.
+    #:
+    #: **A third category, and the three are disjoint by construction.** Safety is
+    #: what physical reachability compels and is price-blind; coverage is the same
+    #: energy the household was going to buy, bought at a better hour; economic is
+    #: a discretionary trade and answers to the user's own thresholds. Each
+    #: kilowatt-hour is attributed to exactly one, in that order of precedence.
+    coverage_buy_attribution: dict[int, float] = field(default_factory=dict)
+    #: The runs coverage is materially responsible for, above one bucket.
+    coverage_buy_runs: tuple[int, ...] = ()
+    #: What promoting the coverage plan saved the household, in cash including the
+    #: inventory each plan ends with. Zero when discretion already bought the
+    #: energy, which is the ordinary case.
+    coverage_saving_eur: float = 0.0
+    #: What the **discretionary** plan would have bought, in AC kWh, whether or not
+    #: coverage was promoted.
+    #:
+    #: Published so the coverage attribution is auditable from outside: coverage is
+    #: a difference against this plan, and without the figure the claim "coverage
+    #: never takes credit for energy discretion would have bought anyway" is a
+    #: property only ``build_outcome`` could check. With it, the bound is
+    #: arithmetic a reader can do. Diagnostics only -- nothing reads it to decide.
+    coverage_baseline_charge_ac_kwh: float = 0.0
     #: Per charge run, ``(safety_buy_kwh, economic_buy_kwh)``, keyed by start
     #: index. Diagnostics only: nothing in :func:`solve` reads it, and it is
     #: derived from a solve that already happened rather than a new one.
@@ -4225,6 +4811,20 @@ def build_outcome(
             )
             solve_count += 1
 
+    # The compulsory purchase, expressed at the boundary the runs are measured
+    # at. ``bridge_kwh`` is DC energy the pack is short of its reachability
+    # requirement; a run reports AC energy bought, and the two differ by the
+    # measured charge ratio. Used only where the relaxed baseline is itself in
+    # violation -- see :func:`_safety_buy_attribution`.
+    bridge_dc_kwh = (
+        None if reachability is None else reachability.bridge_kwh(start_energy_kwh)
+    )
+    compelled_ac_kwh = (
+        None
+        if bridge_dc_kwh is None or table.charge_dc_per_ac <= 0.0
+        else bridge_dc_kwh / table.charge_dc_per_ac
+    )
+
     # ------------------------------------------------------------------ pass 2
     solve_count += 3  # desired, capability and reserve-relaxed, always all three
     desired = solve(
@@ -4259,6 +4859,100 @@ def build_outcome(
         permitted=desired_permitted,
         **economics,
     )
+
+    # ------------------------------------------------------------- coverage
+    #
+    # **The household will buy this energy anyway; this asks whether it could
+    # buy it earlier for less.** That is not arbitrage and it must not be able to
+    # become arbitrage, so the counterfactual is built so that a purchased
+    # kilowatt-hour has exactly one way to pay for itself:
+    #
+    #   * **export is forbidden**, so nothing bought can be sold;
+    #   * **the terminal spare segment earns nothing**, so nothing bought can be
+    #     parked at the horizon edge and credited at the export price;
+    #   * the discretionary gates are set aside, because their job is to demand a
+    #     *profit* on a trade, and this is not a trade -- it is the same purchase
+    #     at a better hour.
+    #
+    # What is left is that a purchased kilowatt-hour pays only by displacing
+    # household import the forecast says will otherwise happen. So every grid
+    # charge in this solve is coverage **by construction** rather than by
+    # inspection, which is what makes the attribution below sound rather than
+    # heuristic. The reserve, the hard floor, the power limits and the carry-axis
+    # physical state are identical to the desired solve: this changes what a
+    # purchase must *earn*, never what the pack may *do*.
+    coverage_economics = dict(economics)
+    coverage_economics["minimum_trade_gain_eur"] = 0.0
+    coverage_economics["grid_charge_margin_eur_per_kwh"] = 0.0
+    #
+    # **Terminal inventory must earn only what the household will take.** With the
+    # demand-bounded rule that means zeroing the spare segment, which is priced at
+    # the export price: keep it and a purchase could pay for itself by sitting at
+    # the horizon edge, which is the arbitrage this counterfactual exists to
+    # exclude.
+    #
+    # With the flat legacy rule there is no served segment to keep -- it credits
+    # *any* terminal energy at one rate -- so the whole credit goes. Leaving it
+    # would let coverage buy simply to hold, be paid for holding, and call the
+    # difference a saving.
+    if terminal_value is not None:
+        coverage_economics["terminal_value"] = replace(
+            terminal_value, export_price_eur_kwh=0.0
+        )
+    else:
+        coverage_economics["terminal_value"] = TerminalValue(
+            discharge_efficiency=table.limits.discharge_efficiency,
+            edge_value_eur_per_kwh=0.0,
+            edge_creditable_kwh=edge_creditable_kwh,
+            basis=TERMINAL_VALUE_BASIS_FLAT_EDGE,
+        )
+    coverage_economics["edge_value_eur_per_kwh"] = 0.0
+    coverage_permitted = desired_permitted - {ECONOMIC_ACTION_EXPORT}
+    solve_count += 1
+    coverage = solve(
+        table=table,
+        horizon=gated_horizon,
+        start_energy_kwh=start_energy_kwh,
+        terminal_floor_kwh=terminal_floor_kwh,
+        permitted=coverage_permitted,
+        **coverage_economics,
+    )
+
+    # **Precedence, and it is decided on one yardstick.** Coverage outranks
+    # discretion only where it leaves the household better off in cash *including
+    # the inventory each plan ends with*, both valued under the rule the executed
+    # plan will be judged by. A plan that merely spends less because it bought
+    # less is not cheaper, and this is what stops that being mistaken for a saving.
+    #
+    # Two further conditions, and neither is a taste:
+    #
+    #   * it must buy **more** than discretion would, by more than one state-space
+    #     bucket. Coverage that changes nothing is not coverage, and a rounding
+    #     may not promote a whole trajectory.
+    #   * it must not be **less safe**. The reserve is lexicographically above
+    #     money and stays there: a coverage plan that violated more would be
+    #     refused however cheap it was.
+    #
+    # Promoted whole. ``desired`` becomes this solve or stays the discretionary
+    # one; the two are never spliced, so whatever executes is a single complete
+    # dynamic-programming solution with one physical trajectory.
+    gated_plan = desired
+    coverage_saving_eur = 0.0
+    if coverage.available and desired.available:
+        gated_cash = _household_cash_eur(desired, terminal_value, terminal_floor_kwh)
+        coverage_cash = _household_cash_eur(
+            coverage, terminal_value, terminal_floor_kwh
+        )
+        coverage_saving_eur = gated_cash - coverage_cash
+        buys_more = (
+            coverage.planned_charge_ac_kwh
+            > desired.planned_charge_ac_kwh + table.bucket_kwh
+        )
+        no_less_safe = coverage.violation_kwh <= desired.violation_kwh + 1e-9
+        if coverage_saving_eur > 0.0 and buys_more and no_less_safe:
+            desired = coverage
+        else:
+            coverage_saving_eur = 0.0
 
     # **A fourth solve, and only in Shadow.** ``legacy`` is the same problem under
     # beta.30's economics: the whole-horizon autonomy curve as a hard floor, and no
@@ -4342,6 +5036,48 @@ def build_outcome(
         )
     solve_ms = (time.perf_counter() - started) * 1000.0
 
+    # **Safety is measured where the question is well-posed.** The compelled
+    # quantity is a property of the reserve and the forecast, not of which
+    # economics won, so it is differenced between the discretionary plan and the
+    # same plan with the reserve relaxed -- a pair that differs in nothing else.
+    #
+    # Where coverage was promoted the executed plan is not that pair, and neither
+    # candidate replacement works. Differencing the coverage plan against
+    # ``relaxed`` attributes the gates to the reserve, and a band fixture where
+    # discretion bought nothing and coverage bought 8.611 kWh then reported all of
+    # it as Safety Buy. Differencing it against a *coverage*-economics relaxed
+    # solve is comparable but answers the wrong question: with the gates at zero
+    # the optimiser buys the compelled energy for economic reasons anyway, the
+    # difference collapses to zero, and a purchase the pack cannot decline is
+    # published as though price had chosen it. Both were implemented and measured
+    # before this was.
+    #
+    # So the quantity is taken from the discretionary pair and carried onto the
+    # executed plan's runs in index order. Promotion requires the coverage plan to
+    # buy strictly more, so the compelled energy is always inside it, and a later
+    # run is credited only with what the earlier ones left unfilled.
+    #
+    # Not the head bridge, deliberately. Capping at ``compelled_ac_kwh`` was tried
+    # and is the defect beta.31 exists to have removed: on the winter shape the
+    # head asks 9.590 kWh while the curve peaks at 10.855 four quarters later, so a
+    # pack at 46 % has a head deficit of exactly zero and 1.25 kWh it cannot
+    # decline to buy.
+    if desired is gated_plan:
+        safety_attribution = _safety_buy_attribution(desired, relaxed, compelled_ac_kwh)
+    else:
+        gated_attribution = _safety_buy_attribution(
+            gated_plan, relaxed, compelled_ac_kwh
+        )
+        safety_attribution = _carry_compelled_forward(
+            desired, sum(compelled for compelled, _ in gated_attribution.values())
+        )
+    coverage_attribution = _coverage_attribution(
+        desired, gated_plan, safety_attribution
+    )
+    coverage_attribution = _coverage_attribution(
+        desired, gated_plan, safety_attribution
+    )
+
     return EconomicOutcome(
         desired=desired,
         capability=capability,
@@ -4368,9 +5104,7 @@ def build_outcome(
         reachability=reachability,
         uncertainty=uncertainty,
         actionable_interval_count=actionable_interval_count,
-        bridge_kwh_now=(
-            None if reachability is None else reachability.bridge_kwh(start_energy_kwh)
-        ),
+        bridge_kwh_now=bridge_dc_kwh,
         discharge_efficiency=table.limits.discharge_efficiency,
         ungated=ungated,
         anti_churn_buffer_kwh=buffer_kwh,
@@ -4390,14 +5124,164 @@ def build_outcome(
         adaptation_ratio_applied=adaptation_applied,
         adaptation_clipped=adaptation_clipped,
         terminal_legacy=terminal_legacy,
-        safety_buy_runs=_safety_buy_runs(desired, relaxed, table.bucket_kwh),
-        safety_buy_attribution=_safety_buy_attribution(desired, relaxed),
+        coverage_buy_runs=_coverage_runs(coverage_attribution, table.bucket_kwh),
+        coverage_buy_attribution=coverage_attribution,
+        coverage_saving_eur=coverage_saving_eur,
+        coverage_baseline_charge_ac_kwh=(
+            gated_plan.planned_charge_ac_kwh if gated_plan.available else 0.0
+        ),
+        safety_buy_runs=_runs_above(safety_attribution, table.bucket_kwh),
+        safety_buy_attribution=_net_of_coverage(
+            safety_attribution, coverage_attribution
+        ),
         legacy=legacy,
     )
 
 
+def _household_cash_eur(
+    plan: EconomicPlan, terminal: TerminalValue | None, floor_kwh: float
+) -> float:
+    """Return what a plan costs the household, inventory included, on one yardstick.
+
+    ``_cash_eur`` is the metered money and stops at the horizon edge, which is the
+    right answer for pricing a *permission* but the wrong one for choosing between
+    two plans: a plan that ends holding more has bought something, and comparing it
+    against one that did not, on cash alone, would prefer whichever spent least
+    regardless of what it has to show for it.
+
+    So the terminal inventory is valued and subtracted, and **both plans are valued
+    under the same terminal rule** -- the one the executed plan will be judged by.
+    Valuing each under its own would compare the rules rather than the decisions.
+    """
+    if terminal is None:
+        return _cash_eur(plan)
+    return _cash_eur(plan) - terminal.credit_eur(plan.end_energy_dc_kwh, floor_kwh)
+
+
+def _runs_above(
+    attribution: Mapping[int, tuple[float, float]], bucket_kwh: float
+) -> tuple[int, ...]:
+    """Return the runs whose compelled share clears one state-space bucket.
+
+    The materiality threshold beta.16 chose and this release did not move: a run is
+    a safety buy when the reserve is responsible for more of it than the lattice can
+    resolve, so a rounding can never label one.
+    """
+    return tuple(
+        index
+        for index, (compelled, _economic) in sorted(attribution.items())
+        if compelled > bucket_kwh
+    )
+
+
+def _carry_compelled_forward(
+    executed: EconomicPlan, compelled_ac_kwh: float
+) -> dict[int, tuple[float, float]]:
+    """Spread a compelled quantity across an executed plan's charge runs.
+
+    Used only where the executed plan is not the one the compelled quantity was
+    measured on -- that is, where coverage was promoted. Allocated in index order,
+    earliest first, because the reserve is a deadline: energy that has to exist by
+    a given quarter has to be bought before it, and a later run cannot satisfy an
+    earlier requirement.
+
+    Capped at each run's own charge, so the shares still sum to the run, and the
+    remainder is economic exactly as it is in the windowed attribution.
+    """
+    remaining = max(0.0, compelled_ac_kwh)
+    found: dict[int, tuple[float, float]] = {}
+    for run in executed.runs:
+        if run.action != ECONOMIC_ACTION_CHARGE:
+            continue
+        compelled = min(run.battery_charge_ac_kwh, remaining)
+        remaining -= compelled
+        found[run.start_index] = (compelled, run.battery_charge_ac_kwh - compelled)
+    return found
+
+
+def _net_of_coverage(
+    safety: Mapping[int, tuple[float, float]], coverage: Mapping[int, float]
+) -> dict[int, tuple[float, float]]:
+    """Return the safety pair with coverage energy taken out of the economic half.
+
+    ``_safety_buy_attribution`` answers one question -- how much of this run does
+    the reserve compel -- and calls the remainder economic, which was exact while
+    there were only two categories. There are three now, and the published pair
+    must not report a coverage kilowatt-hour as a discretionary trade any more than
+    it may report it as compulsory.
+
+    Precedence is unchanged and the arithmetic is a subtraction, so the three
+    shares still sum to the run and still cannot overlap. Where coverage is zero --
+    which is every horizon on which discretion already buys the useful energy --
+    this returns the pair untouched.
+    """
+    if not coverage:
+        return dict(safety)
+    return {
+        index: (compelled, max(0.0, economic - coverage.get(index, 0.0)))
+        for index, (compelled, economic) in safety.items()
+    }
+
+
+def _coverage_attribution(
+    executed: EconomicPlan,
+    gated: EconomicPlan,
+    safety: Mapping[int, tuple[float, float]],
+) -> dict[int, float]:
+    """Return, per charge run, the AC energy coverage is responsible for.
+
+    **Precedence, not arithmetic taste: safety, then coverage, then discretion.**
+    A run's charge is attributed to the reserve first -- that quantity is
+    compulsory and its size is not a matter of price -- and coverage claims only
+    what is left *and* only what the discretionary plan would not have bought
+    anyway. Whatever remains is ordinary economics.
+
+    So the three shares are disjoint by construction and sum to the run's charge,
+    and when the executed plan **is** the discretionary plan every coverage share
+    is zero without needing a special case: ``executed - gated`` is zero
+    everywhere.
+
+    Measured within the run's own index window, exactly as
+    :func:`_safety_buy_attribution` is, and with the same stated boundary: a
+    counterfactual is free to move charging to different intervals, so these are
+    "coverage energy *within this run window*" rather than a globally exact
+    decomposition.
+    """
+    if executed is gated:
+        return {}
+    gated_by_index = {
+        entry.index: entry.battery_charge_ac_kwh for entry in gated.intervals
+    }
+    found: dict[int, float] = {}
+    for run in executed.runs:
+        if run.action != ECONOMIC_ACTION_CHARGE:
+            continue
+        compelled = safety.get(run.start_index, (0.0, 0.0))[0]
+        remaining = max(0.0, run.battery_charge_ac_kwh - compelled)
+        discretionary = sum(
+            gated_by_index.get(index, 0.0)
+            for index in range(run.start_index, run.end_index + 1)
+        )
+        extra = max(0.0, run.battery_charge_ac_kwh - discretionary)
+        found[run.start_index] = min(remaining, extra)
+    return found
+
+
+def _coverage_runs(coverage: Mapping[int, float], bucket_kwh: float) -> tuple[int, ...]:
+    """Return the runs coverage is materially responsible for.
+
+    One state-space bucket, the same materiality threshold Safety Buy uses, so a
+    rounding cannot label a run.
+    """
+    return tuple(
+        index for index, energy in sorted(coverage.items()) if energy > bucket_kwh
+    )
+
+
 def _safety_buy_attribution(
-    desired: EconomicPlan, relaxed: EconomicPlan
+    desired: EconomicPlan,
+    relaxed: EconomicPlan,
+    compelled_ac_kwh: float | None = None,
 ) -> dict[int, tuple[float, float]]:
     """Return, per charge run, how much of it the reserve is responsible for.
 
@@ -4420,9 +5304,54 @@ def _safety_buy_attribution(
     globally exact decomposition. The diagnostics say so in the field own rule
     string, because a figure that looks exact and is not is worse than one that
     admits its boundary.
+
+    **beta.41: and the difference is abandoned entirely where it means nothing.**
+    Below the hard floor the relaxed solve is in violation too, both solves are
+    minimising violation rather than cost, and their difference reflects tie-breaks
+    instead of motives. There the whole charge is attributed to safety, which is
+    what it physically is.
     """
     if not relaxed.available:
         return {}
+    # **A baseline that is itself in violation is not a baseline.** The relaxed
+    # solve exists to answer "what would this horizon buy if only the *hard floor*
+    # had to be met", and the difference is the reserve's responsibility. When the
+    # relaxed solve cannot meet the hard floor either, the pack is below the
+    # physical minimum and there is no discretionary component to separate out:
+    # energy you do not have and must not spend cannot be traded, so every
+    # kilowatt-hour bought is compelled. Differencing two violation-dominated
+    # solves measures their tie-breaks, not their motives.
+    #
+    # This is pre-existing and beta.41 only made it visible. Until the ambient
+    # correction landed, holding cost nothing, so on a below-floor shape the whole
+    # plan was price-invariant and the two solves were identical -- which made the
+    # unsound difference look like a stable zero.
+    # **The difference only means anything between plans priced the same way**, and
+    # that is the caller's obligation rather than this function's: ``relaxed`` must
+    # be the executed plan's own solve with the reserve removed and nothing else
+    # changed. ``build_outcome`` runs a second relaxed solve under the coverage
+    # economics on exactly the horizons where coverage was promoted, for that
+    # reason.
+    if relaxed.violation_kwh > 0.0:
+        # The compelled quantity is the one this module already names as the only
+        # compulsory purchase, and it is price-blind by construction. Allocated in
+        # index order, so a later run is credited only with what the earlier ones
+        # left unfilled. Anything beyond it is economic even down here: at a dear
+        # price the plan legitimately holds *more* than the bridge so the inverter
+        # can self-consume rather than import, and calling that safety would make
+        # the published safety figure move with the tariff.
+        remaining = max(0.0, compelled_ac_kwh or 0.0)
+        emergency: dict[int, tuple[float, float]] = {}
+        for run in desired.runs:
+            if run.action != ECONOMIC_ACTION_CHARGE:
+                continue
+            safety = min(run.battery_charge_ac_kwh, remaining)
+            remaining -= safety
+            emergency[run.start_index] = (
+                safety,
+                max(0.0, run.battery_charge_ac_kwh - safety),
+            )
+        return emergency
     relaxed_by_index = {
         entry.index: entry.battery_charge_ac_kwh for entry in relaxed.intervals
     }
@@ -4443,7 +5372,10 @@ def _safety_buy_attribution(
 
 
 def _safety_buy_runs(
-    desired: EconomicPlan, relaxed: EconomicPlan, bucket_kwh: float
+    desired: EconomicPlan,
+    relaxed: EconomicPlan,
+    bucket_kwh: float,
+    compelled_ac_kwh: float | None = None,
 ) -> tuple[int, ...]:
     """Return the start indices of charge runs that exist because of the reserve.
 
@@ -4452,11 +5384,8 @@ def _safety_buy_runs(
     attributed to the reserve exceeds one state-space bucket, which is the same
     threshold beta.16 used and is unchanged.
     """
-    attribution = _safety_buy_attribution(desired, relaxed)
-    return tuple(
-        index
-        for index, (safety, _economic) in sorted(attribution.items())
-        if safety > bucket_kwh
+    return _runs_above(
+        _safety_buy_attribution(desired, relaxed, compelled_ac_kwh), bucket_kwh
     )
 
 
@@ -5716,7 +6645,21 @@ def economic_value_summary(
             "run_count": len(plan.runs),
             "campaign_count": len(plan.campaigns),
             "safety_buy_ac_kwh": _round_kwh(outcome.safety_buy_ac_kwh),
+            "coverage_buy_ac_kwh": _round_kwh(
+                sum(outcome.coverage_buy_attribution.values())
+            ),
+            "coverage_saving_eur": _round_eur(outcome.coverage_saving_eur),
+            "coverage_baseline_charge_ac_kwh": _round_kwh(
+                outcome.coverage_baseline_charge_ac_kwh
+            ),
             "bridge_kwh_now": _round_kwh(outcome.bridge_kwh_now),
+            "purchase_categories": (
+                "safety, then coverage, then economic. disjoint by construction and "
+                "in that precedence: safety is what physical reachability compels "
+                "and is price-blind, coverage is household import the forecast says "
+                "will happen anyway bought at a cheaper reachable hour, economic is "
+                "a discretionary trade answering to the user's own thresholds"
+            ),
             "model_terms_are_cash": False,
             "rule": (
                 "positive cost means money leaves the household. the four model "
@@ -6045,20 +6988,21 @@ def _plan_totals(plan: EconomicPlan) -> dict[str, Any]:
         # because violations are evaluated on the decided state. The endpoint the
         # optimiser actually chose is ``planned_end_energy_dc_kwh``.
         "end_energy_dc_kwh": _round_kwh(plan.end_energy_dc_kwh),
-        "end_energy_basis": PLAN_END_ENERGY_BASIS_AMBIENT_WALK,
+        "end_energy_basis": PLAN_END_ENERGY_BASIS_PHYSICAL_STATE,
         "planned_end_energy_dc_kwh": _round_kwh(plan.edge_energy_kwh),
-        "planned_end_energy_basis": PLAN_END_ENERGY_BASIS_LATTICE_STATE,
+        "planned_end_energy_basis": PLAN_END_ENERGY_BASIS_PHYSICAL_STATE,
         "end_energy_rule": (
-            "end_energy_dc_kwh is the ambient-corrected reported walk and is a "
-            "diagnostic projection: it is reduced every interval by ambient "
-            "self-consumption, which is real discharge but is not a lattice "
-            "transition, so it can fall below the configured hard floor while the "
-            "plan decided nothing of the kind. planned_end_energy_dc_kwh is the "
-            "energy the recursion actually ends on, is a lattice level by "
-            "construction, and is the figure the terminal credit was priced on. "
-            "reserve_violation_kwh is measured against the decided state, which "
-            "is why it is 0.0 while the projection sits lower. neither figure is "
-            "an executable target -- Stage B executes the quarter schedule"
+            "end_energy_dc_kwh and planned_end_energy_dc_kwh are the same "
+            "quantity: the physical energy the pack ends holding, which is also "
+            "the state the recursion ends in and the figure the terminal credit "
+            "was priced on. beta.40 had to publish them separately because "
+            "household self-consumption was real discharge that moved no lattice "
+            "state, so the two differed by kilowatt-hours and a violation of 0.0 "
+            "was correct only because violations were measured on the state "
+            "rather than on the energy. that service is a state transition now, "
+            "so reserve_violation_kwh and the trajectory describe the same pack. "
+            "both keys are kept so existing readers keep working. neither is an "
+            "executable target -- Stage B executes the quarter schedule"
         ),
     }
 

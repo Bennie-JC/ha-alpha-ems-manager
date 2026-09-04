@@ -269,36 +269,78 @@ def test_the_basis_change_is_what_stops_it_reporting_a_benefit() -> None:
         head=HEAD_1300, end=96, stored=STORED_1345, allow_charge=False
     ).outcome
 
-    assert outcome.export_gate_cost_eur == pytest.approx(0.136, abs=0.01)
+    assert outcome.export_gate_cost_eur == pytest.approx(0.1355, abs=0.01)
     assert outcome.export_gate_cost_eur > 0.0
-    # The figure the basis change replaced, computed here so the contradiction is
-    # visible rather than described.
-    objective = outcome.desired.objective_eur - outcome.ungated.objective_eur
-    assert objective < 0.0
-    # And the permission really did withhold something, so neither figure is
+    # And the permission really did withhold something, so the figure is not
     # reporting on a gate that never fired.
     assert outcome.export_gate_withheld_kwh > 0.1
 
+    # **beta.41: the basis still matters and the contradiction is gone.** The
+    # objective basis reported a *benefit* because the gated plan ended holding
+    # more energy and the terminal credit paid for it -- credit on energy the
+    # household would have eaten before the horizon ended. Priced on inventory the
+    # pack will really hold, the two answers no longer point in opposite
+    # directions: the permission costs cash, and the plan that keeps more energy
+    # is credited only for energy it will actually keep.
+    #
+    # The endpoint may still move -- it does here, by 0.395 kWh -- which is why
+    # both halves are published rather than netted. What is asserted is the pair,
+    # not a coincidence between them.
+    assert outcome.export_gate_retained_kwh > 0.0
+
+    # The basis is cash, recomputed here from the intervals rather than read back
+    # from the property, so this is a cross-check and not a tautology.
+    def metered(plan):
+        return (
+            sum(entry.cost_eur for entry in plan.intervals)
+            + plan.switching_cost_eur
+            + plan.grid_charge_margin_eur
+            + plan.battery_throughput_cost_eur
+        )
+
+    assert outcome.export_gate_cost_eur == pytest.approx(
+        metered(outcome.desired) - metered(outcome.ungated), abs=1e-6
+    )
+
 
 def test_a_negative_cash_figure_is_always_explained_by_the_inventory() -> None:
-    """**The counterexample, kept rather than hidden.**
+    """**beta.41 removed both counterexamples, and this is that visible decision.**
 
-    beta.32 asserted that the gate cost can never be negative. It can. At stored
-    18.0 kWh on the two-day reconstruction the gated plan moves 0.67 EUR *less*
-    cash than the ungated one -- and ends 3.69 kWh emptier, having been refused
-    4.81 kWh of export it then never made up. A restriction re-optimises the whole
-    horizon, and where the end state is free it can land lower.
+    beta.32 asserted the gate cost can never be negative; beta.34 disproved it and
+    pinned two counterexamples here, asking that any later change which quietly
+    made the figure non-negative be *a visible decision rather than a
+    coincidence*. beta.41 is that change, and both counterexamples turn out to
+    have been artefacts of the two defects it fixes:
 
-    Pinned as a fact about the model, so that a later change which quietly makes
-    this figure non-negative is a visible decision rather than a coincidence.
+    * **stored 18.0 kWh, two-day: cash -0.67, ending 3.69 kWh emptier.** Ending
+      emptier was cheap because the terminal credit was priced on the *undepleted*
+      lattice bucket -- energy the household would have self-consumed was still
+      being paid for. Priced on the inventory the pack will really hold, the
+      permission stops moving the endpoint: ``retained`` is now exactly 0.0 and
+      the cash is +0.25.
+    * **stored 17.0 kWh, today-only: cash -0.0046 with 0.29 kWh *more* retained.**
+      beta.34 called this "half a cent of genuine free lunch, and the direct
+      fingerprint of the ``_walk_forward`` discrepancy" -- holding cost almost no
+      import while leaving the bucket untouched, so a restriction could come out
+      ahead on both counts at once. It is now +0.030 with ``retained`` at 0.0.
+
+    **Non-negativity is still not claimed.** That was beta.32's mistake and a
+    sweep that merely lacks a counterexample proves nothing. What is pinned is the
+    mechanism: the figure was negative *because* the endpoint moved and was
+    mispriced, and it is the endpoint no longer moving that removes it. If a future
+    change lets the endpoint move again, ``retained`` becomes non-zero first and
+    this test says so before the sign does.
     """
     outcome = solve_at(head=HEAD_1400, end=192, stored=18.0).outcome
 
     assert outcome.export_gate_cost_eur is not None
-    assert outcome.export_gate_cost_eur < 0.0
-    assert outcome.export_gate_withheld_kwh > 1.0
-    # Emptier, not fuller: the cash was not saved, it was spent on being poorer.
-    assert outcome.export_gate_retained_kwh < 0.0
+    assert outcome.export_gate_withheld_kwh > 0.1
+    assert outcome.export_gate_cost_eur > 0.0
+
+    # The second counterexample, on its own horizon, checked the same way.
+    today_only = solve_at(head=HEAD_1400, end=96, stored=17.0).outcome
+    assert today_only.export_gate_withheld_kwh > 0.1
+    assert today_only.export_gate_cost_eur > 0.0
 
 
 # ===========================================================================
@@ -335,18 +377,46 @@ def test_seeing_tomorrow_does_not_change_what_the_plan_does_today() -> None:
     *following* morning's refill and the floor to 23.09 kWh.
 
     Asserted structurally rather than on a scalar: the campaigns the plan makes
-    inside today must be the same ones, in the same intervals.
+    inside today must be the same ones, starting in the same intervals.
+
+    **beta.41 stopped requiring the same *end* index, and the reason is the point
+    of the release.** Once holding depletes the pack honestly and the terminal
+    credit is priced on inventory the pack will really hold, the two-day plan
+    knows what the today-only plan cannot: tomorrow forecasts 21.65 kWh of load
+    against 7.79 kWh of production. So it stops selling three quarters earlier and
+    carries **5.27 kWh more** into tomorrow, spending 0.84 EUR more over the shared
+    prefix to do it -- inventory worth around 1.58 EUR at the prices it then
+    displaces.
+
+    That is the two-day optimum being *better*, not worse, and the stated invariant
+    is about the objective rather than about cash alone. Requiring identical end
+    indices would forbid exactly the improvement this release exists to make. What
+    still catches the original frame bug is unchanged: it made the same-day sale
+    **disappear**, and a missing campaign fails the list below.
     """
     today = solve_at(head=HEAD_1400, end=96, stored=STORED_1400).outcome.desired
     both = solve_at(head=HEAD_1400, end=192, stored=STORED_1400).outcome.desired
 
-    def within_today(plan):
+    def campaigns_of(plan):
         return [
-            (campaign.direction, campaign.start_index, campaign.end_index)
+            (campaign.direction, campaign.start_index)
             for campaign in plan.campaigns
             if campaign.end_index < 96
         ]
 
-    assert within_today(both) == within_today(today)
+    assert campaigns_of(both) == campaigns_of(today)
     # And the sale is still there, at the size it was.
     assert both.planned_grid_export_kwh >= today.planned_grid_export_kwh - 1e-6
+
+    def ends_of(plan):
+        return {
+            campaign.start_index: campaign.end_index
+            for campaign in plan.campaigns
+            if campaign.end_index < 96
+        }
+
+    # A campaign may end *earlier* on the longer horizon -- carrying energy forward
+    # can only be motivated by what the longer horizon can see -- but never later,
+    # which would be the longer horizon selling into today what it cannot value.
+    for start, end in ends_of(both).items():
+        assert end <= ends_of(today)[start], (start, end)

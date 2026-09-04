@@ -296,7 +296,6 @@ from .const import (
     STOP_SCOPE_CAMPAIGN,
     STOP_SCOPE_ROW,
     STOP_SCOPES,
-    TERMINAL_LOOKAHEAD_INTERVALS,
     TICK_APPLIED,
     TICK_ERROR,
     TICK_HELD_QUARTER_SATISFIED,
@@ -348,6 +347,7 @@ from .economic import (
     execution_revision,
     execution_target,
     fingerprint_settings,
+    post_horizon_window,
     run_state_for_intent,
     select_bucket_kwh,
 )
@@ -3767,61 +3767,32 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         **Every input already existed. Nothing new is forecast here.**
 
-        The horizon stops where the *prices* stop -- ``limited_by`` says so, and on
-        the reference installation that is two thirds of the day, because the
-        day-ahead publishes around 16:00. The demand and production forecasts do
-        not stop there: they already run a full day further, which is what makes
-        this answerable at all.
-
         Three quantities:
 
-        * **how much** the household will take before the pack refills for free.
-          Scanned forward from the horizon's end and stopped at the first interval
-          forecasting a production surplus. That bound is physical and price-blind
-          -- the sun is not an economic decision -- and it is why a full pack does
-          not get credited for energy the morning was going to supply anyway.
-        * **at what price**, by clock position. Tomorrow's 02:00 is unknown; today's
-          02:00 is not, and is by far the best estimator of it. Emphatically not the
-          day's 25th percentile, which is what beta.34 used and which values
-          overnight energy at roughly half what the house will actually pay --
-          the reason the chosen plan ended the horizon at ``0.00 kWh`` above floor
-          having sold 14.22 kWh on its last evening.
-        * **what the rest could fetch**, which is the export price at the horizon's
+        * **how much** the household will take before the pack refills for free,
+          and **at what price**. Both come from :func:`post_horizon_window`, which
+          owns the bound and its provenance.
+
+          This method used to compute them from ``demands[horizon_intervals:]``
+          directly, on the stated assumption that the demand and production
+          forecasts "already run a full day further" than the prices. They do
+          not. The price series is built one entry per demand, so the moment
+          tomorrow day-ahead publishes, the priced horizon and the forecast series
+          end at the same instant, that slice is empty, and the demand-bounded
+          segment of the terminal value collapses to zero width. On the reference
+          installation that fired every afternoon from roughly 13:00 and pinned
+          the worth of stored energy at ``eta_discharge * export_price``, which put
+          the break-even import price below any quarter the market has offered.
+        * **what the rest could fetch**, which is the export price at the horizon
           edge, or nothing at all where the user has not permitted export.
         """
         eta = getattr(limits, "discharge_efficiency", 1.0) or 1.0
-        tail = demands[horizon_intervals:][:TERMINAL_LOOKAHEAD_INTERVALS]
-        known_import = [
-            price.import_eur_kwh
-            for price in prices[:horizon_intervals]
-            if price.import_eur_kwh is not None
-        ]
-        demand_kwh = 0.0
-        weighted = 0.0
-        for demand in tail:
-            # The next free refill ends the window. Anything past it would be
-            # crediting the pack for energy the sun is about to provide.
-            if (demand.surplus_kwh or 0.0) > 0.0:
-                break
-            net = demand.net_demand_kwh
-            if net is None:
-                break
-            clock = (
-                demand.index % today_interval_count if today_interval_count else None
-            )
-            price = (
-                prices[clock].import_eur_kwh
-                if clock is not None and 0 <= clock < len(prices)
-                else None
-            )
-            if price is None:
-                # No clock-matched price for this position: the interval still
-                # counts as demand, priced at the mean of what *is* known, rather
-                # than being dropped -- dropping it would understate the window.
-                price = sum(known_import) / len(known_import) if known_import else 0.0
-            demand_kwh += net
-            weighted += net * price
-        displaced = weighted / demand_kwh if demand_kwh > 0.0 else 0.0
+        window = post_horizon_window(
+            demands,
+            prices,
+            horizon_intervals=horizon_intervals,
+            today_interval_count=today_interval_count,
+        )
         export_edge = 0.0
         if self.config.allow_battery_export:
             for price in reversed(prices[:horizon_intervals]):
@@ -3829,12 +3800,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     export_edge = max(0.0, price.export_eur_kwh)
                     break
         return TerminalValue(
-            demand_ac_kwh=demand_kwh,
-            displaced_price_eur_kwh=displaced,
+            demand_ac_kwh=window.demand_ac_kwh,
+            displaced_price_eur_kwh=window.displaced_price_eur_kwh,
             export_price_eur_kwh=export_edge,
             discharge_efficiency=eta,
             edge_value_eur_per_kwh=edge_value_eur_per_kwh,
             edge_creditable_kwh=edge_creditable_kwh,
+            window_basis=window.basis,
+            window_intervals=window.intervals,
+            window_stopped_by=window.stopped_by,
         )
 
     @callback
@@ -8744,9 +8718,25 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return ()
 
         projection = plan.reserve_projection
+        # **The enforced curve, not the autonomy one.** ``planning_reserve_kwh`` is
+        # the reserve the recursion actually obeyed: aligned with
+        # ``horizon.demands``, already quantised up to a bucket and capped at the
+        # ceiling. What used to be read here was ``plan.reserve_projection`` -- the
+        # *autonomy* curve, which ``reserve_as_dict`` labels
+        # ``consumed_by: diagnostics_only`` and which has enforced nothing since
+        # beta.31, having demanded 73 percent state of charge against a 20 percent
+        # physical floor. Freezing that figure into a claim payload whose own field
+        # comment reads "physical limits Stage B must honour" named the wrong
+        # curve. Nothing downstream compares it today -- every consumer is a
+        # declaration, a pass-through or a serialisation -- so this is a
+        # provenance correction, made before some future reader starts trusting it.
         required = {
-            entry.index: entry.required_dc_kwh
-            for entry in (projection.intervals if projection else ())
+            demand.index: value
+            for demand, value in zip(
+                outcome.horizon.demands,
+                outcome.horizon.planning_reserve_kwh,
+                strict=False,
+            )
         }
         hard_floor = projection.floor_energy_kwh if projection is not None else 0.0
         ceiling = projection.ceiling_energy_kwh if projection is not None else None

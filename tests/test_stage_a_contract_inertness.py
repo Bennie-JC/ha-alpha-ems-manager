@@ -138,8 +138,8 @@ def test_the_solve_count_is_pinned_and_every_solve_is_accounted_for() -> None:
                 ):
                     calls += 1
 
-    # Four of the seven are conditional; see the docstring for each.
-    assert calls == 7
+    # Four of the eight are conditional; see the docstring for each.
+    assert calls == 8
 
     # **Both conditional solves must actually be conditional.** Counting is not
     # enough -- the fault this test guards against is an *unconditional* solve, and
@@ -171,7 +171,12 @@ def test_the_solve_count_is_pinned_and_every_solve_is_accounted_for() -> None:
     ]
     conditional = [node for node in solves if _is_conditional(node)]
     assert len(conditional) == 4, "exactly four solves may be conditional"
-    assert len(solves) - len(conditional) == 3, "three solves run every refresh"
+    # Four every refresh since beta.41: desired, capability, the reserve-relaxed
+    # label, and the coverage counterfactual. The coverage solve is deliberately
+    # unconditional -- "could the household have bought this cheaper" has an
+    # answer on every horizon -- so it is counted on this side rather than
+    # smuggled behind a heuristic, which is what this assertion is for.
+    assert len(solves) - len(conditional) == 4, "four solves run every refresh"
 
 
 def test_the_balance_helper_cannot_reach_the_solver() -> None:

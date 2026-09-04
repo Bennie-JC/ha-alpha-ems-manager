@@ -568,10 +568,10 @@ def test_the_terminal_comparison_is_absent_rather_than_zero() -> None:
 
 
 def test_the_solver_runs_four_solves_not_five() -> None:
-    """Three unconditional solves, plus four that must be asked for.
+    """Four unconditional solves, plus four that must be asked for.
 
-    Desired, capability and the reserve-relaxed label solve run every refresh. The
-    three conditional ones:
+    Desired, capability, the reserve-relaxed label and the beta.41 coverage
+    counterfactual run every refresh. The three conditional ones:
 
     * the **ungated pass**, when there is measured forecast evidence to build the
       export permission from. It is not a diagnostic -- the permission has to know
@@ -594,6 +594,16 @@ def test_the_solver_runs_four_solves_not_five() -> None:
       a caller with no post-horizon demand pays nothing for it. Diagnostics only --
       it never reaches an execution target.
 
+    beta.41 adds a fourth unconditional solve, the **coverage counterfactual**:
+    the same horizon with the user's discretionary gates set aside, export removed
+    from the permitted set and the terminal spare segment earning nothing, so that a
+    purchased kilowatt-hour can only pay for itself by displacing household import
+    the forecast says will otherwise happen. It is unconditional on purpose -- the
+    question "could the household have bought this cheaper" has an answer on every
+    horizon, and gating it on a heuristic would be gating it on a guess. It is not a
+    diagnostic: where it wins on cash including terminal inventory, buys strictly
+    more and is no less safe, it becomes the executed plan.
+
     An unconditional fourth would be the regression this test exists to catch.
 
     The one beta.18 deleted was different in kind: it priced a constraint that no
@@ -611,8 +621,8 @@ def test_the_solver_runs_four_solves_not_five() -> None:
                 ):
                     calls += 1
 
-    # Four of the seven are conditional; see the docstring for each.
-    assert calls == 7
+    # Four of the eight are conditional; see the docstring for each.
+    assert calls == 8
 
     # **Both conditional solves must actually be conditional.** Counting is not
     # enough -- the fault this test guards against is an *unconditional* solve, and
@@ -644,7 +654,12 @@ def test_the_solver_runs_four_solves_not_five() -> None:
     ]
     conditional = [node for node in solves if _is_conditional(node)]
     assert len(conditional) == 4, "exactly four solves may be conditional"
-    assert len(solves) - len(conditional) == 3, "three solves run every refresh"
+    # Four every refresh since beta.41: desired, capability, the reserve-relaxed
+    # label, and the coverage counterfactual. The coverage solve is deliberately
+    # unconditional -- "could the household have bought this cheaper" has an
+    # answer on every horizon -- so it is counted on this side rather than
+    # smuggled behind a heuristic, which is what this assertion is for.
+    assert len(solves) - len(conditional) == 4, "four solves run every refresh"
 
 
 def test_the_published_plan_is_the_only_plan() -> None:

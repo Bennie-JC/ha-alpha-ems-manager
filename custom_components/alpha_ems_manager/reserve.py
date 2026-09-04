@@ -765,6 +765,20 @@ def build_reserve_reachable(
     **This function still contains physics only.** It does not read a price, rank
     an interval, or prefer a cheap refill to a dear one. Pass ``0`` and it is the
     autonomy recursion exactly.
+
+    It also does not consult ``allow_grid_charging``, and that is a decision
+    rather than an omission -- recorded here because it looks like one. The switch
+    permits *buying*, and nothing else: with it off the household is still served
+    from the meter, so the physical question this recursion answers, can the pack
+    stay above the floor, has the same answer either way. Gating the credit on it
+    would be worse than untidy. Charging is unpermitted in every solve when the
+    switch is off, so the requirement would collapse to the autonomy curve and
+    become unsatisfiable; more stored energy strictly reduces the lexicographic
+    violation term, so the optimiser would then hoard regardless of price and the
+    pack would never discharge again. That is the beta.31 immobilisation exactly,
+    and since the switch defaults to off it would be the fresh-install behaviour.
+    What actually protects the floor below this curve is the physics clamp and the
+    configured minimum state of charge, neither of which reads this function.
     """
     return _build(
         limits=limits,

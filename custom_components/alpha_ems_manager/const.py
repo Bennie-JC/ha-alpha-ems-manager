@@ -2365,6 +2365,79 @@ ECONOMIC_BUCKET_MAX_DIVISOR: Final = 80
 #: daylight-saving day is handled by the surplus bound long before this matters.
 TERMINAL_LOOKAHEAD_INTERVALS: Final = 96
 
+#: How the terminal value's post-horizon demand window was obtained.
+#:
+#: **beta.41.** The window used to be ``demands[horizon_intervals:]`` alone, and
+#: the cap above claimed the surplus bound would be reached "long before this
+#: matters". Neither was true once the day-ahead published: the price series is
+#: built one entry per demand, so when tomorrow's prices arrive the priced horizon
+#: and the forecast series end at the *same instant*, the slice is empty, and the
+#: whole demand-bounded segment of the terminal value silently collapsed to zero
+#: width. Publishing the basis is what makes that visible instead of invisible.
+#: How finely the sub-bucket ambient drain is carried between intervals.
+#:
+#: **beta.41, and it is what makes one physical energy state possible.** The
+#: inverter serves residual house load from the pack in amounts far below one
+#: lattice step -- on the reference installation 95.4 % of intervals sit under the
+#: 0.25 kWh AC smallest discharge, at 0.003 to 0.247 kWh -- so the drain cannot be
+#: a lattice move and, until beta.41, was not a state transition at all. The pack
+#: emptied in the report while the recursion still believed it was full.
+#:
+#: Refining the *energy* grid instead is quadratic: the charge power spans
+#: proportionally more buckets, so an eighth of a bucket costs 84 093 moves against
+#: 1 390 and 5.4 s against 0.10 s per solve. A carry axis advances deterministically
+#: with the interval and adds no moves, so it costs a **linear** multiple.
+#:
+#: **Eight, and the reason is downstream stability rather than fidelity.**
+#:
+#: The state quantisation is *cumulative*: the remainder one interval cannot
+#: express is carried to the next rather than discarded, so the total household
+#: service the state records is within **one step of exact whatever this number
+#: is**. Raising it buys nothing in the total.
+#:
+#: What it does bound is the **per-interval** residual, published as
+#: ``battery_state_quantisation_residual_kwh``. That is not cosmetic: at four
+#: steps the residual is 0.066 kWh, which is large enough to cross the
+#: sub-resolution thresholds Stage B uses to decide whether a row is executable,
+#: whether a campaign advanced and whether a budget is spent. Measured on the full
+#: suite, four steps cost **217** failing tests against **44** at eight, across
+#: Stage-B families the change has no business touching.
+#:
+#: The cost is linear and real -- 3.4x the base solve at four, 6.9x at eight,
+#: because the recursion visits every carry state and forward pruning does not
+#: help: the reachable set saturates at all of them within six intervals. So this
+#: is 0.83 s per solve and about 4.1 s per refresh, which is spent in an executor
+#: and never on the event loop.
+AMBIENT_CARRY_STEPS: Final = 8
+
+TERMINAL_WINDOW_FORECAST_TAIL: Final = "forecast_tail"
+TERMINAL_WINDOW_CLOCK_MATCHED: Final = "clock_matched_replay"
+TERMINAL_WINDOW_EMPTY: Final = "no_window"
+TERMINAL_WINDOW_BASES: Final = (
+    TERMINAL_WINDOW_FORECAST_TAIL,
+    TERMINAL_WINDOW_CLOCK_MATCHED,
+    TERMINAL_WINDOW_EMPTY,
+)
+
+#: Why the post-horizon demand window stopped where it did. Every one of these
+#: *shortens* the window, which narrows the demand-bounded segment and lowers the
+#: worth of stored energy -- the conservative direction, because overstating that
+#: worth is what authorises real spending.
+TERMINAL_WINDOW_STOP_SURPLUS: Final = "production_surplus"
+TERMINAL_WINDOW_STOP_PV_BLIND: Final = "no_production_forecast"
+TERMINAL_WINDOW_STOP_UNFORECAST: Final = "no_demand_forecast"
+TERMINAL_WINDOW_STOP_UNPRICED: Final = "no_clock_matched_price"
+TERMINAL_WINDOW_STOP_LOOKAHEAD: Final = "lookahead_exhausted"
+TERMINAL_WINDOW_STOP_NONE: Final = "not_started"
+TERMINAL_WINDOW_STOP_REASONS: Final = (
+    TERMINAL_WINDOW_STOP_SURPLUS,
+    TERMINAL_WINDOW_STOP_PV_BLIND,
+    TERMINAL_WINDOW_STOP_UNFORECAST,
+    TERMINAL_WINDOW_STOP_UNPRICED,
+    TERMINAL_WINDOW_STOP_LOOKAHEAD,
+    TERMINAL_WINDOW_STOP_NONE,
+)
+
 #: How the terminal inventory was valued, published so a reader can see which.
 #:
 #: ``demand_bounded`` is the beta.35 rule: energy the household will consume before
@@ -3775,11 +3848,22 @@ CAMPAIGN_OUTCOMES: Final = (
 #: is the lattice level the recursion actually ends on. The first can sit below the
 #: configured hard floor while the plan decided nothing of the kind, so a reader
 #: must be able to tell them apart without inferring it from the field name.
+#: **beta.41: both endpoint names now describe this one quantity.**
+#:
+#: beta.40 had to publish two figures with a basis apiece because the solver's
+#: state and the pack's energy were genuinely different -- 9.75 kWh against 4.32 on
+#: the live 2026-09-03 horizon. Household service is a state transition now, so
+#: there is one trajectory and one endpoint. The two *keys* are kept because
+#: consumers read them and two names cost nothing; the two *bases* are retained in
+#: the vocabulary so a payload written by an older release still parses.
+PLAN_END_ENERGY_BASIS_PHYSICAL_STATE: Final = "physical_state"
+
 PLAN_END_ENERGY_BASIS_AMBIENT_WALK: Final = "ambient_corrected_reported_walk"
 PLAN_END_ENERGY_BASIS_LATTICE_STATE: Final = "decided_lattice_state"
 
 PLAN_END_ENERGY_BASES: Final = frozenset(
     {
+        PLAN_END_ENERGY_BASIS_PHYSICAL_STATE,
         PLAN_END_ENERGY_BASIS_AMBIENT_WALK,
         PLAN_END_ENERGY_BASIS_LATTICE_STATE,
     }

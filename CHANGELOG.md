@@ -9,6 +9,275 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.41] - 2026-09-04
+
+**The optimiser could not value stored energy above the export rate, so it stopped
+buying entirely.** On 2026-09-03 at 20:45, live on `beta.40`, the reference
+installation held 9.936 kWh in a 21.6 kWh pack against a 4.32 kWh floor, tomorrow's
+day-ahead prices were fully published, tomorrow forecast 7.79 kWh of production
+against 21.65 kWh of load, and the pack reached the floor at 02:45 and could not
+refill itself. Stage A returned `runs: []`, `run_count: 0`,
+`reason_code: no_material_economic_action`.
+
+The figure that explains it is `stored_energy_marginal_value_eur_kwh: 0.15013`,
+which is exactly `discharge_efficiency x terminal_export_price`
+(0.948683 x 0.15825). Break-even for any grid charge was therefore **0.0924
+EUR/kWh** -- below the cheapest quarter this installation has ever recorded
+(0.15285). **No price cleared it, ever.** The user's 0.20 EUR minimum trade gain
+and 0.05 EUR/kWh grid-charge margin were never reached: the per-kWh gate refused
+first, and would have refused at a zero margin too. They are unchanged by this
+release, and the settings were never the cause.
+
+Two defects locked together to produce that number, and neither substitutes for
+the other.
+
+### Fixed: the solver held two different beliefs about how much energy was in the pack
+
+The recursion measured the hard floor, the reserve, reachability, the terminal
+credit, the worth of storage and the export permission against the **lattice
+level** -- the addressable state -- while the forward reconstruction subtracted
+household self-consumption **afterwards**. Two representations of one physical
+quantity, and on the live horizon they were 5.4 kWh apart: the optimiser believed
+it held 9.75 kWh where the pack held 4.32, published `battery_discharge_ac_kwh:
+5.15` alongside `battery_throughput_kwh: 0.0`, and paid a terminal credit on
+energy the household had already eaten. Holding cost nothing *and* depleted
+nothing, which is an unbounded free-energy source, and the same kilowatt-hour
+could be credited twice.
+
+**The state now carries the drain.** A second axis was added to the dynamic
+program: `(lattice_bucket, carry)`, where `carry` is sub-bucket household service
+accumulated so far in eight sub-divisions of one bucket, and physical energy is
+
+    physical = lattice_energy - carry * bucket_kwh / 8
+
+read from one place by every physical constraint. The axis advances
+deterministically with the interval rather than with a decision, so it adds states
+without adding transitions -- a linear cost rather than the quadratic one a finer
+lattice would carry.
+
+Both alternatives were measured before this one was chosen, and both were
+rejected on evidence rather than taste:
+
+* **A one-dimensional coordinate transform is not exact.** Over the live
+  108-interval horizon 95.4 % of intervals have a residual load below one lattice
+  discharge step, so sub-lattice service is the dominant mode, and the
+  unconditional drain totals 17.34 kWh against 5.62 kWh of room above the floor.
+  The pack is exhausted after 32 of the 103 sub-lattice intervals and must then
+  *stop* serving and import instead. A state at the floor therefore needs two
+  successors -- serve, and suspend -- differing by a sub-bucket amount. No
+  relabelling of a single grid carries both.
+* **Refining the lattice is quadratic and still not enough.** Halving the bucket
+  costs 3.6x, quartering 13.6x, eighths 52.9x (82 to 656 buckets, 1 390 to 84 093
+  moves, 101 ms to 5 356 ms). Quantising the drain down to the grid leaks
+  `103 x step` kWh, so a 0.5 kWh tolerance needs roughly a 730x solve. Ruled out.
+
+Two things were corrected during implementation, both found by measurement rather
+than by reading. The served amount is **differenced from the two states** rather
+than derived from the step count, because the top of the lattice is clamped to the
+pack ceiling and is not uniformly spaced -- a closed form was 8.9e-03 kWh out on
+exactly that interval. And the floor stayed a **reserve** rather than becoming a
+state exclusion: excluding below-floor states made every survival horizon report
+`economic_terminal_unreachable` and plan nothing, which is the beta.31
+immobilisation under another name. Only negative energy is excluded; the floor is
+enforced through `violations`, lexicographically above cost, exactly as before.
+
+The `_ambient_*` drain helpers and the whole-horizon drain bound are deleted rather
+than corrected. There is no second representation left to reconcile.
+
+### Fixed: the post-horizon demand window collapsed the moment the day-ahead published
+
+`TerminalValue.credit_eur` is piecewise-linear: a first segment serving
+post-horizon household demand at the displaced import price, a second exporting
+the spare at the export price. It is concave **only because** the first segment's
+rate is higher. With `demand_ac_kwh = 0.0` that segment has zero width and the
+whole curve flattens to `discharge_efficiency x export_price` -- the beta.34 cliff
+the class was written to replace.
+
+It was zero every afternoon. The window was built from `demands[horizon_intervals:]`,
+the horizon ran to the last interval carrying both a price and a demand, and the
+demand series is only ever "the rest of today, then all of tomorrow". So once
+tomorrow's prices published, the horizon consumed the entire series and the tail
+was empty. `build_horizon` had been publishing the tell all along -- `limited_by`
+flipped from `"prices"` to `"complete"` -- and nothing read it.
+
+**The window is now a clock-matched replay of the horizon's own tail.** The
+post-horizon window begins where tomorrow ends, so the day-after's overnight
+profile, matched by civil-time slot, *is* tomorrow's own overnight profile --
+already in the series, with its own production forecast, at a price that is known
+by construction. Extending the forecast a third day was rejected: production
+cannot be forecast that far on the free Solcast tier, and a missing production
+figure makes the free-refill break silently unreachable, which would credit a whole
+day of load at the import price and license hoarding.
+
+Sourcing the estimator from the priced prefix only is a structural guarantee that
+no unknown-price interval is ever read. Five break rules each shorten the window
+and record why in `post_horizon_window_stopped_by`; every one of them errs toward
+understating the worth of stored energy, which is the safe direction -- overstating
+it authorises real spending on a day nobody has published a price for.
+
+### Fixed: two clock defects in the estimator, both live
+
+The clock-matched price estimator computed an **absolute** civil-day slot and then
+read it out of an array whose zero is the **head** of the horizon. With a 14:00
+head, tomorrow's 02:00 was priced at today's 16:15. It also used a modulus against
+a fixed 96 intervals, which is wrong on the two days a year that have 92 or 100.
+Both now use the same head-relative arithmetic the price alignment already used,
+with an unmatchable sentinel so a missing interval count degrades to an empty
+window rather than raising.
+
+`_terminal_value` had no test coverage at all. It has a family of its own now.
+
+### Added: minimum-cost coverage of energy the household will buy anyway
+
+Separate from safety, and separate from discretionary trading.
+
+Where the forecast says the pack will reach the floor and the household will then
+import at the meter, that import is going to be bought. The only open question is
+*when*. Buying it earlier at a cheaper reachable quarter is not a trade and does
+not answer to the thresholds that govern one -- the 0.20 EUR minimum trade gain and
+0.05 EUR/kWh margin exist to demand a *profit*, and there is no profit here, only
+the same purchase at a better hour.
+
+The coverage counterfactual is built so that a purchased kilowatt-hour has exactly
+one way to pay for itself: **export is forbidden**, so nothing bought can be sold;
+**the terminal spare segment earns nothing**, so nothing bought can be parked at
+the horizon edge and credited; and the discretionary gates are set aside. What is
+left is displacement of household import the forecast says will otherwise happen.
+Every grid charge in that solve is coverage **by construction** rather than by
+inspection. The reserve, the hard floor, the power limits and the physical state
+are identical to the ordinary solve: this changes what a purchase must *earn*,
+never what the pack may *do*.
+
+It is promoted **whole** or not at all -- the two plans are never spliced, so
+whatever executes is a single complete solution with one physical trajectory -- and
+only when it leaves the household better off in cash **including the inventory each
+plan ends with**, buys more than discretion would by more than one bucket, and is
+no less safe. A plan that merely spends less because it bought less is not cheaper,
+and valuing the terminal inventory under the rule the executed plan will be judged
+by is what stops that being mistaken for a saving.
+
+Purchases now carry three disjoint categories, in precedence order: `safety_buy_*`
+is what physical reachability compels and is price-blind; `coverage_buy_*` is
+household import moved to a cheaper reachable hour; `economic_buy_*` is a
+discretionary trade and answers to the user's own thresholds. Each kilowatt-hour
+belongs to exactly one.
+
+On the live case coverage contributes **nothing**, and that is the intended result:
+once the state model and the terminal window are corrected, ordinary economics
+already buys the useful energy. Measured on a horizon where the gates genuinely
+bind -- a 0.25 against 0.42 band -- discretion buys 0.000 kWh and coverage buys
+8.611 kWh, saving 0.247 EUR, with export structurally zero.
+
+### Fixed: Safety Buy could absorb coverage energy and publish it as compulsory
+
+The safety attribution differences two solves and calls the difference compulsory.
+That is sound while the two differ *only* in the reserve, and the coverage
+counterfactual also sets the gates aside -- so the difference is partly the reserve
+and partly the gates, and attributing all of it to the reserve published
+discretionary energy as physically mandatory. Measured: the band fixture above
+reported all 8.611 kWh of coverage energy as Safety Buy.
+
+Where the pair is not comparable the compelled quantity is now the bridge itself,
+which is what physical reachability actually demands and is price-blind by
+construction. The published safety figure remains identical at 0.02 and at 0.90
+EUR/kWh.
+
+### Added: the two household-service quantities are published separately
+
+Exact meter-side household energy and quantised state movement are two different
+numbers, and both are now published, reconciled by a signed residual:
+
+    ambient_self_consumption_ac_kwh (exact, meter side)
+    battery_state_service_dc_kwh    (how far the modelled state moved)
+    battery_state_quantisation_residual_kwh  (the signed difference)
+
+The meter figure is untouched and stays exact -- every grid figure on the interval
+is split against it, which is what makes the beta.39 no-battery counterfactual
+arithmetic rather than an estimate. Substituting the solver's quantised movement
+for it was tried and fabricated export across 230 rows of Stage B. The residual is
+bounded by one carry step per interval and reaches no decision; publishing it is
+what makes the pair one model rather than two accounts.
+
+### Changed: the frozen execution claim carries the curve the plan obeyed
+
+`reserve_floor_kwh` is documented as "Stage-A physical limits Stage B must honour,
+frozen with the schedule". It was filled from the **autonomy** projection -- the
+counterfactual that asks what the pack would need if the grid vanished, which read
+21.93 kWh against a 21.6 kWh pack on the live horizon. It now carries
+`horizon.planning_reserve_kwh`, the enforced reachability curve the recursion
+actually obeyed, still floored at the hard floor.
+
+Inert before and after: all ten references were checked one at a time and every one
+is a declaration, a pass-through or a serialisation. `dispatch.py` never mentions
+it. What enforces the floor is the configured state of charge, which never reads
+this field. This is a provenance correction made before something starts trusting
+it, and no claim schema changes -- the field's shape is unchanged, so pre-upgrade
+claims parse identically.
+
+### Deliberately not changed
+
+* **The user's settings.** The 0.20 EUR minimum trade gain and 0.05 EUR/kWh
+  grid-charge margin are passed through untouched and remain authoritative for
+  discretionary trading. The reported fault was a defect, and weakening a setting
+  to hide it would have been the wrong fix.
+* **Reachability's grid credit still ignores `allow_grid_charging`.** With the
+  switch off the plan may still spend down to the hard floor plus margin and let
+  the household import at the meter, because the *physical* reachability answer
+  does not change with a preference. Gating it collapses reachability to autonomy,
+  which nothing can satisfy, and the optimiser would then hoard regardless of
+  price -- the beta.31 immobilisation verbatim, for the default configuration. Now
+  stated in `reserve.py` as a recorded decision rather than a latent surprise.
+* **`terminal_bucket` is not raised by the drain.** On a no-production horizon that
+  collapses to "end no lower than you are now", which is exactly what beta.18
+  removed after measuring it selling nothing into a 1.20 EUR/kWh peak and buying
+  4.74 kWh at peak prices.
+* **`CLAIM_SCHEMA_VERSION` is still written and never read.** Validation is by
+  parsing, which is the right design; the constant's docstring overstates what it
+  does and is now the only thing that says so.
+
+### Schema
+
+Additive only. `EconomicInterval` gains `battery_state_service_dc_kwh` and
+`battery_state_quantisation_residual_kwh`; `EconomicOutcome` gains
+`coverage_buy_attribution`, `coverage_buy_runs`, `coverage_saving_eur` and
+`coverage_baseline_charge_ac_kwh`; `TerminalValue` gains `window_basis`,
+`window_intervals` and `window_stopped_by`. Every new field is defaulted.
+Diagnostics gain `coverage_buy_ac_kwh`, `coverage_saving_eur` and
+`coverage_baseline_charge_ac_kwh` alongside the existing `safety_buy_ac_kwh`. No
+stored claim, entity or option changes shape.
+
+`coverage_baseline_charge_ac_kwh` is what the discretionary plan would have bought,
+published so the coverage attribution is checkable from outside: coverage is a
+difference against that plan, and without the figure "coverage never takes credit
+for energy discretion would have bought anyway" is a property only the solver could
+verify.
+
+### Verified
+
+The live 20:45 horizon is replayed verbatim as a fixture. Before: 0 runs, stored
+energy worth 0.15013 EUR/kWh, the pack projected to the floor and staying there.
+After: **2 runs** -- 3.889 kWh the reserve compels at 0.270, and 12.778 kWh bought
+economically in tomorrow's cheap window at 0.160 -- stored energy worth 0.3809
+EUR/kWh, the two decided endpoints identical, zero violation and zero export.
+
+**The test suite was strengthened because mutation testing said it had to be.** Of
+the first 37 mutations written against this release, 24 survived -- and not because
+the code was over-guarded. Almost every property of a solved plan is a
+*self-consistency* property, and self-consistency survives breaking the state model:
+replace the physical-energy function with the identity and the recursion, the
+forward walk, the terminal credit and both published endpoints all move together,
+back to the beta.40 model exactly, with every "the walk closes onto the endpoint"
+assertion still passing because both sides moved.
+
+Two files were added rather than the mutations weakened. One anchors every physical
+claim on the **exact meter-side household figure**, which the state model cannot
+touch: a trajectory reconstructed from it is what the pack really does, and the
+published one has to match -- measured across 42 shape-and-state combinations at
+1.72 carry steps, against the old model's divergence of the whole of consumption.
+The other pins the rounding directions, the materiality thresholds and the
+precedence arithmetic on the functions themselves. Four mutations were removed as
+provably equivalent, each with the reason recorded beside it.
+
 ## [1.0.0-beta.40] - 2026-09-03
 
 **Free production stopped going to the meter while the pack had room for it.** On

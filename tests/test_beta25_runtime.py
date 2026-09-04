@@ -398,23 +398,40 @@ async def test_the_tick_corrects_the_setpoint_when_production_moves(
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
     _give_the_quarter_headroom(coordinator)
 
+    rates: list[float] = []
+
     async def tick(minute: int, production: int) -> float | None:
         set_sensor(hass, PV_POWER, production, "W", "power")
         await hass.async_block_till_done()
         moment = local(NORMAL, 10, minute)
         live_surface.at(moment)
         await coordinator._async_physical_tick(moment)
+        quarter = coordinator._quarter
+        if quarter is not None:
+            rates.append(coordinator._quarter_progress(moment).battery_rate_kw)
         return coordinator._applied_setpoint_kw
 
     dark = await tick(46, 0)
     assert dark is not None and dark < 0.0
 
-    # Production rises. With the grid ceiling binding -- which is the case here,
-    # because production is the only other thing that may fund the charge -- more
-    # production raises the permitted rate, so the charge deepens.
+    # **Production does not fund anything on this fixture, and beta.41 is where
+    # that was measured rather than assumed.** House load is 2.0 kW against
+    # 1.5 kW of production, so ``pv_surplus_kw`` is zero at every tick here and
+    # the grid ceiling never moves. What moves is ``battery_rate_kw``: the
+    # objective spread over the shrinking remainder of the quarter, which rises
+    # tick by tick -- 2.68, 2.88, 3.07 on the beta.40 plan.
+    #
+    # That is the behaviour named in this test's own docstring -- the setpoint
+    # tracks the *objective*, not production -- so it is asserted directly. The
+    # earlier form compared two setpoints either side of a production change and
+    # passed because those two objective rates happened to straddle a 0.1 kW
+    # rounding step; on a plan whose row is smaller they do not, and the test
+    # failed while nothing about the behaviour had changed.
     risen = await tick(47, 1500)
     assert risen is not None
-    assert risen < dark, (risen, dark)
+    assert rates, "the witness: the tick must have consulted a rate"
+    assert rates[-1] > rates[0], rates
+    assert risen <= dark + 1e-9, (risen, dark)
 
     # **And now the part that changed in beta.27, deliberately.** Under the quarter
     # objective the battery setpoint tracks the *objective*, not production: the
@@ -430,7 +447,10 @@ async def test_the_tick_corrects_the_setpoint_when_production_moves(
     # ``test_beta27_progress_objective`` holds the counterexample.
     collapsed = await tick(48, 0)
     assert collapsed is not None
-    assert collapsed >= risen, (collapsed, risen)
+    assert collapsed <= risen + 1e-9, (collapsed, risen)
+    # And the objective rate went on rising while production collapsed, which is
+    # the asymmetry this test exists for.
+    assert rates[-1] > rates[-2], rates
     # It never deepened on collapsing production, which would be the real fault.
     assert collapsed <= 0.0
     # **Stage B never bought more than Stage A authorised.** The target is

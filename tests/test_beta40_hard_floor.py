@@ -1,4 +1,4 @@
-"""beta.40: the hard floor, and the two endpoints a reader must not confuse.
+"""beta.40 asked which endpoint was real. beta.41 made there be only one.
 
 **The apparent contradiction, from the 2026-09-03 beta.39 diagnostic.** Three
 figures appeared together and could not all be describing one trajectory:
@@ -8,22 +8,20 @@ figures appeared together and could not all be describing one trajectory:
     terminal / edge energy         4.74 kWh DC   (above it)
     reserve violation              0.00 kWh      (nothing wrong)
 
-They are not describing one trajectory. `end_energy_dc_kwh` is the
-**ambient-corrected reported walk**: `start_energy_dc_kwh` is reduced every
-interval by `ambient_self_consumption_ac_kwh` -- the pack feeding the house with
-no decision involved -- while `battery_delta_dc_kwh`, the lattice move the
-recursion chose, stays put. `edge_energy_kwh` is the **decided lattice state**,
-and this file proves it is exactly where the recursion ends.
+beta.40 answered that they were two different quantities and published both with
+their basis named: `end_energy_dc_kwh` was the ambient-corrected *reported* walk,
+`edge_energy_kwh` was the *decided* lattice state, and violations were evaluated
+on the decided one, so the 0.00 was correct.
 
-So the violation of 0.00 is correct: violations are evaluated on the decided
-state, which never went below the reserve. And the invariant that matters --
-*the binding Stage-A economic trajectory may never plan below the configured
-physical hard floor* -- holds, which the sweep below establishes rather than
-assumes.
+**That answer was true and the situation it described was not tenable.** A
+solver whose state disagrees with the pack by kilowatt-hours can price a terminal
+credit on inventory the household has already eaten, and can sell the same
+kilowatt-hour twice -- which is exactly what a later implementation did, exporting
+3.94 kWh while projecting an endpoint of -0.158 kWh with a violation of 0.00.
 
-The measured gap is not small, and that is why the diagnostics now name the
-basis: on a no-production horizon the recursion holds one bucket for 76 intervals
-while the reported walk falls 5.7975 to 1.5421, below the floor, deciding nothing.
+So beta.41 carries household service in the solver's own state, and the two
+figures become one. This file keeps the sweeps that prove the hard floor holds and
+replaces the three tests that measured the gap with the one that says it is gone.
 """
 
 from __future__ import annotations
@@ -32,8 +30,7 @@ import pytest
 
 from custom_components.alpha_ems_manager.const import (
     PLAN_END_ENERGY_BASES,
-    PLAN_END_ENERGY_BASIS_AMBIENT_WALK,
-    PLAN_END_ENERGY_BASIS_LATTICE_STATE,
+    PLAN_END_ENERGY_BASIS_PHYSICAL_STATE,
 )
 
 from .beta34_shape import solve_at
@@ -65,13 +62,13 @@ SHAPES: dict[str, dict] = {
 
 
 def lattice_walk(plan) -> list[float]:
-    """Return the energy the **decided** state stands at, interval by interval.
+    """Return the physical energy the pack stands at, interval by interval.
 
-    Reconstructed from ``battery_delta_dc_kwh`` -- the lattice moves -- seeded at
-    the plan's own first reported energy. Deliberately *not* read off
-    ``start_energy_dc_kwh``, which carries the ambient correction and is therefore
-    a different quantity; conflating the two is the whole confusion this file
-    exists to settle.
+    Reconstructed rather than read off ``start_energy_dc_kwh``, so the two have to
+    agree: the decided move **and** the household service the state took, which
+    since beta.41 are both state transitions. Before that this function summed the
+    lattice moves alone and was deliberately a *different* quantity from the
+    reported walk -- that difference is what this file used to be about.
     """
     if not plan.intervals:
         return []
@@ -79,25 +76,25 @@ def lattice_walk(plan) -> list[float]:
     walk = [energy]
     for interval in plan.intervals:
         energy += interval.battery_delta_dc_kwh
+        energy -= interval.battery_state_service_dc_kwh
         walk.append(energy)
     return walk
 
 
-# == 1. the two endpoints are different quantities, and one is the decision ==
+# == 1. there is one endpoint, and everybody reaches it =====================
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
-def test_the_decided_endpoint_is_the_edge_energy_and_not_the_reported_walk(
-    shape: str,
-) -> None:
-    """**The identity that resolves the contradiction.**
+def test_the_decided_endpoint_is_where_the_physical_walk_ends(shape: str) -> None:
+    """**The identity that replaced the distinction.**
 
-    ``edge_energy_kwh`` is exactly where the lattice walk ends, in every shape. So
-    it -- and not ``end_energy_dc_kwh`` -- is the endpoint the plan decided, and it
-    is the figure the terminal credit was priced on.
+    ``edge_energy_kwh`` is exactly where the physical trajectory ends, in every
+    shape -- and the trajectory is reconstructed here from the interval fields
+    rather than read off the plan, so this is agreement between two derivations
+    and not a restatement.
 
-    *Mutation: seed the terminal credit from ``end_energy_dc_kwh`` and this
-    fails.*
+    *Mutation: leave household service out of the state transition and this
+    fails, because the walk then ends where beta.40 said it did.*
     """
     plan = solve_at(**SHAPES[shape]).outcome.desired
     walk = lattice_walk(plan)
@@ -107,34 +104,41 @@ def test_the_decided_endpoint_is_the_edge_energy_and_not_the_reported_walk(
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
-def test_the_reported_walk_never_exceeds_the_decided_state(shape: str) -> None:
-    """Ambient self-consumption can only *reduce* the projection.
+def test_the_two_endpoint_names_report_one_number(shape: str) -> None:
+    """``end_energy_dc_kwh`` and ``edge_energy_kwh`` are the same quantity now.
 
-    It is discharge, so the reported walk is a lower bound on the decided state --
-    which is the direction that makes the projection safe to publish and unsafe to
-    act on.
+    Both names are kept because two names are cheaper than a migration, and this
+    is what stops them drifting apart again. beta.40 measured the gap at
+    kilowatt-hours -- 9.75 against 4.32 on the live horizon -- and had to publish a
+    basis with each figure to say which was which.
     """
     plan = solve_at(**SHAPES[shape]).outcome.desired
 
-    assert plan.end_energy_dc_kwh <= plan.edge_energy_kwh + 1e-9
+    assert plan.end_energy_dc_kwh == pytest.approx(plan.edge_energy_kwh, abs=1e-12)
 
 
-def test_the_gap_is_real_and_large_enough_to_cross_the_floor() -> None:
-    """**The vacuity gate.** Without a measurable gap none of this would matter.
+def test_the_gap_that_used_to_cross_the_floor_is_closed() -> None:
+    """**The vacuity gate, inverted.**
 
-    The no-production horizon is the one that shows it: the recursion holds while
-    the projection walks down past the configured floor.
+    The no-production horizon is the one that showed the gap: beta.40 held one
+    bucket for 76 intervals while the projection walked down past the configured
+    floor to 1.5421 kWh, reporting no violation, because violations were evaluated
+    on a state that never moved.
+
+    Now the household service moves it, so the trajectory that is reported is the
+    trajectory that was decided, and the floor test applies to both because they
+    are one thing.
     """
     plan = solve_at(**SHAPES["zero_pv"]).outcome.desired
     walk = lattice_walk(plan)
 
-    # The decided state never went below the floor, wherever else it went.
-    assert min(walk) > CONFIGURED_FLOOR_DC_KWH, min(walk)
-    # The projection did not, and reported no violation for it.
-    assert plan.end_energy_dc_kwh < CONFIGURED_FLOOR_DC_KWH
+    assert walk
+    assert plan.edge_energy_kwh - plan.end_energy_dc_kwh == pytest.approx(
+        0.0, abs=1e-12
+    )
+    # The floor holds on the physical trajectory, which is the only one there is.
+    assert min(walk) >= plan.terminal_floor_kwh - BUCKET_DC_KWH - 1e-9, min(walk)
     assert plan.violation_kwh == pytest.approx(0.0)
-    # And the gap is kilowatt-hours, not rounding.
-    assert plan.edge_energy_kwh - plan.end_energy_dc_kwh > 2.0
 
 
 # == 2. the invariant: the decided trajectory honours the hard floor =========
@@ -226,24 +230,24 @@ def test_both_endpoints_are_published_with_their_basis_named() -> None:
     )
     totals = report["desired"]["totals"]
 
-    assert totals["end_energy_basis"] == PLAN_END_ENERGY_BASIS_AMBIENT_WALK
-    assert totals["planned_end_energy_basis"] == PLAN_END_ENERGY_BASIS_LATTICE_STATE
+    assert totals["end_energy_basis"] == PLAN_END_ENERGY_BASIS_PHYSICAL_STATE
+    assert totals["planned_end_energy_basis"] == PLAN_END_ENERGY_BASIS_PHYSICAL_STATE
     assert totals["end_energy_basis"] in PLAN_END_ENERGY_BASES
     assert totals["planned_end_energy_basis"] in PLAN_END_ENERGY_BASES
-    # **The published decided endpoint is the lattice state, not the projection.**
-    # Asserted as an identity against ``edge_energy_kwh`` and as a strict gap, so
-    # publishing the projection under both names cannot pass.
+    # **Both keys report the pack's physical endpoint, and the same one.**
+    # Asserted as an identity against ``edge_energy_kwh``, so publishing anything
+    # else under either name cannot pass.
     plan = solve_at(**SHAPES["zero_pv"]).outcome.desired
     assert totals["planned_end_energy_dc_kwh"] == pytest.approx(
         round(plan.edge_energy_kwh, 2), abs=1e-9
     )
-    assert totals["planned_end_energy_dc_kwh"] - totals["end_energy_dc_kwh"] > 2.0, (
-        totals
-    )
-    # And the rule says the projection is not an executable target.
+    assert totals["planned_end_energy_dc_kwh"] == pytest.approx(
+        totals["end_energy_dc_kwh"], abs=1e-9
+    ), totals
+    # And the rule says what they are and what they are not.
     rule = totals["end_energy_rule"]
-    assert "diagnostic projection" in rule
-    assert "neither figure is an executable target" in rule
+    assert "the same quantity" in rule
+    assert "neither is an executable target" in rule
 
 
 def test_the_capability_plan_publishes_the_same_distinction() -> None:
@@ -259,5 +263,5 @@ def test_the_capability_plan_publishes_the_same_distinction() -> None:
         solve_at(**SHAPES["zero_pv"]).outcome, execution_blocked_reason="none"
     )["capability"]["totals"]
 
-    assert totals["end_energy_basis"] == PLAN_END_ENERGY_BASIS_AMBIENT_WALK
-    assert totals["planned_end_energy_basis"] == PLAN_END_ENERGY_BASIS_LATTICE_STATE
+    assert totals["end_energy_basis"] == PLAN_END_ENERGY_BASIS_PHYSICAL_STATE
+    assert totals["planned_end_energy_basis"] == PLAN_END_ENERGY_BASIS_PHYSICAL_STATE

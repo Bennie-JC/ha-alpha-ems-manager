@@ -326,12 +326,28 @@ def test_a_thin_trade_survives_a_zero_margin_and_dies_at_ten_cents() -> None:
     A twelve-cent gross spread does not clear ten cents per kWh once the round
     trip has taken its share, so the same opportunity flips from accepted to
     refused on the strength of the setting alone.
+
+    **The trade dies whole.** At a zero margin the plan buys 15.0 kWh and sells
+    12.75 of it: that is the arbitrage, and the setting removes all of it. What
+    survives the ten-cent margin is 0.833 kWh with **nothing exported** -- the
+    household's own next-morning import, bought six intervals earlier at 0.20
+    instead of 0.32. It is not a trade and this setting is not what governs it,
+    which is the whole of beta.41's coverage layer: the band where the round trip
+    genuinely saves money but by less than the user demands a trade earn.
+
+    So the assertion is stated on the discretionary share rather than on the total.
+    The old form measured the same thing while every purchase was a trade.
     """
     free = solved(spread=0.12, margin=0.0)
     charged = solved(spread=0.12, margin=0.10)
 
     assert bought_kwh(free) > 1.0
-    assert bought_kwh(charged) == pytest.approx(0.0, abs=1e-9)
+    assert exported_kwh(free) > 1.0
+
+    discretionary = bought_kwh(charged) - sum(charged.coverage_buy_attribution.values())
+    assert discretionary == pytest.approx(0.0, abs=1e-9)
+    assert exported_kwh(charged) == pytest.approx(0.0, abs=1e-9)
+    assert charged.coverage_saving_eur > 0.0
 
 
 def test_a_clearly_profitable_trade_still_happens_with_a_margin() -> None:
@@ -452,5 +468,15 @@ def test_swapping_the_two_economic_settings_is_caught(monkeypatch) -> None:
     monkeypatch.setattr(coordinator_module, "build_outcome", swap)
     swapped = solved(spread=0.12, margin=0.10, gain=0.0)
 
-    assert bought_kwh(honest) == pytest.approx(0.0, abs=1e-9)
+    # Stated on the discretionary share for the reason given in the thin-trade
+    # test above: a ten-cent *margin* refuses this trade, and what it leaves behind
+    # is coverage of the household's own import rather than a trade it let through.
+    honest_discretionary = bought_kwh(honest) - sum(
+        honest.coverage_buy_attribution.values()
+    )
+    assert honest_discretionary == pytest.approx(0.0, abs=1e-9)
+    assert exported_kwh(honest) == pytest.approx(0.0, abs=1e-9)
+    # Swapped, the ten cents lands on the campaign fee instead of the kWh rate and
+    # the arbitrage survives -- exported, which is what says it is a trade.
     assert bought_kwh(swapped) > 1.0
+    assert exported_kwh(swapped) > 1.0

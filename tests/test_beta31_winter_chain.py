@@ -363,9 +363,18 @@ def test_only_the_unavoidable_amount_bypasses_the_economic_gate() -> None:
     generous = _plan(45.0, gain=0.0)
     prohibitive = _plan(45.0, gain=5.0)
 
+    # **Measured against the published three-way split, not against the verdict's
+    # ``economic_extra_kwh``.** That field is the run minus what the reserve
+    # compels, which was the discretionary share exactly while safety and economics
+    # were the only two categories. beta.41 added a third, so the discretionary
+    # share is what is left after coverage as well -- and that is the quantity this
+    # test has always been about: energy bought because a *trade* looked good.
+    outcome = prohibitive["outcome"]
     discretionary_prohibitive = sum(
-        verdict["economic_extra_kwh"]
-        for _label, _run, verdict in _charge_runs(prohibitive["outcome"])
+        run.battery_charge_ac_kwh
+        - outcome.safety_buy_attribution.get(run.start_index, (0.0, 0.0))[0]
+        - outcome.coverage_buy_attribution.get(run.start_index, 0.0)
+        for _label, run, _verdict in _charge_runs(outcome)
     )
     total_generous = sum(
         _bought_in(generous["plan"], window)
@@ -376,15 +385,28 @@ def test_only_the_unavoidable_amount_bypasses_the_economic_gate() -> None:
         for window in (WINDOW_A, WINDOW_B, WINDOW_C)
     )
 
-    # A prohibitive gain removes the cheap main refill entirely...
-    assert _bought_in(prohibitive["plan"], WINDOW_B) == 0.0
+    # A prohibitive gain removes the last window entirely...
     assert _bought_in(prohibitive["plan"], WINDOW_C) == 0.0
     # ...but not the energy the pack cannot do without.
     assert _bought_in(prohibitive["plan"], WINDOW_A) > 0.0
-    # Nothing discretionary survives it, which is the whole purpose of a gate.
+    # **Nothing discretionary survives it, which is the whole purpose of a gate.**
+    # This is the assertion the test exists for and it is unchanged.
     assert discretionary_prohibitive == pytest.approx(0.0, abs=1e-9)
     # And raising the gate can only ever reduce what is bought.
     assert total_prohibitive <= total_generous + 1e-9
+
+    # **The main refill survives the gate, and it is no longer a trade.** Every
+    # kilowatt-hour of it is coverage: on this winter shape the pack empties and
+    # the household imports whatever it needs at whatever the hour costs, so
+    # buying it in the cheap window is the same purchase moved, not a spread being
+    # taken. The proof that it is not arbitrage is structural rather than
+    # circumstantial -- the plan exports nothing at all, and it cannot, because
+    # export is not in the coverage counterfactual's permitted set.
+    covered = sum(outcome.coverage_buy_attribution.values())
+    assert _bought_in(prohibitive["plan"], WINDOW_B) == pytest.approx(4.0)
+    assert covered >= _bought_in(prohibitive["plan"], WINDOW_B) - 1e-9
+    assert prohibitive["plan"].planned_grid_export_kwh == pytest.approx(0.0, abs=1e-9)
+    assert outcome.coverage_saving_eur > 0.0
 
     # **Deliberately not asserted: that the *attributed* compulsory share is
     # monotone in the gate.** It is not, and it must not be read as though it
@@ -419,12 +441,27 @@ def test_a_zero_head_bridge_does_not_mean_nothing_was_compulsory() -> None:
 
     runs = _charge_runs(outcome)
     assert runs, "a purchase the pack cannot decline must still be planned"
-    for _label, _run, verdict in runs:
-        assert verdict["compulsory_kwh"] > 0.0, verdict
+
+    # **The head asks 9.590 kWh (44.4 %) and the curve peaks at 10.855 (50.3 %)
+    # four quarters later, so a pack at 46 % clears the head and not the peak:
+    # 1.25 kWh is compulsory with a head bridge of exactly zero.** That figure is
+    # the whole test. An implementation measuring the unavoidable amount at the
+    # head would report zero here, which is the defect this pins.
+    compelled = sum(
+        compulsory for compulsory, _economic in outcome.safety_buy_attribution.values()
+    )
+    assert compelled == pytest.approx(1.25), outcome.safety_buy_attribution
+
+    # It is carried by the run that answers the reachability deadline, and that run
+    # is classified by the counterfactual rather than by the head figure.
+    compulsory_runs = [
+        (label, run, verdict)
+        for label, run, verdict in runs
+        if verdict["compulsory_kwh"] > 0.0
+    ]
+    assert compulsory_runs, "the compelled energy must be attributed to some run"
+    for _label, _run, verdict in compulsory_runs:
         assert verdict["compulsory_basis"] == "reserve_relaxed_counterfactual"
-        # The head asks 9.590 kWh (44.4 %) and the curve peaks at 10.855 (50.3 %)
-        # four quarters later, so a pack at 46 % clears the head and not the peak:
-        # 1.25 kWh is compulsory with a head bridge of exactly zero.
         assert verdict["classification"] in (
             BUY_REASON_REACHABILITY,
             BUY_REASON_UNCERTAINTY,
@@ -432,6 +469,18 @@ def test_a_zero_head_bridge_does_not_mean_nothing_was_compulsory() -> None:
         )
         # And the payload says why the head figure looked satisfied.
         assert verdict["why_not_earlier"] is not None
+
+    # **The runs carrying no compelled energy are not discretionary either.** At a
+    # five-euro trade gain nothing is bought as a trade; what remains beside the
+    # compelled quantity is coverage of import this pack cannot avoid, and the
+    # plan exports nothing.
+    for _label, run, verdict in runs:
+        if verdict["compulsory_kwh"] > 0.0:
+            continue
+        assert outcome.coverage_buy_attribution.get(
+            run.start_index, 0.0
+        ) == pytest.approx(run.battery_charge_ac_kwh, abs=1e-9), run.start_index
+    assert result["plan"].planned_grid_export_kwh == pytest.approx(0.0, abs=1e-9)
 
 
 def test_the_compulsory_amount_shrinks_as_the_pack_rises() -> None:

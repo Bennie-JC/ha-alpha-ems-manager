@@ -19,7 +19,7 @@ switched off.
 
 ## Project status
 
-> **Current release: `1.0.0-beta.40` — a public beta.**
+> **Current release: `1.0.0-beta.41` — a public beta.**
 >
 > Stage A is feature-complete. Stage B — the physical execution controller — is
 > wired end to end and, from beta.24, **can charge your battery**. From beta.27 it
@@ -180,7 +180,7 @@ custom repository first.
    - **Type:** `Integration`
 4. Click **Add**, then search HACS for **Alpha EMS Manager** and install it.
    - This is a pre-release, so enable **Show beta versions** in the download
-     dialog if `1.0.0-beta.40` is not offered.
+     dialog if `1.0.0-beta.41` is not offered.
 5. **Restart Home Assistant.**
 6. Continue with [Configuration](#configuration).
 
@@ -910,6 +910,83 @@ gave it a different one — check **Developer tools → States** for the entity 
 The full audit trail is in the nested `today_accounting` attribute: the day's
 interval partition, both ends of the position, where the opening valuation came from
 and when, and the reconciliation error. It is also in the diagnostics download.
+
+### The battery knows it is being used (new in beta.41)
+
+On 2026-09-03 at 20:45 the controller planned nothing at all. The pack held
+9.936 kWh of a 21.6 kWh battery, tomorrow's prices were fully published, tomorrow
+forecast far more household load than production, and the pack was on course to hit
+its floor at 02:45 and stay there -- buying the whole of the next day from the grid
+at whatever it cost. There were cheap quarters available. It bought none of them.
+
+The reason was not a setting. Internally the planner had two different ideas of how
+much energy was in the pack: the level it made decisions against, and the level it
+reported afterwards. On that evening they were **5.4 kWh apart**. Because the
+deciding level never fell as the house consumed, holding energy looked free *and*
+looked like it lost nothing -- so there was never any reason to buy more.
+
+That also capped what a stored kilowatt-hour could ever be worth, at exactly the
+export rate. Break-even for buying anything came out at **0.0924 EUR/kWh**, below
+the cheapest quarter this installation has ever seen. Your minimum trade gain and
+grid-charge margin were never reached; a different gate refused first, and it would
+have refused at zero.
+
+The planner now carries household self-consumption in the state it decides on, so
+the pack depletes while it is planning. Replayed on that same evening it buys
+**12.778 kWh** in the cheap window instead of sitting on the floor all day. **Your
+settings are unchanged and still decide every discretionary trade** -- the 0.20 EUR
+minimum gain and 0.05 EUR/kWh margin are passed through exactly as configured.
+
+There is a second half to it. What a stored kilowatt-hour is worth depends on the
+household demand waiting beyond the end of the plan, and that estimate quietly
+collapsed to zero every afternoon the moment the next day's prices published --
+because the plan then covered the whole forecast and there was nothing left over to
+measure. It now estimates that demand from the same overnight hours it already has,
+matched by clock time, and it never reads a price it does not know.
+
+### Buying the energy you were going to buy anyway (new in beta.41)
+
+Your minimum trade gain and grid-charge margin exist to make sure a *trade* is
+worth doing. They ask a purchase to earn a profit.
+
+But some energy is not a trade. If the forecast says the pack will run empty
+tonight and the house will import from the grid tomorrow morning regardless, that
+electricity is going to be bought. The only open question is *when* -- and buying it
+at 0.25 instead of 0.42 is not profit, it is the same purchase at a better hour.
+Asking it to clear a profit threshold refuses it for the wrong reason.
+
+`beta.41` looks for exactly that case. It is deliberately narrow, and it cannot
+become anything wider:
+
+* it only ever buys energy the forecast says your household will **actually
+  consume**, whether inside the plan or just past its end;
+* the energy it buys **cannot be sold** -- exporting is not available to it, and it
+  earns nothing for simply holding energy beyond what the house will take, so the
+  only way a purchase can pay for itself is by replacing a grid import you were
+  going to make;
+* it must show a **cash saving including what the battery ends up holding**, so a
+  plan that merely spends less because it bought less never counts as cheaper;
+* it never crosses into hours whose prices are not published yet.
+
+Where ordinary economics already buys that energy, this does nothing at all -- and
+on the reference installation, that is the usual case. Measured on a horizon where
+the thresholds genuinely bite, with cheap quarters at 0.25 against a 0.42 day, the
+ordinary optimiser bought **nothing** and this bought **8.611 kWh**, saving
+**0.247 EUR**, with no export.
+
+Purchases are now labelled with which of three reasons they had, and each
+kilowatt-hour has exactly one:
+
+| Label | Why it was bought |
+|---|---|
+| Safety | the battery physically cannot reach its reserve without it -- no price test applies |
+| Coverage | your household was going to import it anyway, and this hour is cheaper |
+| Economic | a discretionary trade, judged against your own minimum gain and margin |
+
+The evidence is in the diagnostics download, as `safety_buy_ac_kwh`,
+`coverage_buy_ac_kwh`, `coverage_saving_eur` and
+`coverage_baseline_charge_ac_kwh` -- the last being what ordinary economics would
+have bought on its own, so the split can be checked rather than taken on trust.
 
 ### Keeping your own production instead of selling it (new in beta.40)
 
