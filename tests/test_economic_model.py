@@ -30,7 +30,6 @@ Arithmetic is asserted at exact values wherever the arithmetic is exact.
 from __future__ import annotations
 
 import math
-import time
 from collections.abc import Sequence
 
 import pytest
@@ -1161,13 +1160,28 @@ def test_the_solver_never_raises_on_absurd_inputs() -> None:
         assert math.isfinite(plan.violation_kwh)
 
 
-def test_a_full_day_horizon_solves_inside_the_refresh_budget() -> None:
-    """Ninety-six intervals, four solves' worth of work, well under a second.
+def test_a_full_day_horizon_solves_by_bucket_delta_and_not_per_transition() -> None:
+    """Ninety-six intervals, and the grid split called once per **delta**.
 
-    The guard exists because the first working version took 670 ms by calling the
-    grid split once per transition. Precomputing the per-interval outcomes by
-    bucket delta cut it to a sixth, and this is what stops that regressing
+    The guard exists because the first working version called the grid split once
+    per transition. Keying the precomputed outcomes by bucket delta instead cut the
+    work by more than an order of magnitude -- the module says so itself: *"the
+    difference between calling split_grid_energy thirty-four thousand times and nine
+    hundred thousand times for one solve"*. This is what stops that regressing
     silently into a refresh that misses its quarter-hour.
+
+    **It was a wall-clock bound until beta.42, and that was the wrong instrument.**
+    A duration measures the machine as much as the code: the bound was 1500 ms
+    against roughly 710 ms on the development machine, so it carried 2.1x headroom
+    while claiming to guard a 6x regression -- and it failed on a GitHub runner that
+    is simply slower per core, on a solve the neutrality digests prove is unchanged.
+    Switching to a CPU clock would not have helped, because on that runner the cost
+    is genuine rather than contention.
+
+    A call count is the property the duration was proxying, and it is exact,
+    deterministic and independent of how fast the host is. The per-transition
+    alternative would be in the hundreds of thousands, so the regression this exists
+    to catch moves the figure by more than two orders of magnitude.
     """
     table = reference_table()
     horizon = horizon_for(
@@ -1176,12 +1190,30 @@ def test_a_full_day_horizon_solves_inside_the_refresh_budget() -> None:
         prices=two_tier_prices(96, cheap_until=48),
     )
 
-    started = time.perf_counter()
-    plan = solved(table, horizon, start_kwh=START_KWH)
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    import custom_components.alpha_ems_manager.economic as economic_module
+
+    real = economic_module.split_grid_energy
+    calls = 0
+
+    def counting(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return real(*args, **kwargs)
+
+    economic_module.split_grid_energy = counting
+    try:
+        plan = solved(table, horizon, start_kwh=START_KWH)
+    finally:
+        economic_module.split_grid_energy = real
 
     assert plan.intervals_evaluated == 96
-    assert elapsed_ms < 1500.0, f"one solve took {elapsed_ms:.0f} ms"
+    # 42 per interval, which is the reachable delta set for this fixture's table.
+    # Pinned exactly rather than bounded, so a change in the table's shape is
+    # noticed and explained rather than absorbed by a margin.
+    assert calls == 42 * 96 == 4032, calls
+    # And the order of magnitude the docstring above names, stated as an assertion
+    # so the claim cannot drift away from the code it describes.
+    assert calls < 20_000
 
 
 # -- K. the two ratified contracts -------------------------------------------
