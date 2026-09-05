@@ -62,6 +62,7 @@ from .const import (
     BALANCE_SAMPLE_WINDOW,
     DAY_TYPE_WEEKDAY,
     DAY_TYPE_WEEKEND,
+    MAX_CAMPAIGN_LIFECYCLE_REMEMBERED,
     MAX_DECISION_RECORDS_RETAINED,
     MAX_HISTORY_DAYS,
     MIN_DAY_COMPLETENESS,
@@ -263,6 +264,36 @@ class DayRecord:
     #: reason, never zero. Keyed by the civil date the record already is, so the
     #: 92/96/100-interval machinery is untouched by it.
     open_value: dict[str, Any] | None = None
+    #: The day's authoritative realised battery benefit, sealed once. beta.42.
+    #:
+    #: **Persisted because the evidence does not outlive the figure**, which is a
+    #: narrower claim than the one this field was first written to make and is the
+    #: one the arithmetic actually supports. The comparator is four measured cash
+    #: legs -- import and export, actual and counterfactual -- so it reads no state
+    #: of charge, no capacity and no efficiency, and a re-derivation of a day whose
+    #: record and prices are both still on disk returns the same number. That is a
+    #: property worth having and ``test_beta42_day_finalisation`` pins it rather
+    #: than assuming it.
+    #:
+    #: What re-derivation cannot survive is the day record being **evicted** at 365
+    #: days, and a lifetime total has to. So the value is computed while the
+    #: evidence exists and folded forward when the evidence goes -- which also means
+    #: eviction needs no prices and no ``await``, and can therefore happen where it
+    #: actually happens, inside a synchronous callback.
+    #:
+    #: Write-once, on the same guard as :attr:`open_value`: the field's own absence.
+    #: So a restart, a reload or an extra refresh cannot re-seal a day, and a lost
+    #: write simply replays.
+    #:
+    #: ``bv`` records **which comparator produced the figure**, because beta.42 is
+    #: itself the release that corrects the comparator. A day sealed under an older
+    #: basis has to be identifiable rather than quietly summed alongside days sealed
+    #: under the corrected one.
+    #:
+    #: Additive and optional. Absent on every document written before beta.42, and
+    #: on any day that never became finalisable -- which is a defined state that
+    #: withholds the lifetime total's completeness claim, never a zero.
+    final_benefit: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         """Size the parallel lists to the day's real interval count."""
@@ -316,6 +347,35 @@ class DayRecord:
         if self.ev_expected[index] and flexible is None:
             return None
         return max(measured - (flexible or 0.0), 0.0)
+
+    def total_load_at(self, index: int) -> float | None:
+        """Return the whole household's energy for one interval, or ``None``.
+
+        **The same reading as :meth:`baseline_at` without the flexible load taken
+        out**, and it exists because the two are not interchangeable and beta.42
+        found them being differenced against each other.
+
+        The baseline is what the *forecast* wants: it excludes an electric vehicle
+        so the optimiser never reserves battery energy to cover a charging session
+        it may itself schedule. The realised counterfactual wants the opposite. It
+        asks what the meter would have read with no battery, and it compares that
+        against ``grid_import_at`` -- which is the whole house, vehicle included. Fed
+        the baseline, ``max(0, baseline - pv) - import`` went to zero on every
+        interval the vehicle drew, so realised avoidance silently read as no battery
+        benefit at all, while those intervals still counted as priced.
+
+        Validity is the baseline's rule and not a looser one. A missing measurement
+        is ``None``; and an interval where a flexible load was expected but not
+        recorded is ``None`` too, because the total is then unknown by exactly the
+        amount nobody measured. Returning the bare measured figure there would be
+        the same class of error in the other direction.
+        """
+        measured = self.measured[index]
+        if measured is None:
+            return None
+        if self.ev_expected[index] and self.ev[index] is None:
+            return None
+        return max(measured, 0.0)
 
     def soc_at(self, index: int) -> float | None:
         """Return the recorded state of charge at the end of one interval."""
@@ -479,6 +539,57 @@ class DayRecord:
         }
         return True
 
+    def note_final_benefit(
+        self,
+        *,
+        finalized_at: str,
+        benefit_eur: float,
+        basis_version: str,
+    ) -> bool:
+        """Seal this day's realised battery benefit, once. Returns whether it wrote.
+
+        **The idempotence is the correctness**, exactly as it is for
+        :meth:`note_opening_valuation`, and for a sharper reason: this figure is
+        summed into a lifetime total. A second write would not merely move a
+        reference, it would double-count, and no later read could tell that it had.
+
+        The caller decides *when* a day qualifies -- that judgement needs prices,
+        an interval count and a rollover, none of which belong in a storage record.
+        What belongs here is that the answer is written at most once.
+        """
+        if self.final_benefit is not None:
+            return False
+        self.final_benefit = {
+            "at": finalized_at,
+            "v": round(float(benefit_eur), 6),
+            "bv": str(basis_version),
+        }
+        return True
+
+    @property
+    def benefit_eur_final(self) -> float | None:
+        """Return the sealed benefit, or ``None`` while the day is not sealed."""
+        if not self.final_benefit:
+            return None
+        value = self.final_benefit.get("v")
+        return float(value) if isinstance(value, int | float) else None
+
+    @property
+    def benefit_finalized_at(self) -> str | None:
+        """Return when the day was sealed, or ``None``."""
+        if not self.final_benefit:
+            return None
+        value = self.final_benefit.get("at")
+        return value if isinstance(value, str) else None
+
+    @property
+    def benefit_basis_version(self) -> str | None:
+        """Return which comparator sealed the day, or ``None``."""
+        if not self.final_benefit:
+            return None
+        value = self.final_benefit.get("bv")
+        return value if isinstance(value, str) else None
+
     # -- serialisation ---------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
@@ -518,6 +629,10 @@ class DayRecord:
             # document from a day that never had a usable opening reading is
             # byte-identical to a beta.38 one.
             payload["ov"] = dict(self.open_value)
+        if self.final_benefit is not None:
+            # Omitted while absent, exactly as ``ov`` is. A day that never became
+            # finalisable writes the document a beta.41 release would have written.
+            payload["bf"] = dict(self.final_benefit)
         return payload
 
     @classmethod
@@ -584,6 +699,14 @@ class DayRecord:
         # degrade to "no opening valuation" -- which is a defined state with its
         # own published reason -- rather than to a plausible-looking zero.
         record.open_value = _opening_valuation(raw.get("ov"))
+        # Absent on every document written before beta.42. **Validated rather than
+        # trusted, for the same reason ``ov`` is and one more**: this value is
+        # summed into a lifetime total, so a non-numeric entry that degraded to a
+        # plausible zero would not merely be wrong, it would be invisible -- a day
+        # that reads as sealed-at-nothing is indistinguishable from a day the
+        # battery genuinely saved nothing. A malformed entry reads as *unsealed*,
+        # which is a defined state that says so.
+        record.final_benefit = _final_benefit(raw.get("bf"))
         flags_raw = raw.get("x")
         if isinstance(flags_raw, list):
             record.ev_expected = [bool(flag) for flag in flags_raw[:count]] + [
@@ -617,6 +740,36 @@ def _opening_valuation(raw: Any) -> dict[str, Any] | None:
             return None
         values[key] = number
     return values
+
+
+def _final_benefit(raw: Any) -> dict[str, Any] | None:
+    """Return a usable sealed benefit, or ``None``.
+
+    All three fields or none. The euro figure alone would be summable but not
+    auditable: without ``at`` nothing can say when the day stopped being
+    re-derivable, and without ``bv`` a figure produced by the comparator beta.42
+    replaced is indistinguishable from one produced by the corrected one. A
+    lifetime total assembled from unattributable addends is not evidence.
+
+    A benefit of exactly zero is legitimate and is kept -- a day the battery did
+    not help is a real measurement. What is refused is a *malformed* entry, which
+    reads as unsealed rather than as zero, because those two say opposite things.
+    """
+    if not isinstance(raw, dict):
+        return None
+    at = raw.get("at")
+    basis = raw.get("bv")
+    if not isinstance(at, str) or not at:
+        return None
+    if not isinstance(basis, str) or not basis:
+        return None
+    value = raw.get("v")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if value != value or abs(value) == float("inf"):
+        return None
+    return {"at": at, "v": value, "bv": basis}
 
 
 def _numeric_list(raw: Any, count: int) -> list[float | None]:
@@ -752,6 +905,39 @@ class LearningStore:
         if len(self.decisions) > MAX_DECISION_RECORDS_RETAINED:
             del self.decisions[:-MAX_DECISION_RECORDS_RETAINED]
 
+    def note_lifecycle_closed(self, instance_id: str) -> bool:
+        """Latch one instance's public terminal. Returns whether it was new.
+
+        Idempotent by membership, which is what makes a restart replay nothing: the
+        recovery pass asks this before publishing, so an instance closed before the
+        restart is closed once in total rather than once per boot.
+        """
+        if instance_id in self.closed_lifecycle:
+            return False
+        self.closed_lifecycle.append(instance_id)
+        del self.closed_lifecycle[:-MAX_CAMPAIGN_LIFECYCLE_REMEMBERED]
+        return True
+
+    def lifecycle_closed(self, instance_id: str | None) -> bool:
+        """Return whether this instance's public terminal was already published."""
+        return instance_id is not None and instance_id in self.closed_lifecycle
+
+    def seal_day(self, day: date, benefit_eur: float) -> bool:
+        """Fold one finalised day into the lifetime total. Returns whether it moved.
+
+        **Monotonic by refusal, not by convention.** A day at or before the cursor
+        is already counted and is rejected, which is what makes a replay after a
+        lost write harmless and what stops a backwards clock from double-counting.
+        The cursor advances to the sealed day and never past it, so a gap left by a
+        day that never qualified stays visible instead of being stepped over.
+        """
+        if self.sealed_through is not None and day <= self.sealed_through:
+            return False
+        self.sealed_benefit_eur = round(self.sealed_benefit_eur + float(benefit_eur), 6)
+        self.sealed_day_count += 1
+        self.sealed_through = day
+        return True
+
     def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
         """Initialise a per-entry store.
 
@@ -800,6 +986,67 @@ class LearningStore:
         #: allowed to overwrite a file whose only problem may have been a
         #: momentary I/O error.
         self.corrupt = False
+        #: The open campaign's public lifecycle: which transitions have been
+        #: published for it, and the evidence needed to close it truthfully after a
+        #: restart. beta.42.
+        #:
+        #: **Without this a ``created`` event can be emitted and never closed**, and
+        #: that breaks the one guarantee the surface is built on. The open campaign's
+        #: identity was in-memory only -- ``_campaign_id``,
+        #: ``_campaign_instance_id`` and ``_campaign_started_at`` are plain
+        #: attributes -- so a restart mid-campaign minted a fresh instance with a new
+        #: ``opened_at`` and the pre-restart one never received ``removed``. One
+        #: physical objective appeared twice in the log under two ids.
+        #:
+        #: **The evidence, not merely the four booleans**, and that distinction is
+        #: the difference between reporting a restart and papering over it. A
+        #: campaign whose terminal verdict was already computed before the restart --
+        #: objective measurable, target frozen, reason recorded -- has a *truthful*
+        #: result, and it is preserved. Without the evidence that case would be
+        #: indistinguishable from one interrupted mid-flight, and the log would
+        #: report a successful campaign as failed.
+        self.campaign_lifecycle: dict[str, Any] | None = None
+        #: Instances whose public terminal has already been published. beta.42.
+        #:
+        #: **A telemetry latch, and deliberately not one of the two that exist.**
+        #: ``_final_campaigns`` means a campaign may never run again, and
+        #: ``_closed_instances`` is session-local. A never-started campaign must
+        #: receive its ``removed`` event *and* stay free to be attempted properly
+        #: later, so filing its terminal through either of those would block a
+        #: legitimate later attempt. This one answers exactly one question -- has
+        #: this instance's terminal already been published? -- and a later attempt
+        #: opens a different instance, so it can never be the answer for that one.
+        self.closed_lifecycle: list[str] = []
+        #: The realised battery benefit of every finalised day the store no longer
+        #: retains, and the date through which that total is complete. beta.42.
+        #:
+        #: **A running total plus a cursor, rather than a flag on each record**, and
+        #: the cursor is what makes it survive the three ways a per-record flag
+        #: fails. It replays idempotently after a lost write, because re-sealing a
+        #: day already behind the cursor is a no-op. It still covers a day that
+        #: ``DayRecord.from_dict`` rejected outright -- which ``prune`` never sees,
+        #: because the record was never built. And it survives a change to
+        #: ``MAX_HISTORY_DAYS``, where a flag living on the deleted record could not.
+        #:
+        #: The earlier design sealed a day as it was evicted. That could not work:
+        #: the same operation deletes the record the guard lives on, so the guard
+        #: could only ever be read ``False``, and a day 365 days old cannot be priced
+        #: at the moment it is dropped -- ``prune`` is a synchronous callback and the
+        #: prices live behind an awaitable partition load.
+        self.sealed_benefit_eur: float = 0.0
+        #: The last civil day folded into :attr:`sealed_benefit_eur`. Monotonic on
+        #: write, enforced rather than assumed: a clock that steps backwards, or a
+        #: ``prune`` cutoff that trails wall-clock after an outage, must not be able
+        #: to rewind the cursor and re-add days already counted.
+        self.sealed_through: date | None = None
+        #: How many days :attr:`sealed_benefit_eur` is the sum of.
+        #:
+        #: **A total without its count is not a mean.** Once a day is evicted the
+        #: record it was derived from is gone, so "how many days does this figure
+        #: cover?" is unanswerable from the retained days alone -- and an average
+        #: computed over only what is still on disk would climb every time a day
+        #: aged out, on a figure whose whole purpose is to stay put.
+        self.sealed_day_count: int = 0
         #: Set when a pre-v2 document was discarded by the migration guard.
         self.reset_by_migration = False
 
@@ -856,6 +1103,54 @@ class LearningStore:
                         self.execution_revisions[plan_id] = dict(value)
             record = execution.get("record")
             self.execution_record = dict(record) if isinstance(record, dict) else None
+            # Absent on every document written before beta.42, and absence means no
+            # campaign was open -- never an assertion that one was. A malformed entry
+            # reads the same way: the recovery then finds nothing to close, which
+            # loses one log line, where trusting it could publish a terminal for a
+            # campaign that never existed.
+            lifecycle = execution.get("lifecycle")
+            if isinstance(lifecycle, dict) and isinstance(
+                lifecycle.get("instance_id"), str
+            ):
+                self.campaign_lifecycle = dict(lifecycle)
+            closed = execution.get("closed_lifecycle")
+            if isinstance(closed, list):
+                self.closed_lifecycle = [
+                    value for value in closed if isinstance(value, str)
+                ][-MAX_CAMPAIGN_LIFECYCLE_REMEMBERED:]
+
+        # Absent on every document written before beta.42, and absence means no day
+        # has been sealed -- never that the lifetime benefit was measured at zero.
+        # Read defensively and **together**: a cursor without its total, or a total
+        # without its cursor, would let the next seal add to a figure whose coverage
+        # nothing can state. Half a lifetime total is not a smaller one.
+        sealed = raw.get("sealed")
+        if isinstance(sealed, dict):
+            through = sealed.get("through")
+            amount = sealed.get("eur")
+            if (
+                isinstance(through, str)
+                and not isinstance(amount, bool)
+                and isinstance(amount, int | float)
+                and float(amount) == float(amount)
+                and abs(float(amount)) != float("inf")
+            ):
+                try:
+                    self.sealed_through = date.fromisoformat(through)
+                except (TypeError, ValueError):
+                    self.sealed_through = None
+                else:
+                    self.sealed_benefit_eur = float(amount)
+                    count = sealed.get("days")
+                    # Absent on a document written between the cursor landing and
+                    # the count joining it. Read as zero, which makes the published
+                    # average conservative rather than inflated: it is divided by
+                    # too few days, never by too many.
+                    self.sealed_day_count = (
+                        int(count)
+                        if isinstance(count, int) and not isinstance(count, bool)
+                        else 0
+                    )
 
         # Additive since beta.31, so a document written by any earlier release
         # simply has no decisions and starts collecting them. Read defensively:
@@ -881,6 +1176,12 @@ class LearningStore:
             execution["revisions"] = self.execution_revisions
         if self.execution_record is not None:
             execution["record"] = self.execution_record
+        if self.campaign_lifecycle is not None:
+            execution["lifecycle"] = dict(self.campaign_lifecycle)
+        if self.closed_lifecycle:
+            execution["closed_lifecycle"] = self.closed_lifecycle[
+                -MAX_CAMPAIGN_LIFECYCLE_REMEMBERED:
+            ]
         if self.decisions:
             # Omitted while empty, exactly as ``execution`` is: an installation
             # that has never planned anything writes the same document it always
@@ -892,6 +1193,13 @@ class LearningStore:
             # from an installation that has never armed anything is byte-identical
             # to a beta.18 one.
             payload["execution"] = execution
+        if self.sealed_through is not None:
+            # Omitted until the first day is sealed, exactly as ``execution`` is.
+            payload["sealed"] = {
+                "through": self.sealed_through.isoformat(),
+                "eur": self.sealed_benefit_eur,
+                "days": self.sealed_day_count,
+            }
         return payload
 
     def schedule_save(self) -> None:
@@ -927,6 +1235,14 @@ class LearningStore:
         self.days.clear()
         self.balance = BalanceStats()
         self.last_finalized = None
+        # The lifetime total goes with the rest of it. Leaving the cursor behind
+        # would let a stray save write a total whose days no longer exist -- and a
+        # re-added entry would then start counting from a figure it never earned.
+        self.sealed_benefit_eur = 0.0
+        self.sealed_day_count = 0
+        self.sealed_through = None
+        self.campaign_lifecycle = None
+        self.closed_lifecycle.clear()
         await self._store.async_remove()
 
     def get_or_create(self, day: date, tz: Any) -> DayRecord:
@@ -974,8 +1290,25 @@ class LearningStore:
             if reference > horizon:
                 reference = horizon
         cutoff = reference - timedelta(days=MAX_HISTORY_DAYS - 1)
-        stale = [day for day in self.days if day < cutoff]
+        stale = sorted(day for day in self.days if day < cutoff)
         for day in stale:
+            # **Folded before it is deleted, in date order.** The value was computed
+            # and persisted when the day became finalisable, so nothing here needs
+            # prices, a partition load or an ``await`` -- which is what makes this
+            # possible inside a synchronous callback at all. The earlier design tried
+            # to *price* a day at eviction and could not: this method never sees the
+            # forecast history, and a 365-day-old day has no live forecast to read.
+            #
+            # A day that was never sealed contributes nothing and the cursor does not
+            # advance past it, so an unfinalisable day leaves a visible gap in the
+            # lifetime coverage rather than being silently skipped over. Both this
+            # and the deletion ride the same document write, so they land together
+            # or not at all -- and a replay is harmless because ``seal_day`` refuses
+            # a day at or before the cursor.
+            record = self.days[day]
+            benefit = record.benefit_eur_final
+            if benefit is not None:
+                self.seal_day(day, benefit)
             del self.days[day]
         return len(stale)
 

@@ -184,6 +184,30 @@ VALIDATION_NOT_CONFIGURED = "not_configured"
 VALIDATION_SOURCE_UNAVAILABLE = "source_unavailable"
 VALIDATION_INSUFFICIENT_COVERAGE = "insufficient_coverage"
 VALIDATION_COMPARABLE = "comparable"
+#: The counter is not measuring the same thing this integration is. beta.42.
+#:
+#: **Observed on the live installation**: a 220 kWh source against a 20 kWh house
+#: published roughly -91 % beside the word ``comparable``, which reads as a
+#: measurement failure on a day nothing failed. The two figures are simply not the
+#: same quantity -- a whole-site or lifetime counter selected where a daily
+#: house-load one was meant.
+#:
+#: **Named, never reinterpreted.** The temptation is to divide by a thousand and
+#: call it fixed; that would be inventing a unit the source never declared, and the
+#: next installation would have a different discrepancy. So the observed ratio is
+#: published and the reader decides. ``difference_percent`` is withheld in this
+#: state for the same reason a partial total is withheld elsewhere: a percentage
+#: between two different quantities is not a small error, it is not an error at all.
+VALIDATION_SOURCE_INCOMPATIBLE = "source_incompatible"
+
+#: How far apart the two totals must be before they are called incompatible.
+#:
+#: An order of magnitude, and deliberately not tighter. A genuinely miscovered day
+#: can read tens of per cent low -- that is what ``measured_coverage_so_far`` is
+#: published for -- and calling *that* incompatible would replace one misleading
+#: word with another. Ten times is not a measurement disagreement; it is a different
+#: measurement.
+VALIDATION_INCOMPATIBLE_RATIO = 10.0
 
 
 def _validation_report(
@@ -219,22 +243,50 @@ def _validation_report(
         }
     measured = 0.0 if measured_kwh is None else measured_kwh
     difference = measured - validation_kwh
-    status = (
-        VALIDATION_COMPARABLE
-        if coverage_so_far is not None and coverage_so_far >= MIN_DAY_COMPLETENESS
-        else VALIDATION_INSUFFICIENT_COVERAGE
-    )
+    # **Checked before coverage, because it outranks it.** An order-of-magnitude gap
+    # is not explained by rejected intervals, and reporting ``insufficient_coverage``
+    # for it would send a reader looking for a sampling problem that is not there.
+    ratio = None
+    if measured > 0.0 and validation_kwh > 0.0:
+        ratio = max(validation_kwh / measured, measured / validation_kwh)
+    incompatible = ratio is not None and ratio >= VALIDATION_INCOMPATIBLE_RATIO
+    if incompatible:
+        status = VALIDATION_SOURCE_INCOMPATIBLE
+    elif coverage_so_far is not None and coverage_so_far >= MIN_DAY_COMPLETENESS:
+        status = VALIDATION_COMPARABLE
+    else:
+        status = VALIDATION_INSUFFICIENT_COVERAGE
     return {
         "status": status,
         "validation_total_kwh": round(validation_kwh, 3),
         "measured_total_kwh": round(measured, 3),
         "difference_kwh": round(difference, 3),
+        # Withheld when the two are not the same quantity. A percentage between a
+        # site counter and a house-load integration is not a large error -- it is a
+        # number with no meaning, and publishing it beside a status word is how the
+        # live installation came to read "-91 %, comparable".
         "difference_percent": (
             None
-            if validation_kwh == 0
+            if validation_kwh == 0 or incompatible
             else round(100.0 * difference / validation_kwh, 2)
         ),
+        "observed_ratio": None if ratio is None else round(ratio, 1),
         "measured_coverage_so_far": coverage_so_far,
+        **(
+            {
+                "unavailable_reason": (
+                    "the configured validation entity reads about "
+                    f"{ratio:.0f}x this integration's own house-load integration, "
+                    "which no sampling gap explains. the likeliest cause is a "
+                    "whole-site or lifetime counter selected where a daily "
+                    "house-load one was meant. nothing is reinterpreted here and "
+                    "no unit is assumed: the observed ratio is published and the "
+                    "reader decides. this entity reaches no decision either way"
+                )
+            }
+            if incompatible
+            else {}
+        ),
     }
 
 
@@ -644,6 +696,12 @@ def _economic_report(coordinator: AlphaEmsCoordinator, tz: Any) -> dict[str, Any
         realized_multi_day=coordinator.realized_days(
             plan, days=LEDGER_DEFAULT_WINDOW_DAYS
         ),
+        # **beta.42.** The lifetime accounting and the investment return, published
+        # here as well as on their entity, because the coverage of a lifetime figure
+        # -- which days it seals, which past days it does not cover, and which price
+        # basis each leg used -- is the kind of question a support download is read
+        # for and a dashboard is not.
+        battery_return=coordinator.battery_return(dt_util.now(tz).date()),
         provenance={
             "settings": {
                 "minimum_trade_gain_eur": config.minimum_trade_gain_eur,

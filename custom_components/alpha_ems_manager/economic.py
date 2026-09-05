@@ -7330,12 +7330,20 @@ def execution_target(
             "the house is taking at the time. measured on the live installation: "
             "1.3 kW of net export needed 2.2 kW of battery against 0.9 kW of load"
         ),
+        # **Corrected in beta.42, and it is the highest-priority of the ~20 stale
+        # execution claims because it ships inside *every published execution
+        # target*.** It still said only an authorised charge executes and that
+        # export is refused -- true when beta.25 wrote it, and false since beta.27
+        # admitted ``net_export``. The authoritative statement is
+        # ``coordinator._EXECUTION_SCOPE``; this is the same rule, said here.
         "contract_rule": (
-            "consumed by the Stage B controller, which since beta.25 executes "
-            "an authorised charge on the Hillview Dispatch surface in mode 2 with "
-            "a negative power, and nothing else: discharge, export, curtailment "
-            "and modes 6 and 7 are refused at the authorisation and send "
-            "boundaries. "
+            "consumed by the Stage B controller, which executes two intents on the "
+            "dispatch mode 2 surface and nothing else: grid_charge with a negative "
+            "power, and net_export with a positive one, inside an admitted quarter. "
+            "serve_load, the reserve guard's discharge, pv curtailment, panel "
+            "shutdown and dispatch modes 6 and 7 are refused at the authorisation "
+            "boundary and again at the send site, and the force-charging and "
+            "force-discharging helper families are never written for either intent. "
             "identity is (intent, window_start) so a run keeps its plan_id as its "
             "remaining energy shrinks; revision increments when the target moves "
             "beyond the published deadband and survives a restart; stale_after is "
@@ -7516,6 +7524,7 @@ def economic_as_dict(
     execution_targets: list[dict[str, Any]] | None = None,
     realized: dict[str, Any] | None = None,
     realized_multi_day: dict[str, Any] | None = None,
+    battery_return: dict[str, Any] | None = None,
     horizon_start: Any = None,
     horizon_end: Any = None,
     provenance: dict[str, Any] | None = None,
@@ -8018,6 +8027,14 @@ def economic_as_dict(
         "realized_window": (
             realized_multi_day or {"available": False, "reason": "not_computed"}
         ),
+        # **What the pack has recovered of what it cost, and over which days.
+        # beta.42.** Published here as well as on its entity because the coverage of
+        # a lifetime figure -- which days it seals, which past days it does not
+        # cover, and which price basis each leg used -- is what a support download is
+        # read for.
+        "battery_return": (
+            battery_return or {"available": False, "reason": "not_computed"}
+        ),
         "solver": {
             "buckets": outcome.buckets,
             "bucket_kwh": outcome.bucket_kwh,
@@ -8030,14 +8047,23 @@ def economic_as_dict(
             # conditional, so the honest number is the one this refresh actually
             # performed.
             "solves": outcome.solve_count,
+            # **Corrected in beta.42, and by exactly the defect the ``solves``
+            # count above was fixed for.** This claimed three unconditional passes
+            # where four run, and named ``coverage`` nowhere at all -- so the string
+            # explaining the pass structure was the one thing in this block that
+            # misdescribed it. The count beside it was honest; the sentence was not.
             "solve_rule": (
                 "every pass is executor-bound and none touches the event loop. "
-                "three run unconditionally -- desired, capability and "
-                "reserve-relaxed -- and the remainder are conditional: the "
-                "ungated pass the export permission is built from, the audit "
-                "baseline re-solve after an anti-churn head bump, the Shadow-only "
-                "legacy comparison, and the beta.35 terminal-value "
-                "counterfactual. solve_ms is the wall time of all of them"
+                "four run unconditionally -- desired, capability, reserve-relaxed "
+                "and coverage -- and the remainder are conditional: the ungated "
+                "pass the export permission is built from, the audit baseline "
+                "re-solve after an anti-churn head bump, the Shadow-only legacy "
+                "comparison, and the beta.35 terminal-value counterfactual. the "
+                "four are kept separate on purpose rather than fused into one "
+                "objective: relaxed is what makes a Safety Buy attributable, "
+                "coverage is what makes coverage sound by construction, and "
+                "ungated is what prices the export permission. solve_ms is the "
+                "wall time of all of them"
             ),
             # The largest AC power a single transition can express, per
             # direction. beta.16 published only the larger of the two, which hid

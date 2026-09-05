@@ -1377,7 +1377,10 @@ def test_the_structural_contracts_are_unchanged_by_beta16() -> None:
 
     from .test_entity_contract import CONTRACT
 
-    assert len(CONTRACT) == 15
+    # The roster grows when a *later* release adds an entity -- beta.42 added
+    # three -- and that is not what this test is about. What it holds is that
+    # beta.16's structural change added none of its own.
+    assert len(CONTRACT) == 18
     assert_charge_only_capability()
     assert len(PERMITTED_SERVICES) == 4
     assert set(FAMILIES) == {ACTION_DISCHARGE, ACTION_CHARGE}

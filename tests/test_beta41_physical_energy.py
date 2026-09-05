@@ -25,14 +25,20 @@ from custom_components.alpha_ems_manager.const import (
     ECONOMIC_ACTION_CHARGE,
 )
 
-from .beta34_shape import LIMITS, solve_at
-from .test_beta39_neutrality import SHAPES
+from .beta34_shape import LIMITS
+from .solve_cache import cached_solve_at
+from .test_beta39_neutrality import SHAPES, cheap_everywhere
 
 #: Starting states swept per shape, spanning empty, near-floor, mid and full.
 STARTS = (0.3, 4.5, 8.0, 12.0, 18.0, 21.0)
 
 #: One carry step, the resolution at which household service is carried.
 STEP = 0.2635230352303523 / AMBIENT_CARRY_STEPS
+
+
+def absurdly_dear(index: int) -> float:
+    """Nine euros a kilowatt-hour: no economic term may buy past a violation."""
+    return 9.00
 
 
 def plans():
@@ -48,7 +54,7 @@ def plans():
         kwargs = dict(SHAPES[name][0])
         for stored in STARTS:
             kwargs["stored"] = stored
-            outcome = solve_at(**kwargs).outcome
+            outcome = cached_solve_at(**kwargs).outcome
             assert outcome.available, f"{name}@{stored}: {outcome.unavailable_reason}"
             yield f"{name}@{stored}", outcome
 
@@ -257,8 +263,8 @@ def test_no_economic_term_can_buy_its_way_past_a_violation() -> None:
     for name in sorted(SHAPES):
         kwargs = dict(SHAPES[name][0])
         kwargs["stored"] = 0.3
-        cheap = solve_at(**{**kwargs, "price_fn": lambda index: 0.02}).outcome
-        dear = solve_at(**{**kwargs, "price_fn": lambda index: 9.00}).outcome
+        cheap = cached_solve_at(**{**kwargs, "price_fn": cheap_everywhere}).outcome
+        dear = cached_solve_at(**{**kwargs, "price_fn": absurdly_dear}).outcome
         if not (cheap.available and dear.available):
             continue
         assert dear.desired.violation_kwh <= cheap.desired.violation_kwh + 1e-9, name

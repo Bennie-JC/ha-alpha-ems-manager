@@ -1042,7 +1042,10 @@ async def test_the_entity_count_and_the_economic_contract_are_untouched(
 
     await drive_control(hass, setup_integration, import_w=400)
 
-    assert len(CONTRACT) == 15
+    # The count moves whenever a *later* release adds an entity -- beta.42 added
+    # three -- and that is fine: this test is about the clamp adding none, which the
+    # ``safety_limited`` assertion below is what actually proves.
+    assert len(CONTRACT) == 18
     assert "safety_limited" not in ECONOMIC_ATTRIBUTES
 
     economic = hass.states.get("sensor.alpha_ems_economic_action")
@@ -1156,7 +1159,11 @@ def test_the_clamp_changed_no_persisted_schema() -> None:
     # control figure -- the assertions below still forbid a command, a safety
     # verdict or a power from reaching either store, which is what this test is
     # about.
-    assert STORAGE_MINOR_VERSION == 7
+    # 2.8 as of beta.42: the sealed per-day benefit and the lifetime cursor, so a
+    # corrected battery capacity cannot rewrite a lifetime figure and an evicted
+    # day still counts toward it. Additive, and the *major* staying at 2 is the
+    # half that guarantees every earlier document is read rather than discarded.
+    assert STORAGE_MINOR_VERSION == 8
     assert FORECAST_STORAGE_MINOR_VERSION == 8
 
     for module in (storage, history_store):

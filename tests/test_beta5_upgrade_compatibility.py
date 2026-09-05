@@ -249,6 +249,14 @@ async def test_a_beta5_installation_keeps_every_entity_and_unique_id(
         "sensor.alpha_ems_next_planned_action": (f"{entry_id}_next_planned_action"),
         "sensor.alpha_ems_economic_value": f"{entry_id}_economic_value",
         "sensor.alpha_ems_control_state": f"{entry_id}_control_state",
+        # beta.42's three. **Unique ids matter more here than names**: this file
+        # exists to prove a beta.5 installation keeps every entity it had, and a
+        # unique id is what an entity keeps across a rename. The return sensor is
+        # named "Battery Return" and keyed ``battery_roi`` deliberately -- the key
+        # is the identity and is frozen; the name is presentation.
+        "sensor.alpha_ems_battery_return": f"{entry_id}_battery_roi",
+        "sensor.alpha_ems_current_campaign": f"{entry_id}_current_campaign",
+        "sensor.alpha_ems_last_campaign_result": (f"{entry_id}_last_campaign_result"),
         "select.alpha_ems_control_mode": f"{entry_id}_control_mode",
     }
 

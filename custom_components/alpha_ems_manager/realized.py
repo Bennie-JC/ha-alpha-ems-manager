@@ -65,6 +65,7 @@ from .const import (
     AVOIDANCE_BASIS_NO_BATTERY,
     LEDGER_BASIS_ATTRIBUTED,
     LEDGER_BASIS_ESTIMATED,
+    LEDGER_BASIS_FORECAST,
     LEDGER_BASIS_MEASURED,
     LEDGER_BASIS_MODEL_TERM,
     LEDGER_BASIS_PLANNER_DERIVED,
@@ -120,6 +121,25 @@ class RealizedWindow:
     #: priced: a figure for what it cost would have to be invented.
     opening_inventory_kwh: float | None
     opening_inventory_provenance: str
+
+    #: What a household with the same load and the same production but **no
+    #: battery** would have imported and exported: ``max(0, load - pv)`` and
+    #: ``max(0, pv - load)`` per interval, priced at that interval's own rates.
+    #:
+    #: **beta.42, and the export leg is the one that was missing.** Only the import
+    #: side of this counterfactual existed, as ``realized_load_avoidance_*``, so any
+    #: figure built from it credited the battery with the export revenue a bare
+    #: photovoltaic array earns by itself. Both legs are needed to say what
+    #: operating the battery actually *changed*.
+    realized_no_battery_import_kwh: float | None = None
+    realized_no_battery_export_kwh: float | None = None
+    realized_no_battery_cost_eur: float | None = None
+    realized_no_battery_export_revenue_eur: float | None = None
+
+    #: How many intervals contributed to the counterfactual. Below
+    #: ``intervals_priced`` wherever load or production was missing, and published
+    #: so a partial comparison is visible rather than merely smaller.
+    counterfactual_intervals_priced: int = 0
 
     # -- beta.35: the attributed split, and the model terms kept out of cash ----
     #
@@ -192,6 +212,56 @@ class RealizedWindow:
         )
 
     @property
+    def realized_no_battery_net_cash_eur(self) -> float | None:
+        """Return what the same household would have paid with no battery.
+
+        Positive means money would have left the household -- the same sign as
+        :attr:`realized_net_cash_flow_eur`, so the two can be differenced directly.
+        """
+        if (
+            self.realized_no_battery_cost_eur is None
+            or self.realized_no_battery_export_revenue_eur is None
+        ):
+            return None
+        return round(
+            self.realized_no_battery_cost_eur
+            - self.realized_no_battery_export_revenue_eur,
+            _EUR_DECIMALS,
+        )
+
+    @property
+    def realized_battery_benefit_eur(self) -> float | None:
+        """Return what operating the battery actually saved, in cash.
+
+        **The incremental comparison, and the only figure here an investment return
+        may be built on.** beta.42 exists partly because a different one was
+        mistaken for it::
+
+            benefit = no_battery_net_cash - actual_net_cash
+                    = (SUM p*N - SUM s*X) - (SUM p*I - SUM s*E)
+
+        ``N`` and ``X`` are the import and export a household with the same load and
+        the same production but no battery would have had; ``I`` and ``E`` are what
+        the meter recorded. **Positive means the battery saved money.**
+
+        Contrast :attr:`realized_net_value_eur`, which is
+        ``avoided_import_value - net_cash_flow``. Expand it and it equals
+        ``benefit - SUM p*min(I, N) + SUM s*X``: it subtracts the household's
+        unavoidable electricity bill, and adds back export revenue a bare array
+        earns without any battery. That is a household *position* -- a real thing to
+        want, and kept -- but its dominant term is the bill, so it reads strongly
+        negative for anyone who imports anything. Published under the name "what the
+        battery saved" it would have reported the battery destroying value.
+
+        ``None`` rather than a partial answer wherever a term is missing, which is
+        the rule the rest of this module follows.
+        """
+        counterfactual = self.realized_no_battery_net_cash_eur
+        if counterfactual is None:
+            return None
+        return round(counterfactual - self.realized_net_cash_flow_eur, _EUR_DECIMALS)
+
+    @property
     def realized_plus_remaining_value_eur(self) -> float | None:
         """Return the window's value **including the change in what is stored**.
 
@@ -236,6 +306,26 @@ class RealizedWindow:
                 "battery_to_grid_kwh": self.realized_battery_to_grid_kwh,
                 "battery_to_house_kwh": self.realized_load_avoidance_kwh,
                 "avoided_import_value_eur": self.realized_load_avoidance_value_eur,
+                # **The comparator, published beside the figure it replaces.
+                # beta.42.** ``realised_net_value_eur`` below is the household's
+                # whole position -- it subtracts an import bill no battery could
+                # have avoided and credits PV export that needed none -- so it is
+                # structurally negative for any household that imports anything and
+                # was never a battery comparator, whatever its name suggested. These
+                # six are: four measured cash legs and the two differences built
+                # from them. Both are published, so a reader can see they are
+                # different numbers rather than discovering it from a sign.
+                "no_battery_import_kwh": self.realized_no_battery_import_kwh,
+                "no_battery_export_kwh": self.realized_no_battery_export_kwh,
+                "no_battery_cost_eur": self.realized_no_battery_cost_eur,
+                "no_battery_export_revenue_eur": (
+                    self.realized_no_battery_export_revenue_eur
+                ),
+                "no_battery_net_cash_eur": self.realized_no_battery_net_cash_eur,
+                "battery_benefit_eur": self.realized_battery_benefit_eur,
+                "counterfactual_intervals_priced": (
+                    self.counterfactual_intervals_priced
+                ),
                 "conversion_loss_kwh": self.realized_conversion_loss_kwh,
                 "opening_inventory_kwh": self.opening_inventory_kwh,
                 "opening_inventory_value_eur": self.opening_inventory_value_eur,
@@ -328,9 +418,30 @@ def _basis_map() -> dict[str, str]:
         "battery_to_house_kwh": LEDGER_BASIS_ATTRIBUTED,
         "avoided_import_value_eur": LEDGER_BASIS_ATTRIBUTED,
         "conversion_loss_kwh": LEDGER_BASIS_ESTIMATED,
+        # beta.42. Four measured cash legs and the two comparators built from them.
+        # Measured throughout: no attribution rule, no model constant, no planner
+        # valuation -- which is exactly what makes them the only figures here an
+        # investment return may be built on.
+        "no_battery_import_kwh": LEDGER_BASIS_MEASURED,
+        "no_battery_export_kwh": LEDGER_BASIS_MEASURED,
+        "no_battery_cost_eur": LEDGER_BASIS_MEASURED,
+        "no_battery_export_revenue_eur": LEDGER_BASIS_MEASURED,
+        "no_battery_net_cash_eur": LEDGER_BASIS_MEASURED,
+        "battery_benefit_eur": LEDGER_BASIS_MEASURED,
+        # A count of intervals, not a quantity -- but the guard that every published
+        # ledger figure carries a basis makes no exception for counts, and it is
+        # right not to: a reader who has to learn which keys the map covers has
+        # learned the map is incomplete. Measured, because it counts intervals that
+        # had both a price and a reading.
+        "counterfactual_intervals_priced": LEDGER_BASIS_MEASURED,
         "opening_inventory_value_eur": LEDGER_BASIS_PLANNER_DERIVED,
         "closing_inventory_value_eur": LEDGER_BASIS_PLANNER_DERIVED,
-        "realised_net_value_eur": LEDGER_BASIS_MEASURED,
+        # **``measured`` until beta.42, and it never was.** One of its two addends
+        # is ``realized_load_avoidance_value_eur``, which is attributed -- measured
+        # energy split by a stated rule -- so the total inherits the weaker of the
+        # two claims. A basis map that upgrades a figure's honesty by summing it is
+        # worse than no basis map.
+        "realised_net_value_eur": LEDGER_BASIS_ATTRIBUTED,
         "realised_plus_remaining_value_eur": LEDGER_BASIS_PLANNER_DERIVED,
         # beta.39, and the reason the vocabulary grew a sixth word: these four
         # are not all the same kind of number. Two are measured, one is a
@@ -339,9 +450,46 @@ def _basis_map() -> dict[str, str]:
         # eventually difference the last one against the first.
         "today_accounting.realised_today_eur": LEDGER_BASIS_PLANNER_DERIVED,
         "today_accounting.in_progress_interval_eur": LEDGER_BASIS_MEASURED,
-        "today_accounting.remaining_expected_today_eur": LEDGER_BASIS_PLANNER_DERIVED,
+        # A figure about energy that has not moved, over prices and a load forecast
+        # that will both be wrong to some degree. ``planner_derived`` said only where
+        # it came from; this says what can still falsify it.
+        "today_accounting.remaining_expected_today_eur": LEDGER_BASIS_FORECAST,
         "today_accounting.forecast_revaluation_eur": LEDGER_BASIS_REVALUED,
-        "today_accounting.total_economic_value_today_eur": LEDGER_BASIS_PLANNER_DERIVED,
+        # Contains the forecast term above, so it inherits it. Same rule as
+        # ``realised_net_value_eur``: a total is as strong as its weakest addend.
+        "today_accounting.total_economic_value_today_eur": LEDGER_BASIS_FORECAST,
+        # beta.42, and this is the half of the finding that mattered. Publishing the
+        # map at the entity was the easy part; ten of the fifteen euro attributes an
+        # operator actually sees were not *in* it, so the projection would have told
+        # them "unclassified" ten times -- honest, and no use at all. These are the
+        # Economic Value entity's own figures, classified where the ledger's are.
+        #
+        # **The forward-looking ones are ``forecast``, not ``planner_derived``.**
+        # ``decision_advantage_eur`` is a comparison against a counterfactual *from
+        # now to the end of the horizon*, and its two day halves are that same
+        # comparison split by civil day. All three move when the weather does, which
+        # is exactly the distinction beta.42 added the seventh word for.
+        "decision_advantage_eur": LEDGER_BASIS_FORECAST,
+        "advantage_cash_eur": LEDGER_BASIS_FORECAST,
+        "today_interval_value_eur": LEDGER_BASIS_FORECAST,
+        "tomorrow_interval_value_eur": LEDGER_BASIS_FORECAST,
+        "next_planned_charge_price_eur_kwh": LEDGER_BASIS_FORECAST,
+        # A residual between the published total and the published addends, so it
+        # inherits the weakest of them by the same rule that made the total a
+        # forecast. It is a rounding check, not a quantity of money.
+        "accounting_reconciliation_error_eur": LEDGER_BASIS_FORECAST,
+        # The value function's slope at the head bucket, and the credit at the
+        # horizon edge. Both are the optimiser valuing energy that exists, at one
+        # instant, on one curve -- which is what ``planner_derived`` means.
+        "stored_energy_marginal_value_eur_kwh": LEDGER_BASIS_PLANNER_DERIVED,
+        "terminal_edge_value_eur_kwh": LEDGER_BASIS_PLANNER_DERIVED,
+        # The price of the interval in flight. The import leg is all-in cash taken
+        # from the source's own total; the export leg is **not** -- the source
+        # publishes no feed-in price, so it is reconstructed as market plus an
+        # adjustment that defaults to zero. Same rate, two different kinds of number,
+        # and giving them one word here would undo the whole point of the map.
+        "current_import_price_eur_kwh": LEDGER_BASIS_MEASURED,
+        "current_export_price_eur_kwh": LEDGER_BASIS_ESTIMATED,
         "model_terms.switching_cost_eur": LEDGER_BASIS_MODEL_TERM,
         "model_terms.grid_charge_margin_eur": LEDGER_BASIS_MODEL_TERM,
         "model_terms.throughput_cost_eur": LEDGER_BASIS_MODEL_TERM,
@@ -432,6 +580,22 @@ class DayAccounting:
     remaining_expected_today_eur: float | None
     forecast_revaluation_eur: float | None
     total_economic_value_today_eur: float | None
+    #: The gap between the published total and the sum of the published addends.
+    #:
+    #: **A rounding check, and beta.42 stopped it claiming to be more.** The total
+    #: is *defined* as the sum of the four addends and the error is that sum less
+    #: the rounded addends, so both sides are the same four numbers and the residual
+    #: can only ever be rounding -- bounded by four half-ulps at four decimals,
+    #: against a tolerance five times that. It cannot fail, and it certainly cannot
+    #: detect a *wrong* addend.
+    #:
+    #: What the prose used to imply is that it tested the telescoping identity
+    #: ``R + G + P + V[now](close) - V[open](open)``. Nothing computes that
+    #: right-hand side independently, so that check does not exist. Building it
+    #: would mean deriving the position a second way, which is the thing this module
+    #: refuses to do elsewhere for good reason -- two derivations of one number is
+    #: how two published figures come to disagree. So the check keeps its real and
+    #: modest job, and now says so.
     reconciliation_error_eur: float | None
     unavailable_reason: str | None
 
@@ -543,8 +707,11 @@ class DayAccounting:
                 "worth now less what it was worth when the day opened. this is "
                 "an economic position, not money in the bank: two of the terms "
                 "are planner valuations and one is a forecast. no residual is "
-                "absorbed into any addend -- if the five do not sum, the total "
-                "is withheld and reconciliation_error_eur says by how much"
+                "absorbed into any addend. reconciliation_error_eur is a rounding "
+                "check on the four addends a reader can add up, not an independent "
+                "derivation of the telescoped identity -- nothing computes that "
+                "right-hand side separately, so this cannot detect a wrong addend, "
+                "only a total that does not equal the numbers printed beside it"
             ),
         }
 
@@ -830,6 +997,10 @@ def realized_window(
     cost = revenue = 0.0
     avoided_kwh = 0.0
     avoided_value = 0.0
+    # The no-battery counterfactual, both legs. beta.42.
+    no_battery_import = no_battery_export = 0.0
+    no_battery_cost = no_battery_revenue = 0.0
+    counterfactual_intervals = 0
     have_avoidance = load_kwh is not None and production_kwh is not None
 
     for index in range(count):
@@ -897,6 +1068,24 @@ def realized_window(
                 saved = max(0.0, without_battery - (imported or 0.0))
                 avoided_kwh += saved
                 avoided_value += saved * buy
+                # **Both legs of the counterfactual, priced. beta.42.**
+                #
+                # A household with the same load and the same production but no
+                # battery would have imported ``max(0, load - pv)`` and exported
+                # ``max(0, pv - load)``. The second of those did not exist anywhere
+                # in this module before, which is why the old figure credited the
+                # battery with export revenue that needed no battery.
+                #
+                # Priced at the same interval's rates as everything else here, and
+                # counted only where the interval was priced at all, so the
+                # comparison is like for like.
+                spilled = max(0.0, produced - load)
+                no_battery_import += without_battery
+                no_battery_export += spilled
+                no_battery_cost += without_battery * buy
+                if sell is not None:
+                    no_battery_revenue += spilled * sell
+                counterfactual_intervals += 1
 
     charge, discharge, basis = _battery_from_state_of_charge(
         stored_energy_kwh,
@@ -941,6 +1130,19 @@ def realized_window(
         realized_load_avoidance_value_eur=(
             round(avoided_value, _EUR_DECIMALS) if have_avoidance else None
         ),
+        realized_no_battery_import_kwh=(
+            round(no_battery_import, _KWH_DECIMALS) if have_avoidance else None
+        ),
+        realized_no_battery_export_kwh=(
+            round(no_battery_export, _KWH_DECIMALS) if have_avoidance else None
+        ),
+        realized_no_battery_cost_eur=(
+            round(no_battery_cost, _EUR_DECIMALS) if have_avoidance else None
+        ),
+        realized_no_battery_export_revenue_eur=(
+            round(no_battery_revenue, _EUR_DECIMALS) if have_avoidance else None
+        ),
+        counterfactual_intervals_priced=counterfactual_intervals,
         opening_inventory_kwh=(
             round(opening, _KWH_DECIMALS) if opening is not None else None
         ),

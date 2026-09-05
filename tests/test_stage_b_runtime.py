@@ -419,7 +419,11 @@ async def test_the_document_declares_the_new_minor_and_stays_readable(
     # Additive like every bump before it -- a beta.38 document reads back with the
     # key absent, which is a defined state with its own published reason -- so the
     # major staying at 2 is still the load-bearing half.
-    assert document["minor_version"] == STORAGE_MINOR_VERSION == 7
+    # 2.8 as of beta.42: the sealed per-day benefit and the lifetime cursor, so a
+    # corrected battery capacity cannot rewrite a lifetime figure and an evicted
+    # day still counts toward it. Additive, and the *major* staying at 2 is the
+    # half that guarantees every earlier document is read rather than discarded.
+    assert document["minor_version"] == STORAGE_MINOR_VERSION == 8
     # The learning history is untouched by any of this.
     assert "days" in document["data"]
 

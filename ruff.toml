@@ -43,6 +43,10 @@ ignore = [
 # Tests routinely import inside a function to keep module import order explicit
 # and to avoid circular fixture imports, and they assert on private helpers.
 "tests/*" = ["SLF001"]
+# A mutation table's anchor strings must match the source they replace byte for
+# byte -- that is the whole mechanism -- so they cannot be wrapped to fit a line
+# length. Every other rule still applies to them, and run.py is fully linted.
+"tools/mutation/b*.py" = ["E501"]
 
 [format]
 docstring-code-format = true

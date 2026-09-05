@@ -131,6 +131,49 @@ CONTRACT: dict[str, dict[str, object]] = {
         "state_class": None,
         "icon": "mdi:cash-clock",
     },
+    # beta.42. One row for the investment return, and its state is a **percentage**
+    # rather than euros: Economic Value stays the integration's only EUR-valued
+    # state, whose own comment reasons that a second monetary state could disagree
+    # with it. This one is admissible beside it because its numerator is
+    # realised-only and so cannot disagree with a forecast.
+    "sensor.alpha_ems_battery_return": {
+        "unique_id_suffix": "battery_roi",
+        "name": "Alpha EMS Battery Return",
+        "unit": "%",
+        "device_class": None,
+        # No state class. The figure rises only while the battery earns, falls on a
+        # day it did not, and its denominator moves the instant an operator corrects
+        # a subsidy -- none of which a long-term statistic describes usefully.
+        "state_class": None,
+        "icon": "mdi:cash-refund",
+    },
+    # beta.42. Two rows for the campaign lifecycle, and two is the whole of it: the
+    # log the operator reads is the **event**, and these publish only what a
+    # dashboard and an automation need to see without subscribing to a bus.
+    #
+    # ``Current Campaign`` has three states and not four. ``stopped`` is absent
+    # deliberately: on the ordinary path a campaign-scoped stop calls
+    # ``_close_campaign`` in the same call, so a stopped state would exist for less
+    # than one coordinator tick and no consumer could observe it. A state almost
+    # nobody can see is a state an automation is written against and never fires on.
+    "sensor.alpha_ems_current_campaign": {
+        "unique_id_suffix": "current_campaign",
+        "name": "Alpha EMS Current Campaign",
+        "unit": None,
+        "device_class": "enum",
+        # Categorical, like every other enum here: a long-term statistic over it
+        # would average words.
+        "state_class": None,
+        "icon": "mdi:play-circle-outline",
+    },
+    "sensor.alpha_ems_last_campaign_result": {
+        "unique_id_suffix": "last_campaign_result",
+        "name": "Alpha EMS Last Campaign Result",
+        "unit": None,
+        "device_class": "enum",
+        "state_class": None,
+        "icon": "mdi:flag-checkered",
+    },
     "sensor.alpha_ems_economic_action": {
         "unique_id_suffix": "economic_action",
         "name": "Alpha EMS Economic Action",
@@ -170,7 +213,7 @@ CONTRACT: dict[str, dict[str, object]] = {
 
 
 def test_no_entity_is_missing_or_extra(hass: HomeAssistant) -> None:
-    """Exactly the thirteen documented entities exist.
+    """Exactly the eighteen documented entities exist.
 
     Covers both platforms, so the select is held to the same table as the
     sensors rather than being checked somewhere looser.
@@ -182,7 +225,7 @@ def test_no_entity_is_missing_or_extra(hass: HomeAssistant) -> None:
         if entity.platform == DOMAIN
     }
     assert created == set(CONTRACT)
-    assert len(created) == len(CONTRACT) == 15
+    assert len(created) == len(CONTRACT) == 18
 
 
 #: The entity surface, phase by phase. Named rather than counted, so a new
@@ -236,8 +279,18 @@ PHASE_SEVEN_ENTITIES = {
 BETA_THIRTY_SEVEN_ENTITIES = {
     "sensor.alpha_ems_economic_value",
 }
+#: beta.42 adds exactly two, and both are lifecycle. The classification breakdown,
+#: the stop reason, the frozen objective, the tolerance and the restart provenance
+#: are attributes of these two rather than rows of their own -- the campaign log is
+#: an event stream, and a stream does not become clearer by being made into entities.
+BETA_FORTY_TWO_ENTITIES = {
+    "sensor.alpha_ems_battery_return",
+    "sensor.alpha_ems_current_campaign",
+    "sensor.alpha_ems_last_campaign_result",
+}
 PHASE_EIGHT_ENTITIES = {
     "sensor.alpha_ems_economic_action",
+    *BETA_FORTY_TWO_ENTITIES,
     # beta.34, and it is one entity rather than a second attribute because the
     # two answer different questions. A single value publishing "current run or
     # next run" announced tomorrow evening's sale as though it were happening,

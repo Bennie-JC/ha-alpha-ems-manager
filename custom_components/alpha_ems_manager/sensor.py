@@ -1,14 +1,18 @@
 """Sensor platform for Alpha EMS Manager.
 
-Twelve sensors: the four Phase-1 forecast and learning ones, the two Phase-2
-forecast-error ones, the three Phase-3 battery ones, the single Phase-4
-control state, the single Phase-7 dynamic reserve, and the single Phase-8
-economic action. Every other quantity the integration computes -- per-slot
-profiles, window means, balance residuals, coverage statistics, per-horizon error
-breakdowns, the snapshot inventory, the simulated battery trajectory, the
-per-interval reserve curve, the economic counterfactuals and every planned run --
-is available through diagnostics instead. Ninety-six quarter sensors and five
-window averages would be technically easy and practically awful.
+Seventeen sensors: the four Phase-1 forecast and learning ones, the two Phase-2
+forecast-error ones, the three Phase-3 battery ones, the single Phase-4 control
+state, the single Phase-7 dynamic reserve, and the six Phase-8 ones -- the economic
+action, the next planned action, the economic value, and beta.42's battery return
+and two campaign lifecycle rows. (The eighteenth entity in the contract is the
+control-mode select, which lives on another platform.)
+
+Every other quantity the integration computes -- per-slot profiles, window means,
+balance residuals, coverage statistics, per-horizon error breakdowns, the snapshot
+inventory, the simulated battery trajectory, the per-interval reserve curve, the
+economic counterfactuals and every planned run -- is available through diagnostics
+instead. Ninety-six quarter sensors and five window averages would be technically
+easy and practically awful.
 
 The three Phase-3 sensors describe a plan that is never executed, the Phase-4 one
 describes what the control pipeline made of that plan -- including whether it
@@ -80,6 +84,10 @@ from .const import (
     BATTERY_KWH_PRECISION,
     BATTERY_SOC_PRECISION,
     CAMPAIGN_OUTCOMES,
+    CAMPAIGN_STATE_CREATED,
+    CAMPAIGN_STATE_IDLE,
+    CAMPAIGN_STATE_OPTIONS,
+    CAMPAIGN_STATE_STARTED,
     CONTROL_MODE_ACTIVE,
     CONTROL_STATE_OPTIONS,
     DOMAIN,
@@ -98,12 +106,17 @@ from .const import (
     EXECUTION_STATE_PREPARED,
     EXECUTION_STATE_RUNNING,
     FORECAST_ERROR_WINDOW_DAYS,
+    LEDGER_BASIS_UNCLASSIFIED,
+    LIFECYCLE_KIND_CREATED,
+    LIFECYCLE_KIND_STARTED,
     NAME,
     OWNERSHIP_OWNED,
     SENSOR_BATTERY_PLANNED_POWER,
     SENSOR_BATTERY_RECOMMENDATION,
+    SENSOR_BATTERY_ROI,
     SENSOR_BATTERY_USABLE_ENERGY,
     SENSOR_CONTROL_STATE,
+    SENSOR_CURRENT_CAMPAIGN,
     SENSOR_DYNAMIC_RESERVE,
     SENSOR_ECONOMIC_ACTION,
     SENSOR_ECONOMIC_VALUE,
@@ -111,6 +124,7 @@ from .const import (
     SENSOR_EXPECTED_LOAD_TOMORROW,
     SENSOR_FORECAST_ERROR_WINDOW,
     SENSOR_FORECAST_ERROR_YESTERDAY,
+    SENSOR_LAST_CAMPAIGN_RESULT,
     SENSOR_LEARNING_CONFIDENCE,
     SENSOR_LEARNING_DAYS,
     SENSOR_NEXT_PLANNED_ACTION,
@@ -118,6 +132,7 @@ from .const import (
 from .coordinator import AlphaEmsCoordinator
 from .economic import IMPLEMENTED_ACTIONS, EconomicOutcome
 from .plan import BatteryPlan
+from .realized import _basis_map
 from .reserve import RESERVE_BASIS, shortfall
 from .storage import interval_start_utc
 
@@ -1443,7 +1458,164 @@ def _economic_value_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, An
             attributes[block] = payload[block]
     attributes["day_split_rule"] = payload.get("day_split_rule")
     attributes["accounting_rule"] = _ECONOMIC_VALUE_ACCOUNTING_BASIS
+    attributes["figure_basis"] = _figure_basis(attributes)
     return attributes
+
+
+def _figure_basis(attributes: dict[str, Any]) -> dict[str, str]:
+    """Return the basis word for every euro figure published *at this entity*.
+
+    **The basis map existed and the entity could not see it.** It lives in the
+    ledger block, which reaches the diagnostics download and nothing else -- so an
+    operator looking at this sensor saw a dozen adjacent euro attributes spanning
+    cash, attribution, a planner valuation and a forecast, distinguished only by
+    their names, on an entity Home Assistant labels ``MONETARY``. Adding a term to
+    a cash total is then a matter of reading two attribute names and assuming.
+
+    Projected from ``_basis_map`` rather than restated, so the entity and the
+    download cannot disagree; the ``today_accounting.`` prefix is stripped because
+    those five are flattened up to the top level here. A euro attribute with no
+    entry is reported as such, which is a question a reader can act on -- unlike a
+    silent omission, which reads as no caveat.
+    """
+    published = _basis_map()
+    basis: dict[str, str] = {}
+    for name in attributes:
+        if not name.endswith("_eur") and not name.endswith("_eur_kwh"):
+            continue
+        word = published.get(name) or published.get(f"today_accounting.{name}")
+        basis[name] = word or LEDGER_BASIS_UNCLASSIFIED
+    return basis
+
+
+def _battery_roi_value(coordinator: AlphaEmsCoordinator) -> float | None:
+    """Return the percentage of the net investment recovered so far.
+
+    ``None`` while no investment is configured, or before any day has been sealed.
+    Both are named in ``unavailable_reason``: a recovery of zero and *not knowing*
+    are different answers, and only one of them is a measurement.
+    """
+    payload = coordinator.battery_return(dt_util.now().date())
+    if not payload.get("available"):
+        return None
+    value = payload.get("recovered_percent")
+    return None if value is None else float(value)
+
+
+def _battery_roi_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return the return figure with its coverage and its price basis.
+
+    **The basis travels with the number.** The import leg is all-in cash and the
+    export leg is, on a stock configuration, a wholesale reconstruction -- so
+    ``export_leg_is_cash`` and ``calculation_basis`` sit here beside the euro
+    figures rather than in the diagnostics download, and the period the cumulative
+    total actually covers is published rather than implied.
+    """
+    return coordinator.battery_return(dt_util.now().date())
+
+
+def _current_campaign_value(coordinator: AlphaEmsCoordinator) -> str | None:
+    """Return ``created``, ``started`` or ``idle``.
+
+    **``stopped`` is deliberately not a state, and that is a design decision rather
+    than an omission.** On the normal path ``_async_stop_dispatch`` with campaign
+    scope calls ``_close_campaign`` in the same call, so a ``stopped`` state would
+    exist for less than one coordinator tick and no Home Assistant consumer could
+    observe it. A state almost nobody can ever see is a misleading state: an
+    automation written against it would look correct and never fire.
+
+    The two moments genuinely separate only on the orphan-grace path and the
+    "nothing names it any more" path -- which is exactly where the *event* earns its
+    place. So the ``stopped`` event stays, exactly once, with its reason;
+    ``stopped_at`` and ``stop_reason`` are published on the final result; and this
+    entity moves ``started -> idle`` when the terminal is filed.
+    """
+    mark = coordinator.store.campaign_lifecycle
+    if not mark:
+        return CAMPAIGN_STATE_IDLE
+    marks = mark.get("marks") or []
+    if LIFECYCLE_KIND_STARTED in marks:
+        return CAMPAIGN_STATE_STARTED
+    if LIFECYCLE_KIND_CREATED in marks:
+        return CAMPAIGN_STATE_CREATED
+    return CAMPAIGN_STATE_IDLE
+
+
+def _current_campaign_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return the open campaign's identity, promise and progress.
+
+    **Both classifications, because one of them is allowed to move.** Nothing freezes
+    the purchase split: ``_note_campaign_started`` freezes the start instant and the
+    target and nothing else, ``Target`` has no field for the attribution at all, and
+    ``execution_revision`` compares energy and window rather than attribution -- so a
+    campaign spanning two admitted plans can legitimately read one category and then
+    another under one unchanged instance id. Publishing only the live word would let
+    a reader watch it change with nothing saying it had; publishing only the frozen
+    one would go stale beside a live figure. Both, side by side, and the rule beside
+    them.
+    """
+    mark = coordinator.store.campaign_lifecycle or {}
+    live = coordinator._campaign_classification(mark.get("campaign_id"))
+    return {
+        "campaign_id": mark.get("campaign_id"),
+        "campaign_instance_id": mark.get("instance_id"),
+        "purpose": mark.get("purpose"),
+        "classification": live.get("classification"),
+        "classification_at_creation": mark.get("classification_at_creation"),
+        "planned_kwh": mark.get("planned_kwh"),
+        "realised_kwh": (
+            None if not mark else round(coordinator._campaign_realized_now(), 3)
+        ),
+        "window_start": mark.get("window_start"),
+        "window_end": mark.get("window_end"),
+        "first_executable_at": mark.get("started_at"),
+        "started_at": mark.get("started_at"),
+        "revision": mark.get("revision"),
+        "objective_boundary": mark.get("objective_boundary"),
+        **{key: value for key, value in live.items() if key != "classification"},
+        "rule": (
+            "created is public but not yet physical; started means execution was "
+            "confirmed. there is no stopped state: on the ordinary path the stop "
+            "and the terminal land in the same tick, so a stopped state would be "
+            "unobservable -- the stopped event carries that moment instead, and "
+            "stopped_at and stop_reason are published on the final result. the "
+            "classification may move under one instance because nothing freezes "
+            "the purchase split, so what it was at creation is published beside it"
+        ),
+    }
+
+
+def _last_campaign_value(coordinator: AlphaEmsCoordinator) -> str | None:
+    """Return the last published campaign result, or ``None``."""
+    result = coordinator._last_campaign_result
+    if not result:
+        return None
+    value = result.get("result")
+    return value if isinstance(value, str) else None
+
+
+def _last_campaign_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any]:
+    """Return the terminal exactly as it was published.
+
+    **Read, never re-derived.** The coordinator keeps the payload it fired, so the
+    event and the entity cannot disagree -- which is the failure mode two derivations
+    of one number always eventually produce.
+    """
+    result = coordinator._last_campaign_result
+    if not result:
+        return {"available": False, "unavailable_reason": "no_campaign_closed_yet"}
+    published = {key: value for key, value in result.items() if key != "kind"}
+    return {
+        "available": True,
+        **published,
+        "rule": (
+            "a non-zero realised figure never implies success: only the frozen "
+            "objective within success_tolerance_kwh does, and an unmeasurable total "
+            "outranks even a met objective. not_executed means the campaign was "
+            "publicly created and never started, so nothing under-delivered; "
+            "superseded means a started campaign was replaced by a newer plan"
+        ),
+    }
 
 
 SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
@@ -1606,6 +1778,40 @@ SENSORS: tuple[AlphaEmsSensorDescription, ...] = (
         native_unit_of_measurement=CURRENCY_EURO,
         value_fn=_economic_value_value,
         attributes_fn=_economic_value_attributes,
+    ),
+    AlphaEmsSensorDescription(
+        key=SENSOR_BATTERY_ROI,
+        name="Battery Return",
+        icon="mdi:cash-refund",
+        native_unit_of_measurement=PERCENTAGE,
+        # **A percentage, so Economic Value stays the only EUR-valued state.** No
+        # state class: this rises monotonically only while the battery is earning,
+        # falls on a day it did not, and its denominator changes the moment an
+        # operator corrects a subsidy -- none of which a long-term statistic
+        # describes usefully.
+        value_fn=_battery_roi_value,
+        attributes_fn=_battery_roi_attributes,
+    ),
+    AlphaEmsSensorDescription(
+        key=SENSOR_CURRENT_CAMPAIGN,
+        name="Current Campaign",
+        icon="mdi:play-circle-outline",
+        device_class=SensorDeviceClass.ENUM,
+        options=list(CAMPAIGN_STATE_OPTIONS),
+        value_fn=_current_campaign_value,
+        attributes_fn=_current_campaign_attributes,
+    ),
+    AlphaEmsSensorDescription(
+        key=SENSOR_LAST_CAMPAIGN_RESULT,
+        name="Last Campaign Result",
+        icon="mdi:flag-checkered",
+        device_class=SensorDeviceClass.ENUM,
+        # The full outcome vocabulary, including the two beta.42 added. An ``ENUM``
+        # whose options omit a reachable value publishes ``unknown`` for it, which
+        # would hide exactly the two results this release exists to distinguish.
+        options=list(CAMPAIGN_OUTCOMES),
+        value_fn=_last_campaign_value,
+        attributes_fn=_last_campaign_attributes,
     ),
 )
 

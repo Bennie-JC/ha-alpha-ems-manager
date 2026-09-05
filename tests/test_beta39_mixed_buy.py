@@ -723,7 +723,11 @@ def test_no_schema_version_moved_for_the_classification() -> None:
         STORAGE_VERSION,
     )
 
-    assert (STORAGE_VERSION, STORAGE_MINOR_VERSION) == (2, 7)
+    # 2.8 as of beta.42: the sealed per-day benefit and the lifetime cursor, so a
+    # corrected battery capacity cannot rewrite a lifetime figure and an evicted
+    # day still counts toward it. Additive, and the *major* staying at 2 is the
+    # half that guarantees every earlier document is read rather than discarded.
+    assert (STORAGE_VERSION, STORAGE_MINOR_VERSION) == (2, 8)
     assert CONFIG_ENTRY_VERSION == 2
     assert CLAIM_SCHEMA_VERSION == 2
     assert (FORECAST_STORAGE_VERSION, FORECAST_STORAGE_MINOR_VERSION) == (1, 8)

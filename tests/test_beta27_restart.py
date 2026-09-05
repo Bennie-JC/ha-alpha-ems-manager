@@ -295,13 +295,15 @@ def test_the_storage_version_is_unchanged() -> None:
     civil-day boundary figure and carries no execution state, so it changes
     nothing about what this file pins.
     """
-    # **7 since beta.39**, which adds one optional per-day dict: what the energy
-    # the day opened with was worth on the value curve that existed then. It is the
-    # one datum a forecast revaluation needs and the one datum nothing retained.
-    # Additive like every bump before it -- a beta.38 document reads back with the
-    # key absent, which is a defined state with its own published reason -- so the
-    # major staying at 2 is still the load-bearing half.
-    assert STORAGE_MINOR_VERSION == 7
+    # **8 since beta.42**, which adds two more optional keys, both so a lifetime
+    # figure cannot move when a setting is edited: ``bf`` per day -- the realised
+    # battery benefit sealed once the day is finalisable -- and a document-level
+    # ``sealed`` running total with its monotonic date cursor. 7 was beta.39's
+    # opening valuation. Additive like every bump before it -- a beta.41 document
+    # reads back with both keys absent, which means no day has been sealed rather
+    # than that the benefit was zero -- so the major staying at 2 is still the
+    # load-bearing half.
+    assert STORAGE_MINOR_VERSION == 8
 
 
 def test_the_quarter_is_not_written_to_the_store() -> None:

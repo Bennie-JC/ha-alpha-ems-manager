@@ -848,7 +848,10 @@ def test_only_the_storage_minor_version_moved() -> None:
     """The additive change, and the only schema movement in the release.
 
     Schemas have been frozen since beta.33 and a moving one is worth a test rather
-    than a line in a changelog.
+    than a line in a changelog. beta.39 moved the learning store's minor to 7 for the
+    opening valuation; beta.42 moved it to 8 for the sealed per-day benefit and the
+    lifetime cursor. Every other schema here is still where beta.33 left it, which is
+    the part this test exists to notice.
     """
     from custom_components.alpha_ems_manager.const import (
         CLAIM_SCHEMA_VERSION,
@@ -857,7 +860,7 @@ def test_only_the_storage_minor_version_moved() -> None:
         FORECAST_STORAGE_VERSION,
     )
 
-    assert (STORAGE_VERSION, STORAGE_MINOR_VERSION) == (2, 7)
+    assert (STORAGE_VERSION, STORAGE_MINOR_VERSION) == (2, 8)
     assert CONFIG_ENTRY_VERSION == 2
     assert CLAIM_SCHEMA_VERSION == 2
     assert (FORECAST_STORAGE_VERSION, FORECAST_STORAGE_MINOR_VERSION) == (1, 8)

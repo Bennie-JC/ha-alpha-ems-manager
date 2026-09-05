@@ -200,7 +200,20 @@ STORAGE_VERSION: Final = 2
 #:   beta.38 reads back with the key absent, which is a defined state -- the
 #:   revaluation publishes ``None`` with ``no_opening_valuation`` until the next
 #:   civil day writes one. No migration and no reset.
-STORAGE_MINOR_VERSION: Final = 7
+#:
+#:   v1.0.0-beta.42 adds two more, both for the same reason: a lifetime figure
+#:   must not move when a setting is edited. Per day, an optional ``bf`` -- the
+#:   realised battery benefit sealed once the day is finalisable, with the instant
+#:   and the comparator version that produced it. At document level, an optional
+#:   ``sealed`` -- a running total for days no longer retained and the monotonic
+#:   date cursor through which that total is complete. A day record is evicted at
+#:   365 days and a lifetime figure has to outlive it, so the value is computed
+#:   while the evidence exists and folded forward when the evidence goes -- and the
+#:   comparator version travels with it, because beta.42 is itself the release that
+#:   corrected the comparator. Additive: a beta.41 document reads back
+#:   with both keys absent, which means no day has been sealed -- never that the
+#:   benefit was measured at zero. No migration and no reset.
+STORAGE_MINOR_VERSION: Final = 8
 STORAGE_KEY_TEMPLATE: Final = f"{DOMAIN}.{{entry_id}}.learning"
 
 #: Config-entry schema version. v1 was the previous integration's source model,
@@ -2165,6 +2178,70 @@ DEFAULT_BATTERY_THROUGHPUT_COST_EUR_PER_KWH: Final = 0.0
 MIN_BATTERY_THROUGHPUT_COST_EUR_PER_KWH: Final = 0.0
 MAX_BATTERY_THROUGHPUT_COST_EUR_PER_KWH: Final = 1.0
 
+#: What the battery cost, what came back, and when it was bought. beta.42.
+#:
+#: **All four optional, because they are genuinely absent rather than defaulted** --
+#: the same distinction ``BATTERY_HARDWARE_KEYS`` already draws for the three absent
+#: hardware facts. An installation that has not entered them is not an installation
+#: whose battery cost nothing; it is one that has not said. So the return sensor is
+#: unavailable with a named reason rather than publishing a recovery against zero.
+#:
+#: **None of them reaches anything that decides.** Capital cost is not a marginal
+#: cost and most of an installed battery is sunk, which is the reasoning the three
+#: economic levers are already built on -- adding a fourth here would let a
+#: purchase price change a dispatch. A boundary test asserts these keys are absent
+#: from the settings fingerprint's decision inputs.
+CONF_BATTERY_INVESTMENT_EUR: Final = "battery_investment_eur"
+CONF_BATTERY_SUBSIDY_EUR: Final = "battery_subsidy_eur"
+CONF_OTHER_ONE_TIME_CREDIT_EUR: Final = "other_one_time_credit_eur"
+#: A **date**, validated as one and stored as an ISO date string. Never coerced
+#: through the numeric path the three euro figures use: "when" and "how much" are
+#: different kinds of fact, and a date that survived a numeric selector would be a
+#: number nobody could read back.
+CONF_BATTERY_INVESTMENT_DATE: Final = "battery_investment_date"
+
+MAX_BATTERY_INVESTMENT_EUR: Final = 1_000_000.0
+
+#: How many priceable days the payback estimate requires before it will publish.
+#:
+#: **Below this the estimate is not conservative, it is arbitrary.** A trailing mean
+#: over a week of one season extrapolated to a decade says more about the weather
+#: than about the battery. Under the threshold the estimate is ``unavailable`` with
+#: a named reason -- and a named reason is a better answer than a confident wrong
+#: number, which is the rule the rest of this integration is built on.
+ROI_MIN_SAMPLE_DAYS: Final = 30
+ROI_TRAILING_SHORT_DAYS: Final = 30
+ROI_TRAILING_LONG_DAYS: Final = 90
+
+#: Why the return figure, or its payback half, is not being published.
+ROI_UNAVAILABLE_NO_INVESTMENT: Final = "no_investment_configured"
+ROI_UNAVAILABLE_NO_HISTORY: Final = "no_finalised_days"
+ROI_PAYBACK_UNAVAILABLE_INSUFFICIENT_HISTORY: Final = "insufficient_history"
+#: **Never an infinity, and never a negative payback.** A trailing mean at or below
+#: zero means the recorded period did not pay, which is a real measurement and is
+#: published as one -- but dividing by it would produce either a division error or a
+#: date in the past, and both would read as a fact.
+ROI_PAYBACK_UNAVAILABLE_NO_BENEFIT: Final = "no_realised_benefit"
+
+#: How the two price legs of the return figure were formed.
+#:
+#: **Named in one string because the caveat has to travel with the number.** The
+#: import leg is genuinely all-in cash; the export leg is, on a stock configuration,
+#: bare wholesale. Publishing one basis word for both would average over exactly the
+#: difference an operator needs to know about.
+PRICE_LEG_ALL_IN_CASH: Final = "all_in_cash_total_price"
+CALCULATION_BASIS_IMPORT_CASH_EXPORT_CASH: Final = "import_all_in_cash__export_cash"
+CALCULATION_BASIS_IMPORT_CASH_EXPORT_RECONSTRUCTED: Final = (
+    "import_all_in_cash__export_wholesale_reconstructed"
+)
+
+ROI_UNAVAILABLE_REASONS: Final = (
+    ROI_UNAVAILABLE_NO_INVESTMENT,
+    ROI_UNAVAILABLE_NO_HISTORY,
+    ROI_PAYBACK_UNAVAILABLE_INSUFFICIENT_HISTORY,
+    ROI_PAYBACK_UNAVAILABLE_NO_BENEFIT,
+)
+
 #: A ceiling, in kWh, on how much grid energy one Live charge run may buy.
 #:
 #: **A commissioning tightener, and zero disables it.** The Stage-A figure
@@ -2228,6 +2305,39 @@ SENSOR_NEXT_PLANNED_ACTION: Final = "next_planned_action"
 #: economic sensors is exactly how two of them come to disagree. Everything needed
 #: to audit any of those numbers is an attribute of the same entity.
 SENSOR_ECONOMIC_VALUE: Final = "economic_value"
+
+#: The open campaign, as a three-state enum. beta.42.
+#:
+#: **There is no ``stopped`` state, and its absence is the design.** On the ordinary
+#: path a campaign-scoped dispatch stop calls ``_close_campaign`` in the same call,
+#: so a ``stopped`` state would exist for less than one coordinator tick and no
+#: consumer could observe it. A state almost nobody can ever see is worse than no
+#: state: an automation written against it would look right and never fire. The
+#: ``stopped`` *event* carries that moment instead, exactly once and with its reason,
+#: and ``stopped_at``/``stop_reason`` are published on the final result.
+#: What the battery has recovered of what it cost. beta.42.
+#:
+#: **State is a percentage, not euros**, so Economic Value stays the integration's
+#: only EUR-valued state. That entity's comment reasons that a second monetary state
+#: could disagree with it; this one is admissible beside it because its numerator is
+#: realised-only and therefore cannot disagree with a forecast -- it is a different
+#: kind of number, and the unit says so.
+#:
+#: No ``state_class``, for the reason the other signed and derived figures omit one.
+SENSOR_BATTERY_ROI: Final = "battery_roi"
+
+SENSOR_CURRENT_CAMPAIGN: Final = "current_campaign"
+SENSOR_LAST_CAMPAIGN_RESULT: Final = "last_campaign_result"
+
+CAMPAIGN_STATE_CREATED: Final = "created"
+CAMPAIGN_STATE_STARTED: Final = "started"
+CAMPAIGN_STATE_IDLE: Final = "idle"
+
+CAMPAIGN_STATE_OPTIONS: Final = (
+    CAMPAIGN_STATE_CREATED,
+    CAMPAIGN_STATE_STARTED,
+    CAMPAIGN_STATE_IDLE,
+)
 
 #: The counterfactual every avoidance figure in the day accounting rests on.
 #:
@@ -3822,12 +3932,109 @@ OUTCOME_SUCCESS: Final = "success"
 OUTCOME_PARTIAL: Final = "partial"
 OUTCOME_CANCELED: Final = "canceled"
 OUTCOME_FAILED: Final = "failed"
+#: Publicly created, never started, then displaced or out of window. beta.42.
+#:
+#: **Not a failure, and the distinction is load-bearing rather than cosmetic.**
+#: Nothing physical was attempted, so nothing under-delivered; the plan was
+#: replaced by a better one or its window passed. Filing it as ``failed`` would
+#: read as a plant fault on a day the plant behaved perfectly -- and, worse, would
+#: invite latching an execution finality that ``_close_campaign`` deliberately does
+#: not latch, which is what leaves a never-started campaign free to be attempted
+#: properly later.
+OUTCOME_NOT_EXECUTED: Final = "not_executed"
+#: A **started** campaign displaced by a newer authoritative plan. beta.42.
+#:
+#: Separate from ``partial`` because the shortfall is not the plant's: the campaign
+#: was overtaken, not missed. Separate from ``not_executed`` because energy did
+#: move, and a figure that moved is a measurement someone may want.
+OUTCOME_SUPERSEDED: Final = "superseded"
 
 CAMPAIGN_OUTCOMES: Final = (
     OUTCOME_SUCCESS,
     OUTCOME_PARTIAL,
     OUTCOME_CANCELED,
     OUTCOME_FAILED,
+    OUTCOME_NOT_EXECUTED,
+    OUTCOME_SUPERSEDED,
+)
+
+#: The public campaign lifecycle event, and the four transitions it carries.
+#:
+#: **``stopped`` is defined at the irreversible boundary, not the physical one**,
+#: and that redefinition is the whole difference between a readable log and the
+#: per-quarter spam this surface exists to avoid. ``_async_stop_dispatch`` notes a
+#: stop for all three scopes, and ``STOP_SCOPE_ROW`` means *this row is done and a
+#: later executable row remains* -- the frozen plan and the campaign instance
+#: survive, the dispatch stops, and the next boundary arms again. A multi-row
+#: campaign therefore stops and re-arms at every row boundary and at every
+#: ``serve_load`` gap, and ``test_beta36_lifecycle`` positively asserts one
+#: instance across two plans and two gaps.
+#:
+#: So a row-scope stop emits **nothing**. What emits ``stopped`` is execution
+#: ending for good: a campaign-scoped stop, or the terminal itself.
+#:
+#: At most one event per transition per ``campaign_instance_id``, persisted, so a
+#: restart replays none of them. No event because the realised figure moved, a
+#: quarter completed, Stage A refreshed, the revision incremented, the remaining
+#: target shrank, or power moved inside the deadband.
+EVENT_CAMPAIGN_LIFECYCLE: Final = "alpha_ems_campaign"
+
+LIFECYCLE_KIND_CREATED: Final = "created"
+LIFECYCLE_KIND_STARTED: Final = "started"
+LIFECYCLE_KIND_STOPPED: Final = "stopped"
+LIFECYCLE_KIND_REMOVED: Final = "removed"
+
+CAMPAIGN_LIFECYCLE_KINDS: Final = (
+    LIFECYCLE_KIND_CREATED,
+    LIFECYCLE_KIND_STARTED,
+    LIFECYCLE_KIND_STOPPED,
+    LIFECYCLE_KIND_REMOVED,
+)
+
+#: How many closed lifecycle instances are remembered, so a restart cannot replay
+#: a terminal. Bounded for the same reason ``MAX_ABORTED_CAMPAIGNS_REMEMBERED`` is:
+#: the question "have I already published this instance's terminal?" is only ever
+#: asked about instances from the recent past, and an unbounded list on a
+#: rewritten-every-quarter document is a slow leak rather than a guarantee.
+MAX_CAMPAIGN_LIFECYCLE_REMEMBERED: Final = 64
+
+#: Which lifecycle classification a campaign carried, derived from the planner's
+#: own purchase attribution and **never** from ``category_of()``.
+#:
+#: That helper is not observability-only: the category is a hash input to
+#: ``plan_id_for``, an exact-match key in ``ActivityState.find``, the trigger for
+#: the retraction path, and a dict lookup selecting battery direction -- and it
+#: defaults an unknown category to ``economic``, publishing "this purchase was
+#: entirely a choice" about a coverage buy. Because it is a hash input, a campaign
+#: reclassified between refreshes would get a new plan id, file a cancellation for
+#: the old one and open a fresh Planned line: exactly the churn that surface was
+#: rewritten to kill. So the Activity vocabulary stays frozen and the classification
+#: is published here instead.
+LIFECYCLE_CLASS_SAFETY_BUY: Final = "safety_buy"
+LIFECYCLE_CLASS_COVERAGE_BUY: Final = "coverage_buy"
+LIFECYCLE_CLASS_ECONOMIC_BUY: Final = "economic_buy"
+LIFECYCLE_CLASS_MIXED_BUY: Final = "mixed_buy"
+LIFECYCLE_CLASS_ECONOMIC_EXPORT: Final = "economic_export"
+LIFECYCLE_CLASS_SERVE_LOAD: Final = "serve_load"
+LIFECYCLE_CLASS_UNKNOWN: Final = "unknown"
+
+#: Below this, an attributed figure is a rounding artefact rather than a category.
+#:
+#: The three attributions are computed as differences between solves, so a category
+#: the optimiser did not choose can land at 1e-12 rather than exactly zero. Reading
+#: that as "present" would turn every pure Economic Buy into a Mixed Buy, which is
+#: the same class of error as guessing: a true word made meaningless by being always
+#: true. One tenth of the actuator quantum, well below anything a plant can deliver.
+CAMPAIGN_CLASSIFICATION_EPSILON_KWH: Final = 0.001
+
+CAMPAIGN_LIFECYCLE_CLASSES: Final = (
+    LIFECYCLE_CLASS_SAFETY_BUY,
+    LIFECYCLE_CLASS_COVERAGE_BUY,
+    LIFECYCLE_CLASS_ECONOMIC_BUY,
+    LIFECYCLE_CLASS_MIXED_BUY,
+    LIFECYCLE_CLASS_ECONOMIC_EXPORT,
+    LIFECYCLE_CLASS_SERVE_LOAD,
+    LIFECYCLE_CLASS_UNKNOWN,
 )
 
 #: Which vocabulary a published ``reason`` belongs to.
@@ -4252,12 +4459,33 @@ LEDGER_BASIS_MODEL_TERM: Final = "model_term"
 #: ``planner_derived`` would let a reader difference it against one.
 LEDGER_BASIS_REVALUED: Final = "revalued"
 
+#: A figure about the future. beta.42, and the seventh word.
+#:
+#: **``planner_derived`` was carrying two different claims.** A closing inventory
+#: value is the optimiser's valuation of energy that *exists*; the remaining
+#: expected value is its estimate of energy that has not moved yet, over prices and
+#: a load forecast that will both be wrong to some degree. Both come from the
+#: planner, and only one of them can still be falsified by the weather. A reader
+#: told "planner_derived" about both cannot tell which figure a cloudy afternoon
+#: will move.
+LEDGER_BASIS_FORECAST: Final = "forecast"
+
+#: A published euro figure the basis map does not cover.
+#:
+#: **Deliberately not a silent omission.** An attribute with no basis and an
+#: attribute whose basis is "nobody classified this" look identical to a reader who
+#: sees only the ones that are there -- and the second is a defect worth noticing,
+#: while the first reads as "no caveat applies". Not a member of
+#: :data:`LEDGER_BASES`: it is the absence of a basis, not a seventh kind of number.
+LEDGER_BASIS_UNCLASSIFIED: Final = "unclassified"
+
 LEDGER_BASES: Final = (
     LEDGER_BASIS_MEASURED,
     LEDGER_BASIS_ATTRIBUTED,
     LEDGER_BASIS_ESTIMATED,
     LEDGER_BASIS_PLANNER_DERIVED,
     LEDGER_BASIS_MODEL_TERM,
+    LEDGER_BASIS_FORECAST,
     LEDGER_BASIS_REVALUED,
 )
 
@@ -4267,6 +4495,32 @@ LEDGER_BASES: Final = (
 #: worth it" -- routinely straddles one midnight and almost never straddles two.
 #: Every input is already persisted for a year, so a caller may ask for more.
 LEDGER_DEFAULT_WINDOW_DAYS: Final = 2
+
+#: Where a priced day's rates came from.
+#:
+#: **beta.42, and the second value is the one that was missing.** The realised
+#: ledger read only ``price_forecasts``, which is rebuilt every refresh and holds
+#: today and tomorrow, so every older day was skipped for want of prices and the
+#: multi-day window silently priced exactly one. The issuances are persisted for a
+#: year with the day's own fixed components beside them, so a past day is priced on
+#: the basis published at the time -- never on a setting the operator has since
+#: changed.
+PRICE_BASIS_LIVE_FORECAST: Final = "live_forecast"
+PRICE_BASIS_STORED_SNAPSHOT: Final = "stored_snapshot"
+
+#: Which comparator produced a sealed day's realised battery benefit.
+#:
+#: **Recorded per day because beta.42 is the release that corrected the
+#: comparator.** Through beta.41 the published "net value" was
+#: ``TRUE - sum(p*min(I,N)) + sum(s*X)`` -- the household's whole position, which
+#: subtracts an import bill no battery could have avoided and credits PV export
+#: that needed no battery. Summed into a lifetime figure it would have said the
+#: battery destroys value on any household that imports anything.
+#:
+#: A day sealed under an older basis has to be identifiable rather than quietly
+#: added to days sealed under this one, so the version travels with the figure. It
+#: changes only when the arithmetic behind the number changes.
+REALIZED_BENEFIT_BASIS_VERSION: Final = "b42_no_battery_net_cash"
 
 ACTIVITY_PURPOSE_SAFETY: Final = "safety"
 ACTIVITY_PURPOSE_ECONOMIC: Final = "economic"

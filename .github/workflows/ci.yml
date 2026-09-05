@@ -10,15 +10,24 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # The four neutrality baselines were captured under a fixed hash seed, and
+  # sixty-three of their assertions compare figures whose text order follows a
+  # `frozenset` iteration. CI ran with a random seed, so those tests were one
+  # unlucky hash away from failing on an unrelated change. Set once, for every job.
+  PYTHONHASHSEED: "0"
+
 jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 
@@ -37,11 +46,69 @@ jobs:
 
       - run: ruff format --check .
 
-  test:
-    name: Tests
+  # A tag points at a commit that has usually already been tested on main. Re-running
+  # a two-hour suite for it is waste -- but "it is a tag" is not evidence, because a
+  # tag can point anywhere. So the skip is decided by proving that *this exact SHA*
+  # already passed *this exact workflow* on main, and anything less runs the suite.
+  verify_sha:
+    name: Prior verification
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      already_passed: ${{ steps.check.outputs.already_passed }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "already_passed=false" >> "$GITHUB_OUTPUT"
+            echo "Not a tag: the suite runs."
+            exit 0
+          fi
+          # A successful run of THIS workflow file, on the main branch, for this
+          # exact head SHA, whose Tests job concluded success. Every clause matters:
+          # the name alone is not proof -- this repository has had two check runs
+          # called "Tests" on one SHA, one of them unfinished.
+          runs=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${{ github.sha }}&status=success" \
+            --jq '[.workflow_runs[]
+                   | select(.path == ".github/workflows/ci.yml")
+                   | select(.head_branch == "main")
+                   | select(.conclusion == "success")
+                   | .id] | .[0] // empty')
+          if [ -z "$runs" ]; then
+            echo "already_passed=false" >> "$GITHUB_OUTPUT"
+            echo "No successful main run for ${{ github.sha }}: the suite runs."
+            exit 0
+          fi
+          tests=$(gh api "repos/${{ github.repository }}/actions/runs/$runs/jobs" \
+            --jq '[.jobs[] | select(.name | startswith("Tests")) | .conclusion] | unique')
+          echo "Run $runs Tests conclusions: $tests"
+          if [ "$tests" = '["success"]' ]; then
+            echo "already_passed=true" >> "$GITHUB_OUTPUT"
+            echo "SHA ${{ github.sha }} already passed this workflow on main."
+          else
+            echo "already_passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    name: Tests (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [lint, verify_sha]
+    if: needs.verify_sha.outputs.already_passed != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v5
+        with:
+          # `tests/test_metadata.py` walks `git log HEAD --tags` to prove no commit
+          # credits an author it should not. Under the default depth-1 checkout that
+          # log is empty, so the guard passed by having nothing to look at.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v6
         with:
@@ -51,12 +118,45 @@ jobs:
 
       - run: pip install -r requirements-test.txt
 
-      - name: Run test suite
-        run: python -m pytest -q
+      - name: Report the runner's parallelism
+        # `-n auto` resolves to whatever the runner gives us. Recording it makes the
+        # shard timings interpretable a month from now.
+        run: |
+          python -c "import os; print('cpus:', os.cpu_count())"
+          nproc || true
+
+      - name: Select this shard
+        id: select
+        run: |
+          if [ -f tools/shards.json ]; then
+            files=$(python scripts/shard_plan.py --manifest tools/shards.json \
+                      --shard ${{ matrix.shard }})
+          else
+            files=""
+          fi
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+
+      - name: Run this shard
+        run: |
+          python -m pytest -q -n auto \
+            --junitxml=junit-${{ matrix.shard }}.xml \
+            --durations=25 \
+            ${{ steps.select.outputs.files }}
+
+      - name: Upload timings
+        # The manifest is rebalanced from these. Without them a shard split is a
+        # guess, and the slowest shard silently becomes the whole suite's cost.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: timings-shard-${{ matrix.shard }}
+          path: junit-${{ matrix.shard }}.xml
+          if-no-files-found: warn
 
   hassfest:
     name: Hassfest
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 
@@ -67,6 +167,7 @@ jobs:
   hacs:
     name: HACS validation
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 

@@ -321,7 +321,13 @@ def test_the_position_values_are_still_planner_derived() -> None:
     basis = _basis_map()
     assert basis["opening_inventory_value_eur"] == LEDGER_BASIS_PLANNER_DERIVED
     assert basis["closing_inventory_value_eur"] == LEDGER_BASIS_PLANNER_DERIVED
-    assert len(LEDGER_BASES) == 6, "the sixth word is beta.39's revaluation basis"
+    # Seven since beta.42, which split ``forecast`` out of ``planner_derived``: a
+    # closing inventory value is the optimiser's valuation of energy that *exists*,
+    # while the remaining expected value is its estimate of energy that has not moved
+    # yet. Both come from the planner and only one can still be falsified by the
+    # weather, so one word for both told a reader nothing about which figure a cloudy
+    # afternoon will move. The two figures asserted above keep their word.
+    assert len(LEDGER_BASES) == 7, "the seventh word is beta.42's forecast basis"
     assert LEDGER_BASIS_REVALUED in LEDGER_BASES
     # Exactly one figure wears it, and it is the revaluation.
     revalued = [name for name, word in basis.items() if word == LEDGER_BASIS_REVALUED]

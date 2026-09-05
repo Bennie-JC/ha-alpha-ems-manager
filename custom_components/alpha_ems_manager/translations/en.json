@@ -198,14 +198,22 @@
           "grid_charge_margin_eur_per_kwh": "Extra margin per grid-charged kWh",
           "battery_throughput_cost_eur_per_kwh": "Battery wear cost per kWh",
           "allow_grid_charging": "Allow buying from the grid",
-          "allow_battery_export": "Allow selling from the battery"
+          "allow_battery_export": "Allow selling from the battery",
+          "battery_investment_eur": "Battery investment (gross)",
+          "battery_subsidy_eur": "Subsidy received",
+          "other_one_time_credit_eur": "Other one-time credit",
+          "battery_investment_date": "Purchase date"
         },
         "data_description": {
           "minimum_trade_gain_eur": "How much a single charge or discharge has to earn before it is worth planning, in euros. Charged once per stretch of one action, not per kilowatt-hour, which is what stops a plan full of two-cent trades that wear the battery for nothing. Zero means take every trade the prices justify. This is not a wear model: it is your answer to \"how small is too small\". Charging to protect the reserve ignores it, because keeping the house supplied is not a trade -- and so does your own solar entering the battery, because nobody chose to do that.",
           "grid_charge_margin_eur_per_kwh": "An additional economic requirement, in euros per kilowatt-hour, on the energy a charge actually causes to be bought from the grid. Zero -- the default -- behaves exactly as before, so upgrading changes nothing until you set it. It exists because the minimum gain per trade is a fixed amount: once a trade clears it the volume behind it is unconstrained, so a fourteen-kilowatt-hour round trip can be planned while earning under four cents a kilowatt-hour. Set this and every bought kilowatt-hour has to earn its keep, not just the trade as a whole. Four things are outside it by construction: your own solar entering the battery, the solar share of a quarter that mixes sun and grid, discharging to supply the house, and charging to protect the reserve -- keeping the house supplied outranks every economic figure. It is not a wear model.",
           "battery_throughput_cost_eur_per_kwh": "A cost, in euros per kilowatt-hour, charged on every kilowatt-hour that moves through the battery in either direction. Zero -- the default -- behaves exactly as before, so upgrading changes nothing until you set it. It is the only one of the three economic terms whose basis is throughput: the minimum gain per trade is charged once per run, and the grid-charge margin only on energy a charge actually causes to be bought. Set this and a plan has to earn more than the cycling it asks for, which suppresses long shallow round trips that clear every other test on volume alone. Charged linearly, which under-prices deep cycling and over-prices shallow cycling: real degradation is convex in depth, and modelling that honestly would need throughput-so-far as a fourth solver dimension. So it is a lever, not a wear model, and it was reachable only by hand-editing storage before this release.",
           "allow_grid_charging": "Whether the plan may **buy** energy from the grid to put in the battery. Off by default, because a battery that only ever stores your own solar cannot lose money on a price forecast. Turning it on lets the plan buy in cheap hours -- and lets it plan a safety purchase when the reserve cannot be met from your panels. This is about buying only: your panels filling the battery is not grid charging, needs no permission, and shows as \"hold\" rather than \"charge\".",
-          "allow_battery_export": "Whether the plan may sell stored energy back to the grid. Off by default. Turning it on lets the plan value your battery at the export price rather than only at the import price it avoids, which usually finds more to do in the evening peak. **Since beta.32 this is executed rather than only advised**: an inverter command exists, so a sale the plan announces is a sale it will attempt. Two things follow. The plan will now refuse a sale whose price does not beat what that energy is worth to your house before the next cheap window -- selling at 0.29 to buy the same energy back at 0.30 is a loss, however good the headline price looks -- and it publishes what that protection cost, so you can check it. And with this switched off the battery still feeds the house exactly as before; nothing about this setting has ever stopped ordinary self-consumption."
+          "allow_battery_export": "Whether the plan may sell stored energy back to the grid. Off by default. Turning it on lets the plan value your battery at the export price rather than only at the import price it avoids, which usually finds more to do in the evening peak. **Since beta.32 this is executed rather than only advised**: an inverter command exists, so a sale the plan announces is a sale it will attempt. Two things follow. The plan will now refuse a sale whose price does not beat what that energy is worth to your house before the next cheap window -- selling at 0.29 to buy the same energy back at 0.30 is a loss, however good the headline price looks -- and it publishes what that protection cost, so you can check it. And with this switched off the battery still feeds the house exactly as before; nothing about this setting has ever stopped ordinary self-consumption.",
+          "battery_investment_eur": "What the battery installation cost, in euros, before any subsidy. Optional, and leaving it empty is not the same as entering zero: with no figure here the Battery Return sensor is unavailable with a reason, rather than reporting a recovery against a battery that cost nothing. This setting reaches nothing that decides -- capital cost is not a marginal cost and most of an installed battery is sunk, so a purchase price must never be able to move a dispatch.",
+          "battery_subsidy_eur": "Any subsidy or rebate received, in euros. Subtracted from the gross figure to give the net investment the recovery percentage is measured against.",
+          "other_one_time_credit_eur": "Any other one-time credit against the purchase, in euros -- a trade-in, a supplier contribution, a warranty settlement. Subtracted alongside the subsidy.",
+          "battery_investment_date": "When the battery was bought. Used only to say what period the cumulative figure covers: if it predates the first day this integration has authoritative accounting for, the total is still published -- it is a true measurement of the days it does cover -- and the sensor reports that the lifetime history is incomplete rather than implying benefit was measured before it was. The gap is never estimated."
         }
       }
     }
@@ -269,7 +277,7 @@
           "discharge": "Discharge",
           "export": "Export",
           "safety_buy": "Safety Buy",
-            "mixed_buy": "Mixed Buy",
+          "mixed_buy": "Mixed Buy",
           "curtail_pv": "Curtail",
           "idle": "Idle"
         }
@@ -282,7 +290,7 @@
           "discharge": "Discharge",
           "export": "Export",
           "safety_buy": "Safety Buy",
-            "mixed_buy": "Mixed Buy",
+          "mixed_buy": "Mixed Buy",
           "curtail_pv": "Curtail",
           "idle": "Idle"
         }

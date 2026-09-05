@@ -31,7 +31,8 @@ from custom_components.alpha_ems_manager.const import (
     ECONOMIC_ACTION_CHARGE,
 )
 
-from .beta34_shape import LIMITS, solve_at
+from .beta34_shape import LIMITS
+from .solve_cache import cached_solve_at
 from .test_beta39_neutrality import SHAPES
 
 #: Starting states swept per shape: empty, near-floor, mid, and full.
@@ -53,7 +54,7 @@ def plans():
         kwargs = dict(SHAPES[name][0])
         for stored in STARTS:
             kwargs["stored"] = stored
-            outcome = solve_at(**kwargs).outcome
+            outcome = cached_solve_at(**kwargs).outcome
             assert outcome.available, f"{name}@{stored}: {outcome.unavailable_reason}"
             yield f"{name}@{stored}", outcome
 

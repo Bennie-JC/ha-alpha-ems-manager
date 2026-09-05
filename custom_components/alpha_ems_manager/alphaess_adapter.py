@@ -581,10 +581,18 @@ async def async_execute(
 
     **Two refusals, and the second is the one that matters in beta.24.** The first
     is the release barrier, unchanged. The second is a subset test on the entity
-    ids: this release charges, so the only entities it may write are the charge
-    family and the owner marker. It reads no action field and trusts no caller,
-    which is why it survives a defect upstream -- a discharge that somehow reaches
-    here names discharge entities, and naming them is enough to be refused.
+    ids: the only *helper* entities this release may write are the charge family and
+    the owner marker. It reads no action field and trusts no caller, which is why it
+    survives a defect upstream -- a helper-family discharge that somehow reaches here
+    names discharge entities, and naming them is enough to be refused.
+
+    **That sentence said "this release charges" until beta.42, and had been wrong
+    since beta.27.** An admitted ``net_export`` does execute, and it does so without
+    contradicting anything here: direction on the Dispatch surface is a signed
+    *number*, not a choice of entity, so an entity subset test cannot express a
+    direction on it at all. Dispatch is permitted by entity and constrained by
+    value, in :func:`dispatch_refusal`, checked beside this one. The force-charging
+    and force-discharging helper families are never written for either intent.
     """
     if not CONTROL_EXECUTION_AVAILABLE:
         raise ControlExecutionUnavailable(

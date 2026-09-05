@@ -436,7 +436,11 @@ async def test_the_entity_set_is_unchanged(
     assert ours == [
         "select.alpha_ems_control_mode",
         "sensor.alpha_ems_battery_recommendation",
+        # beta.42's three, in the sorted position they land in. Listed rather than
+        # counted, so a missing entity fails as loudly as an extra one.
+        "sensor.alpha_ems_battery_return",
         "sensor.alpha_ems_control_state",
+        "sensor.alpha_ems_current_campaign",
         "sensor.alpha_ems_dynamic_battery_reserve",
         "sensor.alpha_ems_economic_action",
         "sensor.alpha_ems_economic_value",
@@ -444,6 +448,7 @@ async def test_the_entity_set_is_unchanged(
         "sensor.alpha_ems_expected_house_load_tomorrow",
         "sensor.alpha_ems_forecast_error_7_days",
         "sensor.alpha_ems_forecast_error_yesterday",
+        "sensor.alpha_ems_last_campaign_result",
         "sensor.alpha_ems_learning_confidence",
         "sensor.alpha_ems_learning_days",
         "sensor.alpha_ems_next_planned_action",

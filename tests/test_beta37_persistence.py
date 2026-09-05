@@ -77,22 +77,30 @@ def snapshot_for(*, valued: bool = True) -> EconomicSnapshot:
 # ===========================================================================
 
 
-def test_only_the_evidence_store_minor_version_moved() -> None:
-    """**The main document's schema is untouched, and that is deliberate.**
+def test_the_documented_store_versions_are_pinned() -> None:
+    """**beta.37 left the main document's schema untouched, and that was deliberate.**
 
     The hot ring extends the *contents* of an existing free-form record under an
-    existing key, so nothing about the learning store's shape changes. Only the
-    partitioned evidence store gains fields, and only its minor version moves --
+    existing key, so nothing about the learning store's shape changed here. Only the
+    partitioned evidence store gained fields, and only its minor version moved --
     which is the additive kind that reads every earlier document unchanged.
+
+    The learning store's minor has since moved for reasons of its own -- beta.39's
+    opening valuation, beta.42's sealed benefit -- so this pins the current pair
+    rather than asserting the learning store has never changed. What it still holds
+    is the part that matters on upgrade: **both majors are unchanged**, so every
+    document ever written by this integration is read rather than discarded.
     """
     assert STORAGE_VERSION == 2
-    # **7 since beta.39**, which adds one optional per-day dict: what the energy
-    # the day opened with was worth on the value curve that existed then. It is the
-    # one datum a forecast revaluation needs and the one datum nothing retained.
-    # Additive like every bump before it -- a beta.38 document reads back with the
-    # key absent, which is a defined state with its own published reason -- so the
-    # major staying at 2 is still the load-bearing half.
-    assert STORAGE_MINOR_VERSION == 7
+    # **8 since beta.42**, which adds two more optional keys, both so a lifetime
+    # figure cannot move when a setting is edited: ``bf`` per day -- the realised
+    # battery benefit sealed once the day is finalisable -- and a document-level
+    # ``sealed`` running total with its monotonic date cursor. 7 was beta.39's
+    # opening valuation. Additive like every bump before it -- a beta.41 document
+    # reads back with both keys absent, which means no day has been sealed rather
+    # than that the benefit was zero -- so the major staying at 2 is still the
+    # load-bearing half.
+    assert STORAGE_MINOR_VERSION == 8
     assert FORECAST_STORAGE_VERSION == 1
     assert FORECAST_STORAGE_MINOR_VERSION == 8
 

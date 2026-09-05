@@ -234,8 +234,8 @@ async def test_reload_creates_no_duplicate_entities(
     created = [
         item.entity_id for item in registry.entities.values() if item.platform == DOMAIN
     ]
-    assert len(created) == 15
-    assert len(set(created)) == 15
+    assert len(created) == 18
+    assert len(set(created)) == 18
     assert not [entity_id for entity_id in created if entity_id.endswith("_2")]
 
 

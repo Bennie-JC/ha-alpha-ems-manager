@@ -95,12 +95,14 @@ from .const import (
     AUTHORITY_BASIS_CARRIED_RUN,
     AUTHORITY_BASIS_NONE,
     AVOIDANCE_BASIS_NO_BATTERY,
-    BALANCE_MAX_SOURCE_AGE_SECONDS,
     BATTERY_MAX_SOC_PERCENT,
     CADENCE_PHYSICAL_TICK,
     CADENCE_QUARTER_REFRESH,
+    CALCULATION_BASIS_IMPORT_CASH_EXPORT_CASH,
+    CALCULATION_BASIS_IMPORT_CASH_EXPORT_RECONSTRUCTED,
     CAMPAIGN_BOUNDARY_BATTERY,
     CAMPAIGN_BOUNDARY_METER,
+    CAMPAIGN_CLASSIFICATION_EPSILON_KWH,
     CAMPAIGN_MEASUREMENT_RESOLUTION_PERCENT,
     CAMPAIGN_ORPHAN_GRACE_MINUTES,
     CAMPAIGN_SUCCESS_TOLERANCE_FRACTION,
@@ -113,6 +115,8 @@ from .const import (
     CONF_ALLOW_BATTERY_EXPORT,
     CONF_ALLOW_GRID_CHARGING,
     CONF_BATTERY_CAPACITY_KWH,
+    CONF_BATTERY_INVESTMENT_DATE,
+    CONF_BATTERY_INVESTMENT_EUR,
     CONF_BATTERY_MAX_CHARGE_KW,
     CONF_BATTERY_MAX_DISCHARGE_KW,
     CONF_BATTERY_MIN_SOC_PERCENT,
@@ -120,6 +124,7 @@ from .const import (
     CONF_BATTERY_POWER_SIGN,
     CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_SOC_ENTITY,
+    CONF_BATTERY_SUBSIDY_EUR,
     CONF_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
     CONF_CONTROL_EXECUTION_ENABLED,
     CONF_CONTROL_EXPORT_MARGIN_PERCENT,
@@ -133,6 +138,7 @@ from .const import (
     CONF_HAS_PV,
     CONF_HOUSE_LOAD_ENTITY,
     CONF_MINIMUM_TRADE_GAIN_EUR,
+    CONF_OTHER_ONE_TIME_CREDIT_EUR,
     CONF_PV_POWER_ENTITY,
     CONF_SELECTED_SOLCAST_SITE_IDS,
     CONF_SOLCAST_ENTRY_ID,
@@ -141,6 +147,7 @@ from .const import (
     CONTROL_EXECUTION_AVAILABLE,
     CONTROL_HORIZON_MINUTES,
     CONTROL_LIVE_DISPATCH_INTENTS,
+    CONTROL_MAX_SOURCE_AGE_SECONDS,
     CONTROL_MIN_POWER_KW,
     CONTROL_MODE_ACTIVE,
     CONTROL_MODE_OFF,
@@ -181,6 +188,7 @@ from .const import (
     ECONOMIC_BLOCKED_NONE,
     ECONOMIC_BLOCKED_NOT_ENABLED,
     EV_ABSENCE_GRACE_REFRESHES,
+    EVENT_CAMPAIGN_LIFECYCLE,
     EXECUTION_ABORT_STOP_REASONS,
     EXECUTION_COMPLETION_STOP_REASONS,
     EXECUTION_FAILED_STOP_REASONS,
@@ -191,6 +199,7 @@ from .const import (
     EXECUTION_STOP_EXECUTION_ERROR,
     EXECUTION_STOP_MARKER_LOST,
     EXECUTION_STOP_NO_BATTERY_PLAN,
+    EXECUTION_STOP_PLAN_REPLACED,
     EXECUTION_STOP_QUARTER_EXPIRED,
     EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
     EXECUTION_STOP_QUARTER_TARGET_REACHED,
@@ -213,12 +222,23 @@ from .const import (
     INHIBIT_PLAN_UNAVAILABLE,
     INHIBIT_WITHDRAWAL_REASONS,
     LIFECYCLE_ADMITTED,
+    LIFECYCLE_CLASS_COVERAGE_BUY,
+    LIFECYCLE_CLASS_ECONOMIC_BUY,
+    LIFECYCLE_CLASS_ECONOMIC_EXPORT,
+    LIFECYCLE_CLASS_MIXED_BUY,
+    LIFECYCLE_CLASS_SAFETY_BUY,
+    LIFECYCLE_CLASS_SERVE_LOAD,
+    LIFECYCLE_CLASS_UNKNOWN,
     LIFECYCLE_CLEANUP_COMPLETE,
     LIFECYCLE_DEADMAN_EXPIRED,
     LIFECYCLE_DEGRADED,
     LIFECYCLE_EXECUTING,
     LIFECYCLE_FOREIGN,
     LIFECYCLE_IDLE,
+    LIFECYCLE_KIND_CREATED,
+    LIFECYCLE_KIND_REMOVED,
+    LIFECYCLE_KIND_STARTED,
+    LIFECYCLE_KIND_STOPPED,
     LIFECYCLE_STARTING,
     LIFECYCLE_STATES,
     LIFECYCLE_STOPPED,
@@ -238,16 +258,24 @@ from .const import (
     MIN_QUARTER_COVERAGE,
     OUTCOME_CANCELED,
     OUTCOME_FAILED,
+    OUTCOME_NOT_EXECUTED,
     OUTCOME_PARTIAL,
     OUTCOME_SUCCESS,
+    OUTCOME_SUPERSEDED,
     OWNERSHIP_DEGRADED,
     OWNERSHIP_FOREIGN,
     OWNERSHIP_NONE,
     OWNERSHIP_OWNED,
     OWNERSHIP_UNPROVEN,
+    PRICE_BASIS_LIVE_FORECAST,
+    PRICE_BASIS_STORED_SNAPSHOT,
     PRICE_CROSS_CHECK_DISAGREES,
+    PRICE_EXPORT_BASIS_ADJUSTMENT_VAT,
+    PRICE_EXPORT_BASIS_API_FIELD,
+    PRICE_EXPORT_BASIS_UNKNOWN,
     PRICE_FLAG_EXPORT_CROSS_CHECK_FAILED,
     PRICE_FLAG_IMPORT_CROSS_CHECK_FAILED,
+    PRICE_LEG_ALL_IN_CASH,
     PRICE_UNAVAILABLE_NOT_CONFIGURED,
     PRICE_UNAVAILABLE_OPTIONS_UNREADABLE,
     PRICE_UNAVAILABLE_SOURCE_UNAVAILABLE,
@@ -280,11 +308,19 @@ from .const import (
     QUARTER_END_TARGET_REACHED,
     QUARTER_MINUTES,
     QUARTER_TARGET_TOLERANCE_KWH,
+    REALIZED_BENEFIT_BASIS_VERSION,
     REASON_VOCABULARY_CAMPAIGN_END,
     REASON_VOCABULARY_QUARTER_COMPLETION,
     REASON_VOCABULARY_RUN_STOP,
     REFUSE_MODE_NOT_ACTIVE,
     RETENTION_GATE_NO_PV,
+    ROI_MIN_SAMPLE_DAYS,
+    ROI_PAYBACK_UNAVAILABLE_INSUFFICIENT_HISTORY,
+    ROI_PAYBACK_UNAVAILABLE_NO_BENEFIT,
+    ROI_TRAILING_LONG_DAYS,
+    ROI_TRAILING_SHORT_DAYS,
+    ROI_UNAVAILABLE_NO_HISTORY,
+    ROI_UNAVAILABLE_NO_INVESTMENT,
     SAFETY_SAMPLE_SECONDS,
     SELECT_INVERTER_AC_LIMIT,
     SHORTFALL_ABSORBING_FREE_PV,
@@ -759,6 +795,22 @@ class SourceConfig:
     battery_throughput_cost_eur_per_kwh: float
     allow_grid_charging: bool
     allow_battery_export: bool
+    #: What the battery cost, what came back, and when it was bought. beta.42.
+    #:
+    #: **``None`` where the three levers above carry defaults**, and the difference
+    #: is deliberate: an installation that has not entered a purchase price is not
+    #: one whose battery was free. So the return sensor is unavailable with a named
+    #: reason rather than publishing a recovery against zero -- the same distinction
+    #: the three absent hardware facts already draw.
+    #:
+    #: **These reach nothing that decides.** Capital cost is not a marginal cost and
+    #: most of an installed battery is sunk, which is the reasoning the three
+    #: economic levers are built on; a purchase price that could move a dispatch
+    #: would be a category error, not a feature.
+    battery_investment_eur: float | None
+    battery_subsidy_eur: float | None
+    other_one_time_credit_eur: float | None
+    battery_investment_date: str | None
 
     @classmethod
     def from_entry(cls, entry: ConfigEntry) -> SourceConfig:
@@ -841,7 +893,51 @@ class SourceConfig:
             allow_battery_export=bool(
                 value(CONF_ALLOW_BATTERY_EXPORT, DEFAULT_ALLOW_BATTERY_EXPORT)
             ),
+            # ``_optional_number`` rather than ``_number``: absent has to survive as
+            # absent all the way to the sensor, or the reason it publishes would be
+            # a lie about a figure that had already been turned into a zero.
+            battery_investment_eur=_optional_number(value(CONF_BATTERY_INVESTMENT_EUR)),
+            battery_subsidy_eur=_optional_number(value(CONF_BATTERY_SUBSIDY_EUR)),
+            other_one_time_credit_eur=_optional_number(
+                value(CONF_OTHER_ONE_TIME_CREDIT_EUR)
+            ),
+            battery_investment_date=_optional_date(value(CONF_BATTERY_INVESTMENT_DATE)),
         )
+
+
+def _optional_number(raw: Any) -> float | None:
+    """Return a finite float, or ``None`` -- and never a default.
+
+    The distinction this preserves is the whole of beta.42's investment semantics:
+    *not entered* and *entered as zero* are different facts, and only the second is
+    a measurement. Collapsing them would let an installation that has said nothing
+    publish a recovery percentage against a battery that cost nothing.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value != value or abs(value) == float("inf"):
+        return None
+    return value
+
+
+def _optional_date(raw: Any) -> str | None:
+    """Return an ISO date string, or ``None``.
+
+    Validated as a real date rather than trusted as a string, because it becomes
+    the declared start of a lifetime accounting period. A malformed entry reads as
+    no investment date -- which the provenance block then reports -- rather than as
+    a date nothing can compare against.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return date.fromisoformat(raw[:10]).isoformat()
+    except (TypeError, ValueError):
+        return None
 
 
 def _site_ids(raw: Any) -> tuple[str, ...]:
@@ -1714,6 +1810,18 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: wrong without reading the source.
         self._campaign_objective_rows: int = 0
         self._campaign_measurable: bool = True
+        #: Every campaign this refresh's solve published, and how the purchase
+        #: attribution classifies it. Rebuilt each refresh, because attribution is
+        #: allowed to move under a surviving instance and freezing it here would
+        #: publish a stale word beside a live figure.
+        self._campaign_classifications: dict[str, dict[str, Any]] = {}
+        #: The last public terminal, as published. Read by the result sensor, which
+        #: therefore never re-derives it -- one derivation, one figure.
+        self._last_campaign_result: dict[str, Any] | None = None
+        #: The last computed export-price basis, with the sealed set it was
+        #: computed for. See :meth:`_roi_price_basis` for why an entity read must
+        #: not walk a year of stored issuances.
+        self._roi_basis_cache: tuple[tuple[Any, ...], dict[str, Any]] | None = None
         #: The finished campaign, latched. **Not consumed on read**: the surfaces
         #: make it fire once through their own ``closed`` set, and a latch a reader
         #: could exhaust would be a terminal that depends on who looked first.
@@ -3312,6 +3420,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._campaign_frozen_target_kwh = (
             live if live is not None else self._campaign_opening_target_kwh
         )
+        # The public transition rides the frozen one, so the two can never
+        # disagree about when a campaign began. beta.42.
+        self._lifecycle_started(now)
 
     @callback
     def _lifecycle_state_from(
@@ -3606,6 +3717,20 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.store.record_decision(
             {
                 "decision_at": now.isoformat(),
+                # **What this refresh cost, persisted. beta.42.**
+                #
+                # ``solve_ms`` existed only as an instantaneous reading in the live
+                # diagnostics payload and was never stored, so "what is the typical
+                # solve cost, and has it moved?" was structurally unanswerable from
+                # inside the codebase -- which is why it had to be measured from
+                # outside. Two floats on a two-day ring, and the ring already exists.
+                #
+                # There is no timing *guard* here and this does not become one. The
+                # measured duty cycle is 2.85 s against a 900 s period, so a warning
+                # threshold would be a number invented well before any evidence
+                # justified it. What this buys is the evidence.
+                "solve_ms": None if outcome is None else round(outcome.solve_ms, 1),
+                "solves": None if outcome is None else outcome.solve_count,
                 "start_energy_kwh": None if state is None else state.energy_kwh,
                 "start_soc_percent": None if state is None else state.soc_percent,
                 # The gates in force. Published *and* fingerprinted since beta.31:
@@ -4372,9 +4497,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         else:
             charge_kw = max(0.0, (flows.battery_charge_w or 0.0) / 1000.0)
             self._quarter_battery_kwh += charge_kw * hours
-            pv_w = self._read_pv_power_w()
-            load_w = self._read_house_load_w()
-            if pv_w is None or load_w is None:
+            measured = self._budget_surplus_kw()
+            if measured is None:
                 # Conservative: attribute the whole charge to the grid, so the
                 # ceiling binds earlier. A budget exists to bound buying.
                 #
@@ -4382,10 +4506,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # no readable surplus the grid share is the whole charge and the
                 # absorption branch has nothing to earn, so a site without a
                 # usable production entity gets no opportunistic absorption --
-                # by arithmetic rather than by a special case.
+                # by arithmetic rather than by a special case. Since beta.42 an
+                # *implausible* reading reaches this branch too, rather than
+                # inflating the surplus and emptying the ceiling.
                 surplus_kw = 0.0
             else:
-                surplus_kw = max(0.0, (pv_w - load_w) / 1000.0)
+                surplus_kw = measured
             self._quarter_grid_import_kwh += max(0.0, charge_kw - surplus_kw) * hours
             if surplus_kw > 0.0:
                 self._quarter_pv_helped = True
@@ -5328,6 +5454,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._campaign_quarters_admitted = 0
             self._campaign_measurable = True
             self._campaign_accrued_row = None
+            # **The one moment the codebase did not record. beta.42.** The campaign
+            # is public from here, so this is where its public lifecycle opens --
+            # after the opening target is captured, so ``planned_kwh`` is the figure
+            # the campaign actually announced rather than a null.
+            self._lifecycle_created(now, quarter)
 
         if self._campaign_id is None:
             return
@@ -5467,6 +5598,22 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Nothing physical happened, so there is nothing to have finished -- and
             # nothing to latch either, which is what leaves a never-started campaign
             # free to be attempted properly later.
+            #
+            # **The public lifecycle still closes, and through a different latch.
+            # beta.42.** Every ``created`` gets exactly one ``removed`` or the
+            # guarantee this surface is built on is not a guarantee. Routing that
+            # through the execution finality above would block the legitimate later
+            # attempt this early return exists to preserve, so the telemetry latch is
+            # separate, keyed on the instance, and touches neither
+            # ``_final_campaigns`` nor ``_closed_instances``. ``created -> removed``
+            # with no ``stopped`` is a legal sequence: nothing had begun to stop.
+            if campaign_id is not None:
+                self._lifecycle_removed(
+                    now,
+                    result=OUTCOME_NOT_EXECUTED,
+                    completion_reason=stop_reason,
+                    terminal=None,
+                )
             self._campaign_id = None
             self._campaign_instance_id = None
             self._campaign_opened_at = None
@@ -5589,6 +5736,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "across serve_load gaps and is reset only when the campaign closes"
             ),
         }
+        # **``superseded`` rather than ``partial`` for a started campaign the plan
+        # displaced. beta.42.** The shortfall is not the plant's: the campaign was
+        # overtaken by a newer authoritative plan, not missed. Applied only where the
+        # judgement above did not already reach something stronger, so an
+        # unmeasurable campaign is still ``failed`` and a met objective is still
+        # ``success`` -- the precedence is unchanged, this adds one leaf to it.
+        public_result = outcome
+        if outcome == OUTCOME_PARTIAL and stop_reason == EXECUTION_STOP_PLAN_REPLACED:
+            public_result = OUTCOME_SUPERSEDED
+        self._lifecycle_removed(
+            now,
+            result=public_result,
+            completion_reason=stop_reason,
+            terminal=self._closed_campaign,
+        )
         if instance_id is not None:
             self._closed_instances.append(instance_id)
             del self._closed_instances[:-MAX_ABORTED_CAMPAIGNS_REMEMBERED]
@@ -6133,6 +6295,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._quarter = None
             self._reset_quarter_progress(None)
             if scope == STOP_SCOPE_CAMPAIGN:
+                # **Published before the terminal, and only at campaign scope.**
+                # ``STOP_SCOPE_ROW`` reaches the shared ``_note_lifecycle`` calls
+                # above and deliberately not this one: that scope means the row is
+                # done and a later executable row remains, so the instance survives
+                # and re-arms at the next boundary. A public ``stopped`` there would
+                # fire at every row boundary and every ``serve_load`` gap.
+                self._lifecycle_stopped(now, reason)
                 self._close_campaign(now, reason)
                 self._plan = None
                 self._forward = None
@@ -6547,6 +6716,33 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._ev_seen = True
             self._ev_absences = 0
         return value_w
+
+    @callback
+    def _budget_surplus_kw(self) -> float | None:
+        """Return measured production surplus for the grid budget, or ``None``.
+
+        **The plausibility bands apply here too, and beta.42 exists because they
+        did not.** ``_read_pv_power_w`` returns a bare ``normalize_power_w`` with no
+        ceiling, and ``_read_house_load_w`` names an implausible reading and then
+        returns it anyway -- both correct for their own callers, where the
+        accumulator sanitises afterwards. This path had no accumulator behind it.
+
+        So a production entity spiking to a million watts made
+        ``max(0, charge - surplus)`` zero, and the grid-import ceiling accrued
+        nothing for the whole quarter. That ceiling is the only bound on how much a
+        run may buy, and the unguarded direction was the permissive one --
+        precisely what ``MAX_PLAUSIBLE_PV_W`` was introduced to stop for the balance
+        check, which is the reasoning this call site never received.
+
+        ``None`` when either reading is unusable, which the callers already treat as
+        "attribute the whole charge to the grid". The fail-safe direction is
+        unchanged; an implausible reading now reaches it instead of bypassing it.
+        """
+        pv_w = sanitize_pv_w(self._read_pv_power_w())
+        load_w = sanitize_load_w(self._read_house_load_w())
+        if pv_w is None or load_w is None:
+            return None
+        return max(0.0, (pv_w - load_w) / 1000.0)
 
     @callback
     def _read_pv_power_w(self) -> float | None:
@@ -7137,6 +7333,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # publishing path on purpose: an entity read must never write storage, and
         # the Economic Value attributes are read on every state update.
         self._note_opening_valuation(outcome=economic, plan=plan, now=now, today=today)
+
+        # **Written once per past day, and only here. beta.42.**
+        #
+        # Same reasoning as the line above and the same seam: an entity read must
+        # not write storage, and the ROI attributes are read on every state update.
+        # Sealing from the refresh also gives the pass the one thing it needs and a
+        # midnight timer could not -- an authoritative plan, whose limits convert
+        # stored state of charge to energy.
+        #
+        # Deliberately not "yesterday": every retained past day is offered, so a day
+        # that was unfinalisable for a week and then became complete is picked up
+        # rather than missed forever.
+        self.seal_finalizable_days(plan, today)
 
         # Derived from runs already solved, so this costs no extra search.
         #
@@ -8232,14 +8441,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if seconds <= 0.0 or seconds > MAX_SAMPLE_GAP_SECONDS:
             # Out of order, or a silence too long to integrate across.
             return
-        pv_w = self._read_pv_power_w()
-        load_w = self._read_house_load_w()
-        if pv_w is None or load_w is None:
-            # Incoherent inputs: attribute the whole charge to the grid, which is
-            # the conservative direction for a ceiling on buying.
+        measured_kw = self._budget_surplus_kw()
+        if measured_kw is None:
+            # Incoherent or implausible inputs: attribute the whole charge to the
+            # grid, which is the conservative direction for a ceiling on buying.
             surplus_w = 0.0
         else:
-            surplus_w = max(0.0, pv_w - load_w)
+            surplus_w = measured_kw * 1000.0
         grid_w = max(0.0, charge_w - surplus_w)
         self._execution_grid_kwh += grid_w * seconds / 3_600_000.0
 
@@ -8884,6 +9092,24 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for index in range(campaign.start_index, campaign.end_index + 1):
                 campaign_of[index] = (identity, closes_at)
 
+        # **The lifecycle classification, resolved on the same wiring. beta.42.**
+        #
+        # Read straight off the planner's own purchase attribution, and never from
+        # ``category_of()``. That helper is not observability-only: the category is a
+        # hash input to ``plan_id_for``, an exact-match key in ``ActivityState.find``,
+        # the trigger for the retraction path and a dict lookup selecting battery
+        # direction -- and it defaults an unknown category to ``economic``, which
+        # publishes "this purchase was entirely a choice" about a coverage buy. Being
+        # a hash input is the sharp end: a campaign reclassified between refreshes
+        # would get a new plan id, file a cancellation for the old line and open a
+        # fresh Planned one, which is the churn that surface was rewritten to kill.
+        #
+        # Attribution is *allowed to move* under a surviving instance -- nothing
+        # freezes the split, and a campaign spanning two admitted plans can legitimately
+        # read one thing then another. So this is recomputed every refresh and the
+        # lifecycle publishes both what it was at creation and what it finally was.
+        self._campaign_classifications = self._classify_campaigns(outcome, campaign_of)
+
         targets: list[dict[str, Any]] = []
         # Diagnostics only, and from a solve that already happened.
         attribution = outcome.safety_buy_attribution
@@ -8959,16 +9185,18 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         record = self.store.days.get(plan.target_day)
         if record is None:
             return {"available": False, "reason": "no_day_record"}
-        forecast = (self.price_forecasts or {}).get(plan.target_day)
-        if forecast is None:
+        resolved = self._prices_for_day(plan.target_day, record.interval_count)
+        if resolved is None:
             return {"available": False, "reason": "no_stored_prices"}
+        buy, sell, price_basis = resolved
 
         limits = plan.state.limits if plan.state is not None else None
-        series = self._realized_series(record, forecast, limits)
+        series = self._realized_series(record, (buy, sell), limits)
         window = self._realized_window_for(series, limits)
         return {
             "available": True,
             "day": plan.target_day.isoformat(),
+            "price_basis": price_basis,
             **window.as_dict(),
         }
 
@@ -8993,17 +9221,23 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return {"available": False, "reason": "no_day_record"}
         limits = plan.state.limits if plan.state is not None else None
         wanted = max(1, int(days))
-        forecasts = self.price_forecasts or {}
 
         merged: dict[str, list[Any]] = {}
         used: list[date] = []
+        bases: set[str] = set()
         for offset in range(wanted - 1, -1, -1):
             day = plan.target_day - timedelta(days=offset)
             record = self.store.days.get(day)
-            forecast = forecasts.get(day)
-            if record is None or forecast is None:
+            if record is None:
                 continue
-            for key, values in self._realized_series(record, forecast, limits).items():
+            resolved = self._prices_for_day(day, record.interval_count)
+            if resolved is None:
+                continue
+            buy, sell, price_basis = resolved
+            bases.add(price_basis)
+            for key, values in self._realized_series(
+                record, (buy, sell), limits
+            ).items():
                 merged.setdefault(key, []).extend(values)
             used.append(day)
 
@@ -9017,25 +9251,1074 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "days_priced": len(used),
             "first_day": used[0].isoformat(),
             "last_day": used[-1].isoformat(),
+            "price_basis": sorted(bases),
             **window.as_dict(),
         }
 
+    @staticmethod
+    def _negated(value: Any) -> float | None:
+        """Return ``-value``, or ``None``.
+
+        The terminal publishes a signed *tracking error* -- negative when the plant
+        under-delivered -- while a public result publishes a *shortfall*, which is
+        positive for the same event. One negation, in one place, rather than a sign
+        convention a reader has to carry between two payloads.
+        """
+        if value is None:
+            return None
+        return round(-float(value), 4)
+
+    # == public campaign lifecycle ==========================================
+    #
+    # Four transitions per attempt, at most one event each, persisted so a restart
+    # replays none of them. The identity is ``campaign_instance_id``, which already
+    # exists as the exactly-once attempt key and is minted at exactly one site.
+
     @callback
+    def _fire_lifecycle(self, kind: str, data: dict[str, Any]) -> None:
+        """Publish one lifecycle transition on the event bus."""
+        self.hass.bus.async_fire(EVENT_CAMPAIGN_LIFECYCLE, {"kind": kind, **data})
+
+    @callback
+    def _lifecycle_common(self) -> dict[str, Any]:
+        """Return the fields every kind carries."""
+        live = self._campaign_classification(self._campaign_id)
+        mark = self.store.campaign_lifecycle or {}
+        return {
+            "campaign_id": self._campaign_id,
+            "campaign_instance_id": self._campaign_instance_id,
+            "purpose": mark.get("purpose"),
+            "classification": live.get("classification", LIFECYCLE_CLASS_UNKNOWN),
+            "classification_at_creation": mark.get("classification_at_creation"),
+            "objective_boundary": self._campaign_boundary,
+            "planned_kwh": mark.get("planned_kwh"),
+            "window_start": mark.get("window_start"),
+            "window_end": (
+                None
+                if self._campaign_end_utc is None
+                else self._campaign_end_utc.isoformat()
+            ),
+            "revision": mark.get("revision"),
+        }
+
+    @callback
+    def _lifecycle_created(self, now: datetime, quarter: Any) -> None:
+        """Open the public lifecycle for the instance just minted.
+
+        Fired where the campaign actually becomes public -- when
+        ``_note_campaign_progress`` opens it -- with **no pre-announcement and no
+        timing promise**. A plan Stage A has published but Stage B has not yet
+        placed is not a campaign; announcing one would put a line in the log for
+        every plan that a later refresh replaced before anything happened.
+        """
+        instance_id = self._campaign_instance_id
+        if instance_id is None:
+            return
+        live = self._campaign_classification(self._campaign_id)
+        self.store.campaign_lifecycle = {
+            "instance_id": instance_id,
+            "campaign_id": self._campaign_id,
+            "opened_at": now.isoformat(),
+            "marks": [LIFECYCLE_KIND_CREATED],
+            "purpose": getattr(quarter, "intent", None),
+            "classification_at_creation": live.get(
+                "classification", LIFECYCLE_CLASS_UNKNOWN
+            ),
+            "objective_boundary": self._campaign_boundary,
+            "planned_kwh": (
+                None
+                if self._campaign_opening_target_kwh is None
+                else round(self._campaign_opening_target_kwh, 3)
+            ),
+            "window_start": now.isoformat(),
+            "window_end": (
+                None
+                if self._campaign_end_utc is None
+                else self._campaign_end_utc.isoformat()
+            ),
+            "revision": getattr(quarter, "revision", None),
+            "started_at": None,
+            "stopped_at": None,
+            "stop_reason": None,
+            "realized_kwh": 0.0,
+            "measurable": True,
+            "result": None,
+        }
+        self.store.schedule_save()
+        self._fire_lifecycle(LIFECYCLE_KIND_CREATED, self._lifecycle_common())
+
+    @callback
+    def _lifecycle_started(self, now: datetime) -> None:
+        """Note the first confirmed activation of the open instance.
+
+        ``started`` is already monotonic in the executor and this only mirrors it:
+        ``_campaign_started_at`` is written once behind an idempotent guard, and the
+        two writes that clear it both happen after the instance identity has already
+        changed or been cleared.
+        """
+        mark = self.store.campaign_lifecycle
+        if mark is None or LIFECYCLE_KIND_STARTED in mark["marks"]:
+            return
+        mark["marks"].append(LIFECYCLE_KIND_STARTED)
+        mark["started_at"] = now.isoformat()
+        self.store.schedule_save()
+        self._fire_lifecycle(
+            LIFECYCLE_KIND_STARTED,
+            {**self._lifecycle_common(), "started_at": mark["started_at"]},
+        )
+
+    @callback
+    def _lifecycle_stopped(self, now: datetime, reason: str | None) -> None:
+        """Note that execution ended for good.
+
+        **Only from a campaign-scoped stop or the terminal**, never from a row-scope
+        one. A row-scope stop means this row is done and a later executable row
+        remains: the frozen plan and the campaign instance survive, the dispatch
+        stops and the next boundary arms again. Emitting there would put a line in
+        the log at every row boundary and at every ``serve_load`` gap -- which is
+        the per-quarter noise this surface exists to replace.
+
+        Nothing is published for an instance that never started, because nothing
+        physical had begun to stop.
+        """
+        mark = self.store.campaign_lifecycle
+        if mark is None or LIFECYCLE_KIND_STOPPED in mark["marks"]:
+            return
+        if LIFECYCLE_KIND_STARTED not in mark["marks"]:
+            return
+        mark["marks"].append(LIFECYCLE_KIND_STOPPED)
+        mark["stopped_at"] = now.isoformat()
+        mark["stop_reason"] = reason
+        mark["realized_kwh"] = round(self._campaign_realized_now(), 3)
+        mark["measurable"] = self._campaign_measurable
+        # **The evidence, not merely the mark.** Without the frozen target and the
+        # tolerance, a restart landing between this and the terminal -- which follows
+        # in the same call, so the window is narrow but real -- could not tell a
+        # finished campaign from an interrupted one, and would report a success as a
+        # failure.
+        mark["frozen_target_kwh"] = self._campaign_frozen_target_kwh
+        mark["success_tolerance_kwh"] = round(
+            self._completion_tolerance_kwh(
+                self._campaign_frozen_target_kwh, self._campaign_quarters_admitted
+            ),
+            4,
+        )
+        self.store.schedule_save()
+        self._fire_lifecycle(
+            LIFECYCLE_KIND_STOPPED,
+            {
+                **self._lifecycle_common(),
+                "realised_kwh": mark["realized_kwh"],
+                "started_at": mark.get("started_at"),
+                "stopped_at": mark["stopped_at"],
+                "stop_reason": reason,
+            },
+        )
+
+    @callback
+    def _lifecycle_removed(
+        self,
+        now: datetime,
+        *,
+        result: str,
+        completion_reason: str | None,
+        terminal: dict[str, Any] | None,
+    ) -> None:
+        """File the public terminal, exactly once per attempt.
+
+        **The latch here is a telemetry one and touches neither of the two that
+        already exist.** ``_final_campaigns`` means a campaign may never run again;
+        ``_closed_instances`` is session-local and bounded. A never-started campaign
+        has to receive this event *and* stay free to be attempted properly later, so
+        filing its terminal through either would block a legitimate later attempt --
+        which is exactly what ``_close_campaign`` returns early to avoid.
+        """
+        mark = self.store.campaign_lifecycle
+        instance_id = (
+            self._campaign_instance_id
+            if mark is None
+            else mark.get("instance_id", self._campaign_instance_id)
+        )
+        if instance_id is None or self.store.lifecycle_closed(instance_id):
+            self.store.campaign_lifecycle = None
+            return
+        common = self._lifecycle_common()
+        common["campaign_instance_id"] = instance_id
+        live = common["classification"]
+        payload = {
+            **common,
+            "final_classification": live,
+            "realised_kwh": (
+                0.0 if terminal is None else terminal.get("objective_realized_kwh", 0.0)
+            ),
+            "shortfall_kwh": (
+                None
+                if terminal is None
+                else self._negated(terminal.get("objective_tracking_error_kwh"))
+            ),
+            "first_executable_at": (None if mark is None else mark.get("started_at")),
+            "started_at": (None if mark is None else mark.get("started_at")),
+            "stopped_at": (None if mark is None else mark.get("stopped_at")),
+            "finished_at": now.isoformat(),
+            "result": result,
+            "completion_reason": completion_reason,
+            "objective_measurable": (
+                True if terminal is None else terminal.get("objective_measurable", True)
+            ),
+            "success_tolerance_kwh": (
+                None if terminal is None else terminal.get("success_tolerance_kwh")
+            ),
+        }
+        breakdown = self._campaign_classification(common["campaign_id"])
+        for key in (
+            "safety_buy_kwh",
+            "coverage_buy_kwh",
+            "economic_buy_kwh",
+            "grid_export_kwh",
+        ):
+            if key in breakdown:
+                payload[key] = breakdown[key]
+        self.store.note_lifecycle_closed(instance_id)
+        self.store.campaign_lifecycle = None
+        self.store.schedule_save()
+        self._last_campaign_result = payload
+        self._fire_lifecycle(LIFECYCLE_KIND_REMOVED, payload)
+
+    @callback
+    def _recover_campaign_lifecycle(self, now: datetime) -> str | None:
+        """Close a lifecycle left dangling by a restart. Returns what it did.
+
+        **A ``created`` that can never be closed breaks the one guarantee this
+        surface is built on**, and before beta.42 every restart mid-campaign left
+        one: the open instance lived only in memory, so a fresh id was minted with a
+        new ``opened_at`` and the pre-restart instance never received ``removed``.
+        One physical objective appeared twice in the log under two ids.
+
+        Closing rather than resuming is what the executor already decided. beta.27's
+        restart policy is to **stop** an owned dispatch and mark progress unknown --
+        ``_adopt_persisted_run`` adopts a run only in order to stop it. A restart
+        really does end the attempt, so the lifecycle agrees with the executor rather
+        than overruling it.
+
+        **But the four states do not close the same way, and calling them all
+        ``failed`` would be closing the log rather than reporting it:**
+
+        ``created`` only
+            Nothing physical happened, so ``not_executed`` -- and **no** ``stopped``,
+            because nothing had begun to stop. Execution finality is not touched,
+            which is precisely what leaves a legitimate later attempt permitted.
+
+        ``created`` + ``started``
+            ``failed``, with ``quarter_progress_unknown``. Not a judgement invented
+            here: the adoption marks progress unknown, which clears
+            ``_campaign_measurable``, and the honesty guard already makes success
+            unreachable when the total is not a measurement.
+
+        ``created`` + ``started`` + ``stopped``
+            The verdict was reachable before the restart, so it is **reconstructed
+            from the persisted evidence** rather than downgraded. This is why the
+            marks carry the frozen target, the realised total, the measurability and
+            the reason -- without them this state is indistinguishable from the one
+            above, and the log would report a finished campaign as failed.
+
+        ``removed``
+            Already published. The mark is cleared when it fires, so there is nothing
+            here to find.
+        """
+        mark = self.store.campaign_lifecycle
+        if mark is None:
+            return None
+        instance_id = mark.get("instance_id")
+        if self.store.lifecycle_closed(instance_id):
+            self.store.campaign_lifecycle = None
+            return "already_closed"
+        marks = mark.get("marks") or []
+        campaign_id = mark.get("campaign_id")
+
+        if LIFECYCLE_KIND_STARTED not in marks:
+            reason = self._dangling_creation_reason(mark, now)
+            if reason is None:
+                # **Deliberately left open.** The store is read during setup and the
+                # first solve happens later, so at restore time there is no
+                # authoritative plan to say whether a replacement exists -- guessing
+                # ``plan_replaced`` there would be inventing a fact. The instance is
+                # re-examined every refresh until one of the two answers is true, so
+                # it closes *late* rather than *wrongly*. Nothing is blocked
+                # meanwhile: this state never latched execution finality.
+                return "deferred"
+            self._publish_recovered_terminal(
+                mark,
+                now,
+                result=OUTCOME_NOT_EXECUTED,
+                completion_reason=reason,
+                realised_kwh=0.0,
+                shortfall_kwh=None,
+                measurable=True,
+                emit_stopped=False,
+            )
+            return "not_executed"
+
+        realised = float(mark.get("realized_kwh") or 0.0)
+        target = mark.get("frozen_target_kwh")
+        tolerance = mark.get("success_tolerance_kwh")
+        if LIFECYCLE_KIND_STOPPED in marks:
+            measurable = bool(mark.get("measurable", True))
+            result = self._recovered_outcome(
+                measurable=measurable,
+                target_kwh=target,
+                realised_kwh=realised,
+                tolerance_kwh=tolerance,
+                stop_reason=mark.get("stop_reason"),
+            )
+            self._publish_recovered_terminal(
+                mark,
+                now,
+                result=result,
+                completion_reason=mark.get("stop_reason"),
+                realised_kwh=realised,
+                shortfall_kwh=(None if target is None else round(target - realised, 4)),
+                measurable=measurable,
+                emit_stopped=False,
+            )
+            return result
+
+        # Started and never stopped: the restart is the stop.
+        self._publish_recovered_terminal(
+            mark,
+            now,
+            result=OUTCOME_FAILED,
+            completion_reason=EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
+            realised_kwh=realised,
+            shortfall_kwh=(None if target is None else round(target - realised, 4)),
+            measurable=False,
+            emit_stopped=True,
+        )
+        _LOGGER.debug(
+            "Campaign %s instance %s was open across a restart; closed as failed "
+            "with quarter_progress_unknown",
+            campaign_id,
+            instance_id,
+        )
+        return OUTCOME_FAILED
+
+    @callback
+    def _recovered_outcome(
+        self,
+        *,
+        measurable: bool,
+        target_kwh: float | None,
+        realised_kwh: float,
+        tolerance_kwh: float | None,
+        stop_reason: str | None,
+    ) -> str:
+        """Return the outcome the pre-restart evidence supports.
+
+        **The same precedence ``_close_campaign`` applies, over persisted evidence
+        instead of live state**, and it is written out rather than shared because the
+        two read different things: that one reads the coordinator, this one reads a
+        document. Sharing the body would mean giving the live path a dictionary
+        interface it does not want.
+
+        Unmeasurable outranks a met objective, exactly as it does live: a total that
+        is not a measurement cannot be evidence of success.
+        """
+        if not measurable:
+            return OUTCOME_FAILED
+        if target_kwh is None:
+            return OUTCOME_PARTIAL
+        if tolerance_kwh is not None and target_kwh - realised_kwh <= tolerance_kwh:
+            return OUTCOME_SUCCESS
+        if stop_reason in EXECUTION_FAILED_STOP_REASONS:
+            return OUTCOME_FAILED
+        if stop_reason == EXECUTION_STOP_PLAN_REPLACED:
+            return OUTCOME_SUPERSEDED
+        if stop_reason in EXECUTION_COMPLETION_STOP_REASONS:
+            return OUTCOME_PARTIAL
+        if stop_reason:
+            return OUTCOME_CANCELED
+        return OUTCOME_PARTIAL
+
+    @callback
+    def _dangling_creation_reason(
+        self, mark: dict[str, Any], now: datetime
+    ) -> str | None:
+        """Return why a never-started campaign ended, or ``None`` to ask again later.
+
+        Two authoritative answers and no third: a newer plan demonstrably covers the
+        window, or the window is simply past. Anything else means the question cannot
+        be answered yet, and the honest response to that is to wait rather than to
+        pick one.
+        """
+        stored = mark.get("window_end")
+        window_end = dt_util.parse_datetime(stored) if isinstance(stored, str) else None
+        plan = self._plan
+        if (
+            plan is not None
+            and plan.campaign_id is not None
+            and plan.campaign_id != mark.get("campaign_id")
+        ):
+            return EXECUTION_STOP_PLAN_REPLACED
+        if window_end is not None and now >= window_end:
+            return EXECUTION_STOP_WINDOW_ENDED
+        return None
+
+    @callback
+    def _publish_recovered_terminal(
+        self,
+        mark: dict[str, Any],
+        now: datetime,
+        *,
+        result: str,
+        completion_reason: str | None,
+        realised_kwh: float,
+        shortfall_kwh: float | None,
+        measurable: bool,
+        emit_stopped: bool,
+    ) -> None:
+        """Emit the closing events for a recovered instance, exactly once.
+
+        The classification published here is the one recorded at creation, and only
+        that one. A live reclassification would come from *this* boot's solve, which
+        never saw the campaign -- so it would be a fact about a different plan wearing
+        the recovered campaign's name.
+        """
+        instance_id = mark.get("instance_id")
+        if instance_id is None or self.store.lifecycle_closed(instance_id):
+            self.store.campaign_lifecycle = None
+            return
+        recorded = mark.get("classification_at_creation", LIFECYCLE_CLASS_UNKNOWN)
+        common = {
+            "campaign_id": mark.get("campaign_id"),
+            "campaign_instance_id": instance_id,
+            "purpose": mark.get("purpose"),
+            "classification": recorded,
+            "classification_at_creation": recorded,
+            "objective_boundary": mark.get("objective_boundary"),
+            "planned_kwh": mark.get("planned_kwh"),
+            "window_start": mark.get("window_start"),
+            "window_end": mark.get("window_end"),
+            "revision": mark.get("revision"),
+            "recovered_after_restart": True,
+        }
+        if emit_stopped and LIFECYCLE_KIND_STOPPED not in (mark.get("marks") or []):
+            self._fire_lifecycle(
+                LIFECYCLE_KIND_STOPPED,
+                {
+                    **common,
+                    "realised_kwh": realised_kwh,
+                    "started_at": mark.get("started_at"),
+                    "stopped_at": now.isoformat(),
+                    "stop_reason": completion_reason,
+                },
+            )
+        payload = {
+            **common,
+            "final_classification": recorded,
+            "realised_kwh": realised_kwh,
+            "shortfall_kwh": shortfall_kwh,
+            "first_executable_at": mark.get("started_at"),
+            "started_at": mark.get("started_at"),
+            "stopped_at": mark.get("stopped_at")
+            or (now.isoformat() if emit_stopped else None),
+            "finished_at": now.isoformat(),
+            "result": result,
+            "completion_reason": completion_reason,
+            "objective_measurable": measurable,
+            "success_tolerance_kwh": mark.get("success_tolerance_kwh"),
+        }
+        self.store.note_lifecycle_closed(instance_id)
+        self.store.campaign_lifecycle = None
+        self.store.schedule_save()
+        self._last_campaign_result = payload
+        self._fire_lifecycle(LIFECYCLE_KIND_REMOVED, payload)
+
+    @callback
+    def _classify_campaigns(
+        self, outcome: Any, campaign_of: dict[int, tuple[str, datetime]]
+    ) -> dict[str, dict[str, Any]]:
+        """Return the lifecycle classification of each campaign this solve published.
+
+        **Derived from the three disjoint purchase categories, in their precedence**,
+        and from nothing else. Safety outranks Coverage outranks Economic, the
+        planner already subtracts coverage out of the economic half so the published
+        pair cannot report a coverage kWh as a trade, and every purchased kWh belongs
+        to exactly one. Summing them per campaign is therefore a partition, not an
+        estimate.
+
+        Exactly one category present names the campaign; more than one makes it
+        ``mixed_buy`` with the three-way breakdown beside it, because "mixed" without
+        the split is a word rather than a figure.
+
+        **A discharge campaign is judged on whether it sells, not on whether it
+        moves energy.** One whose segments are all ``serve_load`` has an objective of
+        zero at a battery boundary and commands no actuator: the inverter is serving
+        the house from the pack, which is ordinary self-consumption and not a trade.
+        Calling it an export would put a lifecycle line in the log for every evening.
+        """
+        buys: dict[str, dict[str, float]] = {}
+        sells: dict[str, float] = {}
+        safety = outcome.safety_buy_attribution
+        coverage = outcome.coverage_buy_attribution
+        for run in outcome.desired.runs:
+            resolved = campaign_of.get(run.start_index)
+            if resolved is None:
+                continue
+            identity = resolved[0]
+            if run.start_index in safety or run.start_index in coverage:
+                safety_kwh, economic_kwh = safety.get(run.start_index, (0.0, 0.0))
+                totals = buys.setdefault(
+                    identity,
+                    {
+                        "safety_buy_kwh": 0.0,
+                        "coverage_buy_kwh": 0.0,
+                        "economic_buy_kwh": 0.0,
+                    },
+                )
+                totals["safety_buy_kwh"] += float(safety_kwh)
+                totals["economic_buy_kwh"] += float(economic_kwh)
+                totals["coverage_buy_kwh"] += float(coverage.get(run.start_index, 0.0))
+            else:
+                sells[identity] = sells.get(identity, 0.0) + float(
+                    getattr(run, "grid_export_kwh", 0.0) or 0.0
+                )
+
+        classified: dict[str, dict[str, Any]] = {}
+        for identity, totals in buys.items():
+            present = [
+                name
+                for name, value in (
+                    (LIFECYCLE_CLASS_SAFETY_BUY, totals["safety_buy_kwh"]),
+                    (LIFECYCLE_CLASS_COVERAGE_BUY, totals["coverage_buy_kwh"]),
+                    (LIFECYCLE_CLASS_ECONOMIC_BUY, totals["economic_buy_kwh"]),
+                )
+                if value > CAMPAIGN_CLASSIFICATION_EPSILON_KWH
+            ]
+            if len(present) == 1:
+                classification = present[0]
+            elif present:
+                classification = LIFECYCLE_CLASS_MIXED_BUY
+            else:
+                classification = LIFECYCLE_CLASS_UNKNOWN
+            classified[identity] = {
+                "classification": classification,
+                **{name: round(value, 4) for name, value in totals.items()},
+            }
+        for identity, exported in sells.items():
+            if identity in classified:
+                continue
+            classified[identity] = {
+                "classification": (
+                    LIFECYCLE_CLASS_ECONOMIC_EXPORT
+                    if exported > CAMPAIGN_CLASSIFICATION_EPSILON_KWH
+                    else LIFECYCLE_CLASS_SERVE_LOAD
+                ),
+                "grid_export_kwh": round(exported, 4),
+            }
+        return classified
+
+    @callback
+    def _campaign_classification(self, campaign_id: str | None) -> dict[str, Any]:
+        """Return the live classification of one campaign, or an unknown marker.
+
+        ``unknown`` when this refresh's solve does not name the campaign -- which is
+        an ordinary state for a campaign whose remaining rows are all behind the
+        current head, not an error. It never guesses ``economic``, because guessing
+        is the specific defect this surface exists to avoid.
+        """
+        if campaign_id is None:
+            return {"classification": LIFECYCLE_CLASS_UNKNOWN}
+        return dict(
+            self._campaign_classifications.get(
+                campaign_id, {"classification": LIFECYCLE_CLASS_UNKNOWN}
+            )
+        )
+
+    @callback
+    def battery_return(self, today: date) -> dict[str, Any]:
+        """Return what the battery has recovered of what it cost, and on what basis.
+
+        **The numerator is the cash comparator and nothing else**: what the meter
+        would have cost with no battery, less what it actually cost, summed over
+        finalised days. Deliberately *not* the figure that shipped as
+        ``realized_net_value_eur`` -- that one equals
+        ``TRUE - sum(p*min(I,N)) + sum(s*X)``, the household's whole position. It
+        subtracts an unavoidable import bill and credits PV export that needed no
+        battery, so ``sum(p*min(I,N))`` dominates and it is structurally negative for
+        any household that imports anything. Shown as "battery savings" it would have
+        said the battery destroys value. Its own docstring is accurate; the name was
+        the problem, and this is the correction rather than a second opinion.
+
+        **Half the price basis is genuinely cash and half is a reconstruction, and
+        this publishes which rather than averaging over the difference.** The import
+        leg is all-in: wholesale plus market tax plus sourcing markup plus energy
+        tax, VAT-inclusive, taken from ``total_price_eur_kwh``. The export leg is not
+        -- the source publishes no feed-in price, so it is rebuilt as
+        ``market_price + adjustment`` with the adjustment defaulting to zero and the
+        VAT flag defaulting to off. On a stock configuration ``s`` is bare wholesale.
+        The battery's benefit is mostly avoided import, so the error is small on this
+        installation and could be large on an export-heavy one -- which is why the
+        size of the reconstructed leg is a **published figure** rather than a
+        reassurance that it is bounded.
+
+        Nothing here is forecast or planner-derived. No opening or closing inventory
+        value, no remaining-expected, no revaluation, no ``model_terms``: every one
+        of those revalues on each refresh, which would make a lifetime total move
+        without a day having passed.
+        """
+        config = self.config
+        gross = config.battery_investment_eur
+        if gross is None:
+            return {
+                "available": False,
+                "unavailable_reason": ROI_UNAVAILABLE_NO_INVESTMENT,
+            }
+        subsidy = config.battery_subsidy_eur or 0.0
+        credit = config.other_one_time_credit_eur or 0.0
+        net = round(gross - subsidy - credit, 2)
+
+        lifetime = self.lifetime_benefit(today)
+        cumulative = lifetime["cumulative_realised_benefit_eur"]
+        sample_days = lifetime["sealed_days"]
+        # **Not "are any days still retained".** A figure whose days have all aged
+        # out of the 365-day window is still a measurement -- that is precisely the
+        # case the running total exists for -- so the availability gate is whether
+        # anything has ever been sealed, not whether the evidence is still on disk.
+        if not sample_days:
+            return {
+                "available": False,
+                "unavailable_reason": ROI_UNAVAILABLE_NO_HISTORY,
+                "gross_investment_eur": gross,
+                "subsidy_eur": subsidy,
+                "other_one_time_credit_eur": credit,
+                "net_investment_eur": net,
+            }
+
+        short = self._trailing_benefit(today, ROI_TRAILING_SHORT_DAYS)
+        long = self._trailing_benefit(today, ROI_TRAILING_LONG_DAYS)
+        recovered = None if net <= 0.0 else round(100.0 * cumulative / net, 2)
+        payback = self._payback_from(long, net, cumulative, today)
+
+        return {
+            "available": True,
+            "gross_investment_eur": gross,
+            "subsidy_eur": subsidy,
+            "other_one_time_credit_eur": credit,
+            "net_investment_eur": net,
+            "cumulative_realised_benefit_eur": cumulative,
+            "remaining_to_recover_eur": round(max(0.0, net - cumulative), 2),
+            "recovered_percent": recovered,
+            "average_realised_benefit_per_day_eur": (
+                round(cumulative / sample_days, 4) if sample_days else None
+            ),
+            "trailing_30d_eur": short["total_eur"],
+            "trailing_30d_days": short["days"],
+            "trailing_90d_eur": long["total_eur"],
+            "trailing_90d_days": long["days"],
+            "sample_days": sample_days,
+            **payback,
+            **self._roi_provenance(lifetime, today),
+            **self._roi_price_basis(today),
+        }
+
+    @callback
+    def _trailing_benefit(self, today: date, window: int) -> dict[str, Any]:
+        """Return the sealed benefit over the last ``window`` civil days.
+
+        **Sealed values only, never a re-derivation.** A trailing mean assembled by
+        re-pricing would move whenever a day's prices were re-issued, and a payback
+        estimate built on a mean that moves is not an estimate.
+
+        ``days`` is published beside the total because a 30-day window over 11
+        sealed days is a different figure from one over 30, and only the count says
+        which it was.
+        """
+        first = today - timedelta(days=window)
+        values = [
+            record.benefit_eur_final
+            for day, record in self.store.days.items()
+            if first <= day < today and record.benefit_eur_final is not None
+        ]
+        return {"total_eur": round(sum(values), 4), "days": len(values)}
+
+    @callback
+    def _payback_from(
+        self,
+        trailing: dict[str, Any],
+        net_investment_eur: float,
+        cumulative_eur: float,
+        today: date,
+    ) -> dict[str, Any]:
+        """Return the payback estimate, or a named reason there is none.
+
+        **One published estimate, from the trailing 90-day mean**, with the 30-day
+        figure beside it so a reader can see the spread rather than being offered two
+        answers and asked to choose.
+
+        Two refusals, both named. Under ``ROI_MIN_SAMPLE_DAYS`` priceable days the
+        extrapolation says more about the season than the battery. At or below a zero
+        trailing mean the recorded period did not pay -- which is a real measurement,
+        published as one -- and dividing by it would give either an error or a date
+        in the past, and a date in the past would read as a fact.
+        """
+        days = trailing["days"]
+        if days < ROI_MIN_SAMPLE_DAYS:
+            return {
+                "estimated_payback_date": None,
+                "estimated_payback_years": None,
+                "payback_unavailable_reason": (
+                    ROI_PAYBACK_UNAVAILABLE_INSUFFICIENT_HISTORY
+                ),
+            }
+        per_day = trailing["total_eur"] / days
+        if per_day <= 0.0:
+            return {
+                "estimated_payback_date": None,
+                "estimated_payback_years": None,
+                "payback_unavailable_reason": ROI_PAYBACK_UNAVAILABLE_NO_BENEFIT,
+            }
+        remaining = max(0.0, net_investment_eur - cumulative_eur)
+        days_left = remaining / per_day
+        return {
+            "estimated_payback_date": (
+                today + timedelta(days=round(days_left))
+            ).isoformat(),
+            "estimated_payback_years": round(days_left / 365.25, 2),
+            "payback_unavailable_reason": None,
+        }
+
+    @callback
+    def _roi_provenance(self, lifetime: dict[str, Any], today: date) -> dict[str, Any]:
+        """Return what period the cumulative figure actually covers.
+
+        **The gap is reported, never estimated.** An operator may enter a purchase
+        date earlier than the first day this integration has authoritative accounting
+        for, and the figure must not read as "benefit since purchase" when the
+        evidence starts later. The total is still published -- it is a true
+        measurement of the days it covers -- and the reader is told which days those
+        are, which is this module's own rule that a total missing one of its terms is
+        a different number wearing the same name.
+        """
+        configured = self.config.battery_investment_date
+        available = lifetime["history_available_since"]
+        start = available
+        if configured and available:
+            start = max(configured, available)
+        elif configured:
+            start = configured
+        complete = bool(configured and available and available <= configured)
+        return {
+            "investment_date": configured,
+            "history_available_since": available,
+            "accounting_start_date": start,
+            "sealed_through": lifetime["sealed_through"],
+            "unsealed_past_days": lifetime["unsealed_past_days"],
+            # **The split, because the two halves have different evidence behind
+            # them.** The retained half can still be checked against the day records
+            # on disk; the evicted half cannot, and a reader auditing the figure
+            # needs to know which part they can go and look at.
+            "retained_sealed_eur": lifetime["retained_sealed_eur"],
+            "retained_sealed_days": lifetime["retained_sealed_days"],
+            "sealed_evicted_eur": lifetime["sealed_evicted_eur"],
+            "sealed_evicted_through": lifetime["sealed_evicted_through"],
+            "lifetime_history_complete": complete,
+            "benefit_basis_version": lifetime["basis_version"],
+        }
+
+    @callback
+    def _roi_price_basis(self, today: date) -> dict[str, Any]:
+        """Return how each price leg was formed, beside the figure it produced.
+
+        **Read from the days the figure actually covers**, not from today's
+        configuration. Each stored issuance carries its own ``export_basis`` per
+        interval, expressly so a later reader can tell "the market moved" from "the
+        rule changed" -- and a lifetime figure spanning a configuration change has to
+        report both bases rather than the current one.
+
+        ``export_leg_is_cash`` sits next to the euro figures rather than inside a
+        nested basis map, following the ``model_terms.is_cash`` precedent: a caveat
+        reachable only through the diagnostics download is a caveat nobody reads.
+        """
+        # **Memoised on the sealed set, because this is read from an entity.**
+        # Home Assistant re-reads attributes on every state update, and the scan
+        # below walks a year of days and 96 basis tokens each -- roughly 35 000
+        # set operations to answer a question whose answer changes at most once a
+        # day, when a day is sealed. The key is the sealed-day count and the civil
+        # day, which are exactly the two things that can move the answer: a new
+        # seal, or midnight bringing a different fallback into view.
+        key = (len(self.store.days), self.store.sealed_day_count, today)
+        cached = self._roi_basis_cache
+        if cached is not None and cached[0] == key:
+            return dict(cached[1])
+        observed: set[str] = set()
+        for day, record in self.store.days.items():
+            if record.final_benefit is None:
+                continue
+            snapshot = self.history.latest_price_snapshot(day)
+            if snapshot is not None:
+                observed.update(snapshot.export_basis)
+        forecast = (self.price_forecasts or {}).get(today)
+        if not observed and forecast is not None:
+            observed.update(
+                interval.export_basis
+                for interval in forecast.intervals
+                if getattr(interval, "export_basis", None)
+            )
+        observed.discard(PRICE_EXPORT_BASIS_UNKNOWN)
+        # **Cash only where the evidence says cash.** A published feed-in price is
+        # the real thing; a reconstruction that had VAT applied is close enough to
+        # call cash. A bare ``market_price_plus_adjustment`` is not: the adjustment
+        # defaults to zero and the VAT flag to off, so on a stock configuration that
+        # token means the wholesale price with nothing added, and the token itself
+        # cannot say whether an adjustment was configured. Refusing to claim cash
+        # there is the same choice as refusing to guess a category elsewhere.
+        is_cash = bool(observed) and observed <= {
+            PRICE_EXPORT_BASIS_API_FIELD,
+            PRICE_EXPORT_BASIS_ADJUSTMENT_VAT,
+        }
+        published = {
+            "import_leg_basis": PRICE_LEG_ALL_IN_CASH,
+            "export_leg_basis": sorted(observed) or [PRICE_EXPORT_BASIS_UNKNOWN],
+            "export_leg_is_cash": is_cash,
+            "calculation_basis": (
+                CALCULATION_BASIS_IMPORT_CASH_EXPORT_CASH
+                if is_cash
+                else CALCULATION_BASIS_IMPORT_CASH_EXPORT_RECONSTRUCTED
+            ),
+            "rule": (
+                "the import leg is all-in cash -- wholesale, market tax, sourcing "
+                "markup and energy tax, VAT inclusive -- and excludes fixed daily "
+                "and annual charges, which are not per-kWh and so cannot distort a "
+                "marginal figure, but do mean this will never reconcile to a "
+                "supplier invoice. the export leg is reconstructed from the market "
+                "price unless the source published a real feed-in price or VAT was "
+                "applied to the reconstruction, and export_leg_is_cash says which. "
+                "no forecast, planner valuation or inventory revaluation reaches "
+                "any figure here"
+            ),
+        }
+        self._roi_basis_cache = (key, published)
+        return dict(published)
+
+    @callback
+    def seal_finalizable_days(self, plan: Any, today: date) -> int:
+        """Seal every retained past day that qualifies. Returns how many moved.
+
+        **Runs on an ordinary refresh rather than on a midnight timer**, because
+        the condition being waited for is evidence, not a time. Yesterday's last
+        quarter closes after midnight and is filed against yesterday, so the first
+        valid refresh of today is the earliest moment the day is actually complete
+        -- and a day that is *not* complete then simply gets asked again on the next
+        one. A day is therefore sealed late rather than sealed short.
+
+        Ascending, so the lifetime cursor can only ever move forwards, and
+        idempotent twice over: :meth:`DayRecord.note_final_benefit` refuses a day
+        that already has a figure, and the pass skips it before computing one.
+        """
+        if plan is None:
+            return 0
+        limits = plan.state.limits if plan.state is not None else None
+        stamp = dt_util.utcnow().isoformat()
+        sealed = 0
+        for day in sorted(self.store.days):
+            record = self.store.days[day]
+            if record.final_benefit is not None:
+                continue
+            usable, _reason = self.day_finalizable(day, today)
+            if not usable:
+                continue
+            benefit = self._day_benefit_eur(record, day, limits)
+            if benefit is None:
+                continue
+            if record.note_final_benefit(
+                finalized_at=stamp,
+                benefit_eur=benefit,
+                basis_version=REALIZED_BENEFIT_BASIS_VERSION,
+            ):
+                sealed += 1
+        if sealed:
+            self.store.schedule_save()
+        return sealed
+
+    @callback
+    def _day_benefit_eur(self, record: Any, day: date, limits: Any) -> float | None:
+        """Return one finalised day's realised battery benefit in EUR, or ``None``.
+
+        The cash comparator and nothing else: what the meter would have cost with
+        no battery, less what it actually cost. Both legs are measured, so the
+        figure does not move when a forecast does -- which is the property that lets
+        it be summed into a lifetime total at all.
+        """
+        resolved = self._prices_for_day(day, record.interval_count)
+        if resolved is None:
+            return None
+        buy, sell, _basis = resolved
+        window = self._realized_window_for(
+            self._realized_series(record, (buy, sell), limits), limits
+        )
+        return window.realized_battery_benefit_eur
+
+    @callback
+    def lifetime_benefit(self, today: date) -> dict[str, Any]:
+        """Return the cumulative realised battery benefit, and what it covers.
+
+        ``sealed_benefit_eur`` carries the days the store no longer retains and the
+        retained sealed days are added back, so the total is complete over
+        ``[history_available_since, sealed_through_retained]`` and says so rather
+        than implying a longer reach. A day inside that span that never qualified is
+        reported as a hole -- the figure is still a true measurement of the days it
+        covers, and a reader is told which days those are.
+        """
+        finalised = {
+            day: record.benefit_eur_final
+            for day, record in self.store.days.items()
+            if record.benefit_eur_final is not None
+        }
+        retained_total = round(sum(finalised.values()), 6)
+        total = round(self.store.sealed_benefit_eur + retained_total, 6)
+
+        earliest = self.store.sealed_through
+        if finalised:
+            first_retained = min(finalised)
+            earliest = first_retained if earliest is None else earliest
+        last = max(finalised) if finalised else self.store.sealed_through
+
+        # A past day the store retains, that carries no sealed figure, is a day the
+        # lifetime total does not include. Counted rather than hidden: the total is
+        # honest about its own coverage or it is not a lifetime total.
+        unsealed = sorted(
+            day
+            for day, record in self.store.days.items()
+            if day < today and record.final_benefit is None
+        )
+        return {
+            "cumulative_realised_benefit_eur": total,
+            "sealed_evicted_eur": self.store.sealed_benefit_eur,
+            "sealed_evicted_through": (
+                None
+                if self.store.sealed_through is None
+                else self.store.sealed_through.isoformat()
+            ),
+            "retained_sealed_eur": retained_total,
+            # **Every day the figure covers, retained or not.** Counting only the
+            # retained ones would make the published average climb each time a day
+            # aged out of the window -- on a figure whose entire point is not to move
+            # when nothing has happened.
+            "sealed_days": len(finalised) + self.store.sealed_day_count,
+            "retained_sealed_days": len(finalised),
+            "history_available_since": (
+                None if earliest is None else earliest.isoformat()
+            ),
+            "sealed_through": None if last is None else last.isoformat(),
+            "unsealed_past_days": len(unsealed),
+            "basis_version": REALIZED_BENEFIT_BASIS_VERSION,
+        }
+
+    @callback
+    def day_finalizable(self, day: date, today: date) -> tuple[bool, str]:
+        """Return whether ``day`` can be sealed, and the reason when it cannot.
+
+        **Midnight is not the same thing as final, and treating it as such is how a
+        lifetime total quietly loses its last quarter every day.** A quarter that
+        spans midnight closes *after* it and is filed against the day it started in,
+        so at 00:00 yesterday's last interval does not exist yet. Sealing on the
+        clock would seal a day short, once, permanently.
+
+        Every clause here is a way a day can be complete-looking and not complete:
+
+        * the day is in the past -- an unfinished day has intervals still to come;
+        * a record exists at all -- a day the integration was switched off for has
+          no evidence, and an absent record is not a zero;
+        * every one of its **own** ``interval_count`` intervals is present. That
+          count is 92, 96 or 100 from real timezone arithmetic, so a DST day is
+          judged against its own length rather than a nominal 96;
+        * prices exist for the day, on either basis;
+        * **nothing was skipped for want of a price.** This is the clause that
+          matters most for a *cumulative* figure: an unpriced past interval shrinks
+          the day's total in silence, always in the same direction, and a lifetime
+          sum of quietly-short days is biased rather than noisy. A day with a price
+          hole is not sealed at a smaller number, it is not sealed.
+
+        A day that fails any clause stays re-derivable and is re-examined on the next
+        refresh. If it never qualifies the cursor does not advance past it, and the
+        lifetime figure says its history is incomplete rather than pretending
+        otherwise.
+        """
+        if day >= today:
+            return False, "day_not_past"
+        record = self.store.days.get(day)
+        if record is None:
+            return False, "no_day_record"
+        count = record.interval_count
+        if any(record.measured[index] is None for index in range(count)):
+            return False, "intervals_missing"
+        # Separate from the clause above, because they fail for different reasons
+        # and only one of them is fixable. ``total_load_at`` is also ``None`` when a
+        # flexible load was expected and never recorded -- the whole-house figure is
+        # then unknown by exactly the amount nobody measured, which is not a smaller
+        # day, it is an unpriceable one.
+        if any(record.total_load_at(index) is None for index in range(count)):
+            return False, "load_boundary_incomplete"
+        if self._prices_for_day(day, count) is None:
+            return False, "no_stored_prices"
+        return True, "finalizable"
+
+    @callback
+    def _prices_for_day(
+        self, day: date, count: int
+    ) -> tuple[list[float | None], list[float | None], str] | None:
+        """Return ``(buy, sell, basis)`` for one civil day, or ``None``.
+
+        **Live forecast first, persisted snapshot second, and the second half is
+        what beta.42 added.** ``price_forecasts`` is rebuilt every refresh and holds
+        only today and tomorrow, so any older day fell through and was skipped. The
+        multi-day ledger therefore priced exactly one day while its own docstring
+        claimed it read the stored issuances -- and the published window has been
+        reporting ``days_priced: 1`` ever since it was written.
+
+        The issuances *are* stored, for a year, with the day's own fixed components
+        beside them. A past day is priced on the basis that was published for it and
+        never on today's configuration: the operator may since have changed a feed-in
+        adjustment or a VAT flag, and re-pricing history under a later setting would
+        rewrite what already happened.
+        """
+        forecast = (self.price_forecasts or {}).get(day)
+        if forecast is not None:
+            buy: list[float | None] = [None] * count
+            sell: list[float | None] = [None] * count
+            for interval in forecast.intervals:
+                if 0 <= interval.index < count:
+                    buy[interval.index] = interval.import_price_eur_kwh
+                    sell[interval.index] = interval.export_price_eur_kwh
+            return buy, sell, PRICE_BASIS_LIVE_FORECAST
+
+        snapshot = self.history.latest_price_snapshot(day)
+        if snapshot is None:
+            return None
+        stored_buy = list(snapshot.import_price[:count])
+        stored_sell = list(snapshot.export_price[:count])
+        stored_buy += [None] * (count - len(stored_buy))
+        stored_sell += [None] * (count - len(stored_sell))
+        return stored_buy, stored_sell, PRICE_BASIS_STORED_SNAPSHOT
+
     def _realized_series(
-        self, record: Any, forecast: Any, limits: Any
+        self,
+        record: Any,
+        prices: tuple[list[float | None], list[float | None]],
+        limits: Any,
     ) -> dict[str, list[Any]]:
         """Return one day's measured series, aligned and priced by interval index.
 
         Extracted so the single-day and multi-day views cannot drift apart: they
         are the same arithmetic over a longer list.
+
+        **Takes price lists rather than a forecast. beta.42.** A past day's prices
+        do not come from the live forecast -- that object only ever holds today and
+        tomorrow -- they come from the persisted snapshot of what was published at
+        the time. Both sources produce two lists, so this takes the lists and lets
+        :meth:`_prices_for_day` decide where they came from.
         """
         count = record.interval_count
-        buy: list[float | None] = [None] * count
-        sell: list[float | None] = [None] * count
-        for interval in forecast.intervals:
-            if 0 <= interval.index < count:
-                buy[interval.index] = interval.import_price_eur_kwh
-                sell[interval.index] = interval.export_price_eur_kwh
+        buy, sell = prices
 
         capacity = None if limits is None else limits.capacity_kwh
         energies = soc_series_to_energy(
@@ -9061,7 +10344,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "grid_export_kwh": [record.grid_export_at(i) for i in range(count)],
             "import_price_eur_kwh": buy,
             "export_price_eur_kwh": sell,
-            "load_kwh": [record.baseline_at(i) for i in range(count)],
+            # **The whole household, not the baseline. beta.42.**
+            #
+            # This fed ``baseline_at`` -- measured less the flexible load -- into a
+            # counterfactual that is differenced against ``grid_import_at``, which
+            # includes it. Only one of the two terms had been re-based, so on any
+            # interval the vehicle charged, ``max(0, load - pv) - import`` collapsed
+            # to zero and the battery's whole contribution vanished from the
+            # realised figures without anything saying so.
+            #
+            # The forecast path keeps ``baseline_at``, which is correct for it.
+            "load_kwh": [record.total_load_at(i) for i in range(count)],
             "production_kwh": [record.pv_at(i) for i in range(count)],
             "stored_energy_kwh": list(energies),
             "battery_charge_kwh": charge_series,
@@ -9338,7 +10631,18 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         limits = plan.state.limits if plan.state is not None else None
-        series = self._realized_series(record, forecast, limits)
+        resolved = self._prices_for_day(record.day, count)
+        if resolved is None:  # pragma: no cover - the guard above already returned
+            return day_accounting(
+                realised=None,
+                in_progress_eur=None,
+                in_progress_index=None,
+                in_progress_coverage=None,
+                remaining_expected_eur=None,
+                forecast_revaluation_eur=None,
+                unavailable_reason=ACCOUNTING_UNAVAILABLE_NO_STORED_PRICES,
+            ).as_dict()
+        series = self._realized_series(record, (resolved[0], resolved[1]), limits)
         realised = self._realized_window_for(
             self._sliced_series(series, len(closed)), limits
         )
@@ -11560,6 +12864,18 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # **The campaign lifecycle, advanced once per refresh, after the reason is
         # known and before anything is published.** This is the ordering that lets
         # the incident's 17:45 refresh speak at all.
+        # **Before the live lifecycle advances, and on every refresh. beta.42.**
+        #
+        # A campaign left open by a restart has to close before this boot's campaign
+        # can open, or one physical objective appears twice in the log under two
+        # ids -- which is precisely the defect the persistence exists to close.
+        #
+        # Every refresh rather than once at startup, because a never-started
+        # instance cannot be classified at restore time: the store is read during
+        # setup and the first solve happens later, so there is no authoritative plan
+        # yet to say whether a replacement exists. It is asked again until one of the
+        # two authoritative answers is true, and closes late rather than wrongly.
+        self._recover_campaign_lifecycle(now)
         self._note_campaign_progress(now, stop_reason)
         stage_b["completed_campaign"] = self._closed_campaign
         stage_b["open_campaign"] = self._open_campaign_block()
@@ -11964,7 +13280,25 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             grid_import_w=flows_now.grid_import_w,
             grid_export_w=flows_now.grid_export_w,
             grid_age_seconds=self._state_age_seconds(self.config.grid_power_entity),
-            max_source_age_seconds=BALANCE_MAX_SOURCE_AGE_SECONDS,
+            # **Control grade, not diagnostics grade. beta.42.**
+            #
+            # This was ``BALANCE_MAX_SOURCE_AGE_SECONDS``, which is 300 and was
+            # calibrated for the balance *diagnostic*. ``ControlCoherence`` already
+            # argues in its own docstring why that figure is wrong for an actuator:
+            # "reused as an actuator threshold it would accept a five-minute-old
+            # photovoltaic reading as the basis for a live setpoint, which is not a
+            # bound at all on a controller that corrects every sixty seconds."
+            # ``CONTROL_MAX_SOURCE_AGE_SECONDS`` was introduced for exactly that and
+            # the safety gate -- the thing that authorises an individual write --
+            # never received it.
+            #
+            # It matters most for the state of charge. Coherence times only the four
+            # balance *flows*; the state of charge is not one of them and has no
+            # place in an identity it does not appear in. So between ninety and three
+            # hundred seconds a stale state of charge was caught by nothing, and the
+            # floor guarantee rests on it. Now the freshness gate covers it at the
+            # same grade as everything else it authorises.
+            max_source_age_seconds=CONTROL_MAX_SOURCE_AGE_SECONDS,
             device_power_kw=0.0 if command is None else command.power_kw,
             device_cutoff_percent=(
                 0 if command is None else command.cutoff_soc_percent

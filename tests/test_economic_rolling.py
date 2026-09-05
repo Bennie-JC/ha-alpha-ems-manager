@@ -122,7 +122,19 @@ def day_shape(*, pv_total: float, days: int, load_kwh: float = 0.30):
     return production, price, [load_kwh] * (96 * days)
 
 
-def roll(
+#: Rolled results, memoised. ``roll`` and ``roll_edge`` are pure functions of
+#: hashable arguments that each run a dozen solves, and the tests below ask for the
+#: same ``(rule, scenario)`` pairs repeatedly -- ten parametrised cases over four
+#: rules and a handful of scenarios, re-solving the identical rollouts each time.
+#: Measured at 21.4 minutes, the second-largest cost in the suite.
+#:
+#: A **copy** is handed out on every call: the rollouts return plain dicts, and a
+#: shared mutable result is how one test comes to depend on another having run
+#: first. The values are floats, so a shallow copy is a complete one.
+_ROLL_CACHE: dict[tuple, dict] = {}
+
+
+def _roll_uncached(
     rule: str,
     *,
     pv_total: float,
@@ -364,28 +376,36 @@ def test_filling_the_pack_before_publication_is_priced_not_forced(
     )
 
 
-def test_losing_tomorrows_prices_changes_no_rule_into_the_best_one() -> None:
+@pytest.mark.parametrize("scenario", sorted(SCENARIOS))
+def test_losing_tomorrows_prices_changes_no_rule_into_the_best_one(
+    scenario: str,
+) -> None:
     """The shrinking horizon does not overturn the verdict either.
 
     Runs the whole comparison with the horizon ending at midnight and shrinking,
     which is the state before the source publishes. If some alternative were
     clearly better *here*, that would be the argument for changing the rule -- and
     it is not: the spread stays in cents.
+
+    **Split by scenario in beta.42, and every comparison is unchanged.** This was
+    the last single test costing five minutes, which made it the floor for its whole
+    shard however many workers it had. The rollouts are memoised, so the scenarios
+    that other tests also ask for are now free here; the rest simply run beside each
+    other instead of in series.
     """
-    for scenario in sorted(SCENARIOS):
-        known = {
-            rule: roll(rule, tomorrow_known=True, **SCENARIOS[scenario])["paid_eur"]
-            for rule in RULES
-        }
-        unknown = {
-            rule: roll(rule, tomorrow_known=False, **SCENARIOS[scenario])["paid_eur"]
-            for rule in RULES
-        }
-        assert max(unknown.values()) - min(unknown.values()) < 0.35, (scenario, unknown)
-        # And seeing further never costs money, which is a sanity check on the
-        # harness as much as on the optimizer.
-        for rule in RULES:
-            assert known[rule] <= unknown[rule] + 0.35, (scenario, rule)
+    known = {
+        rule: roll(rule, tomorrow_known=True, **SCENARIOS[scenario])["paid_eur"]
+        for rule in RULES
+    }
+    unknown = {
+        rule: roll(rule, tomorrow_known=False, **SCENARIOS[scenario])["paid_eur"]
+        for rule in RULES
+    }
+    assert max(unknown.values()) - min(unknown.values()) < 0.35, (scenario, unknown)
+    # And seeing further never costs money, which is a sanity check on the
+    # harness as much as on the optimizer.
+    for rule in RULES:
+        assert known[rule] <= unknown[rule] + 0.35, (scenario, rule)
 
 
 def test_the_harness_actually_executes_something() -> None:
@@ -457,7 +477,45 @@ def edge_shape(kind: str, *, days: int = 2, load_kwh: float = 0.30):
     return production, price, [load_kwh] * total
 
 
-def roll_edge(
+def roll(
+    rule: str,
+    *,
+    pv_total: float,
+    start_kwh: float,
+    reserve_kwh: float,
+    steps: int = 12,
+    tomorrow_known: bool = True,
+    days: int = 2,
+    offset: int = 40,
+):
+    """Return :func:`_roll_uncached`, solving each distinct rollout exactly once."""
+    key = (
+        "roll",
+        rule,
+        pv_total,
+        start_kwh,
+        reserve_kwh,
+        steps,
+        tomorrow_known,
+        days,
+        offset,
+    )
+    hit = _ROLL_CACHE.get(key)
+    if hit is None:
+        hit = _ROLL_CACHE[key] = _roll_uncached(
+            rule,
+            pv_total=pv_total,
+            start_kwh=start_kwh,
+            reserve_kwh=reserve_kwh,
+            steps=steps,
+            tomorrow_known=tomorrow_known,
+            days=days,
+            offset=offset,
+        )
+    return dict(hit)
+
+
+def _roll_edge_uncached(
     rule: str, kind: str, *, start_kwh: float, reserve_kwh: float, steps: int = 10
 ):
     """Roll the last stretch of an awkward horizon, executing one interval each time.
@@ -532,6 +590,19 @@ BENIGN_SHAPES = ("cheap_tail", "peak_then_stop")
 #: Shapes whose dearest quarters *are* at the edge. These expose a defect in the
 #: released rule -- see the module note below and the beta.18 review.
 EDGE_DEFECT_SHAPES = ("late_peak", "expensive_tail")
+
+
+def roll_edge(
+    rule: str, kind: str, *, start_kwh: float, reserve_kwh: float, steps: int = 10
+):
+    """Return :func:`_roll_edge_uncached`, solving each distinct rollout once."""
+    key = ("roll_edge", rule, kind, start_kwh, reserve_kwh, steps)
+    hit = _ROLL_CACHE.get(key)
+    if hit is None:
+        hit = _ROLL_CACHE[key] = _roll_edge_uncached(
+            rule, kind, start_kwh=start_kwh, reserve_kwh=reserve_kwh, steps=steps
+        )
+    return dict(hit)
 
 
 @pytest.mark.parametrize("kind", BENIGN_SHAPES)

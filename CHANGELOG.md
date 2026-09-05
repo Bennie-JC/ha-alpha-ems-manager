@@ -9,6 +9,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.42] - 2026-09-05
+
+**The figure labelled "realised net value" was never a battery comparator, and an
+investment return built on it would have said the battery destroys value.** Written
+out, `realized_net_value_eur` equals `TRUE − Σp·min(I,N) + Σs·X`: it subtracts the
+household's whole unavoidable import bill and credits back PV export that needed no
+battery. `Σp·min(I,N)` dominates, so the number is structurally negative for any
+household that imports anything. Its own docstring was accurate — *"what the
+household is better off by"* — it was the name that misled, and this release adds the
+comparator rather than renaming that one.
+
+Two further Phase-7 defects were found alongside it and are fixed here. The
+no-battery export leg `max(0, PV − L)` **did not exist anywhere**, so PV surplus
+revenue was credited to the battery. And the counterfactual was differenced against
+the wrong meter: `baseline_at` excludes the electric vehicle, `grid_import_at`
+includes it, so on any interval the vehicle drew, `max(0, load − pv) − import`
+collapsed to zero and the battery's contribution vanished from the realised figures
+with nothing saying so. Only one of the two terms had ever been re-based.
+
+Nothing in the planner moved. The DP objective, the reserve, the three purchase
+categories, Safety Buy and Coverage precedence, terminal value, PV retention, Stage A
+authority, Stage B admission, opened-row authority and the no-catch-up rule are all
+unchanged — proven by the seven neutrality digests and the beta.40/41 decision
+anchors being byte-identical.
+
+### Added
+
+- **Realised battery benefit.** `realized_battery_benefit_eur` = no-battery net cash
+  less actual net cash, over four measured cash legs. It reads no state of charge, no
+  capacity and no efficiency, which is what makes it the only figure here an
+  investment return may be built on — and a test pins that rather than assuming it.
+- **The no-battery export counterfactual**, with `realized_no_battery_export_kwh` and
+  `realized_no_battery_export_revenue_eur` published beside the import leg.
+- **`DayRecord.total_load_at()`**, the whole-household reading, carrying
+  `baseline_at`'s validity rule: `None` when an expected flexible-load sample is
+  missing, because the total is then unknown by exactly the amount nobody measured.
+  `baseline_at` is unchanged — the forecast and learning paths legitimately want it.
+- **Historical persisted-day pricing.** A past day is priced from the issuance stored
+  for it, on the basis published at the time, never on a setting the operator has
+  since changed. `realized_window` previously reported `days_priced: 1` on every
+  installation because `price_forecasts` only ever holds today and tomorrow.
+- **Day finalisation and a sealed lifetime total.** `day_finalizable` refuses a day
+  for five named reasons; a qualifying day's benefit is sealed once and folded into a
+  running total when the record is evicted at 365 days. Storage minor 2.7 to 2.8,
+  additive.
+- **Battery Return sensor**, state in percent so Economic Value stays the only
+  EUR-valued state. Optional gross investment, subsidy, other credit and a purchase
+  date. Trailing 30- and 90-day figures, a payback estimate from the 90-day mean, and
+  two named refusals: below 30 priceable days it is arbitrary rather than
+  conservative, and at a non-positive mean it withholds rather than dividing.
+- **Campaign lifecycle events and two sensors.** `alpha_ems_campaign` fires
+  `created`, `started`, `stopped` and `removed` at most once each per
+  `campaign_instance_id`, persisted so a restart replays none of them.
+  `current_campaign` and `last_campaign_result` publish the same state a dashboard
+  needs. Two new outcomes, `not_executed` and `superseded`.
+- **A missing-tomorrow-prices regression**, captured live at 01:00: a 91-interval
+  horizon `limited_by: prices`, no bridge requirement, no Safety Buy, no violation.
+  Across eight starting states the compelled purchase is byte-identical to the
+  complete-horizon solve, so an unpublished day can never manufacture a Safety Buy.
+- **A `forecast` ledger basis**, the seventh word. `planner_derived` was carrying two
+  claims: the optimiser valuing energy that *exists*, and its estimate of energy that
+  has not moved. Only one of those can still be falsified by the weather.
+- **`figure_basis` on the Economic Value entity.** The basis map existed for four
+  releases and the entity could not see it — an operator saw fifteen adjacent euro
+  attributes spanning four kinds of number, distinguished only by their names, on an
+  entity Home Assistant labels `MONETARY`.
+- **`source_incompatible` daily-validation status.** A 220 kWh whole-site counter
+  against a 20 kWh house published roughly -91 % beside the word `comparable`. The
+  observed ratio is now published and no unit is reinterpreted.
+- **Persisted solve timing.** `solve_ms` and `solves` join the decision ring, so
+  "what does a refresh cost, and has it moved?" is answerable from inside the
+  codebase.
+
+### Fixed
+
+- **`realised_net_value_eur` was labelled `measured`** while one of its addends is
+  attributed. A total is no stronger than its weakest addend.
+- **The published `solve_rule` misdescribed the pass structure it exists to
+  explain**: three unconditional passes claimed, four actual, `coverage` named
+  nowhere.
+- **`reconciliation_error_eur` advertised a check it does not perform.** The total is
+  *defined* as the sum of the addends, so the residual can only ever be rounding. It
+  now says what it actually verifies.
+- **Plausibility sanitisers on the grid-budget path.** A PV spike could drive the
+  measured surplus high enough that the grid-import ceiling accrued nothing for a
+  whole quarter, removing the only bound on buying.
+- **Control-grade freshness on the safety gate.** The actuation path was handed the
+  300-second diagnostics bound where the 90-second control bound exists for exactly
+  this, and the state-of-charge entity is not in the coherence source set — so a
+  reading between 90 and 300 seconds old was caught by nothing.
+- **Two stale execution claims that ship to readers**, including the `contract_rule`
+  carried inside *every published execution target*, which still said only a charge
+  can execute — untrue since beta.27 admitted `net_export`.
+
+### Verification
+
+- Suite 4790 to 4894 tests. Serial 90 min to 51:33; `-n 16` 34 min to 14:06; the
+  development tier is 28 s; the slowest single test 14.2 min to 4.2 min. No test was
+  removed and no assertion weakened.
+- Solve grids for the four hot files are memoised behind a shared cache that refuses
+  anonymous callables, so a key collision is not expressible.
+- Deterministic sharding from measured JUnit timings, balanced to 1.00x ideal, with
+  the manifest committed and CI reading it.
+- Mutation testing moved into `tools/mutation/` and hardened: content-hash snapshots,
+  deterministic restore, a lock, and — new here — refusal of any anchor that does not
+  match **exactly once**. Six anchors were ambiguous and had been silently mutating
+  their first match; four of those predated this release.
+- 352 mutations killed, 0 survived, 0 anchors lost. The beta.42 table found five
+  vacuous tests, including both guarding this release's own headline corrections;
+  every one was rewritten rather than the mutation weakened.
+
+### Not validated
+
+No beta.42 code has run on hardware. This is a prerelease for live validation.
+
 ## [1.0.0-beta.41] - 2026-09-04
 
 **The optimiser could not value stored energy above the export rate, so it stopped

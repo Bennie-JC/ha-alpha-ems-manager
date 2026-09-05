@@ -189,9 +189,28 @@ def live_price(index: int) -> float:
         base = 0.09 + 0.02 * abs(hour - 13) / 2
     else:
         base = 0.22
-    random.seed(7)
-    jitter = {h: random.uniform(-0.035, 0.035) for h in range(200)}
+    jitter = _JITTER
     return max(0.01, base + jitter[int((index + 71) / 4) % 200])
+
+
+def _draw_jitter() -> list[float]:
+    """Return the 200 jitter values, in the order one seeded stream produces them."""
+    stream = random.Random(7)
+    return [stream.uniform(-0.035, 0.035) for _ in range(200)]
+
+
+#: Per-quarter jitter, drawn once from a **local** generator.
+#:
+#: These two shapes used to call ``random.seed()``, which reseeds the *global*
+#: generator as a side effect -- so every test running after one of them in the same
+#: worker inherited a deterministic-but-arbitrary global state, and execution order
+#: became observable. A sharded suite must not have that.
+#:
+#: **The sequence is unchanged.** One generator seeded at 7, drawn 200 times in
+#: order, is exactly what ``random.seed(7)`` followed by 200 ``random.uniform``
+#: calls produced -- so every recorded figure in the beta.32 family is byte-identical
+#: to before. Two hundred separately-seeded generators would *not* have been.
+_JITTER: dict[int, float] = dict(enumerate(_draw_jitter()))
 
 
 def live_load(index: int) -> float:
@@ -202,14 +221,14 @@ def live_load(index: int) -> float:
     average that a simpler fixture would use is precisely what hid the label
     alternation.
     """
-    random.seed(1000 + index)
+    noise = random.Random(1000 + index)
     hour = ((index + 71) % 96) / 4.0
     shape = (
         0.10
         + 0.28 * math.exp(-((hour - 7.5) ** 2) / 2.0)
         + 0.42 * math.exp(-((hour - 19.0) ** 2) / 4.0)
     )
-    return max(0.02, shape * random.uniform(0.55, 1.55))
+    return max(0.02, shape * noise.uniform(0.55, 1.55))
 
 
 def live_pv(index: int) -> float:

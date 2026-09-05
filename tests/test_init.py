@@ -45,6 +45,12 @@ SENSORS = (
     "sensor.alpha_ems_next_planned_action",
     "sensor.alpha_ems_economic_value",
     "sensor.alpha_ems_control_state",
+    # beta.42 adds three: the investment return, and the two campaign lifecycle
+    # rows. Listed here rather than counted, so a *missing* one fails as loudly
+    # as an extra one -- a length check alone passes on a swap.
+    "sensor.alpha_ems_battery_return",
+    "sensor.alpha_ems_current_campaign",
+    "sensor.alpha_ems_last_campaign_result",
     "select.alpha_ems_control_mode",
 )
 

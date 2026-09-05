@@ -34,6 +34,12 @@ from custom_components.alpha_ems_manager.const import (
 )
 
 from .beta34_shape import solve_at
+from .solve_cache import cached_solve_at
+from .test_beta39_neutrality import (
+    cheap_everywhere,
+    dear_everywhere,
+    no_production,
+)
 
 #: The reference installation: 21.6 kWh usable DC at a configured 20 % minimum.
 CAPACITY_DC_KWH = 21.6
@@ -144,7 +150,37 @@ def test_the_gap_that_used_to_cross_the_floor_is_closed() -> None:
 # == 2. the invariant: the decided trajectory honours the hard floor =========
 
 
-def test_the_decided_trajectory_never_discharges_below_the_hard_floor() -> None:
+#: The five variations the floor sweep runs each horizon under. Named rather than
+#: inline so :func:`tests.solve_cache.cached_solve_at` can key them -- an anonymous
+#: lambda has no identity a cache can use, and the cache refuses one rather than risk
+#: serving one price curve's plan to a test asking about another.
+FLOOR_SWEEP_VARIANTS: tuple[dict, ...] = (
+    {},
+    {"allow_export": False},
+    {"pv_fn": no_production},
+    {"price_fn": dear_everywhere},
+    {"price_fn": cheap_everywhere},
+)
+
+#: The starting energies swept, from the configured floor to a nearly full pack.
+FLOOR_SWEEP_STORED: tuple[float, ...] = (
+    4.32,
+    4.4,
+    4.5,
+    5.0,
+    6.0,
+    8.294,
+    11.0,
+    14.0,
+    17.0,
+    20.0,
+)
+
+
+@pytest.mark.parametrize("head", [28, 36, 20, 8, 68])
+def test_the_decided_trajectory_never_discharges_below_the_hard_floor(
+    head: int,
+) -> None:
     """**The release gate, swept rather than argued.**
 
     For every horizon shape and every starting energy at or above the configured
@@ -158,33 +194,34 @@ def test_the_decided_trajectory_never_discharges_below_the_hard_floor() -> None:
     not discharge deeper, and that is the invariant: no decision takes the pack
     below the floor.
 
+    **Split by head in beta.42, and the grid is unchanged.** This was one test
+    solving 250 horizons in 14.2 minutes -- eleven per cent of the whole suite's
+    processor time, and irreducible by caching because every one of those horizons
+    is distinct. Splitting it lets the workers share them. The same fifty
+    combinations run per head, and the coverage floor is now asserted per head
+    (``>= 40``, five heads, the same two hundred in total) so a head that
+    contributed nothing fails instead of hiding inside an aggregate.
+
     *Mutation: relax the terminal feasibility test, or let the violation term
     ignore the reserve, and a shape digs below its seed.*
     """
     dug_below_seed = []
     deepest = None
     checked = 0
-    for head in (28, 36, 20, 8, 68):
-        for stored in (4.32, 4.4, 4.5, 5.0, 6.0, 8.294, 11.0, 14.0, 17.0, 20.0):
-            for extra in (
-                {},
-                {"allow_export": False},
-                {"pv_fn": lambda i: 0.0},
-                {"price_fn": lambda i: 0.90},
-                {"price_fn": lambda i: 0.02},
-            ):
-                outcome = solve_at(head=head, end=96, stored=stored, **extra).outcome
-                walk = lattice_walk(outcome.desired)
-                if not walk:
-                    continue
-                checked += 1
-                low, seed = min(walk), walk[0]
-                if deepest is None or low < deepest:
-                    deepest = low
-                if low < seed - 1e-9 and low < CONFIGURED_FLOOR_DC_KWH - 1e-9:
-                    dug_below_seed.append((head, stored, tuple(extra), low, seed))
+    for stored in FLOOR_SWEEP_STORED:
+        for extra in FLOOR_SWEEP_VARIANTS:
+            outcome = cached_solve_at(head=head, end=96, stored=stored, **extra).outcome
+            walk = lattice_walk(outcome.desired)
+            if not walk:
+                continue
+            checked += 1
+            low, seed = min(walk), walk[0]
+            if deepest is None or low < deepest:
+                deepest = low
+            if low < seed - 1e-9 and low < CONFIGURED_FLOOR_DC_KWH - 1e-9:
+                dug_below_seed.append((head, stored, tuple(extra), low, seed))
 
-    assert checked >= 200, checked
+    assert checked >= 40, checked
     assert dug_below_seed == [], dug_below_seed[:5]
     # The deepest level anywhere is the seed quantisation, at most one bucket
     # below the configured floor -- never a decision to discharge past it.

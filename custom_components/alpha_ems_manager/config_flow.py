@@ -39,6 +39,8 @@ from .const import (
     CONF_ALLOW_BATTERY_EXPORT,
     CONF_ALLOW_GRID_CHARGING,
     CONF_BATTERY_CAPACITY_KWH,
+    CONF_BATTERY_INVESTMENT_DATE,
+    CONF_BATTERY_INVESTMENT_EUR,
     CONF_BATTERY_MAX_CHARGE_KW,
     CONF_BATTERY_MAX_DISCHARGE_KW,
     CONF_BATTERY_MIN_SOC_PERCENT,
@@ -46,6 +48,7 @@ from .const import (
     CONF_BATTERY_POWER_SIGN,
     CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_SOC_ENTITY,
+    CONF_BATTERY_SUBSIDY_EUR,
     CONF_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
     CONF_CONTROL_EXECUTION_ENABLED,
     CONF_CONTROL_EXPORT_MARGIN_PERCENT,
@@ -60,6 +63,7 @@ from .const import (
     CONF_HOUSE_LOAD_ENTITY,
     CONF_MINIMUM_TRADE_GAIN_EUR,
     CONF_NAME,
+    CONF_OTHER_ONE_TIME_CREDIT_EUR,
     CONF_PV_POWER_ENTITY,
     CONF_SELECTED_SOLCAST_SITE_IDS,
     CONF_SOLCAST_ENTRY_ID,
@@ -83,6 +87,7 @@ from .const import (
     DOMAIN_SOLCAST,
     GRID_SIGN_OPTIONS,
     MAX_BATTERY_CAPACITY_KWH,
+    MAX_BATTERY_INVESTMENT_EUR,
     MAX_BATTERY_POWER_KW,
     MAX_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     MAX_BATTERY_THROUGHPUT_COST_EUR_PER_KWH,
@@ -296,6 +301,20 @@ _THROUGHPUT_COST_SELECTOR = _number_selector(
 )
 
 
+#: What the battery cost, offered for the first time in beta.42.
+#:
+#: A plain euro box in each case. The upper bound is generous rather than tuned --
+#: this figure decides nothing, so a wrong one costs a wrong recovery percentage and
+#: not a wrong dispatch, and a tight bound would only reject a legitimate
+#: whole-site installation.
+_INVESTMENT_SELECTOR = _number_selector(
+    minimum=0.0,
+    maximum=MAX_BATTERY_INVESTMENT_EUR,
+    step=1.0,
+    unit="EUR",
+)
+
+
 def _economics_schema(
     current: Callable[[str, Any], Any],
 ) -> vol.Schema:
@@ -350,6 +369,44 @@ def _economics_schema(
                     CONF_ALLOW_BATTERY_EXPORT, DEFAULT_ALLOW_BATTERY_EXPORT
                 ),
             ): selector.BooleanSelector(),
+            # **Optional, and that is the whole of their semantics.** These four are
+            # genuinely absent on an installation that has not entered them, exactly
+            # as the three hardware facts are -- so they take no default. An absent
+            # investment makes the return sensor unavailable with a reason; a
+            # defaulted zero would make it publish a recovery against nothing.
+            #
+            # None of them reaches a decision. Capital cost is not a marginal cost
+            # and most of an installed battery is sunk, which is the reasoning the
+            # three levers above are built on; a fourth here would let a purchase
+            # price move a dispatch.
+            vol.Optional(
+                CONF_BATTERY_INVESTMENT_EUR,
+                description={
+                    "suggested_value": current(CONF_BATTERY_INVESTMENT_EUR, None)
+                },
+            ): _INVESTMENT_SELECTOR,
+            vol.Optional(
+                CONF_BATTERY_SUBSIDY_EUR,
+                description={
+                    "suggested_value": current(CONF_BATTERY_SUBSIDY_EUR, None)
+                },
+            ): _INVESTMENT_SELECTOR,
+            vol.Optional(
+                CONF_OTHER_ONE_TIME_CREDIT_EUR,
+                description={
+                    "suggested_value": current(CONF_OTHER_ONE_TIME_CREDIT_EUR, None)
+                },
+            ): _INVESTMENT_SELECTOR,
+            # **A date selector, not a number.** "When" and "how much" are different
+            # kinds of fact, and a date pushed through the numeric path would be a
+            # figure nobody could read back -- and would silently become the
+            # accounting start of a lifetime figure.
+            vol.Optional(
+                CONF_BATTERY_INVESTMENT_DATE,
+                description={
+                    "suggested_value": current(CONF_BATTERY_INVESTMENT_DATE, None)
+                },
+            ): selector.DateSelector(),
         }
     )
 

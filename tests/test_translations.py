@@ -115,6 +115,22 @@ EXPECTED_OPTIONS_FIELDS: dict[str, list[str]] = {
         "battery_throughput_cost_eur_per_kwh",
         "allow_grid_charging",
         "allow_battery_export",
+        # beta.42: what the battery cost, what came back and when it was bought.
+        # **Optional, unlike the five above**, and that is the whole of their
+        # semantics: an installation that has not entered a purchase price is not
+        # one whose battery was free, so the Battery Return sensor is unavailable
+        # with a named reason rather than reporting a recovery against zero.
+        #
+        # Listed here rather than on a page of their own because they belong to the
+        # same question the five above answer -- what this battery is worth -- and
+        # because none of them reaches a decision, which is the property that makes
+        # them safe to sit beside three genuine economic levers.
+        "battery_investment_eur",
+        "battery_subsidy_eur",
+        "other_one_time_credit_eur",
+        # A date, and the only non-numeric field on this page. It says what period
+        # the cumulative figure covers and nothing else.
+        "battery_investment_date",
     ],
 }
 

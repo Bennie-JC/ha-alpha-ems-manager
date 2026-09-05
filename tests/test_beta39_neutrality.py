@@ -172,6 +172,22 @@ def test_the_lifecycle_helpers_name_no_price() -> None:
 # 2. the decision surface, frozen against the beta.38 release
 # ===========================================================================
 
+
+def no_production(index: int) -> float:
+    """No production at all. Named rather than inline so the solve cache can key it."""
+    return 0.0
+
+
+def dear_everywhere(index: int) -> float:
+    """A flat 0.90 EUR/kWh, for the price-blindness half of the Safety-Buy proof."""
+    return 0.90
+
+
+def cheap_everywhere(index: int) -> float:
+    """A flat 0.02 EUR/kWh, the other half of the same proof."""
+    return 0.02
+
+
 #: ``name -> (kwargs, canonical plan digest, solve count, interval count)``.
 #:
 #: Recorded by solving each shape twice -- once at ``v1.0.0-beta.38`` (commit
@@ -236,7 +252,7 @@ SHAPES: dict[str, tuple[dict, str, int, int]] = {
         60,
     ),
     "zero_pv": (
-        {"head": 20, "end": 96, "stored": 6.0, "pv_fn": lambda index: 0.0},
+        {"head": 20, "end": 96, "stored": 6.0, "pv_fn": no_production},
         "26de93d36ce9457e8f52a84507de6857084359231671ae75c07b6f96747216bc",
         5,
         76,
@@ -248,13 +264,13 @@ SHAPES: dict[str, tuple[dict, str, int, int]] = {
         28,
     ),
     "survival_dear": (
-        {"head": 68, "end": 96, "stored": 0.3, "price_fn": lambda index: 0.90},
+        {"head": 68, "end": 96, "stored": 0.3, "price_fn": dear_everywhere},
         "277b1ed779e604edef2e18d5d479cd86d3e0eb33c94e17706516fa1070f1674f",
         6,
         28,
     ),
     "survival_cheap": (
-        {"head": 68, "end": 96, "stored": 0.3, "price_fn": lambda index: 0.02},
+        {"head": 68, "end": 96, "stored": 0.3, "price_fn": cheap_everywhere},
         "4542d1aa25f48cb207f1f65c6f9895dc9b0e4393dd9c1674d83d2e6454af8d87",
         6,
         28,

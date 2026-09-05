@@ -2135,7 +2135,13 @@ async def test_a_failed_reset_keeps_its_evidence_and_retries(
 
     coordinator = await owned_live_charge(hass, config_data, frank, live_surface)
 
-    async def failing(hass_arg, steps):
+    async def failing(hass_arg, steps, *, intent=None):
+        # **The real signature, keyword-only ``intent`` included.** The double used
+        # to take two positional arguments, which raised ``TypeError`` rather than
+        # the ``RuntimeError`` this test is about on any path that names the intent
+        # -- and which path runs depends on ordering, so the test passed serially
+        # and failed at ``-n 32``. A stub narrower than the function it replaces is
+        # a test that measures its own double.
         raise RuntimeError("the helper refused the write")
 
     monkeypatch.setattr(module, "async_execute", failing)
