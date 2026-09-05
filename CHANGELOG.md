@@ -9,6 +9,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.44] - 2026-09-06
+
+**One economic campaign can ask for several physical arm cycles, and no published
+figure said so.** The optimiser prices a campaign as one uninterrupted run and charges
+one fee for it. Stage B may arm, stop and re-arm several times inside that same
+campaign: a `serve_load` gap between two exports, or a PV-only `hold` inside a charge,
+each force a stop and a fresh marker claim. On the 2026-09-05 horizon that was **eleven
+arms against two direction changes** — nine of them free.
+
+The reason is structural and is now measured rather than guessed at. The DP's state is
+`(interval, bucket, carry, run_state)` and `run_state` is a *direction*: both
+`ECONOMIC_ACTION_EXPORT` and `ECONOMIC_ACTION_DISCHARGE` set `_RUN_DISCHARGE`, so
+`export → serve_load → export` costs the objective exactly nothing. The codebase already
+called those splits reporting artefacts. They are — for the fee. Underneath each one is
+a real arm cycle.
+
+**Nothing in the planner moved, and that is this release's hard gate.** The DP
+objective, `minimum_trade_gain_eur`, the grid-charge margin, the throughput cost,
+terminal value, reserve feasibility, reachability, headroom, Safety Buy, the
+battery-side charge objective, the meter-side export objective, PV retention and
+absorption, and every beta.43 behaviour are untouched — proven by the seven neutrality
+digests and the beta.40/41 anchors passing **unchanged**, not re-baselined.
+
+### Added
+
+- **An arm plan.** `arm_count`, `campaign_count`, `segment_count`,
+  `executable_segment_count`, `direction_changes` and `runs_total` published together,
+  so the eleven-against-two gap is readable without reconstructing it by hand. An arm is
+  one maximal contiguous stretch of executable rows, because a non-executable row makes
+  the tick stop the dispatch and the next executable row claim the marker again — it is
+  **not** inferred from the campaign or direction-change counts.
+- **Per-arm detail**, bounded: `arm_index`, `intent`, `starts_at`, `ends_at`,
+  `objective_kwh` at the boundary it is paid at, and `marginal_value_eur`.
+- **The plan-versus-execution mismatch.** `runs_refused_nothing_armable`,
+  `energy_planned_on_refused_runs_kwh` and `value_planned_on_refused_runs_eur` — runs
+  Stage B can never arm because no row of them is executable. Value is measured as the
+  advantage over leaving the battery alone, so ambient production and unavoidable
+  household import sit inside the idle counterfactual on **both** sides of the
+  difference and neither can be reported as dispatch-caused.
+- **Per-arm physical measurement, with the two clocks kept apart.** The live capture is
+  why: one arm's claim was written at 22:15:05.2, the vendor register's own
+  `last_changed` was 22:15:42 — **37.3 s** — and the first tick that saw it was
+  22:16:36.9, giving **91.7 s**. A single figure would have reported the vendor as two
+  and a half times slower than it is, and a later release would have priced an arm
+  against our own sixty-second cadence.
+  - `activation_latency_s` — the vendor's clock, accepted only across an observed
+    inactive-to-active transition at or after the claim. Precision is bounded by the
+    source integration's poll interval, which is disclosed and never corrected for.
+  - `observation_latency_s` — our clock, and it includes our cadence on purpose.
+  - `delivery_latency_s` — the first coherent delivery **attributable to the dispatch**:
+    caused export above the measured production surplus at the meter, or grid-caused
+    charge above it at the battery.
+  - `battery_delivery_latency_s` — any battery charge, published beside it precisely so
+    ambient absorption can never be read as proof that a dispatch started.
+  - `objective_forgone_to_activation_kwh` — derived, not measured, with its formula
+    published, and an upper bound because ambient behaviour may have delivered part of
+    it anyway.
+  - `null` is never zero. Missing evidence names itself: `no_observed_transition`,
+    `register_predates_claim`, `sources_incoherent`, `delivery_not_attributable`,
+    `restarted_before_evidence`, `incomplete`.
+
+### Fixed
+
+- **A duplicated attribution computation.** `_coverage_attribution` was called twice
+  with byte-identical arguments; the second call is removed. No figure changes.
+- **A docstring describing a solve that has never existed.** `_safety_buy_attribution`
+  claimed `build_outcome` re-solves under the coverage economics where coverage was
+  promoted. It does not, and never has — it carries the compelled total forward instead.
+- **A stale `solve()` docstring** that described the recursion as three-dimensional. The
+  carry axis has been a dimension since beta.41.
+
+### Not changed, deliberately
+
+An **activation cost inside the objective** is not added here. Making the DP see an arm
+boundary requires widening `run_state`, which is roughly a third more work on five or
+six full backward inductions — 31–35 s becomes ~41 s on the reference hardware, on a
+host where beta.43 already documented that budget as the cause of two-cadence staleness.
+And the figure it would be calibrated against does not exist yet: two live tracking
+errors, −0.017 kWh on a 0.25 kWh objective and −0.047 kWh on a 1.02 kWh one, cannot
+separate a fixed per-arm loss from a proportional one. This release produces that
+measurement.
+
+An **export-threshold alignment** was designed, challenged and withdrawn. `caused_export`
+is derived *from* `flows.export_kwh` and never feeds back into it, and the cash term
+prices `flows.export_kwh` unconditionally — so moving that threshold changes the label
+and the permission and not one euro. It would also have stopped sub-threshold export
+remainders from needing the export permission, loosening `allow_battery_export`.
+
+A **charge-side materiality gate** is not added, and the question is not closed:
+`charge → HOLD → charge` mints a second arm while `run_start` stays false, so
+`minimum_trade_gain_eur` does not cover every physical charge arm. No additional gate is
+currently justified; revisit only if these measurements expose an uncovered
+economically relevant shape.
+
+### Verification
+
+- 25 new tests; **18 mutations killed, 0 survived, 0 anchors lost**. Two survivors in the
+  first table were vacuous tests and both were rewritten — one asserted a bound on a
+  ring the test itself had constructed, so the declaration it was meant to protect was
+  never executed.
+- Neutrality digests and the beta.40/41 anchors **unchanged**.
+- No new entity, no new persistent store, no configuration key. Everything lands in
+  existing bounded diagnostic rings.
+
+### Not validated
+
+No beta.44 code has run on hardware. This is a prerelease for live validation.
+
 ## [1.0.0-beta.43] - 2026-09-06
 
 **A row's measured energy did not survive its own boundary, and a campaign with more

@@ -1993,7 +1993,9 @@ def solve(
 ) -> EconomicPlan:
     """Return the least-cost plan over the horizon. Pure, total, never raises.
 
-    Backward induction over ``(interval, bucket, run_state)``. The value at each
+    Backward induction over ``(interval, bucket, carry, run_state)`` -- the carry
+    axis has been a dimension since beta.41 and this line omitted it. The value at
+    each
     state is the pair ``(violation, cost)`` compared lexicographically, so reserve
     feasibility dominates economics without a second mechanism and without a mode
     switch: when no violation is achievable anywhere the first term ties and the
@@ -5076,9 +5078,6 @@ def build_outcome(
     coverage_attribution = _coverage_attribution(
         desired, gated_plan, safety_attribution
     )
-    coverage_attribution = _coverage_attribution(
-        desired, gated_plan, safety_attribution
-    )
 
     return EconomicOutcome(
         desired=desired,
@@ -5331,9 +5330,11 @@ def _safety_buy_attribution(
     # **The difference only means anything between plans priced the same way**, and
     # that is the caller's obligation rather than this function's: ``relaxed`` must
     # be the executed plan's own solve with the reserve removed and nothing else
-    # changed. ``build_outcome`` runs a second relaxed solve under the coverage
-    # economics on exactly the horizons where coverage was promoted, for that
-    # reason.
+    # changed. Where coverage was promoted ``build_outcome`` does *not* re-solve
+    # under the coverage economics -- an earlier draft of this comment said it did,
+    # and no such solve has ever existed here. It carries the compelled total
+    # forward from the gated attribution instead, which is the choice the block
+    # above explains.
     if relaxed.violation_kwh > 0.0:
         # The compelled quantity is the one this module already names as the only
         # compulsory purchase, and it is price-blind by construction. Allocated in

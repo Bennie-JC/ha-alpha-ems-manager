@@ -91,6 +91,11 @@ from .const import (
     AMBIENT_SELF_CONSUMPTION_PEAK_SHAVING,
     AMBIENT_SELF_CONSUMPTION_SELF_CONSUMPTION,
     AMBIENT_SELF_CONSUMPTION_STATE_UNREADABLE,
+    ARM_EVIDENCE_INCOHERENT,
+    ARM_EVIDENCE_INCOMPLETE,
+    ARM_EVIDENCE_NO_TRANSITION,
+    ARM_EVIDENCE_STALE_REGISTER,
+    ARM_EVIDENCE_UNATTRIBUTABLE,
     AUTHORITY_BASIS_ADMITTED_PLAN,
     AUTHORITY_BASIS_CARRIED_RUN,
     AUTHORITY_BASIS_NONE,
@@ -110,6 +115,7 @@ from .const import (
     CAMPAIGN_TARGET_UNAVAILABLE,
     CAP_NONE,
     CLAIM_SCHEMA_VERSION,
+    COHERENCE_OK,
     COMPARATOR_MODEL_AMBIENT_ABSORB_ONLY,
     COMPARATOR_MODEL_AMBIENT_WALK,
     CONF_ALLOW_BATTERY_EXPORT,
@@ -248,6 +254,8 @@ from .const import (
     LIFECYCLE_UNPROVEN,
     LOG_THROTTLE_SECONDS,
     MAX_ABORTED_CAMPAIGNS_REMEMBERED,
+    MAX_ARM_MEASUREMENTS_REPORTED,
+    MAX_ARM_PLAN_ENTRIES_PUBLISHED,
     MAX_COMPLETED_QUARTERS_REPORTED,
     MAX_CONTROL_EVENTS_REPORTED,
     MAX_DISPATCH_START_ACTIVE_SAMPLES,
@@ -310,12 +318,14 @@ from .const import (
     QUARTER_END_SAFETY,
     QUARTER_END_TARGET_REACHED,
     QUARTER_MINUTES,
+    QUARTER_SECONDS,
     QUARTER_TARGET_TOLERANCE_KWH,
     REALIZED_BENEFIT_BASIS_VERSION,
     REASON_VOCABULARY_CAMPAIGN_END,
     REASON_VOCABULARY_QUARTER_COMPLETION,
     REASON_VOCABULARY_RUN_STOP,
     REFUSE_MODE_NOT_ACTIVE,
+    REFUSED_RUN_VALUE_BASIS,
     RETENTION_GATE_NO_PV,
     ROI_MIN_SAMPLE_DAYS,
     ROI_PAYBACK_UNAVAILABLE_INSUFFICIENT_HISTORY,
@@ -1648,6 +1658,24 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: The row covering this instant, derived from ``_plan`` at the top of every
         #: tick and every refresh. A cache, never an authority.
         self._quarter: CarriedQuarter | None = None
+        #: The arm being measured, keyed on the claim id -- which the execution
+        #: record's own comment says "names one" physical claim. beta.44.
+        self._arm_open: dict[str, Any] | None = None
+        #: Finished arm measurements, bounded. The calibration set a later release
+        #: needs to price an arm cycle, and a log of nothing else. beta.44.
+        self._arm_measurements: deque[dict[str, Any]] = deque(
+            maxlen=MAX_ARM_MEASUREMENTS_REPORTED
+        )
+        #: Whether the previous tick saw a dispatch running, so an activation can be
+        #: recognised as a *transition* rather than as pre-existing state. beta.44.
+        self._arm_saw_dispatch: bool = False
+        #: How many physical arms the latest published plan asks for, and what each
+        #: buys. A finished dict, so no reference to a solve is retained. beta.44.
+        self._arm_plan: dict[str, Any] = {}
+        #: Which solved run each published target came from, so the arm plan can
+        #: price an arm against the idle counterfactual without publishing a
+        #: horizon index. Rebuilt with the targets every refresh. beta.44.
+        self._runs_by_plan_id: dict[str, Any] = {}
         #: Append order for the lifecycle trail, so a reader can order transitions
         #: three cadences wrote without comparing their clocks. beta.43.
         self._lifecycle_seq: int = 0
@@ -2325,6 +2353,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         run = self._carried
         snapshot = read_snapshot(self.hass)
         self._record_dispatch_start_sample(snapshot, now, cadence=CADENCE_PHYSICAL_TICK)
+        self._observe_arm(snapshot, now)
 
         if ended is not None:
             # The row that was being executed has finished. Close it whatever
@@ -9452,6 +9481,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._campaign_classifications = self._classify_campaigns(outcome, campaign_of)
 
         targets: list[dict[str, Any]] = []
+        runs_by_plan: dict[str, Any] = {}
         # Diagnostics only, and from a solve that already happened.
         attribution = outcome.safety_buy_attribution
         for run in outcome.desired.runs:
@@ -9509,8 +9539,388 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             target["revision"] = execution_revision(
                 previous.get(target["plan_id"]), target
             )
+            # **Kept privately, not published. beta.44.** The arm plan needs each
+            # target's solved interval range to price it against the idle
+            # counterfactual, and a horizon index is exactly the kind of internal
+            # object the published contract deliberately addresses by instant
+            # instead. So the mapping lives here rather than on the target.
+            runs_by_plan[target["plan_id"]] = run
             targets.append(target)
+        self._runs_by_plan_id = runs_by_plan
+        # **Built here, where the solve is still in scope, and kept as a finished
+        # dict rather than a reference to the outcome. beta.44.**
+        self._arm_plan = self._arm_plan_block(outcome, targets, runs_by_plan)
         return tuple(targets)
+
+    @callback
+    def _observe_arm(self, snapshot: Any, now: datetime) -> None:
+        """Measure one physical arm, from evidence this tick already read. beta.44.
+
+        **Read-only, and deliberately not wired into the write boundary.** Nothing
+        here can reach a command: it is driven entirely by the execution record and
+        the snapshot the caller has already taken, so an instrumentation fault costs
+        a null figure and never a dispatch. That is also why the arm is keyed on
+        ``claim_id`` rather than hooked at the arm sequence -- the record's own
+        comment says that field *"names one"* physical claim, and watching it change
+        is enough to bracket an arm without touching the path that creates it.
+
+        **Two clocks, never merged.** The 2026-09-05 capture is why: the claim was
+        written at 22:15:05.2, the vendor register's own ``last_changed`` was
+        22:15:42 -- 37.3 s -- and the first tick that *saw* it was 22:16:36.9, giving
+        91.7 s. A single figure would have reported the vendor as 2.5x slower than it
+        is, and a later release would have priced an arm against our own cadence.
+
+        Every figure refuses rather than guesses. ``None`` means the evidence was not
+        there; ``0`` means genuinely immediate and is only reachable from a real
+        measurement.
+        """
+        record = self.store.execution_record
+        claim = record.get("claim_id") if isinstance(record, dict) else None
+        open_arm = self._arm_open
+        if open_arm is not None and open_arm.get("claim_id") != claim:
+            self._close_arm(open_arm, now)
+            open_arm = None
+        if claim is None:
+            self._arm_open = None
+            self._arm_saw_dispatch = bool(
+                snapshot is not None and snapshot.dispatch_active
+            )
+            return
+        if open_arm is None:
+            written = instant_of(record.get("written_at"))
+            quarter = self._quarter
+            open_arm = {
+                "claim_id": claim,
+                "run_id": record.get("run_id"),
+                "intent": self._executing_intent(),
+                "claim_written_at": None if written is None else written.isoformat(),
+                "row_start": None
+                if quarter is None
+                else quarter.quarter_start.isoformat(),
+                "objective_kwh": None
+                if quarter is None
+                else round(self._objective_kwh_for(quarter), 3),
+                "activation_latency_s": None,
+                "observation_latency_s": None,
+                "delivery_latency_s": None,
+                "battery_delivery_latency_s": None,
+                "objective_forgone_to_activation_kwh": None,
+                "evidence": ARM_EVIDENCE_INCOMPLETE,
+            }
+            self._arm_open = open_arm
+
+        written = instant_of(open_arm.get("claim_written_at"))
+        active = bool(snapshot is not None and snapshot.dispatch_active)
+
+        # **Activation: the vendor's own clock, and only across a transition.**
+        # A dispatch that was already running when we claimed proves nothing about
+        # this arm, so a pre-existing active register is refused rather than timed.
+        if (
+            open_arm["activation_latency_s"] is None
+            and written is not None
+            and active
+            and not self._arm_saw_dispatch
+        ):
+            changed = self._dispatch_state_changed_at()
+            if changed is None:
+                open_arm["evidence"] = ARM_EVIDENCE_NO_TRANSITION
+            elif changed < written:
+                open_arm["evidence"] = ARM_EVIDENCE_STALE_REGISTER
+            else:
+                open_arm["activation_latency_s"] = round(
+                    (changed - written).total_seconds(), 1
+                )
+                open_arm["evidence"] = None
+
+        # **Observation: our own clock, and it includes our cadence on purpose.**
+        if (
+            open_arm["observation_latency_s"] is None
+            and written is not None
+            and active
+            and self._ownership_now(snapshot, now) == OWNERSHIP_OWNED
+        ):
+            open_arm["observation_latency_s"] = round(
+                (now - written).total_seconds(), 1
+            )
+
+        self._observe_arm_delivery(open_arm, snapshot, now, written)
+        self._arm_saw_dispatch = active
+
+    @callback
+    def _dispatch_state_changed_at(self) -> datetime | None:
+        """Return when the vendor dispatch register last changed state. beta.44.
+
+        The state machine's own ``last_changed``, which is a *timestamp*, not the
+        register's numeric value -- whose meaning this component has never
+        established and deliberately does not interpret. Its precision is bounded by
+        the source integration's poll interval, which is disclosed beside the figure
+        and never corrected for: subtracting an assumed cadence would be a guess
+        about somebody else's timing.
+        """
+        state = self.hass.states.get(SENSOR_DISPATCH_START)
+        return None if state is None else state.last_changed
+
+    @callback
+    def _observe_arm_delivery(
+        self,
+        arm: dict[str, Any],
+        snapshot: Any,
+        now: datetime,
+        written: datetime | None,
+    ) -> None:
+        """Time the first delivery attributable to this arm. beta.44.
+
+        **Attributable, which for a charge is the whole difficulty.** Ambient
+        production can already be charging the pack before a forced grid charge
+        activates, so battery movement alone does not prove the dispatch started.
+        The grid-caused share is what does, and it is the same construction the
+        run-level budget already uses: measured charge less measured production
+        surplus. Both are published, so a reader can tell activation from absorption
+        rather than being handed one number that conflates them.
+
+        Export is measured at the meter and against the same surplus, so
+        pre-existing photovoltaic export is never credited to the arm.
+        """
+        if arm["delivery_latency_s"] is not None or written is None:
+            return
+        if self._coherence not in (None, COHERENCE_OK):
+            arm.setdefault("delivery_evidence", ARM_EVIDENCE_INCOHERENT)
+            return
+        surplus = self._budget_surplus_kw()
+        if surplus is None:
+            arm["delivery_evidence"] = ARM_EVIDENCE_UNATTRIBUTABLE
+            return
+        flows = self.read_flows()
+        export = arm.get("intent") == EXECUTION_INTENT_NET_EXPORT
+        if export:
+            if flows.grid_export_w is None:
+                arm["delivery_evidence"] = ARM_EVIDENCE_INCOHERENT
+                return
+            caused = max(0.0, max(0.0, flows.grid_export_w) / 1000.0 - surplus)
+        else:
+            if flows.battery_charge_w is None:
+                arm["delivery_evidence"] = ARM_EVIDENCE_INCOHERENT
+                return
+            charge_kw = max(0.0, flows.battery_charge_w / 1000.0)
+            caused = max(0.0, charge_kw - surplus)
+            if (
+                arm["battery_delivery_latency_s"] is None
+                and charge_kw > DISPATCH_POWER_DEADBAND_KW
+            ):
+                arm["battery_delivery_latency_s"] = round(
+                    (now - written).total_seconds(), 1
+                )
+        if caused <= DISPATCH_POWER_DEADBAND_KW:
+            return
+        arm["delivery_latency_s"] = round((now - written).total_seconds(), 1)
+        arm["delivery_evidence"] = None
+        objective = arm.get("objective_kwh")
+        if objective:
+            # **Derived, and an upper bound.** The objective is prorated at the
+            # row's own average rate over the interval that delivered nothing
+            # attributable. Where ambient behaviour delivered part of it anyway the
+            # true loss is smaller, which is why the basis says bound rather than
+            # measurement.
+            elapsed = min(arm["delivery_latency_s"], QUARTER_SECONDS)
+            arm["objective_forgone_to_activation_kwh"] = round(
+                objective * elapsed / QUARTER_SECONDS, 3
+            )
+
+    @callback
+    def _close_arm(self, arm: dict[str, Any], now: datetime) -> None:
+        """File a finished arm measurement. beta.44."""
+        arm["closed_at"] = now.isoformat()
+        if arm.get("activation_latency_s") is None and not arm.get("evidence"):
+            arm["evidence"] = ARM_EVIDENCE_INCOMPLETE
+        arm.setdefault("delivery_evidence", ARM_EVIDENCE_INCOMPLETE)
+        arm["basis"] = (
+            "activation_latency_s is the vendor register's own last_changed less "
+            "our claim, accepted only across an observed inactive-to-active "
+            "transition at or after the claim, and bounded in precision by the "
+            "source integration's poll interval. observation_latency_s is the first "
+            "tick that saw the dispatch owned and active, and deliberately includes "
+            "our own sixty-second cadence -- on 2026-09-05 the two were 37.3 s and "
+            "91.7 s for one arm, so they are never merged. delivery_latency_s times "
+            "the first coherent delivery attributable to the dispatch: caused "
+            "export above the measured production surplus at the meter, or "
+            "grid-caused charge above it at the battery. "
+            "battery_delivery_latency_s times any battery charge and is published "
+            "beside it precisely so ambient absorption cannot be read as proof the "
+            "dispatch started. objective_forgone_to_activation_kwh is derived, not "
+            "measured: the row objective prorated over the undelivered interval, "
+            "and an upper bound because ambient behaviour may have delivered part "
+            "of it. null is never zero"
+        )
+        self._arm_measurements.append(arm)
+
+    @callback
+    def _armable_stretches(self, target: dict[str, Any]) -> list[tuple[int, int]]:
+        """Return the maximal contiguous executable row spans of one target.
+
+        **Each span is one physical arm. beta.44.**
+
+        The dispatch stops whenever no *executable* row covers the instant:
+        ``AdmittedPlan.executing_quarter`` returns ``None`` for a row that is not
+        executable, the tick reads that as ``stop``, and the row-scope teardown
+        clears the carried run -- so the next executable row mints a fresh ``run_id``
+        and runs the full two-stage arm with a marker claim. An ordinary boundary
+        *between* two executable rows does none of that: the slot advances and the
+        sustain path re-arms the dead-man without claiming anything.
+
+        So the count is a property of the published schedule alone, which is why it
+        can be derived here without asking the plan or the device.
+        """
+        spans: list[tuple[int, int]] = []
+        first: int | None = None
+        rows = target.get("quarter_schedule") or ()
+        for index, row in enumerate(rows):
+            armable = row.get("not_executable") is None
+            if armable and first is None:
+                first = index
+            elif not armable and first is not None:
+                spans.append((first, index - 1))
+                first = None
+        if first is not None:
+            spans.append((first, len(rows) - 1))
+        return spans
+
+    @callback
+    def _advantage_eur(self, run: Any, intervals: dict[int, Any]) -> float:
+        """Return one index range's advantage over leaving the battery alone."""
+        if run is None:
+            return 0.0
+        total = 0.0
+        for index in range(run.start_index, run.end_index + 1):
+            entry = intervals.get(index)
+            if entry is not None:
+                total -= entry.marginal_cost_eur
+        return total
+
+    @callback
+    def _arm_entry(
+        self,
+        target: dict[str, Any],
+        span: tuple[int, int],
+        arm_index: int,
+        run: Any,
+        intervals: dict[int, Any],
+    ) -> dict[str, Any]:
+        """Return one planned arm, at the boundary its objective is paid at."""
+        rows = target.get("quarter_schedule") or ()
+        first, last = span
+        export = target.get("intent") == EXECUTION_INTENT_NET_EXPORT
+        key = "grid_export_target_kwh" if export else "battery_kwh"
+        objective = sum(float(rows[i].get(key) or 0.0) for i in range(first, last + 1))
+        value = 0.0
+        if run is not None:
+            for offset in range(first, last + 1):
+                entry = intervals.get(run.start_index + offset)
+                if entry is not None:
+                    value -= entry.marginal_cost_eur
+        return {
+            "arm_index": arm_index,
+            "campaign_id": target.get("campaign_id"),
+            "intent": target.get("intent"),
+            "starts_at": rows[first].get("start"),
+            "ends_at": rows[last].get("end"),
+            "row_count": last - first + 1,
+            "objective_kwh": round(objective, 3),
+            "objective_boundary": (
+                CAMPAIGN_BOUNDARY_METER if export else CAMPAIGN_BOUNDARY_BATTERY
+            ),
+            "marginal_value_eur": round(value, 4),
+        }
+
+    @callback
+    def _arm_plan_block(
+        self,
+        outcome: Any,
+        targets: list[dict[str, Any]],
+        runs_by_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return how many physical arms this plan asks for, and what each buys.
+
+        **beta.44, and it exists because no published figure answered it.** The DP
+        prices a campaign as one uninterrupted run and charges one fee for it, while
+        Stage B may arm, stop and re-arm several times inside that same campaign: a
+        ``serve_load`` gap between two exports, or a PV-only ``hold`` inside a
+        charge, each force a stop and a fresh claim. On the 2026-09-05 horizon that
+        was **eleven arms against two direction changes**.
+
+        Nothing here decides anything. Every figure is derived from targets already
+        published and a trajectory already final.
+        """
+        desired = getattr(outcome, "desired", None)
+        intervals: dict[int, Any] = (
+            {}
+            if desired is None
+            else {entry.index: entry for entry in desired.intervals}
+        )
+        arms: list[dict[str, Any]] = []
+        arm_count = 0
+        refused = 0
+        refused_energy = 0.0
+        refused_value = 0.0
+        published = 0
+        for target in targets:
+            if target.get("intent") not in CONTROL_LIVE_DISPATCH_INTENTS:
+                # ``serve_load`` carries the campaign identity across a gap and
+                # commands nothing. It is not a run Stage B could ever have armed,
+                # so counting it as refused would inflate the very figure this
+                # block exists to measure.
+                continue
+            published += 1
+            run = runs_by_plan.get(target.get("plan_id"))
+            spans = self._armable_stretches(target)
+            if not spans:
+                export = target.get("intent") == EXECUTION_INTENT_NET_EXPORT
+                key = "grid_export_target_kwh" if export else "battery_kwh"
+                rows = target.get("quarter_schedule") or ()
+                refused += 1
+                refused_energy += sum(float(row.get(key) or 0.0) for row in rows)
+                refused_value += self._advantage_eur(run, intervals)
+                continue
+            for span in spans:
+                arm_count += 1
+                if len(arms) < MAX_ARM_PLAN_ENTRIES_PUBLISHED:
+                    arms.append(
+                        self._arm_entry(target, span, arm_count, run, intervals)
+                    )
+
+        campaigns = () if desired is None else desired.campaigns
+        return {
+            "arm_count": arm_count,
+            "campaign_count": len(campaigns),
+            "segment_count": sum(len(c.segments) for c in campaigns),
+            "executable_segment_count": sum(
+                1 for c in campaigns for segment in c.segments if segment.executable
+            ),
+            "direction_changes": (
+                None if desired is None else desired.direction_changes
+            ),
+            "runs_total": 0 if desired is None else len(desired.runs),
+            "runs_published": published,
+            "runs_refused_nothing_armable": refused,
+            "energy_planned_on_refused_runs_kwh": round(refused_energy, 3),
+            "value_planned_on_refused_runs_eur": round(refused_value, 4),
+            "refused_run_value_basis": REFUSED_RUN_VALUE_BASIS,
+            "arms": arms,
+            "arms_truncated": max(0, arm_count - len(arms)),
+            "rule": (
+                "one arm is one maximal contiguous stretch of executable rows, "
+                "because a non-executable row makes the tick stop the dispatch and "
+                "the next executable row claim the marker again. direction_changes "
+                "counts what the DP charged a fee for and is a different question: "
+                "the objective's run state does not distinguish exporting from "
+                "serving load, nor charging from absorbing, so one campaign can ask "
+                "for several arms and pay one fee. a refused run is one Stage B can "
+                "never arm because no row of it is executable, and its value is the "
+                "advantage over leaving the battery alone -- ambient production and "
+                "unavoidable import sit inside the idle counterfactual on both "
+                "sides of that difference, so neither is counted as dispatch-caused "
+                "value. nothing here decides anything"
+            ),
+        }
 
     @callback
     def realized_today(self, plan: Any) -> dict[str, Any]:
@@ -13164,6 +13574,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         stage_b["lifecycle"] = self._lifecycle_block()
         stage_b["admission"] = self._admission_block(now)
         stage_b["dispatch_start_probe"] = list(self._dispatch_start_samples)
+        # **beta.44 calibration, read by nothing.** One entry per finished physical
+        # claim, with the two clocks kept apart. See ``_observe_arm``.
+        stage_b["arm_measurements"] = list(self._arm_measurements)
+        stage_b["arm_plan"] = self._arm_plan
         stage_b["dispatch_start_active_probe"] = {
             "samples": list(self._dispatch_start_active),
             "count": len(self._dispatch_start_active),

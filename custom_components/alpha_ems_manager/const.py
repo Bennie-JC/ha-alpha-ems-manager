@@ -4656,6 +4656,36 @@ ECONOMIC_ANNOUNCE_LEAD_MINUTES: Final = QUARTER_MINUTES
 #: remembering more could never be consulted.
 MAX_ECONOMIC_RUNS_TRACKED: Final = MAX_ECONOMIC_RUNS_REPORTED
 
+#: How many physical arm measurements the diagnostics ring keeps. **beta.44.**
+#:
+#: One entry per physical claim, appended when the claim is superseded or cleared.
+#: A day of quarter-boundary arming on the reference installation is well under this,
+#: and the ring is the calibration set a later release needs -- not a log.
+MAX_ARM_MEASUREMENTS_REPORTED: Final = 48
+
+#: How many planned arms the Stage-A arm plan publishes. **beta.44.**
+MAX_ARM_PLAN_ENTRIES_PUBLISHED: Final = 24
+
+#: Why an arm measurement carries no figure. **beta.44.**
+#:
+#: ``unknown`` is never encoded as zero: zero means genuinely immediate, and these
+#: say which evidence was missing instead.
+ARM_EVIDENCE_INCOMPLETE: Final = "incomplete"
+ARM_EVIDENCE_NO_TRANSITION: Final = "no_observed_transition"
+ARM_EVIDENCE_STALE_REGISTER: Final = "register_predates_claim"
+ARM_EVIDENCE_INCOHERENT: Final = "sources_incoherent"
+ARM_EVIDENCE_RESTARTED: Final = "restarted_before_evidence"
+ARM_EVIDENCE_UNATTRIBUTABLE: Final = "delivery_not_attributable"
+
+#: What ``value_planned_on_refused_runs_eur`` is measured against. **beta.44.**
+#:
+#: The per-interval advantage over leaving the battery alone --
+#: ``EconomicInterval.marginal_cost_eur``, negated. Ambient production and
+#: unavoidable household import are inside the idle counterfactual on **both** sides
+#: of that difference, so neither can be counted as dispatch-caused value. That is
+#: the whole reason the marginal figure is used here rather than ``cost_eur``.
+REFUSED_RUN_VALUE_BASIS: Final = "advantage_over_idle_counterfactual"
+
 #: How many upcoming campaigns the public schedule publishes. **beta.43.**
 #:
 #: A cap rather than the whole horizon, because this is an entity attribute a

@@ -55,7 +55,18 @@ PKG = ROOT / "custom_components" / "alpha_ems_manager"
 SNAPSHOT = HERE / ".snapshot.json"
 LOCK = HERE / ".lock"
 
-TABLES = ("b35", "b36", "b37", "b38", "b39", "b40", "b41", "b42", "b43")
+TABLES = (
+    "b35",
+    "b36",
+    "b37",
+    "b38",
+    "b39",
+    "b40",
+    "b41",
+    "b42",
+    "b43",
+    "b44",
+)
 
 
 def tracked_sources() -> list[pathlib.Path]:
