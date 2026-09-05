@@ -28,6 +28,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from homeassistant.core import callback
 
 from custom_components.alpha_ems_manager.const import (
     CAMPAIGN_LIFECYCLE_KINDS,
@@ -80,16 +81,32 @@ def _mark(**overrides: Any) -> dict[str, Any]:
 
 @pytest.fixture
 def events(hass):
-    """Collect every lifecycle event fired during a test.
+    """Collect every lifecycle event fired during a test, **in fire order**.
 
     ``hass.bus.async_fire`` schedules delivery rather than performing it, so a test
     that asserts immediately after the call is measuring the scheduler. Every test
     here drains the bus through the ``settle`` fixture first.
+
+    **The listener is a ``@callback``, and that is load-bearing rather than
+    idiomatic.** Home Assistant classifies a plain function listener as an
+    ``Executor`` job and runs it in a thread pool, so two events fired back to back
+    arrive in whatever order the pool schedules them. This file asserts that
+    ``stopped`` precedes ``removed``, and with an executor listener that assertion
+    was a race -- it passed locally at one, four and thirty-two workers and on three
+    CI shards before failing on the fourth.
+
+    A ``@callback`` listener is a ``Callback`` job, dispatched synchronously inside
+    ``async_fire``. That is also what any real consumer that cares about ordering
+    uses, so the fixture now observes the bus the way the code's own guarantee is
+    stated: sequential fires, no await between them, delivered in order.
     """
     seen: list[dict[str, Any]] = []
-    hass.bus.async_listen(
-        EVENT_CAMPAIGN_LIFECYCLE, lambda event: seen.append(event.data)
-    )
+
+    @callback
+    def _record(event: Any) -> None:
+        seen.append(event.data)
+
+    hass.bus.async_listen(EVENT_CAMPAIGN_LIFECYCLE, _record)
     return seen
 
 
@@ -631,3 +648,35 @@ async def test_a_partial_result_carries_a_positive_shortfall(
     assert events[0]["result"] == OUTCOME_PARTIAL
     assert events[0]["realised_kwh"] == 9.84
     assert events[0]["shortfall_kwh"] == pytest.approx(2.66)
+
+
+def test_the_event_order_assertions_rest_on_a_synchronous_listener(hass) -> None:
+    """**The guard on this file's own ordering claims.**
+
+    ``test_row_b`` asserts ``stopped`` precedes ``removed``. That assertion is only
+    meaningful if the listener observes the bus in fire order, and Home Assistant
+    decides that from the listener itself: a plain function is an ``Executor`` job
+    dispatched through a thread pool, where two back-to-back fires arrive in
+    whatever order the pool picks. Under that classification the ordering assertions
+    here were a race -- they passed at one, four and thirty-two workers locally and
+    on three CI shards before failing on the fourth.
+
+    Without this test, deleting the decorator would restore the flake silently and
+    the file would keep asserting an order it no longer observes. So the
+    classification is asserted, not the decorator: what matters is the job type
+    Home Assistant derives, which is also what a real order-sensitive consumer gets.
+    """
+    from homeassistant.core import HassJobType, get_hassjob_callable_job_type
+
+    seen: list[dict[str, Any]] = []
+
+    @callback
+    def _record(event: Any) -> None:
+        seen.append(event.data)
+
+    assert get_hassjob_callable_job_type(_record) is HassJobType.Callback
+    # And the negative, so the assertion above is not trivially true of everything.
+    assert (
+        get_hassjob_callable_job_type(lambda event: seen.append(event.data))
+        is HassJobType.Executor
+    )
