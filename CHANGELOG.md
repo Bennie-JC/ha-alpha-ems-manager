@@ -110,8 +110,16 @@ anchors being byte-identical.
   removed and no assertion weakened.
 - Solve grids for the four hot files are memoised behind a shared cache that refuses
   anonymous callables, so a key collision is not expressible.
-- Deterministic sharding from measured JUnit timings, balanced to 1.00x ideal, with
-  the manifest committed and CI reading it.
+- Deterministic sharding from measured JUnit timings, with the manifest committed
+  and CI reading it. **Measured on GitHub: 29.6 min total against beta.41's 127 min**,
+  on 4-core runners at `-n auto`. The four shards ran 27:52 / 15:46 / 16:03 / 13:51 --
+  a 1.94x spread rather than the 1.00x the plan projected from local timings, because
+  a 4-core runner parallelises differently from a 16-worker development machine.
+  Re-planning from the CI artifacts closes the spread on paper and gains almost
+  nothing in practice: `test_beta40_hard_floor.py` alone is 26.92 min of CI processor
+  time, which is 97 % of an ideal shard, so the slowest shard was already at the floor
+  no split can beat. Splitting that file further is the next real gain and is not
+  attempted here.
 - Mutation testing moved into `tools/mutation/` and hardened: content-hash snapshots,
   deterministic restore, a lock, and — new here — refusal of any anchor that does not
   match **exactly once**. Six anchors were ambiguous and had been silently mutating
