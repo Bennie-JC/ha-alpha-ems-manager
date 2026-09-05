@@ -9,6 +9,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.43] - 2026-09-06
+
+**A row's measured energy did not survive its own boundary, and a campaign with more
+than one row could not report what it had done.** On the sixty-second tick the
+executing slot advanced to the successor row and the accumulators were rebased onto it
+*before* the ended row was read — so the row that had just finished recorded `0.0`.
+The capture/restore pair inside `_async_end_row` was written to protect those totals
+across the physical stop, which happens two statements later than the loss.
+
+The outcome depended on something with nothing to do with the plant: a row **with** a
+successor recorded zero, and a row that ended with nothing after it recorded the truth,
+because that path returns early and never resets.
+
+Measured on the reference installation, 2026-09-05. The 20:15–20:30 export row filed
+`realized_grid_kwh: 0.0` with a 100 % shortfall while the physical decision ring held
+`grid_realized_kwh: 0.494` for that same row twenty-three seconds before it ended. All
+nine completed rows of that capture split exactly along "has a successor", across two
+campaigns and both directions — which is why a 3.62 kWh charge campaign reported an
+empty result beside five recorded rows.
+
+**Nothing in the planner moved.** The DP objective, the reserve, the three purchase
+categories, terminal value, PV retention and absorption, Stage A authority, Stage B
+admission, the meter-side export objective, the battery-side charge objective,
+household-load compensation, charge ramping and every safety gate are unchanged —
+proven by the seven neutrality digests and the beta.40/41 decision anchors being
+byte-identical.
+
+### Fixed
+
+- **The boundary.** The ended row's totals are captured before the slot advances and
+  handed to the row-closing path, so a row is recorded and accrued from its own
+  measurement. beta.35's stop-before-record rule is untouched: only the accounting
+  moved, never the physical write.
+- **The accrual reaches the campaign.** `_async_end_row` now accrues before the stop,
+  which is what beta.36 did for its sibling `_async_end_quarter` and only that one —
+  the stop reaches `_close_campaign`, which nulls the campaign identity, so the
+  accrual afterwards early-returned on its own guard.
+- **A row is judged at its own allowance.** `_record_completed_quarter` has stated
+  since beta.35 that *"the subject is a parameter, not `self._quarter`"* and then read
+  three figures off properties resolving against the field. Both recording callers
+  arrive after the slot has moved, so a finished charge row was capped by the
+  **successor's** envelope — zeroed outright where that successor was a `serve_load`
+  gap. Export was never affected; its objective is a plain metered field.
+- **The terminal is not read through a rebased row.** `_async_stop_dispatch` cleared
+  the executing slot and the exactly-once accrual latch *before* `_close_campaign`,
+  making the open-quarter term it promises to include structurally zero. Both moved
+  after the terminal.
+- **`rows_completed` is a real count.** It was the same local as `quarters_admitted`
+  published twice, which read as corroboration: on 2026-09-05 both said 2 while three
+  completed rows carried the campaign id. It now counts rows, and the closing row that
+  beta.35 deliberately records *after* the terminal is counted through the accrual
+  latch rather than dropped.
+- **`objective_row_count` is set on both branches**, so a campaign read through the
+  `execution_targets` fallback no longer publishes the previous campaign's count.
+
+### Added
+
+- **The campaign target may grow, and still may never shrink.** A campaign that opened
+  with one published row froze a 0.25 kWh target, ran three rows whose meter
+  objectives summed to 1.50 kWh, and filed `success` at `0.233 of 0.25` beside
+  1.206 kWh of recorded export. The freeze exists so Stage A changing its mind cannot
+  make a shortfall retroactively successful; it was never meant to cap a campaign at
+  the fraction of itself that happened to be published when it started. Monotonic,
+  identity-guarded, and read only from the live publication — nothing recorded is
+  rewritten.
+- **`releasing`, for a dispatch we armed and have already stopped.** The vendor's
+  dead-man keeps `dispatch_active` true for minutes after our own quarter-boundary
+  stop releases the marker and clears the causal record, so `ownership_of` answered
+  `foreign` about our own cleanup — and `_decide` turned that into
+  `ownership_conflict`, a reason in neither the failed nor the completion set, which
+  falls through to `canceled`. **Authorisation-identical to `foreign`**: no write, not
+  owned, every gate refusing on "not owned" refuses on it unchanged. Reachable only
+  against a release receipt whose recorded dead-man deadline still matches the
+  register's and has not passed; without that proof the answer stays `foreign`, and no
+  fixed grace period is invented.
+- **A controllability floor for `net_export`, beside the resolution floor and not
+  instead of it.** `MIN_EXECUTABLE_QUARTER_KWH` keeps answering *can the actuator
+  express this?* — one step held for a quarter. The new
+  `MIN_CONTROLLABLE_QUARTER_KWH` answers *can the loop hold it?* and is derived from
+  the deadband the controller will not correct inside plus one step it cannot express.
+  The live row that made it necessary published a 0.04 kWh meter objective, 0.16 kW
+  average: its entire incremental export revenue was 0.0083 EUR against 0.010 EUR of
+  deadband exposure, while the 0.21 kWh of avoided import beside it — the great
+  majority of the row's published value — needed no dispatch at all. Export only; a
+  charge objective is battery-side, its rows are continuations inside one arm, and
+  `retention_authorised` is how 62 % of the live charge campaign's energy reached the
+  pack. **A skipped row is not a failure**: self-consumption continues and the energy
+  stays for a window that can be steered.
+- **`upcoming` on Next Planned Action** — the campaigns ahead, at most eight, ordered
+  by start, each with absolute instants, the objective at the boundary it is paid at,
+  `will_execute` and `skip_reason`. A dashboard no longer has to parse the diagnostics
+  download to show a trading log.
+- **Join keys.** `open_campaign` gains `campaign_instance_id` and `campaign_end`;
+  `admitted_plan` publishes the `campaign_id` and `campaign_end` it has carried since
+  beta.32.
+- **`objective_rows_realised` on the terminal** — the rows the total was summed from,
+  so a terminal that disagrees with its own history is visible from one payload.
+- **`seq` and `cadence` on every lifecycle transition.** Three cadences write the
+  trail and the quarter refresh threads one instant through a body that takes 31–35 s
+  on the reference hardware, so it stamps transitions half a minute stale while the
+  tick stamps fresh ones — the 2026-09-05 trail holds `cleanup_complete` at 17:30:20
+  followed by `foreign` at 17:30:05. `at` is unchanged; the order is now readable
+  without inventing a clock.
+- **`published_at` and `completed_campaign_is_current`**, and `completed_campaign` is
+  re-rendered at the write boundary alongside the two blocks that already were.
+
+### Verification
+
+- 38 new tests across four files; 19 mutations killed, 0 survived, 0 anchors lost.
+  Five survivors in the first table were tests aimed at the wrong surface and every
+  one was rewritten — including a gap test whose fixture allowances made two
+  equal-and-opposite errors cancel exactly in the sum, so it now asserts per-row
+  accrual increments.
+- The mutation runner is hardened. `read_text`/`write_text` is not a round trip on
+  Windows: it rewrote every line ending in an LF file, its own content hash then
+  reported drift on a file it had just restored correctly, and `restore()` reached for
+  `git checkout` — which discards uncommitted work on the dirty tree this harness is
+  designed to run against. Reads and writes now preserve line endings, and recovery
+  restores captured content instead of `HEAD`.
+
+### Not validated
+
+No beta.43 code has run on hardware. This is a prerelease for live validation.
+
 ## [1.0.0-beta.42] - 2026-09-05
 
 **The figure labelled "realised net value" was never a battery comparator, and an

@@ -239,6 +239,7 @@ from .const import (
     LIFECYCLE_KIND_REMOVED,
     LIFECYCLE_KIND_STARTED,
     LIFECYCLE_KIND_STOPPED,
+    LIFECYCLE_RELEASING,
     LIFECYCLE_STARTING,
     LIFECYCLE_STATES,
     LIFECYCLE_STOPPED,
@@ -254,6 +255,7 @@ from .const import (
     MAX_PHYSICAL_DECISIONS_REPORTED,
     MAX_QUARTER_REFUSALS_RECORDED,
     MAX_SAMPLE_GAP_SECONDS,
+    MIN_CONTROLLABLE_QUARTER_KWH,
     MIN_EXECUTABLE_QUARTER_KWH,
     MIN_QUARTER_COVERAGE,
     OUTCOME_CANCELED,
@@ -266,6 +268,7 @@ from .const import (
     OWNERSHIP_FOREIGN,
     OWNERSHIP_NONE,
     OWNERSHIP_OWNED,
+    OWNERSHIP_RELEASING,
     OWNERSHIP_UNPROVEN,
     PRICE_BASIS_LIVE_FORECAST,
     PRICE_BASIS_STORED_SNAPSHOT,
@@ -1645,6 +1648,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: The row covering this instant, derived from ``_plan`` at the top of every
         #: tick and every refresh. A cache, never an authority.
         self._quarter: CarriedQuarter | None = None
+        #: Append order for the lifecycle trail, so a reader can order transitions
+        #: three cadences wrote without comparing their clocks. beta.43.
+        self._lifecycle_seq: int = 0
+        #: Which cadence is currently running, stamped onto each transition. beta.43.
+        self._lifecycle_cadence: str = CADENCE_QUARTER_REFRESH
+        #: What Alpha EMS observed at the instant it released its own dispatch, so
+        #: the vendor's dead-man tail can be told from somebody else's run. beta.43.
+        #:
+        #: **Session-local on purpose.** After a restart there is no run to
+        #: recognise and no claim to honour, so the conservative answer -- a running
+        #: dispatch we cannot prove is ours is ``foreign`` -- is the correct one.
+        #: Persisting it would let a reboot inherit a claim it cannot support.
+        self._release_receipt: dict[str, Any] | None = None
         #: Measured progress inside the current quarter, keyed on its start so a
         #: new quarter can never inherit the last one's accumulators.
         self._quarter_key: datetime | None = None
@@ -2276,6 +2292,29 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         would lose energy from the quarter's totals on exactly the ticks a reader
         most wants explained.
         """
+        # **Captured before anything advances, and beta.43 is what it is for.**
+        #
+        # The two statements below rebase the accumulators onto whatever row now
+        # covers this instant: ``_refresh_executing_quarter`` moves the slot to the
+        # successor, and ``_accrue_quarter_progress`` then sees a changed row key and
+        # calls ``_reset_quarter_progress`` -- zeroing the totals of the row that just
+        # ended, *before* ``_async_end_row`` below is ever reached. Its own
+        # ``_capture_quarter_progress`` was written to protect those totals across
+        # the physical stop, which happens two statements later than the loss.
+        #
+        # So a row with a successor recorded ``0.0`` and a row that ended with
+        # nothing after it recorded the truth, because that path returns early from
+        # ``_accrue_quarter_progress`` and never resets. On 2026-09-05 the
+        # 20:15-20:30 export row filed ``realized_grid_kwh: 0.0`` and a 100 %
+        # shortfall while the physical ring, twenty-three seconds before that row
+        # ended, held ``grid_realized_kwh: 0.494``. All nine completed rows of that
+        # capture split exactly along "has a successor".
+        #
+        # Additive on purpose: nothing is reordered, so the derivation still happens
+        # before the measurement and no physical action moves.
+        self._lifecycle_cadence = CADENCE_PHYSICAL_TICK
+        pending = self._capture_quarter_progress()
+        pending_clamps = set(self._quarter_clamps)
         # **Derive before measuring.** The row covering this instant decides which
         # accumulators the sample belongs to, so it must be resolved first -- and the
         # derivation is also what notices a row ending, because a derived quarter
@@ -2290,7 +2329,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if ended is not None:
             # The row that was being executed has finished. Close it whatever
             # follows: the shortfall belongs to the row it happened in.
-            await self._async_end_row(ended, now, snapshot, stop=self._quarter is None)
+            await self._async_end_row(
+                ended,
+                now,
+                snapshot,
+                stop=self._quarter is None,
+                measured=pending,
+                clamps=pending_clamps,
+            )
             if self._quarter is None:
                 self._note_tick(now, TICK_STOPPED_QUARTER_EXPIRED, wrote=True)
                 return
@@ -2390,10 +2436,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # expired: the derivation above stops returning it, and that is where
             # the end is noticed. A test here would be unreachable code pretending
             # to be a safety check.
-            if quarter.objective_kwh() < MIN_EXECUTABLE_QUARTER_KWH:
+            if quarter.objective_kwh() < self._min_armable_kwh(quarter):
                 # Stage A marks such a row non-executable and never publishes it as
                 # armable; this is Stage B's own backstop, because arming it would
                 # overshoot the objective by construction.
+                #
+                # **The same rule as Stage A's, asked through one helper. beta.43.**
+                # Two copies of a floor is one too many, and the copy that drifted
+                # would be this one -- it already had to be kept in step with the
+                # resolution constant by hand.
                 self._note_tick(now, TICK_SKIPPED_SUB_RESOLUTION)
                 return
         elif run.stale_at(now) or not run.actionable_at(now):
@@ -2544,6 +2595,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         snapshot: Any,
         *,
         stop: bool,
+        measured: tuple[Any, ...] | None = None,
+        clamps: set[str] | None = None,
     ) -> None:
         """Close a finished row, stopping the dispatch only when nothing follows.
 
@@ -2556,6 +2609,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         The shortfall is recorded against the row it happened in either way, and is
         **never** carried forward.
         """
+        # **Put the caller's snapshot back first. beta.43.**
+        #
+        # ``measured`` is what the accumulators held before the slot advanced, and
+        # on the tick path they have since been rebased onto the successor row --
+        # see ``_async_correct_setpoint``. Restoring here rather than reading the
+        # live fields is what makes every figure below describe ``row``: the
+        # totals, ``_quarter_target_reached_at``, and the clamps that bound it.
+        # The restore lasts exactly as long as the bookkeeping does; the
+        # ``_reset_quarter_progress`` at the end of this method rebases onto the
+        # successor again, as it always did.
+        if measured is not None:
+            self._restore_quarter_progress(measured)
+            self._quarter_clamps = set(() if clamps is None else clamps)
         measured = self._capture_quarter_progress()
         reached = self._quarter_target_reached_at is not None
         # A row that met its objective did not fall short of it.
@@ -2563,6 +2629,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             SHORTFALL_TARGET_REACHED if reached else SHORTFALL_QUARTER_EXPIRED
         )
         clamps = set(self._quarter_clamps)
+        # **Accrued before the stop, and beta.36's reasoning applied to its
+        # sibling. beta.43.**
+        #
+        # ``_async_end_quarter`` has done this since beta.36 and says why: the
+        # accrual is in-memory arithmetic over energy the plant has already moved,
+        # it has no reason to be sequenced after a physical write, and sequencing it
+        # there let ``_close_campaign`` set ``_campaign_id = None`` in between -- so
+        # the guard in ``_accrue_campaign_progress`` early-returned and the row's
+        # energy reached the history and no campaign figure. That fix was applied to
+        # one of the two row-ending paths. This is the other one.
+        #
+        # Exactly once is a property of ``_campaign_accrued_row``, not of ordering,
+        # so the ``accrue=False`` below is intent made visible rather than the
+        # mechanism: a double call is already harmless.
+        self._accrue_campaign_progress(row, self._row_objective_kwh(row))
         if stop:
             # **Which scope, and beta.36 is the first release that asks. **
             #
@@ -2584,7 +2665,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         self._restore_quarter_progress(measured)
         self._quarter_clamps = clamps
-        self._record_completed_quarter(row, QUARTER_END_EXPIRED)
+        self._record_completed_quarter(row, QUARTER_END_EXPIRED, accrue=False)
         self._reset_quarter_progress(self._quarter)
 
     @callback
@@ -3365,7 +3446,29 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._lifecycle_previous = self._lifecycle
         self._lifecycle = state
         self._lifecycle_at = now
-        self._lifecycle_trail.append({"state": state, "at": now.isoformat()})
+        # **``at`` is the cadence's own instant, and the trail is append-ordered.
+        # Those are two different orderings, and beta.43 stops them being read as
+        # one.** A quarter refresh threads a single ``now`` captured at its first
+        # line through a body that takes 31-35 s on the reference hardware, so it
+        # stamps transitions with an instant that is by then half a minute old --
+        # while the sixty-second tick, running freely inside that window, stamps
+        # fresh ones. On 2026-09-05 the trail holds ``stopped`` and
+        # ``cleanup_complete`` at 17:30:20 followed by ``foreign`` at 17:30:05.
+        #
+        # Neither number is wrong and neither is changed here: ``now`` stays the
+        # refresh's one consistent instant, which is deliberate. What is added is a
+        # monotonic ``seq``, so a reader can reconstruct the true order without
+        # inventing a clock, and the ``cadence`` that stamped it, so the staleness
+        # is attributable rather than mysterious.
+        self._lifecycle_seq += 1
+        self._lifecycle_trail.append(
+            {
+                "state": state,
+                "at": now.isoformat(),
+                "seq": self._lifecycle_seq,
+                "cadence": self._lifecycle_cadence,
+            }
+        )
 
     @callback
     def _note_campaign_started(self, now: datetime) -> None:
@@ -3463,6 +3566,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if ownership_state == OWNERSHIP_DEGRADED:
             return LIFECYCLE_DEGRADED
+        if ownership_state == OWNERSHIP_RELEASING:
+            # beta.43. Projected, never decided on -- like every other state here.
+            return LIFECYCLE_RELEASING
         if ownership_state == OWNERSHIP_FOREIGN:
             return LIFECYCLE_FOREIGN
         if ownership_state == OWNERSHIP_UNPROVEN:
@@ -3610,6 +3716,16 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         return {
             "campaign_id": self._campaign_id,
+            # **The join keys, since beta.43.** Without the instance id an open
+            # campaign could not be tied to the lifecycle events that describe it or
+            # to the terminal that eventually closes it, and ``campaign_id`` alone
+            # cannot: it is stable across attempts by design.
+            "campaign_instance_id": self._campaign_instance_id,
+            "campaign_end": (
+                None
+                if self._campaign_end_utc is None
+                else self._campaign_end_utc.isoformat()
+            ),
             "objective_boundary": self._campaign_boundary,
             "started": self._campaign_started_at is not None,
             "frozen_target_kwh": (
@@ -3651,6 +3767,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         that has since advanced. **Nothing is recomputed and no command is
         reachable from here.**
 
+        **beta.43 adds the third block, and it was the one that needed it most.**
+        ``completed_campaign`` is a latch deliberately *not* consumed on read, so it
+        can be hours old, and it was rendered once in the pure frame and never
+        again. A terminal filed by the sixty-second tick while the solve was in
+        flight therefore appeared only on the *following* report, beside two blocks
+        that had since moved on; on 2026-09-05 it held a campaign from three hours
+        earlier with nothing marking it historical. ``published_at`` and
+        ``completed_campaign_is_current`` are published beside it so a reader can
+        date the payload and the latch independently -- 31 to 35 seconds separate
+        them on the reference hardware.
+
         **What it does not do is promote ``starting`` to ``executing``.** A write
         that landed is not evidence that a dispatch is running, and reading the
         vendor register microseconds after our own write reads an echo rather than
@@ -3671,6 +3798,26 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         execution["lifecycle"] = self._lifecycle_block()
         execution["open_campaign"] = self._open_campaign_block()
+        # The third block, since beta.43. See the docstring.
+        execution["completed_campaign"] = self._closed_campaign
+        ended_at = (
+            None
+            if self._closed_campaign is None
+            else instant_of(self._closed_campaign.get("ended_at"))
+        )
+        # True when the terminal beside it was filed during *this* refresh cycle,
+        # which is the question a reader of a never-consumed latch actually has.
+        execution["completed_campaign_is_current"] = bool(
+            ended_at is not None
+            and self.last_refresh_at is not None
+            and ended_at >= self.last_refresh_at
+        )
+        # **What the payload's own instant is.** ``issued_at`` is captured at the
+        # refresh's first line and the body takes 31-35 s on the reference hardware,
+        # so a reader comparing ``issued_at`` against the wall clock was measuring
+        # the solve without being told. Published rather than corrected: the single
+        # threaded instant is deliberate.
+        execution["published_at"] = dt_util.now().isoformat()
 
     @callback
     def _record_decision(
@@ -4651,7 +4798,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # free production is real energy in the pack and is reported as such,
         # but it is not progress against this row's promise -- and this figure
         # is what a campaign's realised total is summed from.
-        return self._quarter_objective_kwh
+        #
+        # **Against ``row``'s own allowance since beta.43**, not against whatever
+        # the slot has moved on to. See :meth:`_objective_kwh_for`.
+        return self._objective_kwh_for(row)
 
     @callback
     def _campaign_row_is_final(
@@ -4709,7 +4859,6 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     return False
         return True
 
-    @callback
     @callback
     def _campaign_stop_reason(self, row_reason: str) -> str:
         """Return the truthful reason a campaign-scoped stop should carry. beta.40.
@@ -4788,6 +4937,48 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return STOP_SCOPE_CAMPAIGN
         return None
 
+    @callback
+    def _min_armable_kwh(self, row: CarriedQuarter) -> float:
+        """Return the smallest objective this row may be armed for. beta.43.
+
+        The actuator-resolution floor for every intent, and for ``net_export`` the
+        controllability floor as well -- the same asymmetry Stage A applies when it
+        stamps ``not_executable``, expressed once so the two cannot drift apart.
+        Stage B's backstop is a backstop: it never admits a row Stage A refused.
+        """
+        if row.intent == EXECUTION_INTENT_NET_EXPORT:
+            return MIN_CONTROLLABLE_QUARTER_KWH
+        return MIN_EXECUTABLE_QUARTER_KWH
+
+    @callback
+    def _objective_kwh_for(self, row: CarriedQuarter | None) -> float:
+        """Return the realised objective **of ``row``**, at ``row``'s own boundary.
+
+        **The subject is the argument, and beta.43 is where that stopped being a
+        comment.** :meth:`_record_completed_quarter` has stated the rule since
+        beta.35 -- *"the subject is a parameter, not ``self._quarter``"* -- and then
+        read three figures off properties that resolve against the field. Both
+        recording callers reach it after the slot has advanced, so a finished charge
+        row was judged against the **successor** row's allowance: a successor with a
+        zero allowance zeroes it, while ``_campaign_quarters_admitted`` still counts
+        the accrual.
+
+        Export is unaffected either way, because its objective is a plain metered
+        field with no envelope. The expression is otherwise beta.40's exactly.
+        """
+        if row is None:
+            return self._quarter_battery_kwh
+        if row.intent == EXECUTION_INTENT_NET_EXPORT:
+            # An export has no absorption envelope -- there is no such thing as
+            # free production to discharge -- so its whole movement is objective.
+            return self._quarter_battery_kwh
+        return min(self._quarter_battery_kwh, row.battery_allowance_kwh())
+
+    @callback
+    def _absorbed_kwh_for(self, row: CarriedQuarter | None) -> float:
+        """Return free production stored above ``row``'s objective. beta.43."""
+        return max(0.0, self._quarter_battery_kwh - self._objective_kwh_for(row))
+
     @property
     def _quarter_objective_kwh(self) -> float:
         """Return the open row's realised **objective**. beta.40.
@@ -4815,19 +5006,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         to reset, capture, restore or lose across a stop -- and the capture
         tuples this class holds are positional.
         """
-        quarter = self._quarter
-        if quarter is None:
-            return self._quarter_battery_kwh
-        if quarter.intent == EXECUTION_INTENT_NET_EXPORT:
-            # An export has no absorption envelope -- there is no such thing as
-            # free production to discharge -- so its whole movement is objective.
-            return self._quarter_battery_kwh
-        return min(self._quarter_battery_kwh, quarter.battery_allowance_kwh())
+        # The open row is the subject here, and this is the one place that is
+        # true: every *recording* caller names its row instead. beta.43.
+        return self._objective_kwh_for(self._quarter)
 
     @property
     def _quarter_absorbed_kwh(self) -> float:
         """Return free production stored above the row's objective. beta.40."""
-        return max(0.0, self._quarter_battery_kwh - self._quarter_objective_kwh)
+        return self._absorbed_kwh_for(self._quarter)
 
     @callback
     def _retainable_kwh(self, quarter: CarriedQuarter) -> float | None:
@@ -5132,7 +5318,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # every kWh the pack took would let absorbed free production paper over
         # an objective the row genuinely missed -- and this same figure is what
         # the campaign accumulator below is advanced by.
-        realised = realised_grid if export else self._quarter_objective_kwh
+        # **``quarter``, never the field. beta.43.** Both callers arrive after the
+        # slot has advanced; reading the property here judged this row against the
+        # successor's allowance. See :meth:`_objective_kwh_for`.
+        objective = self._objective_kwh_for(quarter)
+        realised = realised_grid if export else objective
         shortfall = max(0.0, planned - realised)
         mean_kw = (
             0.0
@@ -5159,8 +5349,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "planned_battery_kwh": round(planned_battery, 3),
                 "realized_battery_kwh": round(self._quarter_battery_kwh, 3),
                 # beta.40: the split of the figure above. They sum to it.
-                "objective_battery_kwh": round(self._quarter_objective_kwh, 3),
-                "absorbed_extra_kwh": round(self._quarter_absorbed_kwh, 3),
+                "objective_battery_kwh": round(objective, 3),
+                "absorbed_extra_kwh": round(
+                    max(0.0, self._quarter_battery_kwh - objective), 3
+                ),
                 "retention_authorised": quarter.retention_authorised,
                 "absorption_gate": quarter.retention_gate,
                 "planned_grid_kwh": round(planned_grid, 3),
@@ -5362,6 +5554,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         total = 0.0
         seen = False
+        # **Counted on this branch too, since beta.43.** Only the frozen-plan branch
+        # above assigned ``_campaign_objective_rows``, so a campaign read through the
+        # fallback published whatever count the *previous* campaign had left behind:
+        # the 2026-09-05 terminal reported ``objective_row_count: 1`` beside three
+        # recorded rows and two accruals, three figures disagreeing at once.
+        rows = 0
         for target in self.execution_targets:
             if target.get("campaign_id") != campaign_id:
                 continue
@@ -5374,6 +5572,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 total += float(target.get("grid_target_kwh") or 0.0)
             elif intent == EXECUTION_INTENT_GRID_CHARGE:
                 total += float(target.get("battery_target_kwh") or 0.0)
+            rows += 1
+        if seen:
+            self._campaign_objective_rows = rows
         return total if seen else None
 
     @callback
@@ -5494,6 +5695,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             live = self._campaign_objective_kwh(self._campaign_id)
             if live is not None:
                 self._campaign_opening_target_kwh = live
+        else:
+            self._grow_campaign_target()
 
         if self.activation_confirmed:
             self._note_campaign_started(now)
@@ -5515,6 +5718,52 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         grace = timedelta(minutes=CAMPAIGN_ORPHAN_GRACE_MINUTES)
         if now > self._campaign_end_utc + grace:
             self._close_campaign(now, stop_reason or EXECUTION_STOP_WINDOW_ENDED)
+
+    @callback
+    def _grow_campaign_target(self) -> None:
+        """Raise the frozen target to the campaign's full known objective. beta.43.
+
+        **Monotonic, and one-directional on purpose.** The freeze exists so a
+        campaign that promised 2.65 kWh and delivered 1.80 because Stage A changed
+        its mind is Partial rather than a retroactively successful 1.80 / 1.80 --
+        that property is what ``max`` preserves. What the freeze was never meant to
+        do is *cap* a campaign at whatever fraction of itself happened to be
+        published at the instant it started.
+
+        The 2026-09-05 capture is the shape it gets wrong. A campaign opened with a
+        single published row, froze a 0.25 kWh target, and went on to run three rows
+        whose meter objectives summed to 1.50 kWh. It filed ``success`` at
+        ``0.233 of 0.25`` -- a true statement about a promise that had stopped being
+        the promise, beside 1.206 kWh of recorded export.
+
+        Identity-safe by construction rather than by convention:
+        :meth:`_campaign_objective_kwh` matches ``campaign_id`` on both of its
+        branches, so another campaign's energy is not reachable from here, and the
+        instance guard keeps a fresh attempt from inheriting the last one's growth.
+        Growth is read from the live publication only; nothing already recorded is
+        rewritten, and the terminal is judged against the target as finally grown.
+        """
+        if self._campaign_id is None or self._campaign_instance_id is None:
+            return
+        if self._campaign_started_at is None:
+            return
+        live = self._campaign_objective_kwh(self._campaign_id)
+        if live is None:
+            return
+        frozen = self._campaign_frozen_target_kwh
+        if frozen is None or live > frozen:
+            self._campaign_frozen_target_kwh = live
+
+    @callback
+    def _campaign_row_records(self, campaign_id: str | None) -> list[dict[str, Any]]:
+        """Return the completed-row records naming this campaign. beta.43."""
+        if campaign_id is None:
+            return []
+        return [
+            row
+            for row in self._completed_quarters
+            if row.get("campaign_id") == campaign_id
+        ]
 
     @callback
     def _completion_tolerance_kwh(
@@ -5624,6 +5873,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._campaign_id = None
             self._campaign_instance_id = None
             return
+        # Read once, and before anything below can clear the identity. beta.43.
+        campaign_rows = self._campaign_row_records(campaign_id)
+        # **Plus the row that caused this close, which is deliberately not recorded
+        # yet.** beta.35's stop-before-record rule is preserved -- a record written
+        # before a stop that then failed would claim a finished quarter while the
+        # inverter was still moving energy -- so on the ``_async_end_quarter`` path
+        # the closing row reaches ``_completed_quarters`` *after* this terminal. It
+        # has, however, already been accrued, and ``_campaign_accrued_row`` names it.
+        # Counting recorded rows alone would make every such terminal short by one,
+        # which is a new defect rather than a fix for the old one.
+        recorded_starts = {row.get("quarter_start") for row in campaign_rows}
+        pending_row = (
+            self._campaign_accrued_row is not None
+            and self._campaign_accrued_row.isoformat() not in recorded_starts
+        )
         target_kwh = self._campaign_frozen_target_kwh
         # **Including whatever the open quarter had moved.** A campaign cut short
         # mid-quarter delivered that energy, and dropping it would report a
@@ -5709,11 +5973,30 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 else round(-shortfall / target_kwh, 4)
             ),
             "quarters_admitted": quarters,
-            # Same number, named for what it counts. ``quarters_admitted`` counts
-            # *accruals*, and publishing it under two names lets the ledger identity
-            # be asserted from the payload without a reader having to know that.
-            "rows_completed": quarters,
+            # **A real count since beta.43, and no longer the same local.**
+            # ``quarters_admitted`` counts *accruals*; this counts the rows that
+            # actually exist -- recorded, plus the one accrued and awaiting its
+            # record. Publishing one number under two names read as corroboration
+            # and was not: on 2026-09-05 both said 2 while three completed rows
+            # carried the campaign id. They are different questions, and their
+            # disagreement is now the diagnostic rather than something a reader
+            # has to already know.
+            "rows_completed": len(campaign_rows) + (1 if pending_row else 0),
             "objective_row_count": self._campaign_objective_rows,
+            # **What the total was summed from. beta.43.** A terminal that
+            # disagrees with its own rows is now self-evidently wrong from one
+            # payload, instead of needing the physical ring to catch it.
+            "objective_rows_realised": [
+                {
+                    "quarter_start": row.get("quarter_start"),
+                    "objective_kwh": (
+                        row.get("realized_grid_kwh")
+                        if row.get("objective_boundary") == CAMPAIGN_BOUNDARY_METER
+                        else row.get("objective_battery_kwh")
+                    ),
+                }
+                for row in campaign_rows
+            ],
             "accrued_row": (
                 None
                 if self._campaign_accrued_row is None
@@ -5732,8 +6015,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "the outcome is decided here, where the energy was measured, and "
                 "the reason is published beside it rather than standing in for it. "
                 "the target is frozen at the first confirmed activation and may "
-                "never shrink; the realised figure accumulates across segments and "
-                "across serve_load gaps and is reset only when the campaign closes"
+                "never shrink, and since beta.43 it may grow to the campaign's own "
+                "full published objective -- a campaign is judged on what it "
+                "promised, not on the fraction of itself that happened to be "
+                "published when it started; the realised figure accumulates across "
+                "segments and across serve_load gaps and is reset only when the "
+                "campaign closes"
             ),
         }
         # **``superseded`` rather than ``partial`` for a started campaign the plan
@@ -6288,12 +6575,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # stopped, so everything that was evidence *of that dispatch* goes.** The
             # frozen schedule is not evidence of a dispatch; it is Stage A's decision,
             # and it outlives any one arm of it.
+            self._note_release_receipt(snapshot, now)
             self._clear_execution_record()
             self._sustained_deadline = None
             self._sustained_run_id = None
             self._carried = None
-            self._quarter = None
-            self._reset_quarter_progress(None)
             if scope == STOP_SCOPE_CAMPAIGN:
                 # **Published before the terminal, and only at campaign scope.**
                 # ``STOP_SCOPE_ROW`` reaches the shared ``_note_lifecycle`` calls
@@ -6306,6 +6592,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._plan = None
                 self._forward = None
                 self._quarter_progress_unknown = False
+            # **After the terminal, not before it. beta.43.**
+            #
+            # These two lines used to sit above the campaign branch, and between them
+            # they made two of ``_close_campaign``'s inputs unreadable:
+            # ``self._quarter``
+            # is what ``_open_quarter_objective_kwh`` needs to include the row in
+            # flight, and ``_reset_quarter_progress`` clears ``_campaign_accrued_row``
+            # -- the exactly-once latch that keeps the accrual above from being
+            # counted twice through that same term. Moving them here is what makes
+            # the comment at ``_close_campaign``'s ``realized =`` true for the first
+            # time, and it is required by the accrual in ``_async_end_row``.
+            self._quarter = None
+            self._reset_quarter_progress(None)
         self._applied_setpoint_kw = None
         self._coherence = None
         self._emergency_attempts = 0
@@ -6473,6 +6772,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
             readback_duration_minutes=duration,
             readback_duration_permitted=duration_permitted,
+            # beta.43. Only ever *narrows* the answer from foreign to releasing,
+            # and only against a deadline the register still agrees with.
+            release_receipt=self._release_receipt,
+            dispatch_timer_finishes_at=(
+                None if snapshot is None else snapshot.dispatch_timer_finishes_at
+            ),
         )
 
     @callback
@@ -7199,6 +7504,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Recompute forecasts and confidence from the learned history."""
         now = dt_util.now()
         self.last_refresh_at = now
+        # Names the cadence last entered, which is exact except while a solve is in
+        # flight and the tick runs inside it. ``seq`` is the ordering authority.
+        self._lifecycle_cadence = CADENCE_QUARTER_REFRESH
         tz = dt_util.get_default_time_zone()
         today = now.date()
         tomorrow = today + timedelta(days=1)
@@ -8385,6 +8693,39 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.store.execution_record = record
         self.store.schedule_save()
         return True
+
+    @callback
+    def _note_release_receipt(self, snapshot: Any, now: datetime) -> None:
+        """Record what the register showed as our own dispatch was released. beta.43.
+
+        **Written immediately before ``_clear_execution_record``, and that ordering
+        is the whole design.** Clearing the record is what destroys
+        ``record_causation_holds``, and without it a dispatch still draining the
+        vendor dead-man reads ``foreign`` -- about a run Alpha EMS armed and has
+        just stopped. The receipt is the one fact that survives, and it is deliberately
+        the *observed* deadline rather than a duration we assume.
+
+        Two things are kept, and both are load-bearing:
+
+        * ``run_id`` -- which run this release ended, so a receipt can be attributed;
+        * ``timer_finishes_at`` -- the register's own dead-man instant, which is
+          later compared against the live one. A dispatch armed by somebody else
+          after our release carries a *different* deadline, so the comparison is
+          what stops the receipt from excusing a genuinely foreign run.
+
+        A snapshot without a readable timer writes **no receipt at all**: the tail is
+        then indistinguishable from a foreign dispatch on the evidence available, and
+        inventing a fixed grace period would be exactly the guess this refuses.
+        """
+        finishes = None if snapshot is None else snapshot.dispatch_timer_finishes_at
+        if finishes is None:
+            self._release_receipt = None
+            return
+        self._release_receipt = {
+            "run_id": self._execution_identity(),
+            "released_at": now.isoformat(),
+            "timer_finishes_at": finishes.isoformat(),
+        }
 
     @callback
     def _clear_execution_record(self) -> None:

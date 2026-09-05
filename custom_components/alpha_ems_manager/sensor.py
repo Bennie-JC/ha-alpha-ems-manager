@@ -83,6 +83,8 @@ from .const import (
     BATTERY_KW_PRECISION,
     BATTERY_KWH_PRECISION,
     BATTERY_SOC_PRECISION,
+    CAMPAIGN_BOUNDARY_BATTERY,
+    CAMPAIGN_BOUNDARY_METER,
     CAMPAIGN_OUTCOMES,
     CAMPAIGN_STATE_CREATED,
     CAMPAIGN_STATE_IDLE,
@@ -109,6 +111,7 @@ from .const import (
     LEDGER_BASIS_UNCLASSIFIED,
     LIFECYCLE_KIND_CREATED,
     LIFECYCLE_KIND_STARTED,
+    MAX_UPCOMING_CAMPAIGNS_PUBLISHED,
     NAME,
     OWNERSHIP_OWNED,
     SENSOR_BATTERY_PLANNED_POWER,
@@ -832,7 +835,105 @@ def _next_planned_action_attributes(
         "price_eur_kwh": run.average_price_eur_kwh,
         "expected_value_eur": _round(run.net_cash_flow_eur, ECONOMIC_EUR_PRECISION),
         "reason": outcome.reason if published is run else None,
+        "upcoming": _upcoming_campaigns(coordinator),
+        "upcoming_rule": (
+            "the campaigns ahead in the current planning horizon, newest published "
+            "schedule, at most eight and ordered by start. one entry per campaign "
+            "rather than per solved interval, at the boundary the campaign is paid "
+            "at -- the meter for a sale, the battery for a purchase. will_execute "
+            "is false when no row of the campaign can be armed, and skip_reason "
+            "says which rule declined it: below_actuator_resolution means the "
+            "actuator cannot express the objective, below_controllable_objective "
+            "means the control loop cannot hold it. neither is a failure, and "
+            "ordinary self-consumption is unaffected by either"
+        ),
     }
+
+
+def _upcoming_campaigns(
+    coordinator: AlphaEmsCoordinator,
+) -> list[dict[str, Any]]:
+    """Return the planned campaigns ahead, as stable public semantics. beta.43.
+
+    **Built from the published execution targets, and deliberately not from the
+    optimiser's own structures.** Those carry horizon indices, a run state and a
+    label that churns as house load moves beneath one physical discharge; a
+    dashboard consuming them would be consuming implementation. The targets carry
+    absolute instants, a campaign identity anchored on the campaign's *end* so it
+    survives twenty refreshes, and the executability verdict already frozen onto
+    each row.
+
+    One entry per campaign, because that is the thing a trading log records: a
+    campaign is one decision, whatever number of rows and ``serve_load`` gaps it
+    is executed through.
+    """
+    grouped: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for target in coordinator.execution_targets:
+        campaign_id = target.get("campaign_id")
+        if not isinstance(campaign_id, str):
+            continue
+        intent = target.get("intent")
+        if intent not in (EXECUTION_INTENT_NET_EXPORT, EXECUTION_INTENT_GRID_CHARGE):
+            # ``serve_load`` carries the identity across a gap and commands nothing.
+            # It belongs to the campaign, and it is not an action to announce.
+            continue
+        entry = grouped.get(campaign_id)
+        if entry is None:
+            entry = {
+                "campaign_id": campaign_id,
+                "purpose": target.get("purpose"),
+                "starts_at": None,
+                "ends_at": None,
+                "objective_kwh": 0.0,
+                "objective_boundary": (
+                    CAMPAIGN_BOUNDARY_METER
+                    if intent == EXECUTION_INTENT_NET_EXPORT
+                    else CAMPAIGN_BOUNDARY_BATTERY
+                ),
+                "expected_value_eur": 0.0,
+                "will_execute": False,
+                "skip_reason": None,
+            }
+            grouped[campaign_id] = entry
+            order.append(campaign_id)
+        start = target.get("window_start")
+        end = target.get("window_end")
+        if isinstance(start, str) and (
+            entry["starts_at"] is None or start < entry["starts_at"]
+        ):
+            entry["starts_at"] = start
+        if isinstance(end, str) and (
+            entry["ends_at"] is None or end > entry["ends_at"]
+        ):
+            entry["ends_at"] = end
+        value = target.get("expected_value_eur")
+        if isinstance(value, (int, float)):
+            entry["expected_value_eur"] += float(value)
+        export = intent == EXECUTION_INTENT_NET_EXPORT
+        for row in target.get("quarter_schedule") or ():
+            refusal = row.get("not_executable")
+            if refusal is not None:
+                # The first refusal is kept, and only while nothing is armable:
+                # a campaign with one skipped row and four good ones executes.
+                if entry["skip_reason"] is None:
+                    entry["skip_reason"] = refusal
+                continue
+            entry["will_execute"] = True
+            key = "grid_export_target_kwh" if export else "battery_kwh"
+            entry["objective_kwh"] += float(row.get(key) or 0.0)
+    upcoming: list[dict[str, Any]] = []
+    for campaign_id in order:
+        entry = grouped[campaign_id]
+        if entry["will_execute"]:
+            entry["skip_reason"] = None
+        entry["objective_kwh"] = _round(entry["objective_kwh"], BATTERY_KWH_PRECISION)
+        entry["expected_value_eur"] = _round(
+            entry["expected_value_eur"], ECONOMIC_EUR_PRECISION
+        )
+        upcoming.append(entry)
+    upcoming.sort(key=lambda item: item["starts_at"] or "")
+    return upcoming[:MAX_UPCOMING_CAMPAIGNS_PUBLISHED]
 
 
 def _planned_runs(coordinator: AlphaEmsCoordinator) -> tuple[PlannedRun, ...]:

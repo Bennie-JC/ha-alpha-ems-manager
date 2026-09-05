@@ -101,6 +101,7 @@ from .const import (
     EXECUTION_STOP_TIMER_NOT_REFRESHED,
     EXECUTION_STOP_WINDOW_ENDED,
     EXECUTION_TARGET_STALE_MINUTES,
+    INHIBIT_OWN_DISPATCH_RELEASING,
     OWNERSHIP_DEGRADED,
     OWNERSHIP_FACTOR_CLAIM,
     OWNERSHIP_FACTOR_CUTOFF,
@@ -117,6 +118,7 @@ from .const import (
     OWNERSHIP_PROVENANCE_EXACT,
     OWNERSHIP_PROVENANCE_PARAMETERS,
     OWNERSHIP_PROVENANCE_SETTLING,
+    OWNERSHIP_RELEASING,
     OWNERSHIP_UNPROVEN,
     PLAN_ADMISSION_LOOKBACK_SECONDS,
 )
@@ -273,6 +275,13 @@ class OwnershipEvidence:
     #: the coordinator, which owns the permitted dead-man set; ``None`` means not
     #: supplied, and then the duration is reported rather than judged.
     readback_duration_permitted: bool | None = None
+    #: What was observed when Alpha EMS released its own dispatch. **beta.43.**
+    #: ``None`` -- the default, and what every existing caller passes -- leaves the
+    #: verdict exactly as it was.
+    release_receipt: dict[str, Any] | None = None
+    #: The vendor dead-man deadline the register reports right now, compared against
+    #: the receipt's so a *new* dispatch cannot inherit our release. **beta.43.**
+    dispatch_timer_finishes_at: datetime | None = None
 
     @property
     def record_present(self) -> bool:
@@ -507,6 +516,46 @@ class OwnershipEvidence:
         return OWNERSHIP_PROVENANCE_PARAMETERS
 
     @property
+    def own_release_draining(self) -> bool:
+        """Return whether this is our own dispatch, stopped, still winding down.
+
+        **The narrowest possible claim, and every clause is a refusal.** It answers
+        one question -- *is the thing the register still reports the very run we
+        released, inside the deadline the register itself gave us?* -- and answers
+        ``False`` to everything it cannot prove:
+
+        * the marker is on, or nothing is running: not this situation at all;
+        * no receipt: we never released anything this session, or the release
+          happened before a restart. Foreign, correctly;
+        * the receipt carries no deadline: we could not read one at release time,
+          so there is nothing to expire against and **no grace is invented**;
+        * the register reports a *different* deadline: somebody armed a dispatch
+          after our release, and that run is genuinely foreign. This is the clause
+          that stops a receipt from excusing a real takeover;
+        * the deadline has passed: the tail is over and whatever is still running is
+          no longer explained by our release.
+
+        Grants nothing. :func:`ownership_of` maps it to a state that authorises no
+        write, and every gate that refuses on "not owned" refuses on it unchanged.
+        """
+        if not self.dispatch_active or self.marker_on:
+            return False
+        receipt = self.release_receipt
+        if not isinstance(receipt, dict):
+            return False
+        claimed = instant_of(receipt.get("timer_finishes_at"))
+        if claimed is None:
+            return False
+        live = self.dispatch_timer_finishes_at
+        if live is None:
+            return False
+        if abs((live - claimed).total_seconds()) > OWNERSHIP_START_TOLERANCE_SECONDS:
+            return False
+        if self.now is None:
+            return False
+        return self.now < claimed
+
+    @property
     def record_causation_holds(self) -> bool:
         """Return whether the record still ties Alpha EMS to the running dispatch.
 
@@ -565,6 +614,15 @@ def ownership_of(evidence: OwnershipEvidence) -> str:
         # causation cannot *still* be shown stays untouchable.
         if evidence.record_causation_holds and evidence.readback_compatible:
             return OWNERSHIP_DEGRADED
+        # **Our own tail, named. beta.43, and it is strictly additive**: the branch
+        # above is untouched, so nothing that reads ``degraded`` today changes, and
+        # this can only ever be reached from what used to be ``foreign``. It
+        # authorises no write -- see ``own_release_draining`` -- and exists so a
+        # healthy campaign stops reporting a takeover at every quarter boundary,
+        # and so ``_decide`` stops naming an ``ownership_conflict`` that can carry a
+        # false ``canceled`` into a campaign terminal.
+        if evidence.own_release_draining:
+            return OWNERSHIP_RELEASING
         return OWNERSHIP_FOREIGN
     if not evidence.record_matches:
         return OWNERSHIP_UNPROVEN
@@ -1171,6 +1229,13 @@ class AdmittedPlan:
                 self.frozen_remaining_at_admission_kwh
             ),
             "rows": [row.as_dict() for row in self.rows],
+            # **Fields the dataclass has carried since beta.32 and ``as_dict``
+            # did not publish. beta.43.** Without them the admitted plan could not
+            # be joined to the campaign it belongs to from the payload alone.
+            "campaign_id": self.campaign_id,
+            "campaign_end": (
+                None if self.campaign_end is None else self.campaign_end.isoformat()
+            ),
             "authority_rule": (
                 "the whole schedule is frozen at admission and the executing "
                 "quarter is derived from it, so a boundary is a lookup rather than "
@@ -2785,6 +2850,37 @@ def _decide(
                     if lost
                     else ()
                 ),
+            ),
+        )
+
+    # 1b. Our own dispatch, already stopped, still draining its dead-man. beta.43.
+    #
+    # **Identical restraint, and one deliberate difference.** No write is
+    # authorised, nothing is touched, and the state is the same ``inhibited`` the
+    # foreign branch returns -- so every safety property above is unchanged.
+    #
+    # What it must *not* do is set ``stop_reason``. ``ownership_conflict`` is in
+    # neither :data:`EXECUTION_FAILED_STOP_REASONS` nor
+    # :data:`EXECUTION_COMPLETION_STOP_REASONS`, so it falls through
+    # ``_close_campaign``'s precedence to ``canceled`` -- and on 2026-09-05 that
+    # reason was live in ``execution.result`` while a carried run existed, purely
+    # because our own quarter-boundary stop had released the marker and the vendor
+    # register had not caught up. A campaign closing on such a refresh would have
+    # filed a false ``canceled`` for a run that ended normally.
+    #
+    # There is nothing to end here: we ended it ourselves, deliberately, and the
+    # campaign's own verdict was decided at that stop.
+    if ownership == OWNERSHIP_RELEASING:
+        return Decision(
+            state=EXECUTION_STATE_INHIBITED,
+            ownership=ownership,
+            progress=progress,
+            stop_reason=None,
+            inhibit_reason=INHIBIT_OWN_DISPATCH_RELEASING,
+            notes=(
+                "a dispatch Alpha EMS armed and has already stopped is still "
+                "draining its vendor dead-man; nothing is written to it, and it "
+                "is not a takeover",
             ),
         )
 

@@ -1103,6 +1103,13 @@ INHIBIT_PEAK_SHAVING_ACTIVE: Final = "peak_shaving_active"
 #: A dispatch is running. Alpha EMS cannot prove it created it, so it belongs to
 #: someone else and is neither modified nor cancelled.
 INHIBIT_DISPATCH_ACTIVE: Final = "dispatch_active"
+
+#: A dispatch is running that Alpha EMS armed, stopped, and is waiting out.
+#: **beta.43.** Reported instead of ``foreign_dispatch`` while the release receipt
+#: still proves the running dispatch is our own. It refuses exactly what
+#: ``foreign_dispatch`` refuses; what it does not do is name our own cleanup as
+#: somebody else's takeover.
+INHIBIT_OWN_DISPATCH_RELEASING: Final = "own_dispatch_releasing"
 #: The battery hardware facts are incomplete.
 INHIBIT_BATTERY_NOT_CONFIGURED: Final = "battery_not_configured"
 #: Stage A published no battery plan at all this refresh.
@@ -2881,11 +2888,33 @@ OWNERSHIP_OWNED: Final = "owned"
 OWNERSHIP_FOREIGN: Final = "foreign"
 OWNERSHIP_UNPROVEN: Final = "unproven"
 
+#: Our own dispatch, already stopped, still draining its vendor dead-man. beta.43.
+#:
+#: **Authorisation-identical to** :data:`OWNERSHIP_FOREIGN` **and that is the whole
+#: safety argument**: it authorises no write, it is not owned, and every gate that
+#: refuses on "not owned" refuses on it unchanged. What it changes is the *name*,
+#: and one consequence of the name.
+#:
+#: The live 2026-09-05 capture shows why. Alpha EMS stops its own run at a quarter
+#: boundary, releases the marker and clears the causal record -- and the vendor's
+#: dead-man keeps ``dispatch_active`` true for minutes afterwards. ``ownership_of``
+#: then read a running dispatch with no marker and no provable causation and
+#: answered ``foreign``, about a dispatch Alpha EMS had armed and had just stopped.
+#: ``_decide`` turns that into ``stop_reason: ownership_conflict``, which is in
+#: neither the failed nor the completion reason set, so a campaign closing on such a
+#: refresh files ``canceled`` -- a false verdict caused by our own cleanup.
+#:
+#: Reachable only against a release receipt this session wrote, whose recorded
+#: dead-man deadline still matches the register's and has not passed. Without that
+#: proof the answer stays ``foreign``: no fixed grace period is invented.
+OWNERSHIP_RELEASING: Final = "releasing"
+
 OWNERSHIP_STATES: Final = (
     OWNERSHIP_NONE,
     OWNERSHIP_OWNED,
     OWNERSHIP_FOREIGN,
     OWNERSHIP_UNPROVEN,
+    OWNERSHIP_RELEASING,
 )
 
 #: Why the write boundary refused a command outright.
@@ -2980,10 +3009,51 @@ DISPATCH_POWER_STEP_KW: Final = 0.1
 #: Derived rather than written down, so it cannot drift from the step it comes from.
 MIN_EXECUTABLE_QUARTER_KWH: Final = DISPATCH_POWER_STEP_KW * 0.25
 
+#: The smallest objective one quarter can be **steered to**, in kWh. beta.43.
+#:
+#: :data:`MIN_EXECUTABLE_QUARTER_KWH` answers a different question and keeps
+#: answering it: *can the actuator express this number?* This one answers *can the
+#: controller hold the plant at it?*, and the two are not the same because the
+#: controller deliberately does not correct every error it can express.
+#:
+#: Derived from the two constants that bound the loop, so it cannot drift from
+#: them:
+#:
+#: * :data:`DISPATCH_POWER_DEADBAND_KW` -- the band the controller **will not
+#:   correct inside**. Held for a quarter that is 0.05 kWh of movement nothing
+#:   answers, which is already twice the resolution floor.
+#: * :data:`DISPATCH_POWER_STEP_KW` -- one step it cannot express, on top.
+#:
+#: 0.075 kWh, and the live 2026-09-05 capture is what made it necessary: a
+#: ``net_export`` row published a 0.04 kWh meter objective -- 0.16 kW average --
+#: whose entire incremental export revenue was 0.0083 EUR against 0.010 EUR of
+#: deadband exposure, while the 0.21 kWh of avoided import beside it needed no
+#: dispatch at all. The row was representable and was not steerable.
+#:
+#: House-load movement is **not** a separate term here on purpose: within one
+#: quarter the controller answers load movement only when it crosses the deadband,
+#: so the deadband already is the uncorrected band. A site-specific learned
+#: dispersion is deliberately left to a later release rather than guessed here.
+MIN_CONTROLLABLE_QUARTER_KWH: Final = (
+    DISPATCH_POWER_DEADBAND_KW + DISPATCH_POWER_STEP_KW
+) * 0.25
+
 #: Why a published row cannot be executed. Reported, never silent: the economics
 #: stay visible so a reader can see what was planned and why it was not armed.
 QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION: Final = "below_actuator_resolution"
 QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE: Final = "no_objective"
+
+#: The objective is representable but not controllable. **beta.43.**
+#:
+#: Kept apart from :data:`QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION` rather than folded
+#: into it, because they are different claims about different hardware properties
+#: and a reader has to be able to tell them apart: sub-resolution means *the
+#: actuator cannot say this number*, this one means *the loop cannot hold it*.
+#:
+#: Not a control failure and never reported as one. The row is not armed, ordinary
+#: self-consumption continues, the energy stays in the pack for a stronger window,
+#: and the campaign is judged on what it actually promised to move.
+QUARTER_NOT_EXECUTABLE_BELOW_CONTROLLABLE: Final = "below_controllable_objective"
 
 #: The intent itself has no actuator. **Added in beta.33.**
 #:
@@ -3424,6 +3494,11 @@ LIFECYCLE_CLEANUP_COMPLETE: Final = "cleanup_complete"
 LIFECYCLE_FOREIGN: Final = "foreign"
 LIFECYCLE_UNPROVEN: Final = "unproven"
 LIFECYCLE_DEGRADED: Final = "degraded"
+#: Our own dispatch, stopped, still draining its vendor dead-man. **beta.43.**
+#: Projected from :data:`OWNERSHIP_RELEASING`, which authorises nothing -- so this
+#: is a hazard-adjacent report rather than a state anything acts on. It exists so a
+#: reader stops seeing ``foreign`` at every quarter boundary of a healthy campaign.
+LIFECYCLE_RELEASING: Final = "releasing"
 
 #: Every state the field may hold. **beta.39, and it exists because nothing
 #: validated the vocabulary**: ``_note_lifecycle`` took a bare string, so a typo
@@ -3442,6 +3517,7 @@ LIFECYCLE_STATES: Final = (
     LIFECYCLE_FOREIGN,
     LIFECYCLE_UNPROVEN,
     LIFECYCLE_DEGRADED,
+    LIFECYCLE_RELEASING,
 )
 
 #: The two states a *projection* can never reach, because they are notes about a
@@ -4579,3 +4655,11 @@ ECONOMIC_ANNOUNCE_LEAD_MINUTES: Final = QUARTER_MINUTES
 #: How many announced runs to remember. The plan publishes at most this many, so
 #: remembering more could never be consulted.
 MAX_ECONOMIC_RUNS_TRACKED: Final = MAX_ECONOMIC_RUNS_REPORTED
+
+#: How many upcoming campaigns the public schedule publishes. **beta.43.**
+#:
+#: A cap rather than the whole horizon, because this is an entity attribute a
+#: dashboard renders, not a diagnostics dump: eight campaigns is more than a day of
+#: decisions on the reference installation, and the full horizon remains available
+#: in ``execution_targets`` for anyone auditing rather than reading.
+MAX_UPCOMING_CAMPAIGNS_PUBLISHED: Final = 8

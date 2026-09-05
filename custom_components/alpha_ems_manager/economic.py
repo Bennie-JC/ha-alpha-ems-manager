@@ -191,11 +191,13 @@ from .const import (
     MAX_ECONOMIC_RUN_INTERVALS_REPORTED,
     MAX_ECONOMIC_RUNS_REPORTED,
     MAX_VALUE_CURVE_POINTS_PUBLISHED,
+    MIN_CONTROLLABLE_QUARTER_KWH,
     MIN_EXECUTABLE_QUARTER_KWH,
     MODE_CHARGE,
     MODE_DISCHARGE,
     MODE_IDLE,
     PLAN_END_ENERGY_BASIS_PHYSICAL_STATE,
+    QUARTER_NOT_EXECUTABLE_BELOW_CONTROLLABLE,
     QUARTER_NOT_EXECUTABLE_INTENT,
     QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE,
     QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION,
@@ -5592,6 +5594,37 @@ def quarter_schedule_for(
             not_executable = QUARTER_NOT_EXECUTABLE_NO_OBJECTIVE
         elif objective_kwh < MIN_EXECUTABLE_QUARTER_KWH:
             not_executable = QUARTER_NOT_EXECUTABLE_SUB_RESOLUTION
+        elif (
+            intent == EXECUTION_INTENT_NET_EXPORT
+            and objective_kwh < MIN_CONTROLLABLE_QUARTER_KWH
+        ):
+            # **Representable, and still not steerable. beta.43.**
+            #
+            # The rule above asks whether the actuator can *say* the number. This
+            # one asks whether the loop can *hold* it, and the two differ by the
+            # deadband -- 0.2 kW, twice the resolution step, and the band the
+            # controller deliberately does not correct inside. Over a quarter that
+            # is 0.05 kWh of meter movement nothing answers, on top of the 0.025 kWh
+            # it cannot express.
+            #
+            # The live 2026-09-05 row is the case: a 0.04 kWh meter objective,
+            # 0.16 kW average. Its whole incremental export revenue was 0.0083 EUR
+            # against 0.010 EUR of deadband exposure, while the 0.21 kWh of avoided
+            # import beside it -- the great majority of the row's published value --
+            # needed no dispatch at all. Arming it risked the part that works to
+            # chase the part that cannot be measured.
+            #
+            # **Export only, and that asymmetry is the point.** A charge objective
+            # is battery-side and its rows are usually continuations inside one arm,
+            # so a per-row test there would cost an extra cycle nothing, forfeit
+            # authorised PV absorption -- 62 % of the live charge campaign's energy
+            # -- and change what ``retention_authorised`` means. The charge-side
+            # question is a campaign-level one and is deliberately left alone here.
+            #
+            # Not armed is not failed: self-consumption continues, the pack keeps
+            # the energy for a window that can actually be steered, and the row
+            # stays published with its economics and its reason intact.
+            not_executable = QUARTER_NOT_EXECUTABLE_BELOW_CONTROLLABLE
         # **The economic verdict, and nothing physical.** A refusal publishes
         # ``False``, which is what a pre-beta.40 row reads back as, so Stage B's
         # free-production branch cannot fire on it. The verdict is frozen onto

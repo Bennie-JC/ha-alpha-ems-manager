@@ -55,7 +55,7 @@ PKG = ROOT / "custom_components" / "alpha_ems_manager"
 SNAPSHOT = HERE / ".snapshot.json"
 LOCK = HERE / ".lock"
 
-TABLES = ("b35", "b36", "b37", "b38", "b39", "b40", "b41", "b42")
+TABLES = ("b35", "b36", "b37", "b38", "b39", "b40", "b41", "b42", "b43")
 
 
 def tracked_sources() -> list[pathlib.Path]:
@@ -66,6 +66,26 @@ def tracked_sources() -> list[pathlib.Path]:
 def digest(path: pathlib.Path) -> str:
     """Return the SHA-256 of one file's bytes."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def read_source(path: pathlib.Path) -> str:
+    """Return one file's text with its line endings left alone.
+
+        **``read_text``/``write_text`` is not a round trip on Windows, and beta.43 found
+        out the expensive way.** The default reader translates ``
+    `` to ``
+    `` and the
+        default writer translates it back to ``os.linesep`` -- so restoring a file that
+        was stored with bare newlines rewrote every line ending in it. The content hash
+        then reported drift on a file it had just restored *correctly*, and the
+        recovery path below took that at face value.
+    """
+    return path.read_text(encoding="utf-8", newline="")
+
+
+def write_source(path: pathlib.Path, text: str) -> None:
+    """Write one file's text byte-for-byte, translating nothing."""
+    path.write_text(text, encoding="utf-8", newline="")
 
 
 def snapshot_now() -> dict[str, str]:
@@ -122,12 +142,25 @@ def run_node(node: str) -> bool:
     return result.returncode == 0
 
 
-def restore(expected: dict[str, str]) -> list[str]:
-    """Restore any file whose content drifted, using git, and report what moved."""
+def restore(expected: dict[str, str], saved: dict[str, str] | None = None) -> list[str]:
+    """Restore any file whose content drifted, and report what moved.
+
+    **From the captured text where there is any, and from git only as a last
+    resort.** ``git checkout`` restores a file to ``HEAD``, which on a tree carrying
+    uncommitted work destroys it -- and a mutation harness is run on exactly that
+    kind of tree, which is the whole point of ``--verify``. beta.43 lost a working
+    session to the combination of this and the newline defect above.
+    """
     changed = differences(expected)
     if not changed:
         return []
-    subprocess.run(["git", "checkout", "--", *changed], cwd=ROOT, check=True)
+    saved = saved or {}
+    from_git = [name for name in changed if name not in saved]
+    for name in changed:
+        if name in saved:
+            write_source(ROOT / name, saved[name])
+    if from_git:
+        subprocess.run(["git", "checkout", "--", *from_git], cwd=ROOT, check=True)
     return changed
 
 
@@ -145,7 +178,7 @@ def run_table(
         if pattern and pattern.lower() not in label.lower():
             continue
         path = target(filename)
-        original = path.read_text(encoding="utf-8")
+        original = read_source(path)
         found = original.count(old)
         if found != 1:
             # **Not found and found twice are both anchor failures, and beta.42
@@ -163,16 +196,21 @@ def run_table(
             missing.append(f"{label}: anchor {reason} in {filename}")
             print(f"ANCHOR  {label} ({reason})", flush=True)
             continue
-        path.write_text(original.replace(old, new, 1), encoding="utf-8")
+        write_source(path, original.replace(old, new, 1))
         try:
             passed = run_node(node)
         finally:
-            path.write_text(original, encoding="utf-8")
+            write_source(path, original)
         drift = differences(expected)
         if drift:
+            # The captured text is what this harness put there, so recovery never
+            # has to reach for ``HEAD`` and never discards uncommitted work.
+            recovered = restore(
+                expected, {str(path.relative_to(ROOT)).replace(chr(92), "/"): original}
+            )
             raise SystemExit(
-                f"{name}: {label!r} did not restore {drift}. The tree is mutated; "
-                "run `python tools/mutation/run.py --restore` before anything else."
+                f"{name}: {label!r} did not restore {drift}; recovered {recovered}. "
+                "Re-run once the cause is understood."
             )
         if passed:
             survivors.append(f"{label} -> {node}")
