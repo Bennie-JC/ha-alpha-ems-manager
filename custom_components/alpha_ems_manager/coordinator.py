@@ -20,6 +20,7 @@ from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta, tzinfo
+from functools import partial
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -30,6 +31,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.event import (
+    async_call_later,
     async_track_state_change_event,
     async_track_time_change,
     async_track_time_interval,
@@ -281,6 +283,8 @@ from .const import (
     OWNERSHIP_RELEASING,
     OWNERSHIP_UNPROVEN,
     PLAN_CLOSED_RESULTS,
+    POST_ARM_OBSERVE_MAX_PASSES,
+    POST_ARM_OBSERVE_SECONDS,
     PRICE_BASIS_LIVE_FORECAST,
     PRICE_BASIS_STORED_SNAPSHOT,
     PRICE_CROSS_CHECK_DISAGREES,
@@ -1671,6 +1675,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: Whether the previous tick saw a dispatch running, so an activation can be
         #: recognised as a *transition* rather than as pre-existing state. beta.44.
         self._arm_saw_dispatch: bool = False
+        #: When the write boundary started sending, and when the activation step
+        #: returned, for the claim named beside them. beta.47.
+        #:
+        #: **Session-local, and deliberately not on the persisted record.** The claim
+        #: is ownership evidence; these are instrumentation. Keeping them apart is
+        #: what lets ``written_at`` -- and every ownership provenance window measured
+        #: from it -- stay byte-identical to beta.46.
+        self._write_timing: dict[str, Any] | None = None
+        #: The outstanding bounded delivery-observation handle, or ``None``. At most
+        #: one exists at any instant, cancelled before another is scheduled. beta.47.
+        self._arm_observe_unsub: Callable[[], None] | None = None
+        #: How many bounded passes the current arm has left. beta.47.
+        self._arm_observe_left: int = 0
         #: How many physical arms the latest published plan asks for, and what each
         #: buys. A finished dict, so no reference to a solve is retained. beta.44.
         self._arm_plan: dict[str, Any] = {}
@@ -2086,6 +2103,23 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             )
 
+        # **The register that says the dispatch is live, watched. beta.47.**
+        #
+        # Until now ``_observe_arm`` ran only inside the sixty-second tick, whose
+        # phase is whatever instant setup finished -- so the delay between the vendor
+        # register moving and this component noticing it was uniform on [0, 60), and
+        # the 2026-09-06 export arms measured 37.1 s, 42.5 s and 45.2 s of it.
+        #
+        # This is not a poll and not a cadence. It fires when that one entity changes
+        # state, which for a well-behaved register is a handful of times a day, and
+        # it changes *when we look* rather than *what we record*: activation is still
+        # read from the register's own ``last_changed``, exactly as before.
+        self.entry.async_on_unload(
+            async_track_state_change_event(
+                self.hass, [SENSOR_DISPATCH_START], self._handle_dispatch_register
+            )
+        )
+
         self.entry.async_on_unload(
             async_track_time_interval(
                 self.hass,
@@ -2237,6 +2271,25 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _handle_source_change(self, event: Event) -> None:
         """Integrate on every published change of the house-load entity."""
         self._sample(dt_util.now())
+
+    @callback
+    def _handle_dispatch_register(self, event: Event) -> None:
+        """Observe the arm the instant the vendor register moves. beta.47.
+
+        **Read-only, and it is the narrowest read there is.** No lock, no write, no
+        decision: it takes its own snapshot and hands it to the same measurement
+        function the tick uses, which is synchronous and guards every field against
+        being written twice. So this cannot double-count with the tick, cannot race
+        it -- there is no await between the two -- and an instrumentation fault here
+        costs a null figure rather than a dispatch.
+
+        It does **not** make the controller react sooner. Every correction, stop and
+        re-arm stays on the locked path at its own cadence. beta.47 observes sooner;
+        it does not act sooner, and nothing here may grow into a second write path.
+        """
+        if self._arm_open is None:
+            return
+        self._observe_arm(read_snapshot(self.hass), dt_util.now())
 
     @callback
     def _handle_hass_started(self, _hass: HomeAssistant) -> None:
@@ -9669,8 +9722,18 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "delivery_latency_s": None,
                 "battery_delivery_latency_s": None,
                 "objective_forgone_to_activation_kwh": None,
+                # **The decomposition of activation_latency_s. beta.47.**
+                # Null until the write that produced this claim is matched to it;
+                # null is not zero, and a write duration below the clock's
+                # resolution is the only way any of these is legitimately 0.0.
+                "dispatch_write_started_at": None,
+                "dispatch_enable_written_at": None,
+                "claim_to_write_latency_s": None,
+                "dispatch_write_duration_s": None,
+                "enable_to_register_latency_s": None,
                 "evidence": ARM_EVIDENCE_INCOMPLETE,
             }
+            self._attach_write_timing(open_arm)
             self._arm_open = open_arm
 
         self._refresh_arm_objective(open_arm, now)
@@ -9708,6 +9771,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 (now - written).total_seconds(), 1
             )
 
+        self._refresh_register_latency(open_arm)
         self._observe_arm_delivery(open_arm, snapshot, now, written)
         self._arm_saw_dispatch = active
 
@@ -9890,8 +9954,157 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
     @callback
+    @callback
+    def _note_write_timing(
+        self, started: datetime, finished: datetime, sent: tuple[Any, ...]
+    ) -> None:
+        """Remember when this claim's write ran, for the arm about to open. beta.47.
+
+        Keyed on the claim so a later arm can never inherit an earlier one's figures,
+        and **dropped entirely unless the sequence ended in the activation**. The
+        enable is edge-triggered and the planner guarantees it is last, so when it is
+        the final step ``finished`` is the instant after it was written -- no step
+        separates them. A sustain, a re-arm of the dead-man and a stop all come
+        through the same send site and none of them is an arm to time.
+        """
+        record = self.store.execution_record
+        claim = record.get("claim_id") if isinstance(record, dict) else None
+        activated = bool(sent) and sent[-1].entity_id == DISPATCH_ENABLE
+        if claim is None or not activated:
+            self._write_timing = None
+            return
+        enable_written = finished
+        self._write_timing = {
+            "claim_id": claim,
+            "dispatch_write_started_at": started.isoformat(),
+            "dispatch_enable_written_at": enable_written.isoformat(),
+        }
+        self._schedule_arm_observation(claim)
+
+    @callback
+    def _cancel_arm_observation(self) -> None:
+        """Drop the outstanding bounded pass, if any. beta.47."""
+        if self._arm_observe_unsub is not None:
+            self._arm_observe_unsub()
+            self._arm_observe_unsub = None
+        self._arm_observe_left = 0
+
+    @callback
+    def _schedule_arm_observation(self, claim: str) -> None:
+        """Begin the bounded delivery sweep for ``claim``. beta.47.
+
+        At most one handle exists at any instant: a new arm cancels the previous
+        arm's sweep before starting its own.
+        """
+        self._cancel_arm_observation()
+        self._arm_observe_left = POST_ARM_OBSERVE_MAX_PASSES
+        self._arm_observe_unsub = async_call_later(
+            self.hass,
+            POST_ARM_OBSERVE_SECONDS,
+            partial(self._handle_arm_observation, claim),
+        )
+
+    @callback
+    def _handle_arm_observation(self, claim: str, _now: datetime) -> None:
+        """Observe once, and reschedule only while it is still this arm. beta.47.
+
+        Three ways to stop, and none of them is a timeout on the arm itself: the
+        claim changed, delivery has been attributed, or the bound is spent. Correctness
+        does not depend on any of them -- ``_observe_arm`` re-derives the arm from the
+        execution record every call -- they are what keep this from becoming a cadence.
+        """
+        self._arm_observe_unsub = None
+        # **The bound is authoritative, not the scheduler.** A pass that arrives with
+        # the budget already spent does nothing at all, so a stray handle can never
+        # drive the sweep past its ceiling.
+        if self._arm_observe_left <= 0:
+            self._arm_observe_left = 0
+            return
+        arm = self._arm_open
+        if arm is None or arm.get("claim_id") != claim:
+            self._arm_observe_left = 0
+            return
+        self._observe_arm(read_snapshot(self.hass), dt_util.now())
+        if self._arm_open is None or self._arm_open.get("claim_id") != claim:
+            self._arm_observe_left = 0
+            return
+        if self._arm_open.get("delivery_latency_s") is not None:
+            self._arm_observe_left = 0
+            return
+        self._arm_observe_left -= 1
+        if self._arm_observe_left <= 0:
+            return
+        self._arm_observe_unsub = async_call_later(
+            self.hass,
+            POST_ARM_OBSERVE_SECONDS,
+            partial(self._handle_arm_observation, claim),
+        )
+
+    @callback
+    def _attach_write_timing(self, arm: dict[str, Any]) -> None:
+        """Decompose this arm's activation latency into its three terms. beta.47.
+
+        ``activation_latency_s`` is unchanged and still measured from the claim. What
+        is new is that the interval it covers is now published in parts:
+
+            activation_latency_s ~= claim_to_write_latency_s
+                                  + dispatch_write_duration_s
+                                  + enable_to_register_latency_s
+
+        The middle term is *measured*, not assumed. It is expected to be tens of
+        milliseconds -- seven blocking service calls on local helpers -- but an
+        identity with an estimated term is not a reconciliation, and a residual that
+        silently absorbs the write path would hide the one stage nobody has timed.
+
+        The third term is the first figure this component has ever published about
+        anything outside itself. It is named for what it measures: our activation
+        write to *the AlphaESS integration's register entity* changing. That is not
+        the vendor device and it is certainly not the battery.
+        """
+        timing = self._write_timing
+        if not isinstance(timing, dict) or timing.get("claim_id") != arm.get(
+            "claim_id"
+        ):
+            return
+        started = instant_of(timing.get("dispatch_write_started_at"))
+        enabled = instant_of(timing.get("dispatch_enable_written_at"))
+        if started is None or enabled is None:
+            return
+        arm["dispatch_write_started_at"] = timing["dispatch_write_started_at"]
+        arm["dispatch_enable_written_at"] = timing["dispatch_enable_written_at"]
+        arm["dispatch_write_duration_s"] = round((enabled - started).total_seconds(), 3)
+        written = instant_of(arm.get("claim_written_at"))
+        if written is not None:
+            arm["claim_to_write_latency_s"] = round(
+                (started - written).total_seconds(), 3
+            )
+
+    @callback
+    def _refresh_register_latency(self, arm: dict[str, Any]) -> None:
+        """Time our activation write against the register moving. beta.47.
+
+        Gated on the same transition evidence ``activation_latency_s`` requires, so a
+        register that was already active -- or one whose ``last_changed`` predates the
+        claim -- yields ``None`` here too rather than a number nothing supports.
+        """
+        if arm.get("enable_to_register_latency_s") is not None:
+            return
+        if arm.get("activation_latency_s") is None:
+            return
+        enabled = instant_of(arm.get("dispatch_enable_written_at"))
+        if enabled is None:
+            return
+        changed = self._dispatch_state_changed_at()
+        if changed is None or changed < enabled:
+            return
+        arm["enable_to_register_latency_s"] = round(
+            (changed - enabled).total_seconds(), 3
+        )
+
     def _close_arm(self, arm: dict[str, Any], now: datetime) -> None:
         """File a finished arm measurement. beta.44."""
+        # The bounded sweep belongs to one arm and dies with it. beta.47.
+        self._cancel_arm_observation()
         arm["closed_at"] = now.isoformat()
         if arm.get("activation_latency_s") is None and not arm.get("evidence"):
             arm["evidence"] = ARM_EVIDENCE_INCOMPLETE
@@ -9916,8 +10129,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "target or a single row. objective_forgone_to_activation_kwh is "
             "derived, not measured: that objective prorated over the undelivered "
             "interval at the arm's mean planned rate across planned_span_s, and a "
-            "bound because ambient behaviour may have delivered part of it. null "
-            "is never zero"
+            "bound because ambient behaviour may have delivered part of it. "
+            "activation_latency_s decomposes as claim_to_write_latency_s plus "
+            "dispatch_write_duration_s plus enable_to_register_latency_s, each "
+            "measured rather than assumed: the first is the refresh ahead of the "
+            "write, almost all of it the Stage A solve; the second is our own "
+            "seven-step sequence; the third is our activation write against the "
+            "AlphaESS integration's register entity changing, which is neither the "
+            "vendor device nor the battery. null is never zero"
         )
         self._arm_measurements.append(arm)
 
@@ -13305,11 +13524,24 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # re-acquiring it here.
             async with self._execution_lock:
                 intent = self._executing_intent()
+                # **The instant we began sending. beta.47.**
+                #
+                # ``written_at`` on the claim is the instant the *refresh* started,
+                # threaded from one ``dt_util.now()`` at the top of the body -- so on
+                # the reference installation it precedes this line by the whole solve,
+                # 32-35 s. That figure is not moved here: ownership provenance is
+                # measured from it, and shrinking the published activation latency by
+                # redefining its origin would be a prettier measurement rather than a
+                # faster one. It is decomposed instead.
+                write_started = dt_util.now()
+                sent: tuple[Any, ...] = ()
                 if stage_one:
                     await async_execute(self.hass, stage_one, intent=intent)
                     landed = verify is None or self._staged_write_landed(verify)
                 if landed and stage_two:
                     await async_execute(self.hass, stage_two, intent=intent)
+                    sent = tuple(stage_two)
+                self._note_write_timing(write_started, dt_util.now(), sent)
         except ControlExecutionUnavailable:
             # The expected outcome while the barrier stands, and recorded rather
             # than swallowed: a release that believes it sent something is worse

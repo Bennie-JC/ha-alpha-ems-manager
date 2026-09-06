@@ -4698,6 +4698,24 @@ MAX_ECONOMIC_RUNS_TRACKED: Final = MAX_ECONOMIC_RUNS_REPORTED
 #: and the ring is the calibration set a later release needs -- not a log.
 MAX_ARM_MEASUREMENTS_REPORTED: Final = 48
 
+#: How often the bounded post-arm observation pass runs, in seconds. **beta.47.**
+#:
+#: A dispatch register transition wakes the controller immediately -- that is an
+#: event subscription, not a timer. Attributable *delivery* cannot be: it needs
+#: battery and meter readings that arrive on the source integration's own cadence,
+#: and a register event says nothing about their freshness. So delivery gets a short
+#: bounded sweep instead of a sixty-second wait, and it is a sweep rather than a
+#: subscription because the power entities publish continuously and watching them
+#: would be a poll wearing a different name.
+POST_ARM_OBSERVE_SECONDS: Final = 10.0
+
+#: How many such passes one arm may ever have. **beta.47.**
+#:
+#: Twelve at ten seconds is two minutes, after which the ordinary tick is the floor
+#: again. The bound is what keeps this from being a second cadence: it exists to
+#: cover the gap between an arm landing and the next tick, not to observe a run.
+POST_ARM_OBSERVE_MAX_PASSES: Final = 12
+
 #: How many planned arms the Stage-A arm plan publishes. **beta.44.**
 MAX_ARM_PLAN_ENTRIES_PUBLISHED: Final = 24
 

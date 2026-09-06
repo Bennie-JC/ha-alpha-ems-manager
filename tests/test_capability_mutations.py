@@ -299,7 +299,7 @@ def test_the_service_caller_set_is_unchanged_by_the_fix() -> None:
     callers = {
         path.stem
         for path in sorted(component.glob("*.py"))
-        if "async_call" in path.read_text(encoding="utf-8")
+        if "services.async_call" in path.read_text(encoding="utf-8")
     }
 
     assert callers == {"alphaess_adapter", "solcast_source"}

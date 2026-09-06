@@ -74,6 +74,12 @@ class _Rig:
         )
         self.c._arm_saw_dispatch = False
         self.c._coherence = coherence(COHERENCE_OK)
+        # beta.47: the decomposition state a real coordinator always carries. With
+        # no write timing recorded the three new figures stay null, which is the
+        # behaviour these beta.44 tests are entitled to see.
+        self.c._write_timing = None
+        self.c._arm_observe_unsub = None
+        self.c._arm_observe_left = 0
         self.c._plan = None
         self.c._quarter = None
         self.c.store = SimpleNamespace(execution_record=None)

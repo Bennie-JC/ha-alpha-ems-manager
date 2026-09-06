@@ -113,6 +113,11 @@ class _Rig:
         self.c._arm_measurements = deque(maxlen=MAX_ARM_MEASUREMENTS_REPORTED)
         self.c._arm_saw_dispatch = False
         self.c._coherence = coherence()
+        # beta.47: with no write timing recorded the three decomposition figures
+        # stay null, which leaves every beta.46 assertion below unchanged.
+        self.c._write_timing = None
+        self.c._arm_observe_unsub = None
+        self.c._arm_observe_left = 0
         self.c._plan = plan(intent, rows)
         self.c._quarter = None
         self.c.store = SimpleNamespace(execution_record=None)

@@ -591,14 +591,25 @@ def test_the_probe_names_no_service_and_no_entity_write() -> None:
 
 
 def test_the_probe_adds_no_second_cadence() -> None:
-    """It samples the snapshot the caller already read. Five call sites, still five."""
+    """It samples the snapshot the caller already read. Seven call sites.
+
+    **The count is a fence, not a target.** Every one of these is a place that reads
+    device state, and an unnoticed eighth is exactly what this test exists to catch.
+
+    Five until beta.47, which added two, both read-only observers of an arm already
+    in flight: the dispatch-register subscription, and the bounded post-arm sweep.
+    Neither is a cadence and neither can write -- they take no lock, reach no service,
+    and hand their snapshot to the same synchronous measurement the tick uses, whose
+    every field refuses to be written twice. The probe itself still adds nothing: it
+    reads the snapshot its caller already took.
+    """
     import inspect
 
     from custom_components.alpha_ems_manager import coordinator as module
 
     source = inspect.getsource(module)
 
-    assert source.count("read_snapshot(self.hass)") == 5
+    assert source.count("read_snapshot(self.hass)") == 7
 
 
 async def test_the_probe_is_bounded(

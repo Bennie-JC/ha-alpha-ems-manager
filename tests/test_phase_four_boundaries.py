@@ -237,11 +237,18 @@ def test_only_two_named_modules_call_a_service() -> None:
     passes *literals*, so the two actions it can reach are visible in its source.
     Neither module can reach an arbitrary domain, and they fail closed in
     different directions.
+
+    **Matched on ``services.async_call`` rather than on ``async_call``, since
+    beta.47.** The looser substring also matched ``async_call_later``, a scheduling
+    helper that reaches no service at all -- so the coordinator tripped a rule it had
+    not broken. The narrower pattern is the invariant stated exactly: it still catches
+    every real service call, and it can no longer be defeated or triggered by an
+    unrelated identifier that happens to share a prefix.
     """
     callers = {
         path.stem
         for path in sorted(COMPONENT_DIR.glob("*.py"))
-        if "async_call" in path.read_text(encoding="utf-8")
+        if "services.async_call" in path.read_text(encoding="utf-8")
     }
     assert callers == {"alphaess_adapter", "solcast_source"}
 

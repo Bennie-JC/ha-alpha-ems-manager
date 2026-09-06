@@ -9,6 +9,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.47] - 2026-09-06
+
+**An observability release. No dispatch is made faster.** The battery starts exactly
+when it did before: no planner change, no economics, no Stage B authorisation, no
+reserve, no ownership or dead-man semantics, no quarter trigger second, and no
+boundary-aligned arming. What changes is *when the controller looks*, and what it can
+say about what it saw.
+
+The 2026-09-06 evening export session took ~40 s from ownership claim to the vendor
+register reading active, and ~80 s to controller-observed delivery. Two separate
+causes, and neither was the vendor.
+
+### Fixed
+
+- **The controller was not watching.** `_observe_arm` ran only inside the
+  sixty-second physical tick, whose phase is whatever instant setup happened to
+  finish. So the delay between the register going active and this component noticing
+  was uniform on `[0, 60)`: the three export arms measured **37.1 s, 42.5 s and
+  45.2 s** of pure waiting. That delay was charged to `delivery_latency_s`, which is
+  prorated into `objective_forgone_to_activation_kwh` -- so an arm that began
+  delivering promptly could report having forgone roughly twice what it really did.
+  The dispatch register is now subscribed directly, and a **bounded** post-arm sweep
+  (10 s, at most 12 passes) covers attributable delivery, which depends on battery
+  and meter readings a register event says nothing about. This is a correction to a
+  published economic figure, not only to a diagnostic.
+
+### Added
+
+- **Activation latency is decomposed, and every term is measured.** The capture
+  showed `solve_ms` of 32.4-35.2 s against `activation_latency_s` of 38.6-41.5 s,
+  which says **84-86 % of it is our own Stage A solve** rather than the vendor -- the
+  opposite of what the code had assumed since beta.44. Saying so is not measuring it,
+  so the interval is now published in parts:
+
+  ```
+  activation_latency_s ~= claim_to_write_latency_s
+                        + dispatch_write_duration_s
+                        + enable_to_register_latency_s
+  ```
+
+  The middle term is measured rather than assumed. An identity with an estimated term
+  is not a reconciliation, and a residual that silently absorbed the write path would
+  hide the one stage nobody has ever timed.
+
+- **`enable_to_register_latency_s` is the first figure this component has published
+  about anything outside itself**, and it is named for exactly what it measures: our
+  activation write against *the AlphaESS integration's register entity* changing.
+  That is not the vendor device and it is certainly not the battery. It was
+  deliberately **not** called a vendor latency.
+
+- New arm-measurement keys, all additive and all `null` before evidence exists:
+  `dispatch_write_started_at`, `dispatch_enable_written_at`,
+  `claim_to_write_latency_s`, `dispatch_write_duration_s`,
+  `enable_to_register_latency_s`.
+
+### Not changed
+
+`claim_written_at` keeps its meaning and its value. It precedes the actual write by
+the whole solve, and ownership provenance is measured from it -- moving it would have
+shrunk the published activation latency with no real improvement, which is a prettier
+measurement rather than a faster one. `activation_latency_s`, `observation_latency_s`,
+`delivery_latency_s`, `battery_delivery_latency_s` and
+`objective_forgone_to_activation_kwh` keep their definitions and their origins; every
+attribution and coherence rule is untouched, and ambient production is still never
+credited to a dispatch on either boundary.
+
+### Validation
+
+- **5 hypothesis tests**, written and green against the pre-change tree, pinning the
+  diagnosis itself: no activation can be written while the solve runs; the tick
+  cannot arm an inactive dispatch; a second refresh over a running dispatch never
+  re-arms; and both halves of a later boundary-aligned arm -- an admitted row *can*
+  build a seven-step sequence without a solve, and *cannot* authorise one without
+  recomputing `start_index`, which `INHIBIT_STALE_PLAN_INTERVAL` refuses.
+- **21 focused tests**, including a three-term reconciliation that fails if the write
+  duration is dropped
+- **266 passed** across the arm, Stage-B, ownership, restart and lifecycle suites
+- **63 passed** on neutrality; planner digests and the beta.40/41 anchors **unchanged
+  and not re-baselined**
+- **Mutations: b47 22/22, b44 18/18, b45 23/23, b46 18/18 -- 0 survived, 0 anchors
+  lost.** Seven b47 mutations survived the first pass and every one was a vacuous
+  test: the reconciliation never exceeded its own terms, the sweep was never run to
+  its bound, and the activation predicate was never shown a stop sequence -- which
+  writes the enable *first* and then cleans up. The tests were rewritten and one
+  predicate was moved where it could be tested; no mutation was weakened.
+- Lint and format clean
+
+### Live validation pending
+
+This prerelease is **not yet hardware-validated**. The next live day must show, over
+at least two charge arms and two export arms, reported as median and worst case:
+
+1. `activation_latency_s` **statistically unchanged** from the 39.8 s median baseline
+   -- beta.47 is not supposed to make dispatch faster, and a change means something
+   unintended moved.
+2. register-to-observed **under 2 s median**, against the 42.5 s baseline.
+3. `enable_to_register_latency_s` present on **every** arm, and never exceeding
+   `activation_latency_s`.
+4. The three-term identity reconciling to within ~0.2 s on every arm.
+
 ## [1.0.0-beta.46] - 2026-09-06
 
 **An arm-observability fix, and nothing else.** No planner decision, no economics, no
