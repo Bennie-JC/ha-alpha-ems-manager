@@ -26,6 +26,7 @@ from custom_components.alpha_ems_manager.const import (
     ARM_EVIDENCE_NO_TRANSITION,
     ARM_EVIDENCE_STALE_REGISTER,
     ARM_EVIDENCE_UNATTRIBUTABLE,
+    COHERENCE_HOLDING,
     COHERENCE_OK,
     DISPATCH_POWER_DEADBAND_KW,
     EXECUTION_INTENT_GRID_CHARGE,
@@ -35,6 +36,26 @@ from custom_components.alpha_ems_manager.const import (
     OWNERSHIP_OWNED,
 )
 from custom_components.alpha_ems_manager.coordinator import AlphaEmsCoordinator
+from custom_components.alpha_ems_manager.energy_balance import ControlCoherence
+
+
+def coherence(state: str) -> ControlCoherence:
+    """Return a real coherence verdict.
+
+    **A string was passed here until beta.46, and that is why the delivery gate's
+    object-versus-string comparison survived three releases.** ``_observe_arm`` is
+    handed a ``ControlCoherence`` by the live tick and nothing else, so a rig that
+    hands it a bare state name is testing a type production never produces.
+    """
+    return ControlCoherence(
+        state=state,
+        bad_since=None,
+        bad_ticks=0,
+        grace_seconds=180.0,
+        action="none",
+        last_coherent_tick=None,
+    )
+
 
 #: The live arm, to the millisecond.
 CLAIM = datetime(2026, 9, 5, 22, 15, 5, 238786, tzinfo=UTC)
@@ -52,7 +73,8 @@ class _Rig:
             maxlen=MAX_ARM_MEASUREMENTS_REPORTED
         )
         self.c._arm_saw_dispatch = False
-        self.c._coherence = COHERENCE_OK
+        self.c._coherence = coherence(COHERENCE_OK)
+        self.c._plan = None
         self.c._quarter = None
         self.c.store = SimpleNamespace(execution_record=None)
         self.register = register
@@ -200,7 +222,7 @@ def test_charge_delivery_does_not_credit_ambient_pv_charging() -> None:
 def test_an_incoherent_sample_yields_no_delivery_figure() -> None:
     """Sources that disagree produce nothing, never a number from a stale reading."""
     rig = _Rig()
-    rig.c._coherence = "degraded"
+    rig.c._coherence = coherence(COHERENCE_HOLDING)
     rig.claim()
     rig.surplus = 0.0
     rig.flows = SimpleNamespace(grid_export_w=5000.0, battery_charge_w=0.0)

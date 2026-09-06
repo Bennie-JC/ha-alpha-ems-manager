@@ -143,15 +143,20 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M7: an incoherent sample is measured anyway",
         "coordinator.py",
-        "        if self._coherence not in (None, COHERENCE_OK):",
+        # Re-anchored by beta.46: the gate reads the coherence *state* now,
+        # because comparing the dataclass itself to the state string was
+        # always true and cost the release its delivery evidence.
+        "        if self._coherence is not None and not self._coherence.usable:",
         "        if False:",
         f"{MEAS}::test_an_incoherent_sample_yields_no_delivery_figure",
     ),
     (
         "M8: delivery fires inside the band the controller will not correct",
         "coordinator.py",
-        "        if caused <= DISPATCH_POWER_DEADBAND_KW:\n            return",
-        "        if caused < 0.0:\n            return",
+        # Re-anchored by beta.46: the branch now names why it attributed
+        # nothing instead of returning silently.
+        "        if caused <= DISPATCH_POWER_DEADBAND_KW:",
+        "        if caused < 0.0:",
         f"{MEAS}::test_delivery_must_clear_the_deadband",
     ),
     (

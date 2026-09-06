@@ -9,6 +9,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.46] - 2026-09-06
+
+**An arm-observability fix, and nothing else.** No planner decision, no economics, no
+buy or sell scheduling, no reserve, no export protection, no admission, no dispatch
+behaviour, no actuation timing and no campaign-lifecycle change. This is not Phase 9
+and adds no activation cost to the planner.
+
+The 2026-09-06 charge ran for eight hours, moved 13.72 kWh against a 15.11 kWh promise,
+and filed an arm measurement that said:
+
+```
+objective_kwh: 0.0
+objective_forgone_to_activation_kwh: null
+delivery_latency_s: null
+delivery_evidence: sources_incoherent
+battery_delivery_latency_s: 43.4
+```
+
+Three separate defects, all of them in the read-only measurement layer.
+
+### Fixed
+
+- **The arm objective was the wrong quantity, and was structurally always zero.**
+  `_observe_arm` captured `_objective_kwh_for(self._quarter)`, which returns the
+  *realised* objective of the row in flight -- `min(realised, allowance)`. An arm opens
+  the instant its claim is written, when nothing has been realised, so the figure was
+  `0.0` on every arm that has ever run. It now sums the **planned** objective of the
+  arm's own maximal contiguous stretch of executable rows, read off the frozen schedule
+  Stage B holds, at `QuarterRow.objective_kwh`'s own boundary: battery for a charge,
+  meter export for an export. Published beside it: `objective_boundary`, `row_count`
+  and `planned_span_s`, so the derivation is legible rather than asserted.
+
+- **`objective_forgone_to_activation_kwh` could not exist, and would have been wrong
+  the moment it could.** It is derived from the objective, and zero times anything is
+  zero, which the guard then correctly withheld -- the right answer for the wrong
+  reason. It was also prorated over a single quarter, which against a real multi-row
+  objective charges the arm's entire promise to its first fifteen minutes. It is now
+  prorated at the arm's mean planned rate over `planned_span_s`, and the delay is
+  clamped to that span, so an arm can never forgo more than it ever planned to deliver.
+
+- **Delivery evidence compared a dataclass to a string.** `self._coherence` holds a
+  `ControlCoherence`; `COHERENCE_OK` is `"ok"`. So
+  `self._coherence not in (None, COHERENCE_OK)` was true on **every** tick that carried
+  a verdict at all -- which is every tick after the first of a run, the field being
+  `None` only while idle. Delivery was therefore evaluated exactly once per arm, before
+  the setpoint had reached the pack, and every later sample was discarded as
+  `sources_incoherent`. The gate now reads the state. The live 43.4 s
+  `battery_delivery_latency_s` was the honest half of that same tick.
+
+- **One bad tick no longer labels the whole arm.** The incoherent reason was written
+  with `setdefault`, so the first hiccup latched for the arm's life. Evidence is a
+  statement about the observation that produced it, so it is assigned; and a tick whose
+  sources were all readable with nothing above the production surplus now says
+  `incomplete` rather than wearing an older failure.
+
+- **The beta.44 arm test rig fabricated a type production never produces.** It set
+  `coordinator._coherence` to the *string* `"ok"`, which is why an object-versus-string
+  comparison passed a suite written to protect it. The rig now builds a real
+  `ControlCoherence`.
+
+### Not changed
+
+Stage A's objective and every planner decision; buy and sell economics; reserve
+feasibility, headroom and the export gate; tomorrow-price handling; run count,
+direction changes and campaign grouping; scheduling; Stage B setpoints, ownership, the
+dead-man and admission semantics; the beta.45 campaign lifecycle and restart recovery.
+The attribution rules themselves are untouched: ambient production is still never
+credited to a dispatch on either boundary, an unreadable surplus still refuses to
+attribute, and `null` is still never zero.
+
+`arm_measurements` remains session-local and is read by the diagnostics block alone --
+retention is not redesigned here.
+
+### Validation
+
+- **17 new tests**, and the beta.44 arm suite corrected to the real coherence type
+- **277 passed** across the arm, Stage-B, ownership, restart and lifecycle suites
+- **98 passed** on neutrality; planner digests and the beta.40/41 anchors **unchanged
+  and not re-baselined**
+- **18 mutations killed, 0 survived, 0 anchors lost** (`tools/mutation/b46.py`). Four
+  survived the first pass, every one of them a vacuous test: the gap test never
+  exercised the backward walk, the forgone test never exceeded its own span, and the
+  evidence test never asked a healthy arm to go blind. The tests were rewritten; no
+  mutation was weakened. Two beta.44 anchors pointed at lines this release rewrote and
+  were re-anchored on the current source, same claim and same test: b44 is 18/18 again.
+- Lint and format clean
+- **Final full suite: 5005 passed, 0 failed, 3 pre-existing skips** -- one sharded
+  run at `-n 16` with `PYTHONHASHSEED=0`, no serial rerun
+
 ## [1.0.0-beta.45] - 2026-09-06
 
 **Every campaign that started published a failure moments later, and then finished in

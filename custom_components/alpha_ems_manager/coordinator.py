@@ -115,7 +115,6 @@ from .const import (
     CAMPAIGN_TARGET_UNAVAILABLE,
     CAP_NONE,
     CLAIM_SCHEMA_VERSION,
-    COHERENCE_OK,
     COMPARATOR_MODEL_AMBIENT_ABSORB_ONLY,
     COMPARATOR_MODEL_AMBIENT_WALK,
     CONF_ALLOW_BATTERY_EXPORT,
@@ -322,7 +321,6 @@ from .const import (
     QUARTER_END_SAFETY,
     QUARTER_END_TARGET_REACHED,
     QUARTER_MINUTES,
-    QUARTER_SECONDS,
     QUARTER_TARGET_TOLERANCE_KWH,
     REALIZED_BENEFIT_BASIS_VERSION,
     REASON_VOCABULARY_CAMPAIGN_END,
@@ -9655,9 +9653,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "row_start": None
                 if quarter is None
                 else quarter.quarter_start.isoformat(),
-                "objective_kwh": None
-                if quarter is None
-                else round(self._objective_kwh_for(quarter), 3),
+                # **The arm's own planned objective, attached below. beta.46.**
+                # It used to be ``_objective_kwh_for(self._quarter)``, which is the
+                # *realised* objective of the row in flight -- and an arm opens the
+                # instant the claim is written, when nothing has been realised yet.
+                # So it was structurally ``0.0`` on every arm that ever ran, and the
+                # 2026-09-06 charge filed ``objective_kwh: 0.0`` against a campaign
+                # that promised 15.11 kWh and moved 13.72.
+                "objective_kwh": None,
+                "objective_boundary": None,
+                "row_count": None,
+                "planned_span_s": None,
                 "activation_latency_s": None,
                 "observation_latency_s": None,
                 "delivery_latency_s": None,
@@ -9667,6 +9673,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             }
             self._arm_open = open_arm
 
+        self._refresh_arm_objective(open_arm, now)
         written = instant_of(open_arm.get("claim_written_at"))
         active = bool(snapshot is not None and snapshot.dispatch_active)
 
@@ -9705,6 +9712,83 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._arm_saw_dispatch = active
 
     @callback
+    def _arm_span_planned(
+        self, moment: datetime, since: datetime | None
+    ) -> tuple[float, str, int, float] | None:
+        """Return the planned objective of the arm covering ``moment``. beta.46.
+
+        **One arm is one maximal contiguous stretch of executable rows**, and the
+        frozen schedule is the only thing that knows where that stretch begins and
+        ends. So the walk is over :attr:`AdmittedPlan.rows` -- outward from the row
+        covering this instant, in both directions, stopping at the first row Stage A
+        stamped ``not_executable`` -- which is the same rule
+        :meth:`_armable_stretches` applies to the published schedule, expressed
+        against the plan Stage B actually holds.
+
+        ``since`` bounds the walk backwards at the arm's own first row, so a claim
+        re-taken mid-stretch after a restart measures the part it is responsible for
+        rather than inheriting rows that ran under the previous claim.
+
+        The boundary is the row's, not a preference: ``QuarterRow.objective_kwh``
+        already answers "battery for a charge, meter export for an export", and it is
+        the same expression the campaign and the arm plan are judged on. ``None``
+        when no frozen schedule covers this instant, because a figure that cannot be
+        derived is withheld rather than guessed.
+        """
+        plan = self._plan
+        if plan is None:
+            return None
+        rows = plan.rows
+        index: int | None = None
+        for position, row in enumerate(rows):
+            if row.covers(moment):
+                index = position
+                break
+        if index is None or not rows[index].executable:
+            return None
+        first = index
+        while (
+            first > 0
+            and rows[first - 1].executable
+            and (since is None or rows[first - 1].start >= since)
+        ):
+            first -= 1
+        last = index
+        while last + 1 < len(rows) and rows[last + 1].executable:
+            last += 1
+        objective = sum(
+            rows[position].objective_kwh(plan.intent)
+            for position in range(first, last + 1)
+        )
+        boundary = (
+            CAMPAIGN_BOUNDARY_METER
+            if plan.intent == EXECUTION_INTENT_NET_EXPORT
+            else CAMPAIGN_BOUNDARY_BATTERY
+        )
+        span = (rows[last].end - rows[first].start).total_seconds()
+        return objective, boundary, last - first + 1, span
+
+    @callback
+    def _refresh_arm_objective(self, arm: dict[str, Any], moment: datetime) -> None:
+        """Attach this arm's planned objective from the frozen schedule. beta.46.
+
+        Refreshed every tick rather than captured once, because the schedule is what
+        it reads and the schedule is frozen: re-deriving it is idempotent while the
+        same plan is admitted, and self-correcting if the arm opened before one was
+        held. A tick that cannot derive it leaves the last derivation standing --
+        withholding an already-proven figure because the plan has since been torn
+        down would lose evidence rather than protect it.
+        """
+        derived = self._arm_span_planned(moment, instant_of(arm.get("row_start")))
+        if derived is None:
+            return
+        objective, boundary, rows, span = derived
+        arm["objective_kwh"] = round(objective, 3)
+        arm["objective_boundary"] = boundary
+        arm["row_count"] = rows
+        arm["planned_span_s"] = round(span, 1)
+
+    @callback
     def _dispatch_state_changed_at(self) -> datetime | None:
         """Return when the vendor dispatch register last changed state. beta.44.
 
@@ -9741,8 +9825,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if arm["delivery_latency_s"] is not None or written is None:
             return
-        if self._coherence not in (None, COHERENCE_OK):
-            arm.setdefault("delivery_evidence", ARM_EVIDENCE_INCOHERENT)
+        # **The state, not the object. beta.46.** ``self._coherence`` is a
+        # ``ControlCoherence`` dataclass and ``COHERENCE_OK`` is the string ``"ok"``,
+        # so ``not in (None, COHERENCE_OK)`` was true on every tick that had a
+        # coherence at all -- which is every tick after the first of a run, since the
+        # field is only ``None`` while idle. Delivery was therefore evaluated exactly
+        # once per arm, before the setpoint had reached the pack, and every later
+        # sample was thrown away as incoherent. The 2026-09-06 charge ran for eight
+        # hours at a metered import above the production surplus and filed
+        # ``delivery_latency_s: null`` with ``sources_incoherent``.
+        #
+        # Assigned rather than ``setdefault``: the published reason is why *this*
+        # observation attributed nothing, so a recovered source must be able to
+        # clear a hiccup instead of latching it for the life of the arm.
+        if self._coherence is not None and not self._coherence.usable:
+            arm["delivery_evidence"] = ARM_EVIDENCE_INCOHERENT
             return
         surplus = self._budget_surplus_kw()
         if surplus is None:
@@ -9769,19 +9866,27 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     (now - written).total_seconds(), 1
                 )
         if caused <= DISPATCH_POWER_DEADBAND_KW:
+            # Every source was readable and nothing above the surplus moved. That is
+            # not an evidence failure, so it must not be left wearing an earlier
+            # one. beta.46.
+            arm["delivery_evidence"] = ARM_EVIDENCE_INCOMPLETE
             return
         arm["delivery_latency_s"] = round((now - written).total_seconds(), 1)
         arm["delivery_evidence"] = None
         objective = arm.get("objective_kwh")
-        if objective:
-            # **Derived, and an upper bound.** The objective is prorated at the
-            # row's own average rate over the interval that delivered nothing
-            # attributable. Where ambient behaviour delivered part of it anyway the
-            # true loss is smaller, which is why the basis says bound rather than
-            # measurement.
-            elapsed = min(arm["delivery_latency_s"], QUARTER_SECONDS)
+        span = arm.get("planned_span_s")
+        if objective and span:
+            # **Derived, and a bound.** The arm's own objective is prorated at the
+            # arm's mean planned rate over the interval that delivered nothing
+            # attributable. It was prorated over one quarter against a figure that
+            # was always zero, so it could only ever publish ``0.0`` or nothing;
+            # against a real multi-row objective a quarter denominator would have
+            # charged the whole arm's promise to its first fifteen minutes.
+            # Ambient behaviour may have delivered part of it anyway, which is why
+            # the basis says bound rather than measurement.
+            elapsed = min(arm["delivery_latency_s"], span)
             arm["objective_forgone_to_activation_kwh"] = round(
-                objective * elapsed / QUARTER_SECONDS, 3
+                objective * elapsed / span, 3
             )
 
     @callback
@@ -9804,10 +9909,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "grid-caused charge above it at the battery. "
             "battery_delivery_latency_s times any battery charge and is published "
             "beside it precisely so ambient absorption cannot be read as proof the "
-            "dispatch started. objective_forgone_to_activation_kwh is derived, not "
-            "measured: the row objective prorated over the undelivered interval, "
-            "and an upper bound because ambient behaviour may have delivered part "
-            "of it. null is never zero"
+            "dispatch started. objective_kwh is this arm's own planned objective "
+            "-- the sum over its maximal contiguous stretch of executable rows in "
+            "the frozen schedule, at objective_boundary: battery for a charge, "
+            "meter export for an export -- and never a realised figure, a campaign "
+            "target or a single row. objective_forgone_to_activation_kwh is "
+            "derived, not measured: that objective prorated over the undelivered "
+            "interval at the arm's mean planned rate across planned_span_s, and a "
+            "bound because ambient behaviour may have delivered part of it. null "
+            "is never zero"
         )
         self._arm_measurements.append(arm)
 
