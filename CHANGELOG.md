@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.49] - 2026-09-07
+
+**Two additive fields on one lifecycle event, and a worked Home Assistant example.**
+
+No planner change, no economics, no Stage B, no dispatch timing, no reserve, no ownership, no safety. No new event, no new sensor, no new lifecycle kind, no new persisted subsystem. Both new fields are publication-only and a structural test says so.
+
+## What a start line could not say
+
+A Trading Log renders one sentence when execution physically begins:
+
+```
+Verkopen gestart —> 4.52 kWh —> economische verkoop
+```
+
+Neither figure in it existed.
+
+`planned_kwh` on the `started` event is the **creation** snapshot -- written once when the campaign opened and never rewritten, identical on every later kind. It is the right number for the plan-created line and the wrong one here. The execution target frozen at first activation was published **nowhere**: at terminal it is recoverable as realised plus shortfall, but at `started` there is no shortfall yet.
+
+And nothing captured the classification at first execution. `classification_at_creation` is the wrong instant; `final_classification` is the terminal-time **live** value, and the live value legitimately moves -- a campaign spanning two admitted plans reads one category and then another under one unchanged instance id. Rendering either would make a sentence already sitting in a user's history describe a different campaign later.
+
+### Added
+
+- **`frozen_target_kwh`** on the `started` payload -- the execution target as it was frozen at first confirmed activation. `null` when unknown, never `0.0`.
+- **`classification_at_start`** on the `started` payload -- frozen at the same instant, from the live value, so a start line cannot change its meaning afterwards.
+
+Both ride the existing exactly-once guard: `started` still fires once per campaign instance, not once per physical arm, so a multi-row campaign re-arming at every row boundary and every `serve_load` gap still logs one start. And neither appears on `planned` or `plan_closed`, which carry no instance id and may carry no execution figures.
+
+## docs/TRADING_LOG.md
+
+A worked example, and the reasoning behind it. **The repository owns no Home Assistant configuration and this release does not change that** -- there is no runtime dependency on `logbook.log` or on any template. The file is documentation to copy from.
+
+Its central point: trigger on the **event**, not on the two campaign sensors. Those are projections, recomputed every refresh, and a trigger on them re-fires whenever any attribute moves even when the state does not -- which is where duplicate lines come from. `current_campaign` also does not return early when idle: it emits its full attribute set with every value `None` and `classification: "unknown"`, so a state-driven template can read a well-formed campaign made entirely of nulls. And `last_campaign_result` **does not survive a restart**, so its disappearance must never be read as a campaign ending.
+
+The event carries none of those hazards. Each kind fires once behind guards the integration already maintains -- including a **persisted** latch on the terminal -- so exactly-once needs no bookkeeping in Jinja, attribute refreshes produce nothing, and a restart replays neither `created` nor `started`.
+
+The example also fixes the mapping: `superseded` is **not** a failure. The integration only renames a `partial` to `superseded` when a plan replaced it, so a displaced campaign that met its tolerance stays `success` and one that did partial work reads as partial work. A reason is shown for `failed` alone, and `unknown` classification renders no type segment rather than the word "unknown".
+
+### Validation
+
+- **8 focused tests**, including one proving a start line cannot change its meaning after the fact
+- **38 passed** on the lifecycle-event and beta.45 lifecycle suites
+- Neutrality anchors **unchanged and not re-baselined**
+- **Mutations: b49 7/7 -- 0 survived, 0 anchors lost.** Three survived a first pass and all three were vacuous tests: two set the frozen fields directly instead of exercising the code that freezes them, and the announcement test looped over events that never fired, so it passed on an empty loop. All three were rewritten; no mutation was weakened.
+- Lint and format clean; one sharded full suite green
+
+### Live validation pending
+
+No campaign completed during implementation, so the rendering is **not yet validated against real history**. The next live day should show, per campaign: exactly one campaign-ID line, exactly one plan-created line after it, zero or one start line, an appropriate result line, and exactly one terminal -- with no duplicate `planned` or `started` lines, no reason on a normal completion, no visible `unknown`, and the correct denominator on each line.
+
 ## [1.0.0-beta.48] - 2026-09-07
 
 **An audit release. It measures the accounting; it does not correct it.** No planner

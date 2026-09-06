@@ -1845,6 +1845,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._campaign_boundary: str | None = None
         self._campaign_started_at: datetime | None = None
         self._campaign_frozen_target_kwh: float | None = None
+        #: The classification as it read at first physical execution, frozen there
+        #: so a start line cannot change its meaning afterwards. beta.49.
+        self._campaign_classification_at_start: str | None = None
         #: The objective read while the campaign was still published, kept so the
         #: freeze has something to freeze. **The freeze is structurally one refresh
         #: late** -- ``_note_campaign_progress`` runs inside the control report,
@@ -3663,6 +3666,18 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._campaign_frozen_target_kwh = (
             live if live is not None else self._campaign_opening_target_kwh
         )
+        # **And the classification, frozen with it. beta.49.**
+        #
+        # ``classification_at_creation`` is the wrong instant and
+        # ``final_classification`` is the terminal-time live value, so a log line
+        # written when execution began would silently change its own meaning later:
+        # a campaign spanning two admitted plans can legitimately read one category
+        # and then another under one unchanged instance id. Nothing captured the
+        # classification at *first physical execution*, which is what a start line
+        # is about, so a reader had no truthful field to render.
+        self._campaign_classification_at_start = self._campaign_classification(
+            self._campaign_id
+        ).get("classification")
         # The public transition rides the frozen one, so the two can never
         # disagree about when a campaign began. beta.42.
         self._lifecycle_started(now)
@@ -5987,6 +6002,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             self._campaign_started_at = None
             self._campaign_frozen_target_kwh = None
+            self._campaign_classification_at_start = None
             self._campaign_opening_target_kwh = self._campaign_objective_kwh(current)
             self._campaign_realized_kwh = 0.0
             self._campaign_quarters_admitted = 0
@@ -6397,6 +6413,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._campaign_boundary = None
         self._campaign_started_at = None
         self._campaign_frozen_target_kwh = None
+        self._campaign_classification_at_start = None
         self._campaign_opening_target_kwh = None
         self._campaign_realized_kwh = 0.0
         self._campaign_quarters_admitted = 0
@@ -10999,7 +11016,26 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.store.schedule_save()
         self._fire_lifecycle(
             LIFECYCLE_KIND_STARTED,
-            {**self._lifecycle_common(), "started_at": mark["started_at"]},
+            {
+                **self._lifecycle_common(),
+                "started_at": mark["started_at"],
+                # **The two figures a start line needs and could not reach. beta.49.**
+                #
+                # ``planned_kwh`` on this payload is the *creation* snapshot, frozen
+                # when the campaign opened; the execution target frozen at first
+                # activation is a different quantity and was published nowhere. At
+                # terminal it is recoverable as realised plus shortfall, but there is
+                # no shortfall yet here, so it had to be carried.
+                #
+                # Both are publication-only. No planner, economic, Stage B, safety or
+                # ownership path reads either, and a structural test says so.
+                "frozen_target_kwh": (
+                    None
+                    if self._campaign_frozen_target_kwh is None
+                    else round(self._campaign_frozen_target_kwh, 3)
+                ),
+                "classification_at_start": self._campaign_classification_at_start,
+            },
         )
 
     @callback
