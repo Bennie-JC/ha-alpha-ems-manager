@@ -89,6 +89,7 @@ from .const import (
     CAMPAIGN_STATE_CREATED,
     CAMPAIGN_STATE_IDLE,
     CAMPAIGN_STATE_OPTIONS,
+    CAMPAIGN_STATE_PLANNED,
     CAMPAIGN_STATE_STARTED,
     CONTROL_MODE_ACTIVE,
     CONTROL_STATE_OPTIONS,
@@ -1633,6 +1634,12 @@ def _current_campaign_value(coordinator: AlphaEmsCoordinator) -> str | None:
     """
     mark = coordinator.store.campaign_lifecycle
     if not mark:
+        # **The plan, before the campaign. beta.45.** An announcement is not a
+        # campaign -- it has no instance and has moved nothing -- but it is the
+        # thing a trading log needs to show first, so it gets its own state rather
+        # than borrowing ``created``.
+        if coordinator.store.campaign_announcement:
+            return CAMPAIGN_STATE_PLANNED
         return CAMPAIGN_STATE_IDLE
     marks = mark.get("marks") or []
     if LIFECYCLE_KIND_STARTED in marks:
@@ -1656,6 +1663,34 @@ def _current_campaign_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, 
     them.
     """
     mark = coordinator.store.campaign_lifecycle or {}
+    if not mark:
+        announced = coordinator.store.campaign_announcement
+        if announced:
+            # **Announcement attributes carry no realised figure at all.** Not
+            # ``0.0`` and not ``None``: a plan has moved no energy, and a key that
+            # renders as a zero beside a promise is the exact shape beta.45 removes.
+            plan = coordinator._campaign_classification(announced.get("campaign_id"))
+            return {
+                "campaign_id": announced.get("campaign_id"),
+                "campaign_instance_id": None,
+                "purpose": announced.get("purpose"),
+                "classification": plan.get("classification"),
+                "planned_kwh": announced.get("planned_kwh"),
+                "window_start": announced.get("window_start"),
+                "window_end": announced.get("window_end"),
+                "objective_boundary": announced.get("objective_boundary"),
+                "rule": (
+                    "planned is Stage A's intention, not a campaign: no instance "
+                    "exists yet, nothing has been executed, and no realised figure "
+                    "is published because there is none. the window is the "
+                    "economic campaign's own, and it may move under this state "
+                    "without a second planned event -- ordinary replanning of one "
+                    "logical campaign is not news. when Stage B opens it the state "
+                    "becomes created and then started; if it is replaced or its "
+                    "window passes unstarted, a plan_closed event carries the "
+                    "closing line and this returns to idle"
+                ),
+            }
     live = coordinator._campaign_classification(mark.get("campaign_id"))
     return {
         "campaign_id": mark.get("campaign_id"),

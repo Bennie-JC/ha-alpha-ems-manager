@@ -2340,7 +2340,16 @@ CAMPAIGN_STATE_CREATED: Final = "created"
 CAMPAIGN_STATE_STARTED: Final = "started"
 CAMPAIGN_STATE_IDLE: Final = "idle"
 
+#: Stage A intends a campaign that Stage B has not placed. beta.45.
+#:
+#: **Ahead of ``created``, and a different claim.** ``created`` says the campaign
+#: is real -- Stage B opened it and an instance id exists. ``planned`` says only
+#: that a future campaign is published and close enough to announce, which is what
+#: a trading log needs in order to show a plan before the action.
+CAMPAIGN_STATE_PLANNED: Final = "planned"
+
 CAMPAIGN_STATE_OPTIONS: Final = (
+    CAMPAIGN_STATE_PLANNED,
     CAMPAIGN_STATE_CREATED,
     CAMPAIGN_STATE_STARTED,
     CAMPAIGN_STATE_IDLE,
@@ -4060,11 +4069,37 @@ LIFECYCLE_KIND_STARTED: Final = "started"
 LIFECYCLE_KIND_STOPPED: Final = "stopped"
 LIFECYCLE_KIND_REMOVED: Final = "removed"
 
+#: The announcement pair. beta.45.
+#:
+#: **Deliberately not campaign kinds, and that separation is load-bearing.** An
+#: announcement exists before any instance is minted, so it can end without a
+#: campaign ever having existed. Publishing that ending as ``removed`` would make
+#: an existing dashboard branch render a campaign result for something that never
+#: ran, and would need a realised figure and an instance id that cannot honestly
+#: be filled.
+#:
+#: One rule spans both vocabularies: **no announcement event uses a campaign kind,
+#: and no campaign event carries a null campaign_instance_id.**
+LIFECYCLE_KIND_PLANNED: Final = "planned"
+LIFECYCLE_KIND_PLAN_CLOSED: Final = "plan_closed"
+
 CAMPAIGN_LIFECYCLE_KINDS: Final = (
+    LIFECYCLE_KIND_PLANNED,
     LIFECYCLE_KIND_CREATED,
     LIFECYCLE_KIND_STARTED,
     LIFECYCLE_KIND_STOPPED,
     LIFECYCLE_KIND_REMOVED,
+    LIFECYCLE_KIND_PLAN_CLOSED,
+)
+
+#: The only two results an announcement that never became a campaign may carry.
+#:
+#: Both already exist in :data:`CAMPAIGN_OUTCOMES`, so a reader needs no new
+#: vocabulary: ``superseded`` when a genuinely different campaign replaced it
+#: before it started, ``not_executed`` when its window passed with no start.
+PLAN_CLOSED_RESULTS: Final = (
+    OUTCOME_SUPERSEDED,
+    OUTCOME_NOT_EXECUTED,
 )
 
 #: How many closed lifecycle instances are remembered, so a restart cannot replay

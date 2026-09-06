@@ -186,6 +186,7 @@ from .const import (
     DISPATCH_POWER_DEADBAND_KW,
     ECONOMIC_ACTION_CURTAIL,
     ECONOMIC_ACTION_EXPORT,
+    ECONOMIC_ANNOUNCE_LEAD_MINUTES,
     ECONOMIC_BLOCKED_ACTION_NOT_EXECUTABLE,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
     ECONOMIC_BLOCKED_EXPORT_NOT_PERMITTED,
@@ -242,6 +243,8 @@ from .const import (
     LIFECYCLE_FOREIGN,
     LIFECYCLE_IDLE,
     LIFECYCLE_KIND_CREATED,
+    LIFECYCLE_KIND_PLAN_CLOSED,
+    LIFECYCLE_KIND_PLANNED,
     LIFECYCLE_KIND_REMOVED,
     LIFECYCLE_KIND_STARTED,
     LIFECYCLE_KIND_STOPPED,
@@ -278,6 +281,7 @@ from .const import (
     OWNERSHIP_OWNED,
     OWNERSHIP_RELEASING,
     OWNERSHIP_UNPROVEN,
+    PLAN_CLOSED_RESULTS,
     PRICE_BASIS_LIVE_FORECAST,
     PRICE_BASIS_STORED_SNAPSHOT,
     PRICE_CROSS_CHECK_DISAGREES,
@@ -3555,6 +3559,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # The public transition rides the frozen one, so the two can never
         # disagree about when a campaign began. beta.42.
         self._lifecycle_started(now)
+        # The freeze is evidence a restart would otherwise have to guess at. beta.45.
+        self._refresh_lifecycle_evidence()
 
     @callback
     def _lifecycle_state_from(
@@ -3754,6 +3760,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 None
                 if self._campaign_end_utc is None
                 else self._campaign_end_utc.isoformat()
+            ),
+            # **Beside it, never instead of it. beta.45.** ``campaign_end`` keeps
+            # its meaning -- the furthest row this campaign has actually reached,
+            # which is what the orphan grace is measured from -- and the end Stage A
+            # planned gets its own key rather than borrowing that name.
+            "planned_end": (
+                None
+                if self._campaign_planned_end_utc is None
+                else self._campaign_planned_end_utc.isoformat()
             ),
             "objective_boundary": self._campaign_boundary,
             "started": self._campaign_started_at is not None,
@@ -5488,6 +5503,46 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # measurement, and saying so is the honesty guard that outranks even a
             # met objective in the outcome precedence.
             self._campaign_measurable = False
+        self._refresh_lifecycle_evidence()
+
+    @callback
+    def _refresh_lifecycle_evidence(self) -> None:
+        """Keep the persisted mark's evidence current. beta.45.
+
+        **The mark is the only thing a restart has to reason from, and it was
+        written once and then left behind.** ``realized_kwh`` was set to ``0.0`` at
+        creation and refreshed only by :meth:`_lifecycle_stopped`, which a campaign
+        reaches only through a campaign-scoped stop -- so a genuine restart three
+        hours into a campaign recovered ``0.0`` and filed ``failed``, when the
+        evidence to file ``partial`` against the real figure existed all along.
+
+        Written where progress already changes and on the save the caller already
+        schedules, so this costs one dict update per accrual and no extra I/O.
+
+        Nothing is fabricated: the tolerance is written only when there is a frozen
+        target to compute it from, and a target that has never been frozen stays
+        absent rather than becoming a zero.
+        """
+        mark = self.store.campaign_lifecycle
+        if mark is None:
+            return
+        if mark.get("instance_id") != self._campaign_instance_id:
+            # Somebody else's mark, waiting for the recovery pass. Writing this
+            # boot's figures into it would invent the very evidence that pass
+            # exists to read.
+            return
+        mark["realized_kwh"] = round(self._campaign_realized_now(), 3)
+        mark["measurable"] = self._campaign_measurable
+        frozen = self._campaign_frozen_target_kwh
+        mark["frozen_target_kwh"] = frozen
+        if frozen is not None:
+            mark["success_tolerance_kwh"] = round(
+                self._completion_tolerance_kwh(
+                    frozen, self._campaign_quarters_admitted
+                ),
+                4,
+            )
+        self.store.schedule_save()
 
     @callback
     def _open_quarter_objective_kwh(self) -> float:
@@ -5782,6 +5837,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         frozen = self._campaign_frozen_target_kwh
         if frozen is None or live > frozen:
             self._campaign_frozen_target_kwh = live
+            # A grown target changes what a recovered terminal is judged against,
+            # so the persisted evidence moves with it. beta.45.
+            self._refresh_lifecycle_evidence()
 
     @callback
     def _campaign_row_records(self, campaign_id: str | None) -> list[dict[str, Any]]:
@@ -10046,11 +10104,305 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "window_start": mark.get("window_start"),
             "window_end": (
                 None
-                if self._campaign_end_utc is None
-                else self._campaign_end_utc.isoformat()
+                if self._campaign_window_end_utc() is None
+                else self._campaign_window_end_utc().isoformat()
             ),
             "revision": mark.get("revision"),
         }
+
+    @callback
+    def _campaign_window_end_utc(self) -> datetime | None:
+        """Return the campaign end a reader should be shown. beta.45.
+
+        **The planned end, and the observed one only when there is no planned
+        one.** ``_campaign_end_utc`` is a high-water mark of rows already executed
+        -- its own declaration says so and warns what conflating the two costs --
+        so publishing it as ``window_end`` told a reader a thirty-three row
+        campaign ended at the quarter in flight. The live capture had
+        ``window_end`` at 10:15Z against a planned end of 15:00Z, which is also
+        the instant ``_dangling_creation_reason`` compares ``now`` against.
+
+        The observed end keeps its own name and its own job: it still bounds the
+        orphan grace, which is a statement about how far execution actually got.
+        """
+        return self._campaign_planned_end_utc or self._campaign_end_utc
+
+    # == the pre-execution announcement =====================================
+    #
+    # A campaign becomes public when Stage B opens it, which is at best one quarter
+    # before it acts and far too late for a trading log: the first line a reader
+    # ever saw was "started". beta.45 adds the plan ahead of it, on its own
+    # vocabulary, so that nothing here can be mistaken for a campaign.
+    #
+    # **The whole surface is publication-only.** It reads the published targets and
+    # the plan-derived classification, and it writes one persisted dict. It never
+    # touches a campaign instance, a realised figure, a settlement path or any
+    # ledger -- see :meth:`_fire_plan_closed`, where that boundary is drawn in the
+    # payload as well as in the code.
+
+    @callback
+    def _published_campaign_windows(self) -> list[dict[str, Any]]:
+        """Return one entry per campaign this refresh published.
+
+        **Grouping by ``campaign_id`` is sound here and only here.** The identifier
+        is stable *within* one solve, so it is the right way to collect the several
+        targets of one campaign; it churns *across* refreshes, which is why
+        continuity between refreshes is decided by :meth:`_announcement_continues`
+        and never by this id.
+
+        Only executable targets contribute. A ``serve_load`` gap is published with a
+        battery figure it never commands, so counting it would inflate a promise by
+        the energy the house happened to take -- the same rule, and the same reason,
+        as :meth:`_campaign_objective_kwh`. A campaign made entirely of gaps
+        announces nothing, because it promises nothing.
+        """
+        grouped: dict[str, dict[str, Any]] = {}
+        for target in self.execution_targets:
+            campaign_id = target.get("campaign_id")
+            if not isinstance(campaign_id, str):
+                continue
+            intent = target.get("intent")
+            if intent not in CONTROL_LIVE_DISPATCH_INTENTS:
+                continue
+            starts = instant_of(target.get("window_start"))
+            closes = instant_of(target.get("campaign_end"))
+            if starts is None or closes is None:
+                continue
+            if intent == EXECUTION_INTENT_NET_EXPORT:
+                objective = float(target.get("grid_target_kwh") or 0.0)
+            else:
+                objective = float(target.get("battery_target_kwh") or 0.0)
+            entry = grouped.get(campaign_id)
+            if entry is None:
+                grouped[campaign_id] = {
+                    "campaign_id": campaign_id,
+                    "purpose": intent,
+                    "objective_boundary": (
+                        CAMPAIGN_BOUNDARY_METER
+                        if intent == EXECUTION_INTENT_NET_EXPORT
+                        else CAMPAIGN_BOUNDARY_BATTERY
+                    ),
+                    "planned_kwh": objective,
+                    "window_start": starts,
+                    "window_end": closes,
+                }
+                continue
+            entry["planned_kwh"] += objective
+            if starts < entry["window_start"]:
+                entry["window_start"] = starts
+            if closes > entry["window_end"]:
+                entry["window_end"] = closes
+        return sorted(grouped.values(), key=lambda entry: entry["window_start"])
+
+    @callback
+    def _announcement_continues(
+        self, published: dict[str, Any], announced: dict[str, Any]
+    ) -> bool:
+        """Return whether a published campaign continues an announced one.
+
+        **Same purpose, and the windows genuinely overlap** -- both halves, and
+        strictly.
+
+        The executor can afford a one-sided test for runs
+        (``published.window_start <= carried.window_end``) because its carried run
+        is already executing, so ``published.window_end > now >= carried.start``
+        holds by construction. An announcement has no such footing: it is a claim
+        about the future that persists across refreshes, and the first half alone
+        would match a campaign lying entirely in the past.
+
+        One could argue the lead-time bound makes the second half redundant. That
+        argument has exactly the shape of the one this release exists to correct:
+        ``campaign_identity`` leaned on "its end sits still", the guarantee quietly
+        stopped holding, and every campaign published a false failure. The second
+        comparison is free; the assumption is not.
+
+        Strict, because intervals here are half-open ``[start, end)``. Two abutting
+        windows therefore do not continue one another -- which is also right
+        economically, since ``campaigns_from`` groups contiguous same-run-state
+        intervals into one campaign, so two abutting same-purpose campaigns cannot
+        come from a single solve.
+
+        Overlap so defined survives a moving head *and* a moving tail, which is true
+        of neither the start nor the end instant alone.
+        """
+        return (
+            published["purpose"] == announced["purpose"]
+            and published["window_start"] < announced["window_end"]
+            and announced["window_start"] < published["window_end"]
+        )
+
+    @callback
+    def _announcement_record(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """Return the persisted form of one announcement."""
+        return {
+            "campaign_id": entry["campaign_id"],
+            "purpose": entry["purpose"],
+            "objective_boundary": entry["objective_boundary"],
+            "planned_kwh": round(entry["planned_kwh"], 3),
+            "window_start": entry["window_start"].isoformat(),
+            "window_end": entry["window_end"].isoformat(),
+        }
+
+    @callback
+    def _announcement_window(self, mark: dict[str, Any]) -> dict[str, Any] | None:
+        """Return an announcement mark as comparable instants, or ``None``."""
+        starts = instant_of(mark.get("window_start"))
+        closes = instant_of(mark.get("window_end"))
+        purpose = mark.get("purpose")
+        if starts is None or closes is None or not isinstance(purpose, str):
+            return None
+        return {"purpose": purpose, "window_start": starts, "window_end": closes}
+
+    @callback
+    def _announcement_payload(self, mark: dict[str, Any]) -> dict[str, Any]:
+        """Return the public payload for an announcement.
+
+        **No ``realised_kwh`` key, and ``campaign_instance_id`` is null.** Absence
+        rather than ``0.0`` and rather than ``null``: a null invites a template to
+        render a zero, and "0.0 kWh" against a promise is the precise lie this
+        release removes. An announcement has moved no energy, so it reports none.
+        """
+        return {
+            "campaign_id": mark.get("campaign_id"),
+            "campaign_instance_id": None,
+            "purpose": mark.get("purpose"),
+            "classification": self._campaign_classification(
+                mark.get("campaign_id")
+            ).get("classification", LIFECYCLE_CLASS_UNKNOWN),
+            "objective_boundary": mark.get("objective_boundary"),
+            "planned_kwh": mark.get("planned_kwh"),
+            "window_start": mark.get("window_start"),
+            "window_end": mark.get("window_end"),
+        }
+
+    @callback
+    def _fire_plan_closed(
+        self, mark: dict[str, Any], now: datetime, result: str
+    ) -> None:
+        """Close an announcement that never became a campaign.
+
+        **The hard boundary of this release, and it is structural.** This path never
+        calls ``_close_campaign``, ``_lifecycle_removed``,
+        ``_publish_recovered_terminal`` or ``note_lifecycle_closed``; never writes
+        ``campaign_lifecycle``, ``_closed_campaign`` or ``_last_campaign_result``;
+        and reaches no realised, battery-return or day-accounting ledger. It clears
+        one persisted dict and fires one event.
+
+        ``last_campaign_result`` is deliberately **not** updated. It answers "how did
+        the last campaign that actually ran turn out", and overwriting it with an
+        announcement would destroy that answer while publishing a result whose
+        realised figure and instance id cannot honestly be filled. Writing it would
+        be *safe* -- nothing in the accounting reads it -- but safety is not the
+        test. The closing line is this event, and the entity returns to ``idle``.
+        """
+        assert result in PLAN_CLOSED_RESULTS
+        payload = {
+            **self._announcement_payload(mark),
+            "result": result,
+            "closed_at": now.isoformat(),
+        }
+        self.store.campaign_announcement = None
+        self.store.schedule_save()
+        self._fire_lifecycle(LIFECYCLE_KIND_PLAN_CLOSED, payload)
+
+    @callback
+    def _open_campaign_window(self) -> dict[str, Any] | None:
+        """Return the open campaign as a comparable window, or ``None``."""
+        if self._campaign_id is None:
+            return None
+        mark = self.store.campaign_lifecycle or {}
+        starts = instant_of(mark.get("window_start")) or self._campaign_opened_at
+        closes = self._campaign_window_end_utc()
+        purpose = mark.get("purpose")
+        if starts is None or closes is None or not isinstance(purpose, str):
+            return None
+        return {"purpose": purpose, "window_start": starts, "window_end": closes}
+
+    @callback
+    def _consume_announcement(self, quarter: Any) -> None:
+        """Drop the announcement the campaign just opened for. beta.45.
+
+        Silently: the plan did not fail, it became real, and its closing line is the
+        campaign's own terminal.
+        """
+        announced = self.store.campaign_announcement
+        if announced is None:
+            return
+        window = self._announcement_window(announced)
+        if window is None:
+            return
+        starts = self._campaign_opened_at
+        closes = self._campaign_window_end_utc()
+        purpose = getattr(quarter, "intent", None)
+        if starts is None or closes is None or not isinstance(purpose, str):
+            return
+        opened = {"purpose": purpose, "window_start": starts, "window_end": closes}
+        if self._announcement_continues(opened, window):
+            self.store.campaign_announcement = None
+            self.store.schedule_save()
+
+    @callback
+    def _note_campaign_announcement(self, now: datetime) -> None:
+        """Announce, carry or close the pre-execution plan. Once per refresh.
+
+        Policy **C** on a material change: the first ``planned`` event stands and the
+        attributes move under it. The tail of a charge campaign moves on nearly
+        every refresh -- 15:00Z became 14:45Z on the capture that motivated this
+        release -- so emitting a "replanned" line per wiggle would rebuild exactly
+        the per-quarter noise this surface exists to replace. A campaign that does
+        *not* continue the announcement is a different plan, and that is the one case
+        worth a new line.
+        """
+        announced = self.store.campaign_announcement
+        window = None if announced is None else self._announcement_window(announced)
+        if announced is not None and window is None:
+            # Unreadable mark: drop it silently rather than publish a closing line
+            # for a plan nobody can describe.
+            self.store.campaign_announcement = None
+            self.store.schedule_save()
+            announced = None
+
+        open_window = self._open_campaign_window()
+        candidates = [
+            entry
+            for entry in self._published_campaign_windows()
+            if entry["window_end"] > now
+            and not (
+                open_window is not None
+                and self._announcement_continues(entry, open_window)
+            )
+        ]
+
+        if announced is not None and window is not None:
+            for entry in candidates:
+                if self._announcement_continues(entry, window):
+                    # Same plan, moved. Attributes only -- no second event.
+                    announced["planned_kwh"] = round(entry["planned_kwh"], 3)
+                    announced["window_end"] = entry["window_end"].isoformat()
+                    announced["campaign_id"] = entry["campaign_id"]
+                    self.store.schedule_save()
+                    return
+            if candidates:
+                self._fire_plan_closed(announced, now, OUTCOME_SUPERSEDED)
+            elif now >= window["window_end"]:
+                self._fire_plan_closed(announced, now, OUTCOME_NOT_EXECUTED)
+                return
+            else:
+                # Nothing published this refresh and the window is still open.
+                # Silence is not withdrawal.
+                return
+
+        lead = timedelta(minutes=ECONOMIC_ANNOUNCE_LEAD_MINUTES)
+        for entry in candidates:
+            if entry["window_start"] > now + lead:
+                continue
+            record = self._announcement_record(entry)
+            self.store.campaign_announcement = record
+            self.store.schedule_save()
+            self._fire_lifecycle(
+                LIFECYCLE_KIND_PLANNED, self._announcement_payload(record)
+            )
+            return
 
     @callback
     def _lifecycle_created(self, now: datetime, quarter: Any) -> None:
@@ -10084,8 +10436,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "window_start": now.isoformat(),
             "window_end": (
                 None
-                if self._campaign_end_utc is None
-                else self._campaign_end_utc.isoformat()
+                if self._campaign_window_end_utc() is None
+                else self._campaign_window_end_utc().isoformat()
             ),
             "revision": getattr(quarter, "revision", None),
             "started_at": None,
@@ -10096,6 +10448,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "result": None,
         }
         self.store.schedule_save()
+        self._consume_announcement(quarter)
         self._fire_lifecycle(LIFECYCLE_KIND_CREATED, self._lifecycle_common())
 
     @callback
@@ -10280,6 +10633,29 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if mark is None:
             return None
         instance_id = mark.get("instance_id")
+        # **The mark has to be somebody else's before it can be recovered. beta.45.**
+        #
+        # This runs on every refresh, and until beta.45 its only questions were
+        # "does a mark exist" and "which marks does it carry" -- neither of which
+        # can tell a corpse from the campaign this very process is running. So the
+        # first report after ``started`` found ``started`` present and ``stopped``
+        # absent, fell through to the branch below, and published
+        # ``failed / quarter_progress_unknown / 0.0`` over a campaign that went on
+        # charging for five more hours. It then latched the instance closed, so the
+        # genuine terminal was swallowed at ``_lifecycle_removed``'s own guard and
+        # the campaign finished in silence.
+        #
+        # The liveness test is free and exact: on a real restart the in-memory
+        # instance id is ``None``, because the attribute is minted at open and this
+        # process has not opened anything, so recovery proceeds untouched. Within
+        # one process it is set the moment the campaign opens, so the live instance
+        # is never mistaken for one left behind.
+        if (
+            instance_id is not None
+            and self._campaign_instance_id is not None
+            and instance_id == self._campaign_instance_id
+        ):
+            return "live"
         if self.store.lifecycle_closed(instance_id):
             self.store.campaign_lifecycle = None
             return "already_closed"
@@ -13632,6 +14008,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # two authoritative answers is true, and closes late rather than wrongly.
         self._recover_campaign_lifecycle(now)
         self._note_campaign_progress(now, stop_reason)
+        # **After the campaign, so an announcement never shadows a real one.**
+        # ``_note_campaign_progress`` may have opened the campaign this refresh, in
+        # which case the announcement has already been consumed and there is
+        # nothing left to announce. beta.45.
+        self._note_campaign_announcement(now)
         stage_b["completed_campaign"] = self._closed_campaign
         stage_b["open_campaign"] = self._open_campaign_block()
         stage_b["admitted_plan"] = None if self._plan is None else self._plan.as_dict()

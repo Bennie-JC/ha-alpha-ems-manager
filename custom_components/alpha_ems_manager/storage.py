@@ -1006,6 +1006,16 @@ class LearningStore:
         #: indistinguishable from one interrupted mid-flight, and the log would
         #: report a successful campaign as failed.
         self.campaign_lifecycle: dict[str, Any] | None = None
+        #: The one future campaign currently announced to the trading log. beta.45.
+        #:
+        #: **Persisted for the same reason the lifecycle mark is: so a restart does
+        #: not re-announce a campaign the log already shows.** A single dict rather
+        #: than a list -- one announcement is live at a time, exactly as one campaign
+        #: is, and the overlap test decides which publications continue it.
+        #:
+        #: It carries no realised figure and no instance id, because an announcement
+        #: has neither. Nothing in the accounting reads it.
+        self.campaign_announcement: dict[str, Any] | None = None
         #: Instances whose public terminal has already been published. beta.42.
         #:
         #: **A telemetry latch, and deliberately not one of the two that exist.**
@@ -1113,6 +1123,14 @@ class LearningStore:
                 lifecycle.get("instance_id"), str
             ):
                 self.campaign_lifecycle = dict(lifecycle)
+            # Absent on every document written before beta.45, and absence means
+            # nothing was announced. A malformed entry reads the same way: the log
+            # loses one plan line rather than announcing a campaign twice.
+            announcement = execution.get("announcement")
+            if isinstance(announcement, dict) and isinstance(
+                announcement.get("purpose"), str
+            ):
+                self.campaign_announcement = dict(announcement)
             closed = execution.get("closed_lifecycle")
             if isinstance(closed, list):
                 self.closed_lifecycle = [
@@ -1178,6 +1196,8 @@ class LearningStore:
             execution["record"] = self.execution_record
         if self.campaign_lifecycle is not None:
             execution["lifecycle"] = dict(self.campaign_lifecycle)
+        if self.campaign_announcement is not None:
+            execution["announcement"] = dict(self.campaign_announcement)
         if self.closed_lifecycle:
             execution["closed_lifecycle"] = self.closed_lifecycle[
                 -MAX_CAMPAIGN_LIFECYCLE_REMEMBERED:
@@ -1242,6 +1262,7 @@ class LearningStore:
         self.sealed_day_count = 0
         self.sealed_through = None
         self.campaign_lifecycle = None
+        self.campaign_announcement = None
         self.closed_lifecycle.clear()
         await self._store.async_remove()
 

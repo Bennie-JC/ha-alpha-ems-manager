@@ -38,6 +38,8 @@ from custom_components.alpha_ems_manager.const import (
     EXECUTION_STOP_QUARTER_PROGRESS_UNKNOWN,
     EXECUTION_STOP_WINDOW_ENDED,
     LIFECYCLE_KIND_CREATED,
+    LIFECYCLE_KIND_PLAN_CLOSED,
+    LIFECYCLE_KIND_PLANNED,
     LIFECYCLE_KIND_REMOVED,
     LIFECYCLE_KIND_STARTED,
     LIFECYCLE_KIND_STOPPED,
@@ -149,14 +151,31 @@ def test_the_two_new_outcomes_are_in_the_published_enum() -> None:
     assert len(set(CAMPAIGN_OUTCOMES)) == len(CAMPAIGN_OUTCOMES)
 
 
-def test_the_four_kinds_are_exactly_the_four_transitions() -> None:
-    """A fifth kind would be a fifth thing a reader has to learn."""
-    assert CAMPAIGN_LIFECYCLE_KINDS == (
+def test_a_campaign_still_has_exactly_four_transitions() -> None:
+    """**The count that matters is the campaign's, and it is still four.**
+
+    beta.45 widened the vocabulary with ``planned`` and ``plan_closed``, and the
+    original form of this test -- an equality against a four-tuple -- would have read
+    that as a regression. It is the opposite: those two kinds exist precisely so the
+    four below keep meaning what they mean.
+
+    An announcement is not a campaign. It is published before any instance is minted,
+    it can end without a campaign ever having existed, and if it borrowed ``removed``
+    a dashboard branch would render a campaign result for something that never ran. So
+    the assertion is now the rule rather than the number: **the campaign kinds are
+    exactly these four, and the announcement kinds are disjoint from them.**
+    """
+    campaign = (
         LIFECYCLE_KIND_CREATED,
         LIFECYCLE_KIND_STARTED,
         LIFECYCLE_KIND_STOPPED,
         LIFECYCLE_KIND_REMOVED,
     )
+    announcement = (LIFECYCLE_KIND_PLANNED, LIFECYCLE_KIND_PLAN_CLOSED)
+
+    assert set(campaign).isdisjoint(announcement), "no shared kind, ever"
+    assert set(CAMPAIGN_LIFECYCLE_KINDS) == set(campaign) | set(announcement)
+    assert len(set(CAMPAIGN_LIFECYCLE_KINDS)) == len(CAMPAIGN_LIFECYCLE_KINDS)
 
 
 # ===========================================================================

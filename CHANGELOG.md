@@ -9,6 +9,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.45] - 2026-09-06
+
+**Every campaign that started published a failure moments later, and then finished in
+silence.** The live trading log read:
+
+```
+Laden gestart — doel 15,11 kWh — economic buy
+Campagne mislukt — 0.0 kWh van 15,11 kWh — quarter progress unknown
+```
+
+while that same charge went on running for five more hours. The 2026-09-06 capture
+shows both halves at once: `campaign_realized_kwh` at **6.323 kWh** and still
+accumulating across thirteen closed quarters, beside a public result of `0.0`.
+
+**Nothing was wrong with the execution, the accounting or the planner.** Stage B was
+running, ownership was `owned`, and the thirteen quarter figures sum to 6.324 kWh
+against the 6.323 the campaign held. The defect was entirely in the publication.
+
+### Fixed
+
+- **A live campaign was recovered as a restart corpse, on the refresh after it
+  started.** `_recover_campaign_lifecycle` runs on every report — deliberately, since a
+  never-started instance cannot be classified at restore time — and asked only whether
+  a persisted mark existed and which marks it carried. Neither question can tell a mark
+  left by a previous process from the mark of the campaign this process is running. So
+  the first report after `started` found `started` present and `stopped` absent, took
+  the branch labelled *"the restart is the stop"*, and published `failed` /
+  `quarter_progress_unknown` — with `recovered_after_restart: true`, when no restart had
+  happened. It then latched the instance closed, so the genuine terminal was refused by
+  `_lifecycle_removed`'s own exactly-once guard and the campaign ended with no line at
+  all. A campaign is now recoverable only when its instance is **not** the one open in
+  memory; on a real restart that attribute is `None`, so recovery is untouched.
+- **The realised figure a restart recovers was structurally zero.** The mark's
+  `realized_kwh` was written once at creation and refreshed only by a campaign-scoped
+  stop, so even a *legitimate* restart mid-campaign reported `0.0` and filed `failed`.
+  The realised total, the frozen target, its tolerance and measurability now move with
+  the campaign, on the save the caller already schedules. A genuine restart files
+  `partial` against the real figure.
+- **The published `window_end` was the row in flight, not the campaign.**
+  `_campaign_end_utc` is a high-water mark of rows already executed — its own
+  declaration warns that conflating the two is how a thirty-three-row campaign reported
+  a window three rows in — and it was published as `window_end` on every event and on
+  the persisted mark. The capture had 10:15Z against a planned end of 15:00Z. The
+  public window is now the planned end, with the observed one as a fallback only.
+  `campaign_end` keeps its name and meaning in diagnostics, and `planned_end` is
+  published beside it.
+
+### Added
+
+- **A plan line, before the action.** Two new lifecycle kinds, `planned` and
+  `plan_closed`, and a `planned` state on *Current Campaign*. `planned` fires about one
+  planning cadence before the first executable row, carrying the purpose, the objective
+  boundary, the promise and the window — and no plan id in any rendered field.
+- **Continuity that survives replanning.** An announcement cannot be tracked by
+  `campaign_id`: that identifier is a digest of the campaign's *end*, and the end moves.
+  The same live charge was published as `af82a579ac6a803a` (end 15:00Z) and ninety
+  minutes later as `c9d9217306560d3a` (end 14:45Z), because the optimiser ends a charge
+  earlier as the pack fills. Continuity is therefore *same purpose, and the windows
+  genuinely overlap* — **both** halves of the overlap, strictly, on half-open intervals.
+  The one-sided form the executor uses for runs is sound there only because a carried
+  run is already executing; an announcement has no such footing and would match a
+  campaign lying entirely in the past.
+- **Policy C on a material change:** the first `planned` event stands and the attributes
+  move under it. The tail moves on nearly every refresh, so a "replanned" line per
+  wiggle would rebuild exactly the per-quarter noise this surface exists to replace. A
+  campaign that does *not* continue the announcement closes it `superseded`; a window
+  that passes unstarted closes it `not_executed`.
+
+### The accounting fence
+
+A planned-only announcement exists before any instance is minted, so it can end without
+a campaign ever having existed. That ending is **publication-only**: it carries
+`campaign_instance_id: null` and **no `realised_kwh` key at all** — not `0.0`, not
+`null`, because a null invites a template to render a zero and "0.0 kWh" against a
+promise is the precise lie this release removes. It never enters `_close_campaign`,
+`_lifecycle_removed` or `_publish_recovered_terminal`, never latches an instance, never
+writes the campaign mark, and **never updates `last_campaign_result`** — which answers
+"how did the last campaign that actually ran turn out", a question an announcement has
+no answer to. One rule spans both vocabularies: *no announcement event uses a campaign
+kind, and no campaign event carries a null instance id.*
+
+### Not changed
+
+Stage A's objective, every planner decision, reserve, Safety Buy, Coverage Buy, the
+switching cost, the grid-charge margin, PV retention and absorption, the controllability
+floor, Stage B's equations, rolling required power, setpoint correction, ownership,
+`releasing`, the beta.44 arm instrumentation, economic-value and battery-return
+accounting, and the `campaign_id` algorithm itself. **No physical stop timing moves:**
+`_campaign_still_published`, `_campaign_row_is_final` and `_completion_scope` are not
+touched, and the diff contains no line naming any of them.
+
+The `campaign_id` churn documented above is real and remains **deferred**. It is masked
+by the frozen-schedule clause of `_campaign_row_is_final` for a campaign inside one
+admitted plan, which covers both shapes on the reference installation today.
+
+### Verification
+
+- 31 new tests; **23 mutations, 23 killed, 0 survived, 0 anchors lost**. One survivor in
+  the first pass was a vacuous test — it gave the orphan a different `campaign_id` from
+  the live campaign, so a campaign-keyed guard reached the right answer by accident. The
+  test was rewritten to the shape that actually matters, one campaign attempted twice.
+- Neutrality digests and the beta.40/41 anchors **unchanged** — a pass, not a re-baseline.
+- One beta.42 test changed by design: it pinned the vocabulary at exactly four kinds. It
+  now asserts the stronger rule — the campaign kinds are exactly those four and the
+  announcement kinds are disjoint from them.
+
+### Not validated
+
+No beta.45 code has run on hardware. This is a prerelease for live validation.
+
 ## [1.0.0-beta.44] - 2026-09-06
 
 **One economic campaign can ask for several physical arm cycles, and no published
