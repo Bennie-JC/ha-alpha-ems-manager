@@ -9,6 +9,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.48] - 2026-09-07
+
+**An audit release. It measures the accounting; it does not correct it.** No planner
+change, no economics, no Stage B, no reserve, no ownership, no dispatch timing. The
+accumulator this release indicts is deliberately left exactly as it was.
+
+### The dropped-interval defect, now confirmed
+
+Code inspection said `_accrue_quarter_progress` discards the whole sample interval in
+which the `(claim_id, quarter_start)` key changes: the reset nulls the cursor and the
+next line returns on `previous is None`. The cursor is not among the eight fields
+`_capture_quarter_progress` preserves, and `_async_end_row` resets on every handover.
+
+That was a **mechanism**, not a magnitude. Five deterministic tests -- fixed
+timestamps, constant 8.0 kW export -- now fix the magnitude, and the numbers correct
+the naive reading:
+
+- **A new claim mid-row loses exactly 45 s / 0.100 kWh**, not a full tick. The
+  discarded interval carried export only for its last 45 seconds, because the vendor
+  register does not go active until after the solve.
+- **A row boundary under one claim loses exactly 60 s / 0.1333 kWh**, split as 30 s
+  missing from the closing row and 30 s from the opening one. Asserted on both rows,
+  since a single total would hide which was short.
+- **Two changes on one tick cost one interval, not two.** The reset condition is a
+  single `or`.
+- **Two changes on different ticks are additive** -- 0.2667 kWh -- and that is the
+  shape of every real arm, because the row advances at the boundary while the claim
+  cannot land until the refresh has finished its solve.
+
+So it is now a **confirmed accounting defect**, one-sided: it can only under-count.
+Whether to repair it is a separate decision, because changing realised energy changes
+campaign outcomes and every downstream euro figure.
+
+### Added
+
+- **`sampled_from`, `sampled_to`, `measured_seconds`, `unmeasured_seconds`** on every
+  completed row. The nominal window and the measured one are no longer conflated, and
+  the gap between them is the defect above, published as a number. It is a duration,
+  never converted to an energy: that would need a rate for an interval nobody sampled.
+
+- **An optional cumulative grid export counter** (`grid_export_energy_entity`) and a
+  `meter_reconciliation` diagnostics block. This is the point of the release. Every
+  other kWh the integration reports is a numerical integral of the one instantaneous
+  grid power sensor, so a scaling error, a wrong sign convention or a publication
+  stall corrupts all of them identically and **none of them can detect it**. A counter
+  the meter maintains itself can.
+
+  Each audited export row states four things and refuses to blur them:
+  `physical_export_kwh` (the counter delta -- the only physically independent figure),
+  `attributed_export_kwh` (what the accounting accrued over **exactly** the same
+  measured window, so the two compare like with like), `unmeasured_seconds`, and
+  `unexplained_kwh`.
+
+  **Ambient production is subtracted from neither side.** The realised export figure
+  deliberately includes it -- using the marginal figure as the objective *"would
+  under-export by exactly the production the site was exporting anyway"* -- so
+  subtracting it here would manufacture a discrepancy out of correct behaviour.
+
+  Following the `daily_house_load_entity` precedent exactly: optional, validated by
+  unit rather than by a `device_class` selector filter (which is frontend-only and
+  would hide entities the integration accepts), no auto-discovery, and **no
+  `CONFIG_ENTRY_VERSION` bump** -- an entry saved by an older release loads unchanged.
+
+### Refusals, which are the substance
+
+`not_configured`, `unavailable` and `reset_detected` are all statuses, and none of
+them is ever a zero delta. A counter that goes backwards is **rejected, never
+wrapped**: one reading cannot distinguish a reset from a rollover. And without a
+configured counter the verdict can never be `exact` -- Path A and Path B agreeing
+proves only that our own arithmetic is self-consistent, since both integrate the same
+sensor. `uncertain` is a pass; a fabricated `exact` would be the one result worth
+nothing.
+
+### Validation
+
+- **14 tests**, five of them the deterministic A/B/C proof above
+- **193 + 108 passed** across quarter execution, diagnostics, config flow,
+  translations, migration, campaign accounting and the beta.44/46/47 arm suites
+- **79 passed** on neutrality; planner digests and the beta.40/41 anchors **unchanged
+  and not re-baselined**
+- **Mutations: b48 14/14 -- 0 survived, 0 anchors lost.** Two survived the first pass
+  and both were vacuous tests: nothing inspected a row that was never measured, and
+  nothing ever reached the tolerance branch with a real discrepancy. Both gaps were
+  closed with tests rather than by weakening a mutation. One of the mutations, C1,
+  reproduces a bug found during implementation: reading the counter at the end of the
+  interval compares it against itself and reports a zero delta for real energy.
+- Lint and format clean; one sharded full suite green
+
+### Live validation pending
+
+The audit is **not yet hardware-validated**, and the reference installation has not
+configured a counter entity -- which is expected, and works honestly as
+`counter_status: not_configured`. The next live export day should provide, over at
+least two export arms:
+
+1. `unmeasured_seconds` non-zero on every row, and consistent with the A/B/C figures.
+2. With a counter configured: `physical_export_kwh` present, and `unexplained_kwh`
+   either within tolerance or explained by a named flow.
+3. A control interval with no Alpha EMS export, proving the audit attributes nothing
+   it should not.
+
+The observed ~0.63 kWh gap of 2026-09-06 is **still not called a bug**: its window
+endpoints were never aligned, and misalignment alone is arithmetically sufficient to
+explain it. The instrument now exists to settle it properly.
+
 ## [1.0.0-beta.47] - 2026-09-06
 
 **An observability release. No dispatch is made faster.** The battery starts exactly

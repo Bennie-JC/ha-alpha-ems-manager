@@ -46,7 +46,14 @@ EXPECTED_CONFIG_FIELDS: dict[str, list[str]] = {
         "battery_round_trip_efficiency_percent",
     ],
     "solar": ["pv_power_entity"],
-    "grid": ["grid_power_entity", "grid_power_sign"],
+    # beta.48 added the optional cumulative export counter here: the one energy
+    # figure the integration can read that does not come from the power sensor
+    # beside it, and therefore the only one that can audit it. Read-only.
+    "grid": [
+        "grid_power_entity",
+        "grid_power_sign",
+        "grid_export_energy_entity",
+    ],
     "sources": ["frank_entry_id", "solcast_entry_id"],
 }
 
@@ -65,6 +72,7 @@ EXPECTED_OPTIONS_FIELDS: dict[str, list[str]] = {
         "pv_power_entity",
         "grid_power_entity",
         "grid_power_sign",
+        "grid_export_energy_entity",
         "frank_entry_id",
         "use_pv_forecast",
         "solcast_entry_id",

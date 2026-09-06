@@ -659,6 +659,18 @@ CONF_PV_POWER_ENTITY: Final = "pv_power_entity"
 CONF_GRID_POWER_ENTITY: Final = "grid_power_entity"
 CONF_GRID_POWER_SIGN: Final = "grid_power_sign"
 
+#: Optional cumulative grid **export** energy counter. **beta.48.**
+#:
+#: The one independent physical truth this integration can reach. Every kWh it
+#: otherwise reports is a numerical integral of the instantaneous grid power sensor,
+#: so a scaling error, a wrong sign convention or a publication stall corrupts all of
+#: them identically and none can detect it. A counter the meter itself maintains can.
+#:
+#: **Read-only audit truth.** It never reaches the planner, the economics, Stage B,
+#: safety or ownership: it exists to reconcile what was accounted against what
+#: physically crossed the meter, and nothing else.
+CONF_GRID_EXPORT_ENERGY_ENTITY: Final = "grid_export_energy_entity"
+
 CONF_FRANK_ENTRY_ID: Final = "frank_entry_id"
 
 CONF_USE_PV_FORECAST: Final = "use_pv_forecast"
@@ -4697,6 +4709,35 @@ MAX_ECONOMIC_RUNS_TRACKED: Final = MAX_ECONOMIC_RUNS_REPORTED
 #: A day of quarter-boundary arming on the reference installation is well under this,
 #: and the ring is the calibration set a later release needs -- not a log.
 MAX_ARM_MEASUREMENTS_REPORTED: Final = 48
+
+#: Why a meter reconciliation carries no physical figure. **beta.48.**
+#:
+#: ``not_configured`` is the ordinary case and is not a fault: the counter is
+#: optional, and an audit that works honestly without one is the point. None of these
+#: is ever encoded as a zero delta.
+METER_COUNTER_OK: Final = "ok"
+METER_COUNTER_NOT_CONFIGURED: Final = "not_configured"
+METER_COUNTER_UNAVAILABLE: Final = "unavailable"
+METER_COUNTER_RESET: Final = "reset_detected"
+
+#: How a reconciliation ended. **beta.48.**
+#:
+#: ``uncertain`` is a pass, not a failure. Publishing it is the whole discipline:
+#: an ``exact`` that was never actually reconciled against a physical counter would
+#: be the one result worth nothing.
+METER_AUDIT_EXACT: Final = "exact"
+METER_AUDIT_EXPLAINED: Final = "explained"
+METER_AUDIT_UNCERTAIN: Final = "uncertain"
+
+#: How close a counter delta and the accounted figure must be to read ``exact``.
+#:
+#: Domestic export meters publish in whole watt-hours, and the accounting is a
+#: sixty-second rectangle rule over a signal that moves continuously. Ten watt-hours
+#: is below one actuator step and well inside both.
+METER_AUDIT_TOLERANCE_KWH: Final = 0.01
+
+#: How many reconciliations the diagnostics ring keeps. **beta.48.**
+MAX_METER_AUDITS_REPORTED: Final = 24
 
 #: How often the bounded post-arm observation pass runs, in seconds. **beta.47.**
 #:

@@ -61,11 +61,13 @@
         "description": "Any meter integration works here, such as HomeWizard P1, DSMR or SlimmeLezer.",
         "data": {
           "grid_power_entity": "Grid power",
-          "grid_power_sign": "Grid power sign convention"
+          "grid_power_sign": "Grid power sign convention",
+          "grid_export_energy_entity": "Cumulative grid export counter (optional)"
         },
         "data_description": {
           "grid_power_entity": "Instantaneous grid exchange in W or kW.",
-          "grid_power_sign": "Check a moment when you are drawing from the grid. Most Dutch meters report a positive value while importing, which is the default here."
+          "grid_power_sign": "Check a moment when you are drawing from the grid. Most Dutch meters report a positive value while importing, which is the default here.",
+          "grid_export_energy_entity": "A total exported energy counter from the meter itself, in kWh. Optional, and used only to audit reported export against what physically crossed the meter. It never influences planning, trading or control."
         }
       },
       "sources": {
@@ -139,7 +141,8 @@
           "use_pv_forecast": "Use a PV forecast source",
           "solcast_entry_id": "Solcast PV Forecast instance",
           "ev_power_entity": "EV charger power (optional)",
-          "selected_solcast_site_ids": "Solcast sites that belong to this system"
+          "selected_solcast_site_ids": "Solcast sites that belong to this system",
+          "grid_export_energy_entity": "Cumulative grid export counter (optional)"
         },
         "data_description": {
           "house_load_entity": "Instantaneous household consumption in W or kW, independent of solar, battery and grid flows.",
@@ -155,7 +158,8 @@
           "use_pv_forecast": "Requires a configured Solcast PV Forecast integration. When on, expected production is netted against predicted load, so the battery is not asked to supply energy the sun is already supplying.",
           "solcast_entry_id": "Required when the PV forecast is enabled.",
           "ev_power_entity": "Optional flexible load. Learned demand excludes EV charging when this is set.",
-          "selected_solcast_site_ids": "Select every rooftop site in your Solcast account that feeds this AlphaESS system. Others -- a second property, someone else's array -- are left out of the plan. You are not asked which site connects to which inverter."
+          "selected_solcast_site_ids": "Select every rooftop site in your Solcast account that feeds this AlphaESS system. Others -- a second property, someone else's array -- are left out of the plan. You are not asked which site connects to which inverter.",
+          "grid_export_energy_entity": "A total exported energy counter from the meter itself, in kWh. Optional, and used only to audit reported export against what physically crossed the meter. It never influences planning, trading or control."
         }
       },
       "battery": {

@@ -28,6 +28,7 @@ from custom_components.alpha_ems_manager.const import (
     CONF_DAILY_HOUSE_LOAD_ENTITY,
     CONF_EV_POWER_ENTITY,
     CONF_FRANK_ENTRY_ID,
+    CONF_GRID_EXPORT_ENERGY_ENTITY,
     CONF_GRID_POWER_ENTITY,
     CONF_GRID_POWER_SIGN,
     CONF_HAS_PV,
@@ -535,10 +536,12 @@ async def test_the_options_form_renders(
     assert result["step_id"] == "sources"
     keys = {str(marker) for marker in result["data_schema"].schema}
     # Every source listed in the README as changeable, plus the Solcast slot,
-    # which is always rendered but only required when the forecast is enabled.
+    # which is always rendered but only required when the forecast is enabled,
+    # and the beta.48 export counter, which is rendered always and required never.
     assert keys == set(options_payload(frank_config_entry.entry_id)) | {
         CONF_SOLCAST_ENTRY_ID,
         CONF_EV_POWER_ENTITY,
+        CONF_GRID_EXPORT_ENERGY_ENTITY,
     }
 
 

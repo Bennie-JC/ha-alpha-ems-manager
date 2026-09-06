@@ -61,11 +61,13 @@
         "description": "Elke metingsintegratie werkt hier, zoals HomeWizard P1, DSMR of SlimmeLezer.",
         "data": {
           "grid_power_entity": "Netvermogen",
-          "grid_power_sign": "Tekenconventie netvermogen"
+          "grid_power_sign": "Tekenconventie netvermogen",
+          "grid_export_energy_entity": "Cumulatieve teruglevermeter (optioneel)"
         },
         "data_description": {
           "grid_power_entity": "Momentane netuitwisseling in W of kW.",
-          "grid_power_sign": "Kijk op een moment dat je van het net afneemt. De meeste Nederlandse meters rapporteren tijdens afname een positieve waarde; dat is hier de standaard."
+          "grid_power_sign": "Kijk op een moment dat je van het net afneemt. De meeste Nederlandse meters rapporteren tijdens afname een positieve waarde; dat is hier de standaard.",
+          "grid_export_energy_entity": "Een totaalteller voor teruggeleverde energie van de meter zelf, in kWh. Optioneel, en wordt alleen gebruikt om de gerapporteerde teruglevering te toetsen aan wat er fysiek over de meter ging. Heeft geen invloed op planning, handel of aansturing."
         }
       },
       "sources": {
@@ -139,7 +141,8 @@
           "use_pv_forecast": "Gebruik een PV-voorspellingsbron",
           "solcast_entry_id": "Solcast PV Forecast-instantie",
           "ev_power_entity": "Laadvermogen elektrische auto (optioneel)",
-          "selected_solcast_site_ids": "Solcast-locaties die bij dit systeem horen"
+          "selected_solcast_site_ids": "Solcast-locaties die bij dit systeem horen",
+          "grid_export_energy_entity": "Cumulatieve teruglevermeter (optioneel)"
         },
         "data_description": {
           "house_load_entity": "Momentaan huishoudelijk verbruik in W of kW, los van zon, accu en net.",
@@ -155,7 +158,8 @@
           "use_pv_forecast": "Vereist een geconfigureerde Solcast PV Forecast-integratie. Wanneer dit aan staat wordt de verwachte productie van de voorspelde belasting afgetrokken, zodat de batterij geen energie hoeft te leveren die de zon al levert.",
           "solcast_entry_id": "Vereist wanneer de PV-voorspelling is ingeschakeld.",
           "ev_power_entity": "Optionele flexibele belasting. Het geleerde verbruik sluit het laden van de auto uit wanneer dit is ingesteld.",
-          "selected_solcast_site_ids": "Selecteer elke locatie in uw Solcast-account die op dit AlphaESS-systeem is aangesloten. Andere locaties -- een tweede woning, iemand anders zijn panelen -- blijven buiten de planning. U hoeft niet aan te geven welke locatie op welke omvormer is aangesloten."
+          "selected_solcast_site_ids": "Selecteer elke locatie in uw Solcast-account die op dit AlphaESS-systeem is aangesloten. Andere locaties -- een tweede woning, iemand anders zijn panelen -- blijven buiten de planning. U hoeft niet aan te geven welke locatie op welke omvormer is aangesloten.",
+          "grid_export_energy_entity": "Een totaalteller voor teruggeleverde energie van de meter zelf, in kWh. Optioneel, en wordt alleen gebruikt om de gerapporteerde teruglevering te toetsen aan wat er fysiek over de meter ging. Heeft geen invloed op planning, handel of aansturing."
         }
       },
       "battery": {

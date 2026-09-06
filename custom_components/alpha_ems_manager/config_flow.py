@@ -57,6 +57,7 @@ from .const import (
     CONF_FRANK_ENTRY_ID,
     CONF_GRID_CHARGE_BUDGET_KWH,
     CONF_GRID_CHARGE_MARGIN_EUR_PER_KWH,
+    CONF_GRID_EXPORT_ENERGY_ENTITY,
     CONF_GRID_POWER_ENTITY,
     CONF_GRID_POWER_SIGN,
     CONF_HAS_PV,
@@ -759,6 +760,11 @@ class AlphaEmsConfigFlow(ConfigFlow, domain=DOMAIN):
             error = validate_power_entity(self.hass, user_input[CONF_GRID_POWER_ENTITY])
             if error:
                 errors[CONF_GRID_POWER_ENTITY] = error
+            counter = user_input.get(CONF_GRID_EXPORT_ENERGY_ENTITY)
+            if counter:
+                counter_error = validate_energy_entity(self.hass, counter)
+                if counter_error:
+                    errors[CONF_GRID_EXPORT_ENERGY_ENTITY] = counter_error
             if not errors:
                 self._data.update(user_input)
                 return await self.async_step_sources()
@@ -769,6 +775,12 @@ class AlphaEmsConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Required(
                     CONF_GRID_POWER_SIGN, default=DEFAULT_GRID_POWER_SIGN
                 ): _sign_selector(GRID_SIGN_OPTIONS, "grid_power_sign"),
+                # **Optional, and read only by the beta.48 audit.** A cumulative
+                # counter the meter maintains is the one energy figure this
+                # integration can reach that does not come from the power sensor
+                # above -- so it is the only one that could ever contradict it, and
+                # it reaches no planner, economic, Stage B or safety path.
+                vol.Optional(CONF_GRID_EXPORT_ENERGY_ENTITY): _ENERGY_SELECTOR,
             }
         )
         return self.async_show_form(
@@ -966,6 +978,7 @@ class AlphaEmsOptionsFlow(OptionsFlow):
                 for optional in (
                     CONF_DAILY_HOUSE_LOAD_ENTITY,
                     CONF_EV_POWER_ENTITY,
+                    CONF_GRID_EXPORT_ENERGY_ENTITY,
                     CONF_PV_POWER_ENTITY,
                     CONF_SOLCAST_ENTRY_ID,
                 ):
@@ -1031,6 +1044,12 @@ class AlphaEmsOptionsFlow(OptionsFlow):
                     CONF_GRID_POWER_SIGN,
                     default=current(CONF_GRID_POWER_SIGN, DEFAULT_GRID_POWER_SIGN),
                 ): _sign_selector(GRID_SIGN_OPTIONS, "grid_power_sign"),
+                vol.Optional(
+                    CONF_GRID_EXPORT_ENERGY_ENTITY,
+                    description={
+                        "suggested_value": current(CONF_GRID_EXPORT_ENERGY_ENTITY)
+                    },
+                ): _ENERGY_SELECTOR,
                 # Only offered as a default when it is still a valid choice. A
                 # stale id -- Frank removed and re-added, so a different entry
                 # exists under a new id -- would otherwise fail schema validation

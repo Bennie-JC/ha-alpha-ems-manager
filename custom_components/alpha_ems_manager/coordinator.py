@@ -140,6 +140,7 @@ from .const import (
     CONF_FRANK_ENTRY_ID,
     CONF_GRID_CHARGE_BUDGET_KWH,
     CONF_GRID_CHARGE_MARGIN_EUR_PER_KWH,
+    CONF_GRID_EXPORT_ENERGY_ENTITY,
     CONF_GRID_POWER_ENTITY,
     CONF_GRID_POWER_SIGN,
     CONF_HAS_PV,
@@ -264,9 +265,18 @@ from .const import (
     MAX_CONTROL_EVENTS_REPORTED,
     MAX_DISPATCH_START_ACTIVE_SAMPLES,
     MAX_DISPATCH_START_SAMPLES_REPORTED,
+    MAX_METER_AUDITS_REPORTED,
     MAX_PHYSICAL_DECISIONS_REPORTED,
     MAX_QUARTER_REFUSALS_RECORDED,
     MAX_SAMPLE_GAP_SECONDS,
+    METER_AUDIT_EXACT,
+    METER_AUDIT_EXPLAINED,
+    METER_AUDIT_TOLERANCE_KWH,
+    METER_AUDIT_UNCERTAIN,
+    METER_COUNTER_NOT_CONFIGURED,
+    METER_COUNTER_OK,
+    METER_COUNTER_RESET,
+    METER_COUNTER_UNAVAILABLE,
     MIN_CONTROLLABLE_QUARTER_KWH,
     MIN_EXECUTABLE_QUARTER_KWH,
     MIN_QUARTER_COVERAGE,
@@ -761,6 +771,8 @@ class SourceConfig:
     has_pv: bool
     pv_power_entity: str | None
     grid_power_entity: str | None
+    #: Optional cumulative export counter, read only by the beta.48 audit.
+    grid_export_energy_entity: str | None
     grid_power_sign: str
     frank_entry_id: str | None
     use_pv_forecast: bool
@@ -854,6 +866,7 @@ class SourceConfig:
             has_pv=bool(value(CONF_HAS_PV, False)),
             pv_power_entity=value(CONF_PV_POWER_ENTITY),
             grid_power_entity=value(CONF_GRID_POWER_ENTITY),
+            grid_export_energy_entity=value(CONF_GRID_EXPORT_ENERGY_ENTITY),
             grid_power_sign=value(CONF_GRID_POWER_SIGN, DEFAULT_GRID_POWER_SIGN),
             frank_entry_id=value(CONF_FRANK_ENTRY_ID),
             use_pv_forecast=bool(value(CONF_USE_PV_FORECAST, False)),
@@ -1714,6 +1727,27 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._quarter_battery_kwh: float = 0.0
         self._quarter_grid_import_kwh: float = 0.0
         self._quarter_grid_export_kwh: float = 0.0
+        #: The first and last instants this row was actually integrated between,
+        #: which is **not** its nominal window. beta.48.
+        #:
+        #: The accrual discards the sample interval in which the
+        #: ``(claim_id, quarter_start)`` key changes, so measurement starts later
+        #: than the row does and the difference is real energy nobody counted.
+        #: Recorded rather than corrected: beta.48 measures the gap and publishes
+        #: it; whether to close it is a separate decision with its own economics.
+        self._quarter_sampled_from: datetime | None = None
+        self._quarter_sampled_to: datetime | None = None
+        #: The cumulative export counter at each end of that measured window, so a
+        #: physical delta can be compared against what was accounted. beta.48.
+        self._quarter_counter_from: float | None = None
+        self._quarter_counter_to: float | None = None
+        #: The counter reading taken at the cursor, so the first accepted interval
+        #: can be priced against a reading at its **start** rather than its end.
+        self._quarter_counter_at_cursor: float | None = None
+        #: Finished meter reconciliations, bounded. Diagnostics only. beta.48.
+        self._meter_audits: deque[dict[str, Any]] = deque(
+            maxlen=MAX_METER_AUDITS_REPORTED
+        )
         self._quarter_sampled_at: datetime | None = None
         self._quarter_peak_kw: float = 0.0
         self._quarter_power_sum: float = 0.0
@@ -2251,6 +2285,28 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             battery_discharge_w=battery_discharge,
             grid_import_w=grid_import,
             grid_export_w=grid_export,
+        )
+
+    def read_grid_export_counter_kwh(self) -> float | None:
+        """Return the cumulative grid export counter in kWh, or ``None``. beta.48.
+
+        **The only physically independent figure this component can read.** Every
+        other kWh it reports is an integral of the instantaneous grid power sensor,
+        so they all share that sensor's failure modes and none of them can detect
+        one. A counter the meter maintains itself can.
+
+        Optional, and refusing is the normal answer: not configured, entity gone,
+        non-numeric, or a unit that is not an energy all return ``None``. None of
+        them is a zero -- a zero delta is a claim that nothing crossed the meter.
+        """
+        entity_id = self.config.grid_export_energy_entity
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return None
+        return normalize_energy_kwh(
+            state.state, state.attributes.get("unit_of_measurement")
         )
 
     def read_daily_house_load_kwh(self) -> float | None:
@@ -4669,6 +4725,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._quarter_grid_import_kwh = 0.0
         self._quarter_grid_export_kwh = 0.0
         self._quarter_sampled_at = None
+        self._quarter_sampled_from = None
+        self._quarter_sampled_to = None
+        self._quarter_counter_from = None
+        self._quarter_counter_to = None
+        self._quarter_counter_at_cursor = None
         self._quarter_peak_kw = 0.0
         self._quarter_power_sum = 0.0
         self._quarter_power_samples = 0
@@ -4719,6 +4780,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         previous = self._quarter_sampled_at
         self._quarter_sampled_at = now
+        # **The counter travels with the cursor. beta.48.** Read on every tick,
+        # including the ones whose interval is discarded, because the first accepted
+        # interval has to be priced against a reading taken at its own *start*.
+        # Reading only when an interval is accepted would compare a counter to
+        # itself and report a zero delta for real exported energy.
+        prior_counter = self._quarter_counter_at_cursor
+        self._quarter_counter_at_cursor = self.read_grid_export_counter_kwh()
         if previous is None:
             return
         seconds = (now - previous).total_seconds()
@@ -4726,6 +4794,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Out of order, or a silence too long to integrate across.
             return
         hours = seconds / 3600.0
+        # **The window that was really integrated. beta.48.** ``previous`` rather
+        # than ``now``, because this interval covers ``[previous, now]`` -- and the
+        # gap between the row opening and this first accepted interval is exactly
+        # the energy the reset discarded.
+        if self._quarter_sampled_from is None:
+            self._quarter_sampled_from = previous
+            self._quarter_counter_from = prior_counter
+        self._quarter_sampled_to = now
+        self._quarter_counter_to = self._quarter_counter_at_cursor
 
         flows = self.read_flows()
         if quarter.intent == EXECUTION_INTENT_NET_EXPORT:
@@ -5377,6 +5454,122 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._note_tick(now, tick_reason, wrote=True)
 
     @callback
+    @callback
+    def _measured_window(self, quarter: CarriedQuarter | None) -> dict[str, Any]:
+        """Return the window this row was integrated over, and what was missed.
+
+        **The nominal window is not the measured one, and beta.48 stops pretending
+        otherwise.** ``_accrue_quarter_progress`` discards the whole sample interval
+        in which the ``(claim_id, quarter_start)`` key changes: the reset nulls the
+        cursor and the next line returns on ``previous is None``. Measurement
+        therefore begins at the *second* tick after a row opens, and at the third
+        when the claim lands a tick later -- which is the ordinary shape, because a
+        claim cannot land until the refresh has finished its solve.
+
+        Deterministically measured rather than argued: a row boundary under one claim
+        costs one tick, split across the closing and opening rows; a claim arriving
+        mid-row costs only the part of its interval in which energy actually flowed.
+
+        ``unmeasured_seconds`` is a **duration, not an energy**. Converting it would
+        need a rate for an interval nobody sampled, which is the guess this refuses.
+        ``null`` where nothing was measured at all, never ``0``.
+        """
+        started = self._quarter_sampled_from
+        ended = self._quarter_sampled_to
+        if quarter is None or started is None or ended is None:
+            return {
+                "sampled_from": None,
+                "sampled_to": None,
+                "measured_seconds": None,
+                "unmeasured_seconds": None,
+            }
+        # Clipped to the row, so a cursor inherited across a boundary -- which the
+        # reset makes unreachable today -- could not report a negative gap.
+        first = max(started, quarter.quarter_start)
+        last = min(ended, quarter.quarter_end)
+        measured = max(0.0, (last - first).total_seconds())
+        nominal = (quarter.quarter_end - quarter.quarter_start).total_seconds()
+        return {
+            "sampled_from": started.isoformat(),
+            "sampled_to": ended.isoformat(),
+            "measured_seconds": round(measured, 1),
+            "unmeasured_seconds": round(max(0.0, nominal - measured), 1),
+        }
+
+    @callback
+    def _file_meter_audit(self, quarter: CarriedQuarter | None) -> None:
+        """Reconcile one finished export row against the physical meter. beta.48.
+
+        **Read-only, and it repairs nothing.** It states four things and refuses to
+        blur them:
+
+        * ``physical_export_kwh`` -- the cumulative counter delta. The only figure
+          here that is independent of the instantaneous grid sensor, and therefore
+          the only one that can catch that sensor being wrong.
+        * ``attributed_export_kwh`` -- what the campaign accounting accrued, over
+          **exactly** the same window, so the two are comparable.
+        * ``unmeasured_seconds`` -- the part of the nominal row nobody integrated,
+          reported beside the comparison rather than folded into it. Converting it
+          to energy would need a rate for an interval nobody sampled.
+        * ``unexplained_kwh`` -- what is left, and only when a counter made the
+          question answerable at all.
+
+        **Ambient production is not subtracted from either side.** The realised
+        export figure deliberately includes it -- Stage A says using the marginal
+        figure as the objective *"would under-export by exactly the production the
+        site was exporting anyway"* -- so subtracting it here would manufacture a
+        discrepancy out of correct behaviour.
+
+        Without a configured counter the status is ``not_configured`` and the verdict
+        can never be ``exact``. That is the honest answer, not a degraded one.
+        """
+        if quarter is None or quarter.intent != EXECUTION_INTENT_NET_EXPORT:
+            return
+        window = self._measured_window(quarter)
+        started = self._quarter_counter_from
+        ended = self._quarter_counter_to
+        attributed = round(self._quarter_grid_export_kwh, 4)
+
+        physical: float | None = None
+        unexplained: float | None = None
+        if not self.config.grid_export_energy_entity:
+            status = METER_COUNTER_NOT_CONFIGURED
+        elif started is None or ended is None:
+            status = METER_COUNTER_UNAVAILABLE
+        elif ended < started:
+            # A counter that went backwards is a reset or a rollover, and one
+            # reading cannot tell them apart. Rejected rather than wrapped.
+            status = METER_COUNTER_RESET
+        else:
+            status = METER_COUNTER_OK
+            physical = round(ended - started, 4)
+            unexplained = round(physical - attributed, 4)
+
+        if unexplained is None:
+            verdict = METER_AUDIT_UNCERTAIN
+        elif abs(unexplained) <= METER_AUDIT_TOLERANCE_KWH:
+            verdict = METER_AUDIT_EXACT
+        else:
+            verdict = METER_AUDIT_EXPLAINED
+
+        self._meter_audits.append(
+            {
+                "scope": "quarter",
+                "row_start": quarter.quarter_start.isoformat(),
+                "row_end": quarter.quarter_end.isoformat(),
+                "claim_id": self._quarter_claim,
+                "campaign_id": quarter.campaign_id,
+                **window,
+                "counter_status": status,
+                "meter_counter_start_kwh": started,
+                "meter_counter_end_kwh": ended,
+                "physical_export_kwh": physical,
+                "attributed_export_kwh": attributed,
+                "unexplained_kwh": unexplained,
+                "status": verdict,
+            }
+        )
+
     def _record_completed_quarter(
         self, quarter: CarriedQuarter | None, reason: str, *, accrue: bool = True
     ) -> None:
@@ -5394,6 +5587,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if quarter is None:
             return
+        # **beta.48: reconcile before the totals are reset.** Filed here because this
+        # is the one place that runs for every finished row, whatever ended it, and
+        # while the measured window and its counter readings still stand.
+        self._file_meter_audit(quarter)
         # Read once, and for the row being recorded rather than for whatever row the
         # accumulators have moved on to.
         provenance = self._row_provenance(quarter.quarter_start)
@@ -5452,6 +5649,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "absorption_gate": quarter.retention_gate,
                 "planned_grid_kwh": round(planned_grid, 3),
                 "realized_grid_kwh": round(realised_grid, 3),
+                # **The window that was actually integrated, and the gap. beta.48.**
+                # The nominal window is above; these say what was measured inside
+                # it. ``unmeasured_seconds`` is the difference, and it is a
+                # measurement of the accrual reset rather than an estimate of it.
+                **self._measured_window(quarter),
                 "shortfall_kwh": round(shortfall, 3),
                 # **Null below one actuator step, since beta.32.** The observed row
                 # published ``140 %`` against a 0.01 kWh objective -- arithmetically
@@ -14295,6 +14497,31 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # **beta.44 calibration, read by nothing.** One entry per finished physical
         # claim, with the two clocks kept apart. See ``_observe_arm``.
         stage_b["arm_measurements"] = list(self._arm_measurements)
+        # **beta.48 reconciliation, read by nothing.** One entry per finished export
+        # row: what physically crossed the meter, what the accounting attributed,
+        # and what neither of them covered. See ``_file_meter_audit``.
+        stage_b["meter_reconciliation"] = {
+            "source": {
+                "instantaneous_power_entity": self.config.grid_power_entity,
+                "cumulative_export_entity": (self.config.grid_export_energy_entity),
+            },
+            "audits": list(self._meter_audits),
+            "basis": (
+                "physical_export_kwh is a cumulative counter delta and is the only "
+                "figure here independent of the instantaneous grid sensor; "
+                "attributed_export_kwh is what the campaign accounting accrued over "
+                "exactly the same measured window, so the two compare like with "
+                "like. unmeasured_seconds is the part of the nominal row nobody "
+                "integrated -- the accrual discards the sample interval in which "
+                "the claim or row identity changes -- and it is reported beside the "
+                "comparison rather than folded into it, because converting a "
+                "duration nobody sampled into an energy would be a guess. Ambient "
+                "production is subtracted from neither side: the realised export "
+                "figure deliberately includes it. Without a configured counter the "
+                "status is not_configured and the verdict can never be exact. null "
+                "is never zero"
+            ),
+        }
         stage_b["arm_plan"] = self._arm_plan
         stage_b["dispatch_start_active_probe"] = {
             "samples": list(self._dispatch_start_active),
