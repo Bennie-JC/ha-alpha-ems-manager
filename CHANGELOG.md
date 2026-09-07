@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.52] - 2026-09-08
+
+**The investment return now covers the investment, and nothing before it.**
+
+No planner change, no economics, no Stage A, no Stage B, no dispatch, no campaign
+lifecycle, no export behaviour, no reserve, no safety, no config flow, no storage
+change. How a day's benefit is measured is untouched; what changes is which days
+the return is allowed to count.
+
+## A date that was published and applied to nothing
+
+`accounting_start_date` has appeared on this sensor since beta.42 and nothing has
+ever used it. The cumulative figure summed every sealed day on disk, the trailing
+windows looked only at their own width, and the sample count counted everything --
+so benefit earned before the battery was bought was subtracted from what remained
+to recover, and drove the recovered percentage.
+
+That is not a conservative approximation. Money saved in a week the battery did not
+exist cannot recover its cost, and counting it moves the headline number in the
+flattering direction. The published attributes said so plainly: `sealed_through`
+could sit *before* `accounting_start_date` -- an accounting period ending three days
+before it began.
+
+The purchase date is now a hard lower bound on the cumulative benefit, the sample
+count and mean, both trailing windows, the remaining-to-recover figure, the
+recovered percentage and the payback estimate.
+
+## Nothing is thrown away
+
+Days before the purchase are still measured, still sealed, still on disk, and are
+now published under names that say what they are: `sealed_days_before_accounting_start`
+and `benefit_before_accounting_start_eur`. Upgrading does not lose them; it stops
+them being counted as recovery of a cost they predate.
+
+Without a configured purchase date there is no period to be outside of, and the
+figure covers everything it always did. The bound is the operator's statement about
+when the battery started earning, not a default.
+
+## When every sealed day predates the purchase
+
+The return reports itself unavailable with its own reason,
+`no_finalised_days_in_accounting_period`, rather than the existing "no history".
+The two call for different actions -- one installation is waiting for evidence, the
+other for the battery to earn something -- and reporting the second as the first
+would send an operator looking for a fault in a measurement that is working. What
+was earned earlier is published beside the refusal.
+
+## Evicted days are placed whole, never split
+
+Days aged out at the retention edge survive as a running total with a cursor and no
+start date. When that cursor falls before the purchase, every day it covers is
+outside the period and it is dropped in full. When it reaches into the period the
+total is included and `pre_investment_days_included` says it may also cover earlier
+days. It is never pro-rated: an estimated share would put a model term inside a
+figure whose whole value is that no model can reach it.
+
+## What you may see after upgrading
+
+The cumulative figure, sample count, trailing windows and recovered percentage can
+all fall, and on an installation whose sealed days all predate its purchase date the
+return will read unavailable. Nothing has been lost and nothing recalculated -- the
+figure has stopped counting days that were never part of this investment.
+
 ## [1.0.0-beta.51] - 2026-09-08
 
 **A lifetime figure that stops moving can now say what it is waiting for.**

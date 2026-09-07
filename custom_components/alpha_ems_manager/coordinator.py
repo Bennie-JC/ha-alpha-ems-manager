@@ -354,6 +354,7 @@ from .const import (
     ROI_SEAL_CANDIDATE_BATCH,
     ROI_TRAILING_LONG_DAYS,
     ROI_TRAILING_SHORT_DAYS,
+    ROI_UNAVAILABLE_BEFORE_INVESTMENT,
     ROI_UNAVAILABLE_NO_HISTORY,
     ROI_UNAVAILABLE_NO_INVESTMENT,
     SAFETY_SAMPLE_SECONDS,
@@ -11759,7 +11760,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         credit = config.other_one_time_credit_eur or 0.0
         net = round(gross - subsidy - credit, 2)
 
-        lifetime = self.lifetime_benefit(today)
+        # **The bound is worked out before the total, not after it. beta.52.** The
+        # first day of evidence is a property of the record and does not depend on
+        # the question, so it can be read first and the period derived from it -- and
+        # the total then computed once, over the period, rather than computed whole
+        # and explained away afterwards.
+        since = self._accounting_start(today)
+        lifetime = self.lifetime_benefit(today, since=since)
         cumulative = lifetime["cumulative_realised_benefit_eur"]
         sample_days = lifetime["sealed_days"]
         # **Not "are any days still retained".** A figure whose days have all aged
@@ -11769,15 +11776,30 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not sample_days:
             return {
                 "available": False,
-                "unavailable_reason": ROI_UNAVAILABLE_NO_HISTORY,
+                "unavailable_reason": (
+                    ROI_UNAVAILABLE_BEFORE_INVESTMENT
+                    if lifetime["sealed_days_before_accounting_start"]
+                    else ROI_UNAVAILABLE_NO_HISTORY
+                ),
                 "gross_investment_eur": gross,
                 "subsidy_eur": subsidy,
                 "other_one_time_credit_eur": credit,
                 "net_investment_eur": net,
+                # **Published even here, and especially here.** An installation whose
+                # every sealed day predates the purchase has no return to report and
+                # would otherwise show an unexplained refusal beside a history it can
+                # see is not empty.
+                "accounting_start_date": None if since is None else since.isoformat(),
+                "sealed_days_before_accounting_start": lifetime[
+                    "sealed_days_before_accounting_start"
+                ],
+                "benefit_before_accounting_start_eur": lifetime[
+                    "benefit_before_accounting_start_eur"
+                ],
             }
 
-        short = self._trailing_benefit(today, ROI_TRAILING_SHORT_DAYS)
-        long = self._trailing_benefit(today, ROI_TRAILING_LONG_DAYS)
+        short = self._trailing_benefit(today, ROI_TRAILING_SHORT_DAYS, since=since)
+        long = self._trailing_benefit(today, ROI_TRAILING_LONG_DAYS, since=since)
         recovered = None if net <= 0.0 else round(100.0 * cumulative / net, 2)
         payback = self._payback_from(long, net, cumulative, today)
 
@@ -11798,13 +11820,22 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "trailing_90d_eur": long["total_eur"],
             "trailing_90d_days": long["days"],
             "sample_days": sample_days,
+            "sealed_days_before_accounting_start": lifetime[
+                "sealed_days_before_accounting_start"
+            ],
+            "benefit_before_accounting_start_eur": lifetime[
+                "benefit_before_accounting_start_eur"
+            ],
+            "pre_investment_days_included": lifetime["pre_investment_days_included"],
             **payback,
             **self._roi_provenance(lifetime, today),
             **self._roi_price_basis(today),
         }
 
     @callback
-    def _trailing_benefit(self, today: date, window: int) -> dict[str, Any]:
+    def _trailing_benefit(
+        self, today: date, window: int, *, since: date | None = None
+    ) -> dict[str, Any]:
         """Return the sealed benefit over the last ``window`` civil days.
 
         **Sealed values only, never a re-derivation.** A trailing mean assembled by
@@ -11816,6 +11847,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         which it was.
         """
         first = today - timedelta(days=window)
+        if since is not None and since > first:
+            # **A thirty-day window over a battery owned for six days is a six-day
+            # window.** ``days`` is published beside the total precisely so the two
+            # are never confused, and clamping here keeps that count honest rather
+            # than letting the total quietly cover a period the battery predates.
+            first = since
         values = [
             record.benefit_eur_final
             for day, record in self.store.days.items()
@@ -11870,6 +11907,44 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
 
     @callback
+    def _history_available_since(self) -> date | None:
+        """Return the first day the lifetime figure has evidence for, unfiltered.
+
+        A property of the record rather than of the question asked of it, which is
+        why it is read before the accounting bound is worked out and reported beside
+        the bounded totals rather than inside them.
+        """
+        if self.store.sealed_through is not None:
+            return self.store.sealed_through
+        finalised = [
+            day
+            for day, record in self.store.days.items()
+            if record.benefit_eur_final is not None
+        ]
+        return min(finalised) if finalised else None
+
+    @callback
+    def _accounting_start(self, today: date) -> date | None:
+        """Return the first day the investment return may count. beta.52.
+
+        The later of the configured purchase date and the first day there is
+        evidence for. Without a purchase date there is no period to be outside of,
+        and the figure covers whatever it has always covered -- the bound is the
+        operator's statement about when the battery started earning, not a default.
+        """
+        available = self._history_available_since()
+        configured = self.config.battery_investment_date
+        if not configured:
+            return available
+        try:
+            purchased = date.fromisoformat(configured)
+        except (TypeError, ValueError):
+            return available
+        if available is None:
+            return purchased
+        return max(purchased, available)
+
+    @callback
     def _roi_provenance(self, lifetime: dict[str, Any], today: date) -> dict[str, Any]:
         """Return what period the cumulative figure actually covers.
 
@@ -11883,11 +11958,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         configured = self.config.battery_investment_date
         available = lifetime["history_available_since"]
-        start = available
-        if configured and available:
-            start = max(configured, available)
-        elif configured:
-            start = configured
+        bound = self._accounting_start(today)
+        start = None if bound is None else bound.isoformat()
         reasons = self.unsealed_day_reasons(today)
         inside = 0
         if start is not None:
@@ -12143,29 +12215,66 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return window.realized_battery_benefit_eur
 
     @callback
-    def lifetime_benefit(self, today: date) -> dict[str, Any]:
+    def lifetime_benefit(
+        self, today: date, *, since: date | None = None
+    ) -> dict[str, Any]:
         """Return the cumulative realised battery benefit, and what it covers.
 
         ``sealed_benefit_eur`` carries the days the store no longer retains and the
-        retained sealed days are added back, so the total is complete over
-        ``[history_available_since, sealed_through_retained]`` and says so rather
-        than implying a longer reach. A day inside that span that never qualified is
-        reported as a hole -- the figure is still a true measurement of the days it
-        covers, and a reader is told which days those are.
+        retained sealed days are added back, so the total is complete over its own
+        span and says so rather than implying a longer reach. A day inside that span
+        that never qualified is reported as a hole -- the figure is still a true
+        measurement of the days it covers, and a reader is told which days those are.
+
+        **``since`` is a hard lower bound, and it is what makes this a return on an
+        investment rather than a running total. beta.52.** Benefit earned before the
+        battery was bought cannot recover its cost. Including it is not a
+        conservative approximation but a category error, and one that moves the
+        headline percentage in the flattering direction.
+
+        ``history_available_since`` is deliberately reported **unfiltered**: it is a
+        property of the record rather than of the question being asked of it, and the
+        caller needs it to work out where the bound goes in the first place.
         """
         finalised = {
             day: record.benefit_eur_final
             for day, record in self.store.days.items()
             if record.benefit_eur_final is not None
         }
-        retained_total = round(sum(finalised.values()), 6)
-        total = round(self.store.sealed_benefit_eur + retained_total, 6)
+        in_scope = {
+            day: value
+            for day, value in finalised.items()
+            if since is None or day >= since
+        }
+        excluded = {
+            day: value for day, value in finalised.items() if day not in in_scope
+        }
+
+        # **The evicted days are a scalar with no dates, so they are placed whole or
+        # not at all.** Their cursor says only which day the total is complete
+        # *through*; where it begins is unrecoverable. Pro-rating an estimated share
+        # would put a model term inside a figure whose entire value is that no model
+        # can reach it, so the ambiguity is published instead of being smoothed over.
+        evicted_total = self.store.sealed_benefit_eur
+        evicted_days = self.store.sealed_day_count
+        evicted_cursor = self.store.sealed_through
+        straddles = False
+        if since is not None and evicted_cursor is not None and evicted_days:
+            if evicted_cursor < since:
+                # Every day it covers ended before the purchase.
+                evicted_total, evicted_days = 0.0, 0
+            else:
+                # It reaches into the period, but may also start before it.
+                straddles = True
+
+        retained_total = round(sum(in_scope.values()), 6)
+        total = round(evicted_total + retained_total, 6)
 
         earliest = self.store.sealed_through
         if finalised:
             first_retained = min(finalised)
             earliest = first_retained if earliest is None else earliest
-        last = max(finalised) if finalised else self.store.sealed_through
+        last = max(in_scope) if in_scope else (evicted_cursor if evicted_days else None)
 
         # A past day the store retains, that carries no sealed figure, is a day the
         # lifetime total does not include. Counted rather than hidden: the total is
@@ -12177,19 +12286,22 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         return {
             "cumulative_realised_benefit_eur": total,
-            "sealed_evicted_eur": self.store.sealed_benefit_eur,
+            "sealed_evicted_eur": evicted_total,
             "sealed_evicted_through": (
-                None
-                if self.store.sealed_through is None
-                else self.store.sealed_through.isoformat()
+                None if evicted_cursor is None else evicted_cursor.isoformat()
             ),
             "retained_sealed_eur": retained_total,
             # **Every day the figure covers, retained or not.** Counting only the
             # retained ones would make the published average climb each time a day
             # aged out of the window -- on a figure whose entire point is not to move
             # when nothing has happened.
-            "sealed_days": len(finalised) + self.store.sealed_day_count,
-            "retained_sealed_days": len(finalised),
+            "sealed_days": len(in_scope) + evicted_days,
+            "retained_sealed_days": len(in_scope),
+            # The days that are real, measured and outside the question. Published
+            # under their own name so upgrading does not read as data loss.
+            "sealed_days_before_accounting_start": len(excluded),
+            "benefit_before_accounting_start_eur": round(sum(excluded.values()), 6),
+            "pre_investment_days_included": straddles,
             "history_available_since": (
                 None if earliest is None else earliest.isoformat()
             ),

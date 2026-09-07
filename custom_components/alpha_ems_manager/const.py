@@ -2258,6 +2258,15 @@ ROI_SEAL_CANDIDATE_BATCH: Final = 31
 #: Why the return figure, or its payback half, is not being published.
 ROI_UNAVAILABLE_NO_INVESTMENT: Final = "no_investment_configured"
 ROI_UNAVAILABLE_NO_HISTORY: Final = "no_finalised_days"
+#: Days have been sealed, but every one of them predates the purchase. beta.52.
+#:
+#: **Distinct from having no history at all, because the two call for different
+#: actions.** An installation with nothing sealed is waiting for evidence; one whose
+#: evidence all predates its battery is waiting for the battery to earn something,
+#: and reporting the second as the first would send an operator looking for a fault
+#: in the measurement. What was earned before the purchase is published beside this
+#: reason rather than being silently dropped.
+ROI_UNAVAILABLE_BEFORE_INVESTMENT: Final = "no_finalised_days_in_accounting_period"
 ROI_PAYBACK_UNAVAILABLE_INSUFFICIENT_HISTORY: Final = "insufficient_history"
 #: **Never an infinity, and never a negative payback.** A trailing mean at or below
 #: zero means the recorded period did not pay, which is a real measurement and is
@@ -2331,6 +2340,7 @@ CALCULATION_BASIS_IMPORT_CASH_EXPORT_RECONSTRUCTED: Final = (
 ROI_UNAVAILABLE_REASONS: Final = (
     ROI_UNAVAILABLE_NO_INVESTMENT,
     ROI_UNAVAILABLE_NO_HISTORY,
+    ROI_UNAVAILABLE_BEFORE_INVESTMENT,
     ROI_PAYBACK_UNAVAILABLE_INSUFFICIENT_HISTORY,
     ROI_PAYBACK_UNAVAILABLE_NO_BENEFIT,
 )
