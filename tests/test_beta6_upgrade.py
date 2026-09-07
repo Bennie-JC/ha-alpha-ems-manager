@@ -567,7 +567,7 @@ async def test_the_storage_minor_version_moved_and_the_major_did_not(
     # is read rather than discarded, and every minor bump so far has been additive
     # for exactly that reason -- this one included, since a document without the
     # key reads back as having no opening valuation, which is a defined state.
-    assert STORAGE_MINOR_VERSION == 8
+    assert STORAGE_MINOR_VERSION == 9
 
     coordinator = upgraded.runtime_data
     assert coordinator.store.reset_by_migration is False
@@ -577,7 +577,7 @@ async def test_the_storage_minor_version_moved_and_the_major_did_not(
     assert document["version"] == 2
     # Rewritten at the current minor, which is what an additive bump does: read
     # the old document unchanged, write the new one back. 7 since beta.39.
-    assert document["minor_version"] == STORAGE_MINOR_VERSION == 8
+    assert document["minor_version"] == STORAGE_MINOR_VERSION == 9
     # The six days beta.6 wrote are all still there.
     assert len(document["data"]["days"]) == 6
     # And nothing was invented. A beta.6 installation has armed nothing, so the

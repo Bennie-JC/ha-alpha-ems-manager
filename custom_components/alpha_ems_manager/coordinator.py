@@ -261,6 +261,7 @@ from .const import (
     MAX_ABORTED_CAMPAIGNS_REMEMBERED,
     MAX_ARM_MEASUREMENTS_REPORTED,
     MAX_ARM_PLAN_ENTRIES_PUBLISHED,
+    MAX_CATCHUP_SECONDS,
     MAX_COMPLETED_QUARTERS_REPORTED,
     MAX_CONTROL_EVENTS_REPORTED,
     MAX_DISPATCH_START_ACTIVE_SAMPLES,
@@ -346,11 +347,15 @@ from .const import (
     ROI_MIN_SAMPLE_DAYS,
     ROI_PAYBACK_UNAVAILABLE_INSUFFICIENT_HISTORY,
     ROI_PAYBACK_UNAVAILABLE_NO_BENEFIT,
+    ROI_SEAL_CANDIDATE_BATCH,
     ROI_TRAILING_LONG_DAYS,
     ROI_TRAILING_SHORT_DAYS,
     ROI_UNAVAILABLE_NO_HISTORY,
     ROI_UNAVAILABLE_NO_INVESTMENT,
     SAFETY_SAMPLE_SECONDS,
+    SEAL_REFUSED_PRICE_PARTITION_UNLOADED,
+    SEAL_REFUSED_PRICES_LOST,
+    SEAL_REFUSED_PRICES_NEVER_STORED,
     SELECT_INVERTER_AC_LIMIT,
     SHORTFALL_ABSORBING_FREE_PV,
     SHORTFALL_NONE,
@@ -604,6 +609,26 @@ def _rounded_price(value: float | None) -> float | None:
 #: Seconds after each quarter boundary at which the bucket is closed. The small
 #: delay lets sources that publish exactly on the boundary land first.
 _QUARTER_TRIGGER_SECOND = 5
+
+#: Shape version of the persisted open-quarter snapshot. beta.50.
+#:
+#: Separate from the store's own minor version because the two answer different
+#: questions: the store version says what the document may contain, this says how to
+#: read one particular key. A snapshot written by a shape this release does not
+#: understand is discarded rather than guessed at -- it is worth one quarter, and
+#: mis-reading it would be worth a day.
+_OPEN_INTEGRATION_VERSION = 1
+
+#: The accumulators whose partial integral is carried across a graceful stop, and
+#: the key each is stored under. beta.50. See ``_capture_open_integration`` for why
+#: it is all five and why the battery-charge accumulator is not among them.
+_OPEN_INTEGRATION_SLOTS: tuple[tuple[str, str], ...] = (
+    ("house", "_accumulator"),
+    ("ev", "_ev_accumulator"),
+    ("pv", "_pv_accumulator"),
+    ("gi", "_grid_import_accumulator"),
+    ("gx", "_grid_export_accumulator"),
+)
 
 #: Why a finalised quarter was not learned.
 #:
@@ -2178,9 +2203,148 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         )
 
+        # **Before the seeding sample, and that ordering is the whole fix. beta.50.**
+        # ``restore`` refuses an accumulator that has already started, so a snapshot
+        # adopted after the seed below would be rejected -- and the quarter the
+        # reload landed in would be discarded exactly as it always was.
+        self._restore_open_integration(tz, dt_util.now())
+
         # Seed the accumulator so integration starts from the current reading
         # rather than from the first future state change.
+        #
+        # It is also what walks a resumed quarter across the downtime. The held
+        # value is deliberately not restored, so those seconds accrue no energy and
+        # no coverage: the gap is reported, never filled in.
         self._sample(dt_util.now())
+
+    @callback
+    def _capture_open_integration(self, moment: datetime) -> None:
+        """Record the open quarter's integral so a restart can resume it. beta.50.
+
+        Samples first, so the cursor is the instant the process actually stopped
+        rather than up to a minute stale -- that last minute is four per cent of a
+        quarter and there is no reason to throw it away.
+
+        **All five measurement accumulators, or none.** House alone decides whether
+        the interval is written at all, so it looks like the only one that matters --
+        but restoring it without the others turns one failure into a worse one.
+        Without the flexible load, ``ev_expected`` is written ``True`` against an
+        ``ev`` that is still ``None`` and the day fails ``load_boundary_incomplete``
+        instead: the same permanent hole wearing a different name. Without generation
+        and the two grid legs the day *does* seal, at a number the realised window
+        quietly shortened -- an interval missing both grid legs is skipped, and the
+        counterfactual leg needs production the actual legs do not. A day that does
+        not seal is a gap; a day that seals wrong is a lie.
+
+        The battery-charge accumulator is deliberately absent. It carries execution
+        progress, which is run-scoped and reset at run boundaries, and the rule this
+        store states for itself is that progress is re-measured from evidence rather
+        than trusted from a snapshot.
+        """
+        self.store.open_integration = None
+        self._sample(moment)
+
+        house = self._accumulator
+        if house.slot_start_utc is None or house.cursor_utc is None:
+            return
+
+        accrued: dict[str, Any] = {}
+        for key, attribute in _OPEN_INTEGRATION_SLOTS:
+            accumulator = getattr(self, attribute)
+            if accumulator is None:
+                continue
+            state = accumulator.snapshot()
+            if state is None:
+                # One configured source never started. Recording a partial set would
+                # invite a partial restore, which is the failure this design refuses.
+                return
+            accrued[key] = state
+
+        self.store.open_integration = {
+            "v": _OPEN_INTEGRATION_VERSION,
+            "tz": self._tz_key,
+            # Held once rather than per accumulator: all of them are advanced from
+            # the same instant in ``_sample``, so five copies free to disagree would
+            # be a new failure mode for nothing.
+            "slot": house.slot_start_utc.isoformat(),
+            "cursor": house.cursor_utc.isoformat(),
+            "acc": accrued,
+        }
+
+    @callback
+    def _restore_open_integration(self, tz: tzinfo, now: datetime) -> str:
+        """Adopt the quarter open at shutdown. Returns a named, published reason.
+
+        **Consumed on read, whatever the outcome.** A snapshot that survived a
+        refusal could be adopted by a later start into a different quarter and count
+        the same seconds twice, so it is cleared before it is judged rather than
+        after it is used.
+
+        The timezone is compared as a string and that is the primary guard, not a
+        belt-and-braces one. ``_handle_core_config_update`` cannot fire for a change
+        made while Home Assistant was stopped, and the slot identity does not catch
+        it: Amsterdam to Berlin is a zero offset change and Amsterdam to London
+        exactly one hour, both whole multiples of fifteen minutes, so the floor is
+        unchanged and the arithmetic check passes on a day belonging to a different
+        calendar.
+        """
+        snapshot = self.store.open_integration
+        if snapshot is None:
+            return "no_snapshot"
+        self.store.open_integration = None
+        self.store.schedule_save()
+
+        if snapshot.get("v") != _OPEN_INTEGRATION_VERSION:
+            return "snapshot_version"
+        if snapshot.get("tz") != str(tz):
+            return "timezone_changed"
+        try:
+            slot_start = datetime.fromisoformat(str(snapshot["slot"]))
+            cursor = datetime.fromisoformat(str(snapshot["cursor"]))
+        except (KeyError, TypeError, ValueError):
+            return "snapshot_unusable"
+        if slot_start.tzinfo is None or cursor.tzinfo is None:
+            return "snapshot_unusable"
+        if cursor > now:
+            return "clock_stepped_back"
+        if (now - cursor).total_seconds() > MAX_CATCHUP_SECONDS:
+            return "snapshot_stale"
+
+        accrued = snapshot.get("acc")
+        if not isinstance(accrued, dict):
+            return "snapshot_unusable"
+
+        # Every configured accumulator is validated before any of them is mutated,
+        # so a partial document cannot leave the set half-resumed.
+        pending: list[tuple[Any, float, float]] = []
+        for key, attribute in _OPEN_INTEGRATION_SLOTS:
+            accumulator = getattr(self, attribute)
+            if accumulator is None:
+                continue
+            state = accrued.get(key)
+            if not isinstance(state, dict):
+                return "partial_snapshot"
+            try:
+                energy_wh = float(state["wh"])
+                valid_seconds = float(state["s"])
+            except (KeyError, TypeError, ValueError):
+                return "partial_snapshot"
+            pending.append((accumulator, energy_wh, valid_seconds))
+
+        for accumulator, energy_wh, valid_seconds in pending:
+            if not accumulator.restore(
+                slot_start_utc=slot_start,
+                cursor_utc=cursor,
+                energy_wh=energy_wh,
+                valid_seconds=valid_seconds,
+            ):
+                # A refusal partway through would leave some accumulators carrying
+                # real measurements and the rest starting fresh, which is the
+                # inconsistent state this method exists to avoid.
+                for started, *_ in pending:
+                    started.reset()
+                return "snapshot_unusable"
+        return "resumed"
 
     @callback
     def _handle_core_config_update(self, event: Event) -> None:
@@ -2218,7 +2382,25 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         The forecast flush is guarded on its own so a failure there cannot stop
         the learning history -- the irreplaceable half -- from being written.
+
+        **The open quarter is captured here and nowhere else. beta.50.** This is the
+        one path a graceful stop always takes -- Home Assistant's stop event and the
+        entry unload both arrive here -- and it is the last moment the in-flight
+        measurement still exists. Capturing it anywhere else would either miss the
+        reload case or leave a snapshot lying in the document during normal running,
+        where a later start could adopt it into the wrong quarter.
         """
+        try:
+            self._capture_open_integration(dt_util.now())
+        except Exception:
+            # Guarded like the forecast flush below and for the same reason: a fault
+            # while recording an optimisation must never cost the write it is riding
+            # on. Losing the snapshot costs one quarter; losing the flush costs the
+            # day.
+            _LOGGER.exception(
+                "The open quarter could not be recorded for resumption. Learning "
+                "history is written normally and is unaffected"
+            )
         await self.store.async_save_now()
         try:
             await self.history.async_save_now()
@@ -8010,7 +8192,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Deliberately not "yesterday": every retained past day is offered, so a day
         # that was unfinalisable for a week and then became complete is picked up
         # rather than missed forever.
-        self.seal_finalizable_days(plan, today)
+        await self.async_seal_finalizable_days(plan, today)
 
         # Derived from runs already solved, so this costs no extra search.
         #
@@ -11794,7 +11976,42 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return dict(published)
 
     @callback
-    def seal_finalizable_days(self, plan: Any, today: date) -> int:
+    def _seal_candidates(self, today: date, limit: int) -> list[date]:
+        """Return past days worth making prices reachable for, oldest first. beta.50.
+
+        **Every condition here is answerable from memory**, which is what keeps the
+        scan free on a healthy installation. A day qualifies only when it is past,
+        unsealed, measured through, and the always-loaded index says an issuance was
+        actually recorded for it. That last clause is the load bound and it is
+        exact: a day whose prices were never stored can never trigger a partition
+        read, however many such days accumulate.
+
+        Bounded because the first refresh after an upgrade can face a year of
+        unsealed days at once, and loading twelve partitions inside one refresh to
+        serve a figure nobody is watching that second is the wrong trade. The
+        backlog drains over successive refreshes instead.
+        """
+        candidates: list[date] = []
+        for day in sorted(self.store.days):
+            if len(candidates) >= limit:
+                break
+            if day >= today:
+                continue
+            record = self.store.days[day]
+            if record.final_benefit is not None:
+                continue
+            usable, _reason = self._day_data_complete(record)
+            if not usable:
+                continue
+            if self.history.partition_loaded(day):
+                continue
+            row = self.history.row(day)
+            if row is None or not row.price_fingerprints:
+                continue
+            candidates.append(day)
+        return candidates
+
+    async def async_seal_finalizable_days(self, plan: Any, today: date) -> int:
         """Seal every retained past day that qualifies. Returns how many moved.
 
         **Runs on an ordinary refresh rather than on a midnight timer**, because
@@ -11804,12 +12021,32 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         -- and a day that is *not* complete then simply gets asked again on the next
         one. A day is therefore sealed late rather than sealed short.
 
+        **A coroutine since beta.50, and the rename is deliberate.** The pass reads
+        prices through a store whose month partitions are loaded on demand, and as a
+        synchronous callback it could not load one -- so it read "not in memory" as
+        "never recorded" and refused days whose evidence was sitting on disk. It now
+        makes the candidates reachable first and then judges them with the predicate,
+        which stays synchronous. Renaming rather than quietly changing the signature
+        means a missed call site raises instead of leaving an un-awaited coroutine.
+
         Ascending, so the lifetime cursor can only ever move forwards, and
         idempotent twice over: :meth:`DayRecord.note_final_benefit` refuses a day
         that already has a figure, and the pass skips it before computing one.
         """
         if plan is None:
             return 0
+        candidates = self._seal_candidates(today, ROI_SEAL_CANDIDATE_BATCH)
+        if candidates:
+            try:
+                await self.history.async_ensure_days(candidates)
+            except Exception:
+                # Guarded exactly as the two existing ``async_ensure_days`` callers
+                # are: a partition that cannot be read costs this pass its seal, and
+                # the day is offered again on the next refresh. It must never cost
+                # the refresh, which is carrying the plan.
+                _LOGGER.debug(
+                    "price evidence partitions unavailable for sealing", exc_info=True
+                )
         limits = plan.state.limits if plan.state is not None else None
         stamp = dt_util.utcnow().isoformat()
         sealed = 0
@@ -11942,6 +12179,20 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         record = self.store.days.get(day)
         if record is None:
             return False, "no_day_record"
+        usable, reason = self._day_data_complete(record)
+        if not usable:
+            return False, reason
+        return self._day_prices_reachable(day, record.interval_count)
+
+    @callback
+    def _day_data_complete(self, record: Any) -> tuple[bool, str]:
+        """Return whether one day's own measurements are complete, and why not.
+
+        Split out from :meth:`day_finalizable` so the candidate scan can ask the
+        same question without also asking about prices -- a day that is not
+        measured through cannot become sealable by loading a partition, and must
+        never provoke one.
+        """
         count = record.interval_count
         if any(record.measured[index] is None for index in range(count)):
             return False, "intervals_missing"
@@ -11952,9 +12203,41 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # day, it is an unpriceable one.
         if any(record.total_load_at(index) is None for index in range(count)):
             return False, "load_boundary_incomplete"
-        if self._prices_for_day(day, count) is None:
-            return False, "no_stored_prices"
-        return True, "finalizable"
+        return True, "data_complete"
+
+    @callback
+    def _day_prices_reachable(self, day: date, count: int) -> tuple[bool, str]:
+        """Return whether one past day can be priced, and why not. beta.50.
+
+        **Three refusals where there was one, because the old one was sometimes
+        false.** A month partition is loaded on demand and only today, tomorrow and
+        yesterday are ever asked for, so any older month is usually absent from
+        memory -- and every reader returns an empty result for an absent partition,
+        exactly as it does for a month that never had an issuance. A day that was
+        complete and priced was therefore refused as unpriced, permanently, and no
+        repair of its intervals could ever have helped.
+
+        The index settles it without touching a partition. ``price_fingerprints``
+        records what was issued and lives in the always-loaded index precisely so
+        this question is free:
+
+        * no row, or no fingerprints -- nothing was ever issued for this day, and
+          nothing ever will be: the recording path only offers today and tomorrow.
+          Terminal.
+        * fingerprints, partition not resident -- the evidence is on disk and out of
+          reach *for the moment*. Transient; the pass loads it and asks again.
+        * fingerprints, partition resident, still no snapshot -- the index claims an
+          issuance the partition does not have. Terminal, and distinct from the first
+          case because it is a disagreement rather than an absence.
+        """
+        if self._prices_for_day(day, count) is not None:
+            return True, "finalizable"
+        row = self.history.row(day)
+        if row is None or not row.price_fingerprints:
+            return False, SEAL_REFUSED_PRICES_NEVER_STORED
+        if not self.history.partition_loaded(day):
+            return False, SEAL_REFUSED_PRICE_PARTITION_UNLOADED
+        return False, SEAL_REFUSED_PRICES_LOST
 
     @callback
     def _prices_for_day(

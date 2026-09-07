@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.50] - 2026-09-08
+
+**Two ways a finished day was locked out of the lifetime return, and both are fixed.**
+
+No planner change, no economics, no Stage A, no Stage B, no dispatch, no campaign
+lifecycle, no export behaviour, no reserve, no safety, no config flow. Nothing here
+touches a decision; it changes only which days the accounting is allowed to read.
+
+## A reload cost a whole day
+
+The quarter-hour measurement lives in memory, and every setup builds it fresh --
+a restart, an options change, a version upgrade. So the quarter a reload landed in
+closed on whatever was observed after it and nothing before, which fails the 80 %
+coverage threshold and is never written.
+
+That single missing interval was permanent. Sealing needs every interval of the day
+and nothing writes one retroactively, so the whole civil day was refused forever:
+a thirty-second options change, and a day of realised benefit gone. On an
+installation that reloads most days, the lifetime figure simply stops moving.
+
+The partial integral is now written at a graceful stop and resumed on the next
+start. The downtime itself still contributes nothing -- the held reading is
+deliberately not restored, so an outage is reported as missing coverage and never
+integrated across. A short reload keeps its quarter; a long outage still loses it,
+and says so. A crash or power cut writes no snapshot and behaves exactly as before.
+
+All five measurement series resume together -- house, vehicle, generation and both
+grid legs. Restoring house alone would have turned a day that could not seal into a
+day that sealed at a quietly short number, which is the worse outcome.
+
+## A past day could not reach its own prices
+
+Price evidence is stored per month and loaded on demand, and a refresh only ever
+loads today, tomorrow and yesterday. The sealing pass was synchronous, so it could
+not load anything -- and it read "this month is not in memory" as "this month never
+had prices". A day that was complete and correctly priced was refused as unpriced.
+
+The refusal was also unrecoverable: once the civil clock moved past a month, nothing
+would ever load it again. Any day left unsealed at that point was lost for a second,
+independent reason.
+
+The pass now makes the evidence it needs reachable before judging, bounded to a
+month of candidate days per refresh so a large backlog drains over successive
+refreshes rather than in one. Days whose prices were genuinely never recorded
+trigger no load at all. The three cases -- never recorded, not currently loaded, and
+recorded but missing -- are now distinguished rather than reported as one.
+
+## What you may see after upgrading
+
+**Historical figures can move upward on the first refresh.** Days that were being
+refused for a reason that was not true may now seal, so `sealed_through`,
+`sample_days` and the cumulative realised benefit can all advance at once. That is
+recovery of evidence that was always on disk, not a recalculation: how a day's
+benefit is computed is unchanged, and a day already sealed is never touched again.
+
+**Existing measurement holes are not filled in.** A day that is genuinely missing an
+interval -- from a reload before this release, or from a real outage -- stays
+unsealed. Nothing is reconstructed and nothing is estimated. This release stops new
+holes being made and lets already-complete days be read; it does not repair old ones.
+
+Storage moves to minor version 9. The new key is additive and written only at a
+graceful stop, so documents from earlier releases load unchanged.
+
 ## [1.0.0-beta.49] - 2026-09-07
 
 **Two additive fields on one lifecycle event, and a worked Home Assistant example.**

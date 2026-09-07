@@ -860,7 +860,7 @@ def test_only_the_storage_minor_version_moved() -> None:
         FORECAST_STORAGE_VERSION,
     )
 
-    assert (STORAGE_VERSION, STORAGE_MINOR_VERSION) == (2, 8)
+    assert (STORAGE_VERSION, STORAGE_MINOR_VERSION) == (2, 9)
     assert CONFIG_ENTRY_VERSION == 2
     assert CLAIM_SCHEMA_VERSION == 2
     assert (FORECAST_STORAGE_VERSION, FORECAST_STORAGE_MINOR_VERSION) == (1, 8)

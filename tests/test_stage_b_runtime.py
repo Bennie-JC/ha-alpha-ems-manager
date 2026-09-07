@@ -423,7 +423,7 @@ async def test_the_document_declares_the_new_minor_and_stays_readable(
     # corrected battery capacity cannot rewrite a lifetime figure and an evicted
     # day still counts toward it. Additive, and the *major* staying at 2 is the
     # half that guarantees every earlier document is read rather than discarded.
-    assert document["minor_version"] == STORAGE_MINOR_VERSION == 8
+    assert document["minor_version"] == STORAGE_MINOR_VERSION == 9
     # The learning history is untouched by any of this.
     assert "days" in document["data"]
 

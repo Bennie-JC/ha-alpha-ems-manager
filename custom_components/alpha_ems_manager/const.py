@@ -213,7 +213,14 @@ STORAGE_VERSION: Final = 2
 #:   corrected the comparator. Additive: a beta.41 document reads back
 #:   with both keys absent, which means no day has been sealed -- never that the
 #:   benefit was measured at zero. No migration and no reset.
-STORAGE_MINOR_VERSION: Final = 8
+#: * 9 adds ``open_integration``: the partial integral of the quarter that was
+#:   still open when Home Assistant stopped. Without it every reload discarded the
+#:   observed part of the quarter it landed in, which failed the coverage threshold,
+#:   was never written, and left the civil day permanently unsealable -- a whole
+#:   day's accounting lost to a thirty-second options change. Additive and written
+#:   only at a graceful stop, so a beta.42 document and a crashed installation both
+#:   read back with the key absent, which means there is nothing to resume.
+STORAGE_MINOR_VERSION: Final = 9
 STORAGE_KEY_TEMPLATE: Final = f"{DOMAIN}.{{entry_id}}.learning"
 
 #: Config-entry schema version. v1 was the previous integration's source model,
@@ -2232,6 +2239,22 @@ ROI_MIN_SAMPLE_DAYS: Final = 30
 ROI_TRAILING_SHORT_DAYS: Final = 30
 ROI_TRAILING_LONG_DAYS: Final = 90
 
+#: How many past days one sealing pass may ask the forecast history to make
+#: reachable, oldest first. beta.50.
+#:
+#: **A bound on I/O, not on correctness.** A day older than yesterday keeps its
+#: price issuance in a month partition that is loaded on demand, and only today,
+#: tomorrow and yesterday are ever asked for during a refresh -- so a day that
+#: becomes sealable later has to have its month fetched deliberately. Fetching
+#: every candidate at once would, on the first refresh after an upgrade with a
+#: year of unsealed days behind it, load twelve partitions inside one refresh.
+#:
+#: A month at a time instead. The backlog then drains over successive refreshes --
+#: a full year inside about six hours at the quarter-hour cadence -- and a healthy
+#: installation asks for nothing at all, because the only candidate it ever has is
+#: yesterday and yesterday is already resident.
+ROI_SEAL_CANDIDATE_BATCH: Final = 31
+
 #: Why the return figure, or its payback half, is not being published.
 ROI_UNAVAILABLE_NO_INVESTMENT: Final = "no_investment_configured"
 ROI_UNAVAILABLE_NO_HISTORY: Final = "no_finalised_days"
@@ -2241,6 +2264,21 @@ ROI_PAYBACK_UNAVAILABLE_INSUFFICIENT_HISTORY: Final = "insufficient_history"
 #: published as one -- but dividing by it would produce either a division error or a
 #: date in the past, and both would read as a fact.
 ROI_PAYBACK_UNAVAILABLE_NO_BENEFIT: Final = "no_realised_benefit"
+
+#: Why a past day carries no sealed figure. beta.50 splits the price refusal.
+#:
+#: **One of these is transient and two are terminal, and the old single token
+#: could not say which.** ``price_snapshots`` returns an empty list both for a
+#: month whose partition is simply not in memory and for a month that never had an
+#: issuance, so a day that is complete and priced was refused for a reason that was
+#: not true -- and any classification built on the conflated token would file a
+#: perfectly sealable day as permanently lost.
+#:
+#: The discriminator costs nothing: ``DayIndexRow.price_fingerprints`` lives in the
+#: always-loaded index, expressly so a question like this need not load a partition.
+SEAL_REFUSED_PRICES_NEVER_STORED: Final = "prices_never_stored"
+SEAL_REFUSED_PRICE_PARTITION_UNLOADED: Final = "price_partition_unloaded"
+SEAL_REFUSED_PRICES_LOST: Final = "prices_lost"
 
 #: How the two price legs of the return figure were formed.
 #:

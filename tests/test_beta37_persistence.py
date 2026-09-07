@@ -100,7 +100,7 @@ def test_the_documented_store_versions_are_pinned() -> None:
     # reads back with both keys absent, which means no day has been sealed rather
     # than that the benefit was zero -- so the major staying at 2 is still the
     # load-bearing half.
-    assert STORAGE_MINOR_VERSION == 8
+    assert STORAGE_MINOR_VERSION == 9
     assert FORECAST_STORAGE_VERSION == 1
     assert FORECAST_STORAGE_MINOR_VERSION == 8
 

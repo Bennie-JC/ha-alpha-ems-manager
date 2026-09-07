@@ -356,10 +356,17 @@ def test_a_day_with_no_stored_prices_is_not_sealed_at_a_smaller_number(
     unpriced = yesterday - timedelta(days=1)
     coordinator.store.days[unpriced] = _complete_day(unpriced)
 
-    assert coordinator.day_finalizable(unpriced, today) == (False, "no_stored_prices")
+    # **The token narrowed in beta.50 and the day did not.** ``no_stored_prices``
+    # used to cover both a month that never had an issuance and one whose partition
+    # simply was not in memory, and only the first is a fact about the day. This day
+    # has no index row at all, so it is the terminal case.
+    assert coordinator.day_finalizable(unpriced, today) == (
+        False,
+        "prices_never_stored",
+    )
 
 
-def test_sealing_is_idempotent_across_repeated_refreshes(sealable) -> None:
+async def test_sealing_is_idempotent_across_repeated_refreshes(sealable) -> None:
     """The refresh runs every fifteen minutes and offers every retained past day.
 
     The second pass must seal nothing, or the lifetime total grows by one day's
@@ -367,12 +374,12 @@ def test_sealing_is_idempotent_across_repeated_refreshes(sealable) -> None:
     """
     coordinator, plan, _yesterday, today = sealable
 
-    assert coordinator.seal_finalizable_days(plan, today) == 1
-    assert coordinator.seal_finalizable_days(plan, today) == 0
-    assert coordinator.seal_finalizable_days(plan, today) == 0
+    assert await coordinator.async_seal_finalizable_days(plan, today) == 1
+    assert await coordinator.async_seal_finalizable_days(plan, today) == 0
+    assert await coordinator.async_seal_finalizable_days(plan, today) == 0
 
 
-def test_the_benefit_is_cash_only_and_no_battery_setting_can_move_it(
+async def test_the_benefit_is_cash_only_and_no_battery_setting_can_move_it(
     sealable,
 ) -> None:
     """**The boundary test on the investment-return numerator**, and it corrects a
@@ -396,7 +403,7 @@ def test_the_benefit_is_cash_only_and_no_battery_setting_can_move_it(
     limits = plan.state.limits
     record = coordinator.store.days[yesterday]
 
-    assert coordinator.seal_finalizable_days(plan, today) == 1
+    assert await coordinator.async_seal_finalizable_days(plan, today) == 1
     sealed = record.benefit_eur_final
     assert sealed is not None
 
@@ -411,10 +418,10 @@ def test_the_benefit_is_cash_only_and_no_battery_setting_can_move_it(
         ), (factor, efficiency)
 
     assert record.benefit_eur_final == sealed
-    assert coordinator.seal_finalizable_days(plan, today) == 0
+    assert await coordinator.async_seal_finalizable_days(plan, today) == 0
 
 
-def test_the_lifetime_total_reports_the_days_it_does_not_cover(sealable) -> None:
+async def test_the_lifetime_total_reports_the_days_it_does_not_cover(sealable) -> None:
     """A total missing one of its terms is a different number wearing the same name.
 
     So a retained past day carrying no sealed figure is counted and published rather
@@ -427,13 +434,13 @@ def test_the_lifetime_total_reports_the_days_it_does_not_cover(sealable) -> None
     """
     coordinator, plan, yesterday, today = sealable
 
-    coordinator.seal_finalizable_days(plan, today)
+    await coordinator.async_seal_finalizable_days(plan, today)
     before = coordinator.lifetime_benefit(today)
 
     gap = yesterday - timedelta(days=30)
     assert gap not in coordinator.store.days, "the added day must be a new one"
     coordinator.store.days[gap] = _complete_day(gap)
-    coordinator.seal_finalizable_days(plan, today)
+    await coordinator.async_seal_finalizable_days(plan, today)
     after = coordinator.lifetime_benefit(today)
 
     # The added day has no prices, so it cannot be sealed -- and it is reported as a
@@ -552,7 +559,7 @@ def test_the_counterfactual_is_differenced_against_the_meter_it_is_compared_to(
     )
 
 
-def test_a_sealed_day_is_never_priced_again(sealable) -> None:
+async def test_a_sealed_day_is_never_priced_again(sealable) -> None:
     """The pass runs every fifteen minutes over every retained past day.
 
     Re-pricing a sealed one cannot change its figure -- the write-once guard sees to
@@ -570,10 +577,10 @@ def test_a_sealed_day_is_never_priced_again(sealable) -> None:
 
     coordinator._day_benefit_eur = _counting
     try:
-        assert coordinator.seal_finalizable_days(plan, today) == 1
+        assert await coordinator.async_seal_finalizable_days(plan, today) == 1
         assert priced == [yesterday]
         priced.clear()
-        assert coordinator.seal_finalizable_days(plan, today) == 0
+        assert await coordinator.async_seal_finalizable_days(plan, today) == 0
         assert priced == []
     finally:
         coordinator._day_benefit_eur = original

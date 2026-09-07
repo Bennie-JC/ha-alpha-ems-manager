@@ -1057,6 +1057,23 @@ class LearningStore:
         #: computed over only what is still on disk would climb every time a day
         #: aged out, on a figure whose whole purpose is to stay put.
         self.sealed_day_count: int = 0
+        #: The partial integral of the quarter still open when the process stopped,
+        #: so a graceful restart can resume it rather than discard it. beta.50.
+        #:
+        #: **A reload used to cost a whole day's accounting.** The accumulators live
+        #: in memory and ``async_start`` builds fresh ones on every setup, so the
+        #: quarter a reload landed in closed on the observed remainder alone, failed
+        #: the coverage threshold, and was never written. ``day_finalizable`` needs
+        #: every interval, and nothing writes one retroactively, so that civil day
+        #: could never be sealed again -- a thirty-second options change, and a day
+        #: of realised benefit gone for good.
+        #:
+        #: Written only by the graceful-stop flush, never by the debounced save, so
+        #: it is absent throughout normal operation. A crash therefore leaves nothing
+        #: to resume and degrades to exactly the old behaviour, which is the correct
+        #: asymmetry and falls out of where it is written rather than from a
+        #: heuristic about how the process died.
+        self.open_integration: dict[str, Any] | None = None
         #: Set when a pre-v2 document was discarded by the migration guard.
         self.reset_by_migration = False
 
@@ -1170,6 +1187,15 @@ class LearningStore:
                         else 0
                     )
 
+        # Absent on every document written before beta.50, and absent after a crash,
+        # because only the graceful-stop flush writes it. Absence means there is
+        # nothing to resume -- never that the quarter was measured at zero. Shape is
+        # validated by the accumulator's own ``restore``; this only has to hand back
+        # something dict-shaped or nothing at all.
+        open_integration = raw.get("open_integration")
+        if isinstance(open_integration, dict):
+            self.open_integration = dict(open_integration)
+
         # Additive since beta.31, so a document written by any earlier release
         # simply has no decisions and starts collecting them. Read defensively:
         # a malformed list costs the replay history and must not cost the load.
@@ -1213,6 +1239,11 @@ class LearningStore:
             # from an installation that has never armed anything is byte-identical
             # to a beta.18 one.
             payload["execution"] = execution
+        if self.open_integration is not None:
+            # Omitted unless a graceful stop is actually in progress, exactly as
+            # ``execution`` is omitted while nothing has been armed. So the ninety-odd
+            # debounced writes a day are byte-identical to a beta.42 document.
+            payload["open_integration"] = dict(self.open_integration)
         if self.sealed_through is not None:
             # Omitted until the first day is sealed, exactly as ``execution`` is.
             payload["sealed"] = {
@@ -1264,6 +1295,7 @@ class LearningStore:
         self.campaign_lifecycle = None
         self.campaign_announcement = None
         self.closed_lifecycle.clear()
+        self.open_integration = None
         await self._store.async_remove()
 
     def get_or_create(self, day: date, tz: Any) -> DayRecord:

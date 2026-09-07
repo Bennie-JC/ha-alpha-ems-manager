@@ -524,6 +524,19 @@ class ForecastHistoryStore:
         for key in sorted({month_key(day) for day in days}):
             await self.async_partition(key)
 
+    def partition_loaded(self, day: date) -> bool:
+        """Return whether the month partition covering ``day`` is in memory. beta.50.
+
+        **Answers "can I read this day's evidence right now?" without reading it.**
+        Every reader below returns an empty result for a partition that is not
+        resident, which is indistinguishable from a month that genuinely holds
+        nothing -- and for the sealing pass those two are a transient condition and a
+        permanent one. This is the seam that separates them, and it is deliberately
+        a dictionary membership test: no disk, no await, so a synchronous predicate
+        can use it.
+        """
+        return month_key(day) in self._partitions
+
     def writable(self, day: date) -> bool:
         """Return whether evidence for a target day may be written right now."""
         if self.corrupt:

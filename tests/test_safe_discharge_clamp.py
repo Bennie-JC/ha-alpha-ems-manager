@@ -1163,7 +1163,7 @@ def test_the_clamp_changed_no_persisted_schema() -> None:
     # corrected battery capacity cannot rewrite a lifetime figure and an evicted
     # day still counts toward it. Additive, and the *major* staying at 2 is the
     # half that guarantees every earlier document is read rather than discarded.
-    assert STORAGE_MINOR_VERSION == 8
+    assert STORAGE_MINOR_VERSION == 9
     assert FORECAST_STORAGE_MINOR_VERSION == 8
 
     for module in (storage, history_store):

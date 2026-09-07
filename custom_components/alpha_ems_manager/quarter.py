@@ -217,6 +217,78 @@ class QuarterAccumulator:
         """Return the energy accrued so far in the open quarter."""
         return self._energy_wh / 1000.0
 
+    @property
+    def slot_start_utc(self) -> datetime | None:
+        """Return the instant the open quarter began, or ``None`` if none is."""
+        return self._slot_start
+
+    @property
+    def cursor_utc(self) -> datetime | None:
+        """Return the instant integration has reached, or ``None`` if unstarted."""
+        return self._cursor
+
+    def snapshot(self) -> dict[str, float] | None:
+        """Return the open quarter's accrued integral, or ``None``. beta.50.
+
+        Scalars only. The instants are the caller's to record, because every
+        accumulator in a set is advanced from the same moment and five copies free
+        to disagree would be a new failure mode for nothing.
+        """
+        if self._slot_start is None or self._cursor is None:
+            return None
+        return {"wh": self._energy_wh, "s": self._valid_seconds}
+
+    def restore(
+        self,
+        *,
+        slot_start_utc: datetime,
+        cursor_utc: datetime,
+        energy_wh: float,
+        valid_seconds: float,
+    ) -> bool:
+        """Resume a quarter that was open when the process stopped. beta.50.
+
+        Returns whether the state was adopted; a refusal mutates nothing, so a
+        caller restoring a set can abandon the whole set on the first rejection.
+
+        **The held power is deliberately not restored, and that omission is the
+        whole of this method's honesty.** ``_advance_to`` accrues energy and
+        coverage across a gap whenever a held value exists and the gap is under
+        :data:`~.const.MAX_SAMPLE_GAP_SECONDS`. Restoring the pre-shutdown reading
+        would therefore integrate it straight across a two-minute downtime and
+        credit the quarter with time nobody observed -- fabricating load across an
+        outage, which is the one thing this module exists to refuse. Left unset,
+        the resume gap contributes nothing and the quarter closes at exactly
+        ``(900 - downtime) / 900``. Honest by construction rather than by a new
+        tolerance.
+
+        Coverage still being measured against the whole quarter is what keeps this
+        from being a way to accept a short quarter: a long outage simply produces a
+        rejection with a true coverage figure, where today it produces silence.
+        """
+        if self._cursor is not None:
+            return False
+        if slot_start_utc != floor_to_quarter_utc(cursor_utc, self._tz):
+            return False
+        if not slot_start_utc <= cursor_utc < slot_start_utc + _QUARTER:
+            return False
+        for value in (energy_wh, valid_seconds):
+            if value != value or value in (float("inf"), float("-inf")) or value < 0.0:
+                return False
+        if valid_seconds > QUARTER_SECONDS:
+            return False
+        if energy_wh > MAX_PLAUSIBLE_LOAD_W * QUARTER_SECONDS / 3600.0:
+            # Every contributing sample passed a sanitiser, so a figure above the
+            # ceiling a full quarter at maximum plausible power could reach is a
+            # corrupt document rather than a large house.
+            return False
+        self._slot_start = slot_start_utc
+        self._cursor = cursor_utc
+        self._energy_wh = energy_wh
+        self._valid_seconds = valid_seconds
+        self._held_value_w = None
+        return True
+
     # -- input -----------------------------------------------------------
 
     def add_sample(

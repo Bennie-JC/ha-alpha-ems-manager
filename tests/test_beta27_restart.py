@@ -287,13 +287,21 @@ async def test_the_tick_writes_nothing_while_waiting_for_a_quarter(
 
 
 def test_the_storage_version_is_unchanged() -> None:
-    """Nothing about the *restart* is persisted, so nothing needs migrating.
+    """Execution progress is still not persisted, and beta.50 does not change that.
 
     ``CarriedQuarter`` is in-memory by design: persisting it would create exactly
     the situation this file exists to avoid -- an envelope restored without the
     measured progress that gives it meaning. beta.39's opening valuation is a
-    civil-day boundary figure and carries no execution state, so it changes
-    nothing about what this file pins.
+    civil-day boundary figure and carries no execution state.
+
+    **beta.50 persists something across a restart for the first time, and it is
+    deliberately the other kind of state.** ``open_integration`` is the partial
+    *measurement* integral of the quarter that was open when the process stopped --
+    metering, not intent. Restoring it re-establishes what the meter had already
+    observed; restoring a carried quarter would re-establish a claim about what the
+    battery was told to do, which is the thing that must always be re-derived. The
+    distinction is the whole reason one is safe and the other is not, and
+    ``test_the_quarter_is_not_written_to_the_store`` below still holds the line.
     """
     # **8 since beta.42**, which adds two more optional keys, both so a lifetime
     # figure cannot move when a setting is edited: ``bf`` per day -- the realised
@@ -303,7 +311,12 @@ def test_the_storage_version_is_unchanged() -> None:
     # reads back with both keys absent, which means no day has been sealed rather
     # than that the benefit was zero -- so the major staying at 2 is still the
     # load-bearing half.
-    assert STORAGE_MINOR_VERSION == 8
+    # **9 since beta.50**, which adds ``open_integration``: the partial integral of
+    # the quarter still open at a graceful stop. Additive and written only by the
+    # stop flush, so a beta.42 document and a crashed installation both read back
+    # with the key absent -- meaning there is nothing to resume, never that the
+    # quarter measured zero. No migration and no reset, so the major stays at 2.
+    assert STORAGE_MINOR_VERSION == 9
 
 
 def test_the_quarter_is_not_written_to_the_store() -> None:

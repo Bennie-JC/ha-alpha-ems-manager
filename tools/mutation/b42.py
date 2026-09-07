@@ -94,11 +94,11 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         f"{FINAL}::test_an_expected_but_unrecorded_flexible_load_withholds_the_seal",
     ),
     (
-        "F5: a day with no stored prices seals at whatever it could price",
+        "F5: a day with no reachable prices seals at whatever it could price",
         "coordinator.py",
-        "        if self._prices_for_day(day, count) is None:\n"
-        '            return False, "no_stored_prices"',
-        '        if False:\n            return False, "no_stored_prices"',
+        "        if self._prices_for_day(day, count) is not None:\n"
+        '            return True, "finalizable"',
+        '        if True:\n            return True, "finalizable"',
         f"{FINAL}::test_a_day_with_no_stored_prices_is_not_sealed_at_a_smaller_number",
     ),
     (
