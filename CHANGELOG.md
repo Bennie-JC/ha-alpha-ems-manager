@@ -9,6 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.51] - 2026-09-08
+
+**A lifetime figure that stops moving can now say what it is waiting for.**
+
+No planner change, no economics, no Stage A, no Stage B, no dispatch, no campaign
+lifecycle, no export behaviour, no reserve, no safety, no config flow, no storage
+change. Every published euro figure is computed exactly as it was in beta.50.
+
+## The refusal was worked out and thrown away
+
+The sealing pass has always asked, for every retained past day, whether it can be
+sealed and why not -- and then kept only the yes or no. So an operator watching the
+return sit still had nothing to go on. The per-session rejection counters could not
+help either: they are reset by the very restart that made the hole.
+
+Every unsealed past day is now counted under a named refusal, with the last seven
+listed individually beside the counts. The counts stay complete; only the per-day
+detail is trimmed, because attributes are re-read on every state update.
+
+The refusals are split into the ones that are final and the ones that are not.
+Nothing writes a measured interval retroactively and a past day can never gain a
+price issuance, so those are finished. A day whose price partition simply is not
+loaded gets it on the next pass. Reporting both as "unsealed" was true and useless.
+
+## A completeness claim that never looked inside its own span
+
+`lifetime_history_complete` compared the first day of evidence against the purchase
+date and nothing else. On an installation with a three-week hole in the middle of
+its accounting period it read `true`.
+
+It now also requires that no day inside the period is unsealed, and publishes
+`unsealed_days_in_accounting_period` beside it -- a number, where there was a
+boolean that could not be wrong in the direction that mattered. When it is false it
+names why: no purchase date, evidence starting after the purchase, or days missing
+inside the period.
+
+Holes *before* the purchase date are published as `unresolved_holes_total` and do
+not make the flag false. They reach no figure the return is built from, and letting
+them pin it false forever would make the flag useless on exactly the installations
+with the most history. Counted, not weighed, and not hidden.
+
+## Days that sealed at a quietly short number
+
+The predicate has claimed in prose since beta.42 that nothing is skipped for want of
+a price. It never checked. It confirmed that a price *object* came back, while the
+lists inside it carry gaps wherever an interval was never published -- and it made
+no check at all on generation or the two grid legs.
+
+What that cost is not noise. An interval that cannot be valued is dropped, an
+interval with neither grid figure is dropped, and the no-battery comparison needs
+generation the actual legs do not -- so a missing generation quarter removed the
+avoided-import term while the legs it is differenced against still counted. Every
+omission shrinks the day in the same direction.
+
+Such a day is now refused rather than sealed short, exactly as a day short an
+interval is. Days already sealed are untouched: the figure is written once and the
+pass skips a day that has one, so nothing is retroactively unsealed. Generation is
+only required where a source was configured to produce it.
+
+## Also
+
+The export-price basis was cached against a count that moves only when a day is
+evicted at the retention edge, while the work it guarded walks the days that are
+still retained. An ordinary seal therefore left a stale basis published until the
+civil day turned. Latent while sealing was broken; corrected before it could bite.
+
 ## [1.0.0-beta.50] - 2026-09-08
 
 **Two ways a finished day was locked out of the lifetime return, and both are fixed.**

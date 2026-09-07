@@ -2280,6 +2280,42 @@ SEAL_REFUSED_PRICES_NEVER_STORED: Final = "prices_never_stored"
 SEAL_REFUSED_PRICE_PARTITION_UNLOADED: Final = "price_partition_unloaded"
 SEAL_REFUSED_PRICES_LOST: Final = "prices_lost"
 
+#: Refusals that no later evidence can lift. beta.51.
+#:
+#: **Terminal is a claim about the future, so it is derived and never stored.** A
+#: persisted flag would go stale the moment a repair landed. Nothing writes
+#: ``measured[i]`` retroactively and a past day can never gain a price issuance, so
+#: those refusals are final; a partition that is merely not loaded is not, and
+#: filing it here would be the same error the conflated price token was.
+SEAL_TERMINAL_REFUSALS: Final = (
+    "intervals_missing",
+    "load_boundary_incomplete",
+    "price_hole",
+    "production_incomplete",
+    "grid_flows_incomplete",
+    SEAL_REFUSED_PRICES_NEVER_STORED,
+    SEAL_REFUSED_PRICES_LOST,
+)
+
+#: How many holed days are published individually beside their counts. beta.51.
+#:
+#: The counts stay complete; only the per-day detail is trimmed. Attributes are
+#: re-read on every state update, so a year of entries here would be a performance
+#: defect delivered alongside a correctness fix -- and a week is the window an
+#: operator can actually act on.
+MAX_UNSEALED_DAYS_PUBLISHED: Final = 7
+
+#: Why the lifetime figure cannot claim to cover the whole accounting period.
+#:
+#: Scoped to ``[accounting_start_date, today)`` deliberately. A hole before the
+#: battery was bought reaches no published figure once the accounting has its hard
+#: lower bound, and letting it pin the flag false forever would make the flag
+#: useless precisely on the installations with the most history. It is published
+#: under ``unresolved_holes_total`` instead, so nothing is hidden.
+LIFETIME_INCOMPLETE_NO_INVESTMENT_DATE: Final = "no_investment_date"
+LIFETIME_INCOMPLETE_HISTORY_STARTS_LATE: Final = "history_starts_after_investment"
+LIFETIME_INCOMPLETE_DAYS_MISSING: Final = "days_missing_inside_period"
+
 #: How the two price legs of the return figure were formed.
 #:
 #: **Named in one string because the caveat has to travel with the number.** The

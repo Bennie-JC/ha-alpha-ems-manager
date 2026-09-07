@@ -257,6 +257,9 @@ from .const import (
     LIFECYCLE_STOPPING,
     LIFECYCLE_TRAIL_LIMIT,
     LIFECYCLE_UNPROVEN,
+    LIFETIME_INCOMPLETE_DAYS_MISSING,
+    LIFETIME_INCOMPLETE_HISTORY_STARTS_LATE,
+    LIFETIME_INCOMPLETE_NO_INVESTMENT_DATE,
     LOG_THROTTLE_SECONDS,
     MAX_ABORTED_CAMPAIGNS_REMEMBERED,
     MAX_ARM_MEASUREMENTS_REPORTED,
@@ -270,6 +273,7 @@ from .const import (
     MAX_PHYSICAL_DECISIONS_REPORTED,
     MAX_QUARTER_REFUSALS_RECORDED,
     MAX_SAMPLE_GAP_SECONDS,
+    MAX_UNSEALED_DAYS_PUBLISHED,
     METER_AUDIT_EXACT,
     METER_AUDIT_EXPLAINED,
     METER_AUDIT_TOLERANCE_KWH,
@@ -356,6 +360,7 @@ from .const import (
     SEAL_REFUSED_PRICE_PARTITION_UNLOADED,
     SEAL_REFUSED_PRICES_LOST,
     SEAL_REFUSED_PRICES_NEVER_STORED,
+    SEAL_TERMINAL_REFUSALS,
     SELECT_INVERTER_AC_LIMIT,
     SHORTFALL_ABSORBING_FREE_PV,
     SHORTFALL_NONE,
@@ -1947,6 +1952,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: computed for. See :meth:`_roi_price_basis` for why an entity read must
         #: not walk a year of stored issuances.
         self._roi_basis_cache: tuple[tuple[Any, ...], dict[str, Any]] | None = None
+        #: Memo for :meth:`unsealed_day_reasons`, on the same terms. beta.51.
+        self._unsealed_reasons_cache: tuple[Any, dict[str, Any]] | None = None
         #: The finished campaign, latched. **Not consumed on read**: the surfaces
         #: make it fire once through their own ``closed`` set, and a latch a reader
         #: could exhaust would be a terminal that depends on who looked first.
@@ -11881,13 +11888,46 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             start = max(configured, available)
         elif configured:
             start = configured
-        complete = bool(configured and available and available <= configured)
+        reasons = self.unsealed_day_reasons(today)
+        inside = 0
+        if start is not None:
+            boundary = date.fromisoformat(start)
+            inside = sum(
+                1
+                for day, record in self.store.days.items()
+                if boundary <= day < today and record.final_benefit is None
+            )
+        # **A completeness claim that never looked inside its own span.** The old
+        # test compared two endpoints, so it read ``true`` over a three-week hole in
+        # the middle -- on the installation that prompted this, while not one day
+        # inside the accounting period was sealed at all.
+        if not configured:
+            incomplete_reason = LIFETIME_INCOMPLETE_NO_INVESTMENT_DATE
+        elif not available or available > configured:
+            incomplete_reason = LIFETIME_INCOMPLETE_HISTORY_STARTS_LATE
+        elif inside:
+            incomplete_reason = LIFETIME_INCOMPLETE_DAYS_MISSING
+        else:
+            incomplete_reason = None
+        complete = incomplete_reason is None
         return {
             "investment_date": configured,
             "history_available_since": available,
             "accounting_start_date": start,
             "sealed_through": lifetime["sealed_through"],
             "unsealed_past_days": lifetime["unsealed_past_days"],
+            # **Scoped to the accounting period, with the rest published beside it.**
+            # A hole before the purchase reaches no figure the return is built from,
+            # so letting it pin the flag false forever would make the flag useless on
+            # exactly the installations that have the most history. It is counted
+            # under ``unresolved_holes_total`` instead: not weighed, but not hidden.
+            "unsealed_days_in_accounting_period": inside,
+            "unresolved_holes_total": reasons["unsealed_past_days"],
+            "unsealed_by_reason": reasons["unsealed_by_reason"],
+            "unsealed_recent": reasons["unsealed_recent"],
+            "terminally_unsealable_days": reasons["terminally_unsealable_days"],
+            "retryable_unsealed_days": reasons["retryable_unsealed_days"],
+            "lifetime_history_incomplete_reason": incomplete_reason,
             # **The split, because the two halves have different evidence behind
             # them.** The retained half can still be checked against the day records
             # on disk; the evicted half cannot, and a reader auditing the figure
@@ -11921,7 +11961,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # day, when a day is sealed. The key is the sealed-day count and the civil
         # day, which are exactly the two things that can move the answer: a new
         # seal, or midnight bringing a different fallback into view.
-        key = (len(self.store.days), self.store.sealed_day_count, today)
+        # **The retained count belongs in the key and was missing from it.** The
+        # body below walks the days carrying a sealed figure, but the key tracked
+        # only ``sealed_day_count`` -- which moves at the 365-day retention edge and
+        # nowhere else. So an ordinary seal, the common case and the one the comment
+        # claimed was covered, left a stale basis served until the civil day turned.
+        key = (
+            len(self.store.days),
+            self.store.sealed_day_count,
+            sum(
+                1
+                for record in self.store.days.values()
+                if record.final_benefit is not None
+            ),
+            today,
+        )
         cached = self._roi_basis_cache
         if cached is not None and cached[0] == key:
             return dict(cached[1])
@@ -12182,7 +12236,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         usable, reason = self._day_data_complete(record)
         if not usable:
             return False, reason
-        return self._day_prices_reachable(day, record.interval_count)
+        count = record.interval_count
+        reachable, reason = self._day_prices_reachable(day, count)
+        if not reachable:
+            return False, reason
+        return self._day_value_complete(record, day, count)
 
     @callback
     def _day_data_complete(self, record: Any) -> tuple[bool, str]:
@@ -12238,6 +12296,126 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self.history.partition_loaded(day):
             return False, SEAL_REFUSED_PRICE_PARTITION_UNLOADED
         return False, SEAL_REFUSED_PRICES_LOST
+
+    @callback
+    def _day_value_complete(
+        self, record: Any, day: date, count: int
+    ) -> tuple[bool, str]:
+        """Return whether every term of the day's benefit exists. beta.51.
+
+        **The clause this predicate has claimed in prose since beta.42 and never
+        implemented.** Its own docstring says nothing is skipped for want of a price;
+        the code only confirmed that a price *object* came back, and the lists inside
+        it carry ``None`` wherever an interval was never published.
+
+        What that costs is not noise. The realised window drops an interval it cannot
+        value and an interval with neither grid figure, and the counterfactual leg
+        needs production the actual legs do not -- so a missing generation quarter
+        removes the avoided-import term while the import and export legs it is
+        differenced against still count. Every one of those omissions shrinks the day
+        in the same direction, so a lifetime sum of quietly short days is biased
+        rather than merely imprecise.
+
+        A day short one of these is therefore not sealed at a smaller number. It is
+        not sealed, exactly as a day short an interval is not, and for the same
+        reason.
+
+        Generation is only required where a source was configured to produce it. On a
+        site without panels a zero is a known fact rather than a gap, which is how
+        ``read_flows`` already treats it.
+        """
+        resolved = self._prices_for_day(day, count)
+        if resolved is None:
+            # Unreachable: the caller checked reachability first. Refusing rather
+            # than assuming keeps the two independent.
+            return False, SEAL_REFUSED_PRICES_LOST
+        buy, _sell, _basis = resolved
+        if any(buy[index] is None for index in range(count)):
+            return False, "price_hole"
+        if (
+            self.config.has_pv
+            and self.config.pv_power_entity
+            and any(record.pv_at(index) is None for index in range(count))
+        ):
+            return False, "production_incomplete"
+        if any(
+            record.grid_import_at(index) is None or record.grid_export_at(index) is None
+            for index in range(count)
+        ):
+            return False, "grid_flows_incomplete"
+        return True, "finalizable"
+
+    @callback
+    def unsealed_day_reasons(self, today: date) -> dict[str, Any]:
+        """Return why each retained past day carries no sealed figure. beta.51.
+
+        **The reason was computed on every refresh and dropped on the floor.** The
+        sealing pass asks the predicate about every retained past day and keeps only
+        the yes-or-no, so a lifetime figure that had stopped moving could not say what
+        it was waiting for -- and the per-session rejection counters cannot answer it
+        either, because they are reset by the very restart that made the hole.
+
+        **Terminal is derived, never stored.** A persisted flag would go stale the
+        instant a repair landed. The distinction matters: a day short an interval can
+        never gain one, while a day whose price partition is simply not resident gets
+        it on the next pass, and reporting those two the same way would be true and
+        useless.
+
+        Memoised, because this is read from an entity. Home Assistant re-reads
+        attributes on every state update and the walk below is a year of days times
+        their intervals; the answer changes at most once a quarter, when a quarter
+        finalises or a day seals, so that is what the key tracks.
+        """
+        retained_sealed = sum(
+            1 for record in self.store.days.values() if record.final_benefit is not None
+        )
+        key = (
+            len(self.store.days),
+            self.store.sealed_day_count,
+            retained_sealed,
+            today,
+            self.last_finalized_quarter,
+        )
+        cached = self._unsealed_reasons_cache
+        if cached is not None and cached[0] == key:
+            return dict(cached[1])
+
+        by_reason: dict[str, int] = {}
+        recent: list[dict[str, str]] = []
+        terminal = 0
+        total = 0
+        for day in sorted(self.store.days, reverse=True):
+            if day >= today:
+                continue
+            record = self.store.days[day]
+            if record.final_benefit is not None:
+                continue
+            _usable, reason = self.day_finalizable(day, today)
+            total += 1
+            _tally(by_reason, reason)
+            # A day that only closed yesterday may still be waiting for the quarter
+            # that spans midnight, so it is not called finished yet.
+            if reason in SEAL_TERMINAL_REFUSALS and day < today - timedelta(days=1):
+                terminal += 1
+            if len(recent) < MAX_UNSEALED_DAYS_PUBLISHED:
+                recent.append({"d": day.isoformat(), "r": reason})
+
+        unsealed = sorted(
+            day
+            for day, record in self.store.days.items()
+            if day < today and record.final_benefit is None
+        )
+        published = {
+            "unsealed_past_days": total,
+            "unsealed_by_reason": by_reason,
+            "unsealed_recent": recent,
+            "first_unsealed_day": unsealed[0].isoformat() if unsealed else None,
+            "last_unsealed_day": unsealed[-1].isoformat() if unsealed else None,
+            "terminally_unsealable_days": terminal,
+            "retryable_unsealed_days": total - terminal,
+        }
+        self._unsealed_reasons_cache = (key, published)
+        return dict(published)
 
     @callback
     def _prices_for_day(
