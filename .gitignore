@@ -263,3 +263,6 @@ tools/mutation/.lock
 # per-release diff of 4800 timings is noise no reviewer can read.
 junit-*.xml
 tools/timings-*.xml
+
+# Local AI working files
+.local-ai/
