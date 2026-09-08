@@ -242,10 +242,34 @@ async def test_both_sources_changing_inside_one_quarter(
     assert record.baseline_at(SLOT) == pytest.approx(0.5, rel=5e-2)
 
 
-async def test_a_reload_mid_quarter_drops_only_the_open_interval(
+async def test_a_reload_mid_quarter_keeps_both_legs_of_the_open_interval(
     hass: HomeAssistant, freezer, config_data: dict
 ) -> None:
-    """Reloading discards the in-flight interval and resumes cleanly."""
+    """**A graceful reload resumes the open interval; it no longer discards it.**
+
+    Until beta.50 this test asserted the opposite, and the assertion was right about
+    the code and wrong about the world. Reloading rebuilt every accumulator from
+    scratch, so the eight minutes already integrated were thrown away, the quarter
+    closed on the remaining seven and failed the coverage threshold -- and because a
+    measured interval is never written retroactively, that civil day could never be
+    sealed again. A thirty-second options change cost a whole day of accounting.
+
+    The partial integral is now recorded at a graceful stop and resumed on the next
+    start, so the interrupted quarter completes normally.
+
+    **The two legs must resume together, which is what this file is really about.**
+    House load alone decides whether the interval is written at all, so it looks like
+    the only one that matters. It is not: resuming it while the charger started from
+    zero would write ``ev_expected`` against an ``ev`` that is still ``None``, and
+    ``baseline_at`` would then refuse the interval as unknown by exactly the amount
+    nobody measured. The baseline assertion below is the one that would catch that --
+    the measured figure would look perfectly healthy.
+
+    Downtime is not a factor here: the freezer does not advance across the reload, so
+    every second of the quarter really was observed. What an unobserved stretch does
+    to a resumed quarter belongs with the resume machinery, and
+    ``test_beta50_measurement_holes`` holds it.
+    """
     entry = await setup_entry(hass, freezer, config_data, 9000.0, 7000.0)
     await drive(
         hass,
@@ -261,7 +285,7 @@ async def test_a_reload_mid_quarter_drops_only_the_open_interval(
     await hass.config_entries.async_reload(entry.entry_id)
     await hass.async_block_till_done()
 
-    # Finish this quarter (partial, so rejected) and run a full clean one.
+    # Finish the interrupted quarter, then run a full clean one beside it.
     await drive(
         hass,
         freezer,
@@ -274,8 +298,18 @@ async def test_a_reload_mid_quarter_drops_only_the_open_interval(
     )
 
     record = entry.runtime_data.store.days[TODAY]
-    # The interrupted 10:00 interval never reached the coverage threshold.
-    assert record.measured[SLOT] is None
-    # The next full interval is measured and its baseline is correct.
+
+    # The interrupted 10:00 interval survived the reload and completed.
+    assert record.measured[SLOT] == pytest.approx(2.25, rel=1e-2)
+    # And its flexible-load leg came back with it, or the baseline would be ``None``.
+    assert record.ev[SLOT] == pytest.approx(1.75, rel=1e-2)
+    assert record.baseline_at(SLOT) == pytest.approx(0.5, rel=1e-2)
+
+    # **The no-double-counting pin, and it needs no tolerance to make its point.**
+    # A quarter split eight minutes either side of a reload holds exactly what an
+    # uninterrupted one holds. Seconds counted twice would show up here as an excess
+    # over the clean neighbour, and 9 kW across a quarter is 2.25 kWh whichever way
+    # the quarter was assembled.
     assert record.measured[SLOT + 1] == pytest.approx(2.25, rel=1e-2)
+    assert record.measured[SLOT] == pytest.approx(record.measured[SLOT + 1], rel=1e-3)
     assert record.baseline_at(SLOT + 1) == pytest.approx(0.5, rel=1e-2)
