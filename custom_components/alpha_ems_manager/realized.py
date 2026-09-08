@@ -63,6 +63,10 @@ from .const import (
     ACCOUNTING_BASIS_POSITION,
     ACCOUNTING_RECONCILIATION_TOLERANCE_EUR,
     AVOIDANCE_BASIS_NO_BATTERY,
+    DECOMPOSITION_BASIS,
+    DECOMPOSITION_UNAVAILABLE_COVERAGE_INCOMPLETE,
+    DECOMPOSITION_UNAVAILABLE_NO_EVIDENCE,
+    DECOMPOSITION_UNAVAILABLE_SELL_PRICE_MISSING,
     LEDGER_BASIS_ATTRIBUTED,
     LEDGER_BASIS_ESTIMATED,
     LEDGER_BASIS_FORECAST,
@@ -140,6 +144,29 @@ class RealizedWindow:
     #: ``intervals_priced`` wherever load or production was missing, and published
     #: so a partial comparison is visible rather than merely smaller.
     counterfactual_intervals_priced: int = 0
+
+    # -- beta.53: the value decomposition, and the two counts that gate it ------
+    #
+    #: What the whole house load would have cost with no array and no battery:
+    #: ``SUM p*L`` over the counterfactual's own intervals.
+    #:
+    #: **World 0, and the only new accumulator the decomposition needed.** It shares
+    #: the counterfactual's exact interval gate, which is what makes the
+    #: self-consumption component ``SUM p*min(L, PV)`` over the same interval set
+    #: rather than a near-miss of it. ``None`` where no counterfactual exists.
+    realized_gross_load_value_eur: float | None = None
+    #: How many counterfactual intervals spilled production with no sell price
+    #: recorded.
+    #:
+    #: **The measure of a defect this release does not repair.** ``no_battery_export``
+    #: accumulates on every counterfactual interval while ``no_battery_revenue``
+    #: accumulates only where a sell price exists, so each of these intervals
+    #: contributes kilowatt-hours at zero revenue: the counterfactual export revenue
+    #: is understated and ``battery_benefit_eur`` correspondingly overstated. Both are
+    #: sealed figures with a recovery percentage built on them, so correcting them
+    #: needs its own release and a migration. What this count does is make the size
+    #: of it measurable, and make the *new* figures refuse to inherit it.
+    counterfactual_intervals_missing_sell_price: int = 0
 
     # -- beta.35: the attributed split, and the model terms kept out of cash ----
     #
@@ -262,6 +289,109 @@ class RealizedWindow:
         return round(counterfactual - self.realized_net_cash_flow_eur, _EUR_DECIMALS)
 
     @property
+    def decomposition_unavailable_reason(self) -> str | None:
+        """Return why the value decomposition withheld a figure, or ``None``.
+
+        **The first failing gate, most fundamental first**, so a reader is told the
+        thing they can act on rather than the last thing that happened to be checked.
+        ``None`` means every gate passed and all four figures below are published.
+
+        Individual components apply this verdict selectively: self-consumption is
+        priced on the import leg alone, so the export-price hole cannot reach it and
+        withholding it too would refuse an answer that is provably sound. See
+        :data:`const.DECOMPOSITION_BASIS`.
+        """
+        if (
+            self.realized_gross_load_value_eur is None
+            or self.realized_no_battery_cost_eur is None
+            or self.counterfactual_intervals_priced <= 0
+        ):
+            return DECOMPOSITION_UNAVAILABLE_NO_EVIDENCE
+        if self.counterfactual_intervals_missing_sell_price > 0:
+            return DECOMPOSITION_UNAVAILABLE_SELL_PRICE_MISSING
+        if self.counterfactual_intervals_priced != self.intervals_priced:
+            return DECOMPOSITION_UNAVAILABLE_COVERAGE_INCOMPLETE
+        return None
+
+    @property
+    def realized_self_consumption_value_eur(self) -> float | None:
+        """Return what using the array's own output saved, at the time it was made.
+
+        ``SUM p*min(L, PV)``, reached as ``gross_load_value - no_battery_cost``: the
+        import leg of the transition from a household with nothing to a household
+        with an array. Both terms are priced on the import leg alone, so this is the
+        one component the known export-price hole cannot bias -- a precise split,
+        not a convenience.
+
+        **Production that went into the pack is not here.** It was not consumed as it
+        was made, so ``min(L, PV)`` excludes it, and it appears exactly once inside
+        the load-shifting term instead.
+        """
+        gross = self.realized_gross_load_value_eur
+        avoided = self.realized_no_battery_cost_eur
+        if gross is None or avoided is None:
+            return None
+        if self.counterfactual_intervals_priced <= 0:
+            return None
+        return round(gross - avoided, _EUR_DECIMALS)
+
+    @property
+    def realized_export_value_eur(self) -> float | None:
+        """Return what a household with the same array and no battery would sell.
+
+        The export leg of the same first transition, and deliberately **not** the
+        measured meter export: ``export_revenue_eur`` includes energy the battery
+        sent to the grid, which belongs to the shifting term, and using it here
+        would count one sale twice.
+
+        Withheld where any counterfactual interval spilled production with no sell
+        price, because that is exactly the amount by which this figure is
+        understated. See :attr:`counterfactual_intervals_missing_sell_price`.
+        """
+        if self.counterfactual_intervals_missing_sell_price > 0:
+            return None
+        if self.realized_gross_load_value_eur is None:
+            return None
+        return self.realized_no_battery_export_revenue_eur
+
+    @property
+    def realized_load_shifting_value_eur(self) -> float | None:
+        """Return what operating the battery changed, in cash.
+
+        The second transition entire, and identically
+        :attr:`realized_battery_benefit_eur` -- not a second derivation of it, because
+        two derivations of one number is how two published figures come to disagree
+        and this one is the investment return's numerator.
+
+        Withheld under either gate. It inherits the export-price hole with the
+        opposite sign to the component above, and it is the one figure that spans
+        both interval sets: actual cash accumulates on every priced interval while
+        the counterfactual needs a load and a production reading too, so where the
+        two counts differ the comparison is not like for like.
+        """
+        if self.decomposition_unavailable_reason is not None:
+            return None
+        return self.realized_battery_benefit_eur
+
+    @property
+    def realized_energy_value_eur(self) -> float | None:
+        """Return the whole distance from World 0 to what happened.
+
+        ``gross_load_value - net_cash_flow``: what the house load would have cost
+        with no array and no battery, less what the meter actually netted. Derived
+        from its own two ends and **never** by adding the three components up, so
+        their sum is a real check on the decomposition rather than a restatement of
+        it -- and published only where every gate passes, which is exactly where the
+        two agree.
+        """
+        if self.decomposition_unavailable_reason is not None:
+            return None
+        gross = self.realized_gross_load_value_eur
+        if gross is None:
+            return None
+        return round(gross - self.realized_net_cash_flow_eur, _EUR_DECIMALS)
+
+    @property
     def realized_plus_remaining_value_eur(self) -> float | None:
         """Return the window's value **including the change in what is stored**.
 
@@ -325,6 +455,26 @@ class RealizedWindow:
                 "battery_benefit_eur": self.realized_battery_benefit_eur,
                 "counterfactual_intervals_priced": (
                     self.counterfactual_intervals_priced
+                ),
+                # **The energy-value view, beta.53.** The four above say what the
+                # battery changed; these say where the value came from. Three
+                # disjoint world transitions and their sum, so a reader can answer
+                # "how much from using my own solar, how much from selling it, how
+                # much from moving it in time" without any figure being counted
+                # twice. A component the interval basis cannot support is null with
+                # a reason, never a zero.
+                "gross_load_value_eur": self.realized_gross_load_value_eur,
+                "self_consumption_value_eur": (
+                    self.realized_self_consumption_value_eur
+                ),
+                "export_value_eur": self.realized_export_value_eur,
+                "load_shifting_value_eur": self.realized_load_shifting_value_eur,
+                "energy_value_eur": self.realized_energy_value_eur,
+                "decomposition_unavailable_reason": (
+                    self.decomposition_unavailable_reason
+                ),
+                "counterfactual_intervals_missing_sell_price": (
+                    self.counterfactual_intervals_missing_sell_price
                 ),
                 "conversion_loss_kwh": self.realized_conversion_loss_kwh,
                 "opening_inventory_kwh": self.opening_inventory_kwh,
@@ -428,6 +578,27 @@ def _basis_map() -> dict[str, str]:
         "no_battery_export_revenue_eur": LEDGER_BASIS_MEASURED,
         "no_battery_net_cash_eur": LEDGER_BASIS_MEASURED,
         "battery_benefit_eur": LEDGER_BASIS_MEASURED,
+        # beta.53. Measured volumes at the interval's own recorded prices on both
+        # legs, exactly like the counterfactual they are built from -- no attribution
+        # rule, no model constant and no planner valuation anywhere in them. They are
+        # published under their ``realised_`` names at the entity as well, and both
+        # spellings are mapped so ``_figure_basis`` cannot miss either.
+        "gross_load_value_eur": LEDGER_BASIS_MEASURED,
+        "self_consumption_value_eur": LEDGER_BASIS_MEASURED,
+        "export_value_eur": LEDGER_BASIS_MEASURED,
+        "load_shifting_value_eur": LEDGER_BASIS_MEASURED,
+        "energy_value_eur": LEDGER_BASIS_MEASURED,
+        "today_accounting.realised_self_consumption_value_eur": (LEDGER_BASIS_MEASURED),
+        "today_accounting.realised_export_value_eur": LEDGER_BASIS_MEASURED,
+        "today_accounting.realised_load_shifting_value_eur": LEDGER_BASIS_MEASURED,
+        "today_accounting.realised_energy_value_eur": LEDGER_BASIS_MEASURED,
+        "counterfactual_intervals_missing_sell_price": LEDGER_BASIS_MEASURED,
+        # A verdict rather than a quantity -- and mapped for the same reason the
+        # interval count above it is. It is derived from nothing but those counts:
+        # no attribution rule, no model constant and no valuation enters it, so
+        # measured is the honest word, and leaving it out would teach a reader that
+        # the map is a subset of the block rather than all of it.
+        "decomposition_unavailable_reason": LEDGER_BASIS_MEASURED,
         # A count of intervals, not a quantity -- but the guard that every published
         # ledger figure carries a basis makes no exception for counts, and it is
         # right not to: a reader who has to learn which keys the map covers has
@@ -619,6 +790,28 @@ class DayAccounting:
     realised_intervals_skipped: int | None = None
     in_progress_coverage: float | None = None
 
+    # -- beta.53: where the realised value came from, in English ---------------
+    #
+    #: **A separate measured view, and never a redefinition of the four above.**
+    #: ``realised_today_eur`` is the household's whole position and carries a
+    #: planner valuation of what is stored; these three are measured cash against a
+    #: stated counterfactual, and they answer the question an owner asks first --
+    #: how much came from using their own solar, how much from selling it, how much
+    #: from moving it in time. Two legitimate questions, kept apart on purpose.
+    #:
+    #: Three disjoint world transitions, so nothing is counted twice and their sum
+    #: needs no plug term. A component whose interval basis cannot support it is
+    #: ``None`` with :attr:`decomposition_unavailable_reason` saying which, and takes
+    #: the total with it.
+    realised_self_consumption_value_eur: float | None = None
+    realised_export_value_eur: float | None = None
+    realised_load_shifting_value_eur: float | None = None
+    realised_energy_value_eur: float | None = None
+    decomposition_unavailable_reason: str | None = None
+    #: The coverage the gates were decided on, published so a refusal can be
+    #: checked rather than merely believed.
+    counterfactual_intervals_missing_sell_price: int | None = None
+
     #: The two ends of the position, and the provenance of the opening valuation.
     opening_inventory_kwh: float | None = None
     opening_inventory_value_eur: float | None = None
@@ -649,6 +842,18 @@ class DayAccounting:
             "unavailable_reason": self.unavailable_reason,
             "accounting_basis": ACCOUNTING_BASIS_POSITION,
             "avoidance_basis": AVOIDANCE_BASIS_NO_BATTERY,
+            # beta.53. Beside the five above, never instead of them.
+            "realised_self_consumption_value_eur": (
+                self.realised_self_consumption_value_eur
+            ),
+            "realised_export_value_eur": self.realised_export_value_eur,
+            "realised_load_shifting_value_eur": (self.realised_load_shifting_value_eur),
+            "realised_energy_value_eur": self.realised_energy_value_eur,
+            "decomposition_unavailable_reason": (self.decomposition_unavailable_reason),
+            "counterfactual_intervals_missing_sell_price": (
+                self.counterfactual_intervals_missing_sell_price
+            ),
+            "decomposition_basis": DECOMPOSITION_BASIS,
             "partition": {
                 "interval_count": self.interval_count,
                 "realised_intervals": self.realised_interval_count,
@@ -817,6 +1022,32 @@ def day_accounting(
             None if realised is None else realised.intervals_skipped
         ),
         in_progress_coverage=in_progress_coverage,
+        # **Projected, not recomputed. beta.53.** The window already applied every
+        # availability gate, and asking it twice is how one figure comes to be
+        # published two ways. Without a window there is no counterfactual at all,
+        # which is the most fundamental of the three refusals.
+        realised_self_consumption_value_eur=(
+            None if realised is None else realised.realized_self_consumption_value_eur
+        ),
+        realised_export_value_eur=(
+            None if realised is None else realised.realized_export_value_eur
+        ),
+        realised_load_shifting_value_eur=(
+            None if realised is None else realised.realized_load_shifting_value_eur
+        ),
+        realised_energy_value_eur=(
+            None if realised is None else realised.realized_energy_value_eur
+        ),
+        decomposition_unavailable_reason=(
+            DECOMPOSITION_UNAVAILABLE_NO_EVIDENCE
+            if realised is None
+            else realised.decomposition_unavailable_reason
+        ),
+        counterfactual_intervals_missing_sell_price=(
+            None
+            if realised is None
+            else realised.counterfactual_intervals_missing_sell_price
+        ),
         opening_inventory_kwh=(
             None if realised is None else realised.opening_inventory_kwh
         ),
@@ -1001,6 +1232,10 @@ def realized_window(
     no_battery_import = no_battery_export = 0.0
     no_battery_cost = no_battery_revenue = 0.0
     counterfactual_intervals = 0
+    # beta.53. World 0 -- the whole load at the import price -- and how many
+    # counterfactual intervals spilled production the export price could not value.
+    gross_load_value = 0.0
+    missing_sell_price = 0
     have_avoidance = load_kwh is not None and production_kwh is not None
 
     for index in range(count):
@@ -1085,6 +1320,20 @@ def realized_window(
                 no_battery_cost += without_battery * buy
                 if sell is not None:
                     no_battery_revenue += spilled * sell
+                elif spilled > 0.0:
+                    # **Counted, because the line above silently biases two sealed
+                    # figures. beta.53.** The spilled energy is already in
+                    # ``no_battery_export`` and its revenue is not, so the
+                    # counterfactual export revenue is understated by exactly this
+                    # interval's worth and ``battery_benefit_eur`` is overstated by
+                    # the same amount. Repairing that changes a write-once sealed
+                    # figure and the recovery percentage built on it, which needs its
+                    # own release; counting it is what makes the size measurable, and
+                    # what lets the decomposition refuse to inherit it.
+                    missing_sell_price += 1
+                # World 0 for this interval, on the counterfactual's own gate: the
+                # whole house load at the price it would have been imported at.
+                gross_load_value += load * buy
                 counterfactual_intervals += 1
 
     charge, discharge, basis = _battery_from_state_of_charge(
@@ -1143,6 +1392,10 @@ def realized_window(
             round(no_battery_revenue, _EUR_DECIMALS) if have_avoidance else None
         ),
         counterfactual_intervals_priced=counterfactual_intervals,
+        realized_gross_load_value_eur=(
+            round(gross_load_value, _EUR_DECIMALS) if have_avoidance else None
+        ),
+        counterfactual_intervals_missing_sell_price=missing_sell_price,
         opening_inventory_kwh=(
             round(opening, _KWH_DECIMALS) if opening is not None else None
         ),

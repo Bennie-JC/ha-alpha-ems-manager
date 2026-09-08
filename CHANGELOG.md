@@ -9,6 +9,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.53] - 2026-09-08
+
+**Three questions answered with the planner's own numbers instead of estimates of
+them.**
+
+No planner decision, no dispatch, no campaign lifecycle, no reserve policy, no
+terminal value, no export behaviour, no sealed accounting, no storage change, no
+migration, no new entity. Everything here is observability, and one figure that was
+published without the label it needed.
+
+## The dashboard was re-deriving the plan, badly
+
+Three cards -- how full the pack will be before the next purchase, before the next
+sale, and how long before it reaches its minimum -- each estimated the future state
+from coarser inputs than the plan used: a daily load total spread flat over
+twenty-four hours, a forecaster's own half-hour rows, an approximate conversion loss,
+and a guess at which meter face a published objective was measured at. Three
+estimates, three different answers, and none of them the plan's.
+
+The plan already holds the exact series. So `Next Planned Action` now carries it as
+bounded scalars: `battery_before_next_charge_dc_kwh` and its state of charge, the
+same pair for the next sale, and `minutes_until_reserve_floor`, each with the instant
+it refers to, the instant that segment closes, and the campaign identity it belongs
+to.
+
+**Read, never recomputed.** There is no second simulation here, no conversion factor
+and no load or production series of its own -- the plan applied every physical
+conversion once, where it belongs, and applying one again here is exactly how the
+figure and the plan it describes came to disagree in the first place.
+
+**Each projection is self-describing.** `upcoming` is capped at eight rows, so a bare
+number could not always be attributed to a campaign. Every projection now states its
+own instant and its own campaign id, and stays complete when the campaign it names is
+the ninth and therefore absent from that list.
+
+Null where the plan makes no such claim -- no purchase ahead, or a horizon that never
+takes the pack to its floor -- and never zero. Where no projection could be formed at
+all, `projection_unavailable_reason` says which fact was missing. That is the same
+rule under which a projected state of charge was deliberately *not* published until
+now: a young installation whose forecast is still withheld has no honest answer, and
+zero would read as "the pack will be empty" rather than "nobody knows yet".
+
+## The most misreadable figure this integration publishes now says what it is
+
+`planned_kwh` changes boundary with the action -- the battery terminals for a purchase
+or a discharge, the grid meter for a sale, neither for a curtailment -- and carried no
+statement of which. Its own source says reporting one number for all four would be
+wrong for three of them, and then published it unlabelled.
+
+`objective_boundary` is now beside it, derived from the same action the energy is, so
+the two cannot come apart. And the rule beside that says the thing a dashboard has to
+know: **every objective energy published here is AC.** The boundary names the meter
+face it is measured at; it is not an AC/DC flag, and no conversion factor should be
+applied to any of them.
+
+## Where the realised value actually came from
+
+The accounting published a correct battery comparator and a correct household
+position, and nothing that answered the question an owner asks first: how much of
+this came from using my own solar, how much from selling it, and how much from moving
+it in time.
+
+Three worlds and two transitions answer it exactly. `Economic Value` now carries
+`realised_self_consumption_value_eur`, `realised_export_value_eur`,
+`realised_load_shifting_value_eur` and their sum `realised_energy_value_eur`.
+
+They do not overlap, and the case that makes that non-obvious is production that went
+into the pack and came out after dark. It was not used as it was made and it was not
+sold, so it is in neither solar component; it appears exactly once inside the shifting
+term, as the import it displaced less the export it gave up. For the same reason the
+export component is what a bare array *would* have sold rather than what the meter
+recorded -- measured export includes energy the battery sent to the grid, which
+belongs to the shifting term and would otherwise be counted twice.
+
+The total is derived from its own two ends and never by adding the three components
+up, so their sum is a real check on the split rather than a restatement of it. There
+is no plug term and no residual.
+
+**Beside the existing figures and never instead of them.** `realised_today_eur` and
+`total_economic_value_today_eur` keep their exact meaning and their four-term
+reconciliation. Those are the household's whole position, two of whose terms are
+planner valuations; these are measured cash against a stated counterfactual. Two
+legitimate questions, and the basis published on each figure says which is which.
+
+## A component that would be wrong is withheld, not published
+
+Two known conditions bias an individual component. Where either holds, the affected
+figures are null with `decomposition_unavailable_reason` naming the first one, and the
+coverage counts that decided it are published beside them.
+
+The first is a real defect in the existing ledger: the counterfactual export *volume*
+accumulates on every interval while its *revenue* accumulates only where a sell price
+was recorded, so an interval that spilled production without one contributes
+kilowatt-hours at nothing. That understates the export component by exactly what it
+overstates the shifting one. The errors cancel in the total -- which is why they were
+easy to miss -- and cancellation makes the total sound without making either component
+honest.
+
+The second is coverage: actual cash accumulates on every priced interval while the
+counterfactual also needs a load and a production reading, and where the two counts
+differ the comparison is not like for like.
+
+Self-consumption survives the first condition, because both of its inputs are priced
+on the import leg alone and the export hole cannot reach them. That is a precise
+split, not a convenience.
+
+**Every existing figure keeps its current value, including where that defect biases
+it.** `battery_benefit_eur`, `no_battery_export_revenue_eur`, `realised_today_eur`,
+the day identity, `recovered_percent` and every sealed figure are unchanged.
+Repairing the ledger changes a write-once sealed number and the recovery percentage
+built on it, which needs its own release and a migration; what this one adds is
+`counterfactual_intervals_missing_sell_price`, which is what makes the size of it
+measurable first. The new figures are held to a stricter standard than the ledger they
+sit beside, and that asymmetry is deliberate.
+
+## For a dashboard
+
+Absence is still not zero. `Battery Return` publishes its investment figures only when
+`available` is true; when it is false the payload carries `unavailable_reason` and what
+was earned outside the accounting period, and the recovery figures **do not exist as
+keys**. A card must read `available` first and render the reason. The same applies to
+every figure above: a null decomposition rendered as `0,00` would turn a refusal into
+a claim.
+
 ## [1.0.0-beta.52] - 2026-09-08
 
 **The investment return now covers the investment, and nothing before it.**

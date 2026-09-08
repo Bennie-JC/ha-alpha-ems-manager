@@ -114,6 +114,7 @@ from .const import (
     LIFECYCLE_KIND_STARTED,
     MAX_UPCOMING_CAMPAIGNS_PUBLISHED,
     NAME,
+    OBJECTIVE_BOUNDARY_RULE,
     OWNERSHIP_OWNED,
     SENSOR_BATTERY_PLANNED_POWER,
     SENSOR_BATTERY_RECOMMENDATION,
@@ -134,7 +135,11 @@ from .const import (
     SENSOR_NEXT_PLANNED_ACTION,
 )
 from .coordinator import AlphaEmsCoordinator
-from .economic import IMPLEMENTED_ACTIONS, EconomicOutcome
+from .economic import (
+    IMPLEMENTED_ACTIONS,
+    EconomicOutcome,
+    objective_boundary_for,
+)
 from .plan import BatteryPlan
 from .realized import _basis_map
 from .reserve import RESERVE_BASIS, shortfall
@@ -820,8 +825,21 @@ def _next_planned_action_attributes(
     if outcome is None or not outcome.available:
         return {}
     run, target = _next_planned_run(coordinator)
+    # **The projection stands on its own. beta.53.** Time to the reserve floor is a
+    # fact about the whole horizon, not about whichever campaign happens to be next,
+    # so it is published whether or not a run is planned -- and each campaign
+    # projection carries its own instant and identity, so nothing here has to be
+    # matched against ``upcoming`` to be understood.
+    projection = coordinator.plan_projection()
     if run is None:
-        return {"starts_at": None, "ends_at": None, "planned_kwh": None}
+        return {
+            "starts_at": None,
+            "ends_at": None,
+            "planned_kwh": None,
+            "objective_boundary": None,
+            "objective_boundary_rule": OBJECTIVE_BOUNDARY_RULE,
+            **projection,
+        }
     start = _economic_run_instant(coordinator, run.start_index)
     end = _economic_run_instant(coordinator, run.end_index + 1)
     published = outcome.desired.published_run
@@ -829,6 +847,13 @@ def _next_planned_action_attributes(
         "starts_at": None if start is None else start.isoformat(),
         "ends_at": None if end is None else end.isoformat(),
         "planned_kwh": _round(run.energy_kwh, BATTERY_KWH_PRECISION),
+        # **The label ``planned_kwh`` was published without. beta.53.** That figure
+        # switches boundary with the action -- the battery for a purchase or a
+        # discharge, the meter for a sale, neither for a curtailment -- and carried
+        # no statement of which, so a dashboard had to infer it. Derived from the
+        # same action the energy is, so the two cannot come apart.
+        "objective_boundary": objective_boundary_for(run.action),
+        "objective_boundary_rule": OBJECTIVE_BOUNDARY_RULE,
         "power_kw": _round(run.first_power_kw, BATTERY_KW_PRECISION),
         "purpose": target.get("purpose", run.action),
         "campaign_id": target.get("campaign_id"),
@@ -848,6 +873,7 @@ def _next_planned_action_attributes(
             "means the control loop cannot hold it. neither is a failure, and "
             "ordinary self-consumption is unaffected by either"
         ),
+        **projection,
     }
 
 
@@ -1452,6 +1478,19 @@ _ECONOMIC_VALUE_FLAT = (
     "remaining_expected_today_eur",
     "forecast_revaluation_eur",
     "total_economic_value_today_eur",
+    # **The energy-value view, beside the position and never instead of it.
+    # beta.53.** The five above are the household's position, two of whose terms
+    # are planner valuations. These four are measured cash against a stated
+    # counterfactual, and they answer the question an owner asks first: how much
+    # came from using their own solar, how much from selling it, how much from
+    # moving it in time. A component the interval basis cannot support is null with
+    # a reason beside it, never a zero.
+    "realised_self_consumption_value_eur",
+    "realised_export_value_eur",
+    "realised_load_shifting_value_eur",
+    "realised_energy_value_eur",
+    "decomposition_unavailable_reason",
+    "counterfactual_intervals_missing_sell_price",
     "accounting_basis",
     "accounting_reconciliation_error_eur",
     "accounting_unavailable_reason",
@@ -1534,6 +1573,14 @@ def _economic_value_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, An
             "remaining_expected_today_eur",
             "forecast_revaluation_eur",
             "total_economic_value_today_eur",
+            # beta.53, projected on the same terms and from the same block, so the
+            # decomposition and the position it sits beside describe one day.
+            "realised_self_consumption_value_eur",
+            "realised_export_value_eur",
+            "realised_load_shifting_value_eur",
+            "realised_energy_value_eur",
+            "decomposition_unavailable_reason",
+            "counterfactual_intervals_missing_sell_price",
         ):
             payload[name] = accounting.get(name)
         partition = accounting.get("partition")

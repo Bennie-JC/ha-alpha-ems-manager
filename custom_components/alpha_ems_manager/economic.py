@@ -5507,6 +5507,131 @@ class RetentionGate:
         return True, RETENTION_GATE_AUTHORISED
 
 
+#: Floating-point slack when a projected pack energy is compared with the floor.
+#: One milliwatt-hour: far below anything the lattice can express, and enough that
+#: a walk which landed exactly on the floor is not read as sitting above it.
+PROJECTION_FLOOR_TOLERANCE_KWH = 1e-6
+
+
+def start_energy_at_index(
+    intervals: tuple[EconomicInterval, ...], index: int
+) -> float | None:
+    """Return the pack energy the plan stood at when ``index`` opened.
+
+    **Matched by equality in one index frame, never by list position.**
+    :attr:`EconomicInterval.index` is the chronological quarter within the plan's
+    target day, and the horizon's head is wherever the day has got to -- so a
+    horizon that begins at 40 has that interval at position 0. Subtracting a base,
+    or trusting the position, reads the wrong interval, and that is the shape of the
+    frame confusion this integration has already had to fix once.
+
+    ``None`` when the horizon does not cover the index, which is a real answer: the
+    plan makes no claim about a quarter it never solved.
+    """
+    for entry in intervals:
+        if entry.index == index:
+            return entry.start_energy_dc_kwh
+    return None
+
+
+def interval_end_energy_dc_kwh(
+    intervals: tuple[EconomicInterval, ...],
+    position: int,
+    *,
+    plan_end_energy_dc_kwh: float,
+) -> float | None:
+    """Return the pack energy at the close of ``intervals[position]``.
+
+    **The next interval's start, and never ``start + delta``.** The walk lands at
+    ``start + delta - battery_state_service_dc_kwh``: the recursion also drains
+    whatever the inverter covered for the household without being dispatched, and
+    that term is non-zero on exactly the hold intervals a projection is most often
+    asked about. Adding the delta would report a pack fuller than the plan expects,
+    on the sunny afternoons where the difference matters.
+
+    The last interval has no successor, so it uses the endpoint the plan publishes.
+    A non-adjacent successor is refused rather than assumed: the walk appends every
+    horizon interval so it cannot arise today, and the failure mode of assuming is a
+    silently plausible number.
+    """
+    if position < 0 or position >= len(intervals):
+        return None
+    entry = intervals[position]
+    if position + 1 >= len(intervals):
+        return plan_end_energy_dc_kwh
+    following = intervals[position + 1]
+    if following.index != entry.index + 1:
+        return None
+    return following.start_energy_dc_kwh
+
+
+def floor_reached_index(
+    intervals: tuple[EconomicInterval, ...],
+    *,
+    floor_energy_kwh: float,
+    plan_end_energy_dc_kwh: float,
+    tolerance_kwh: float = PROJECTION_FLOOR_TOLERANCE_KWH,
+) -> int | None:
+    """Return the chronological index from which the plan holds the pack at its floor.
+
+    **At or below, not a crossing.** Every movement in this plan passes through
+    ``battery.apply_request``, which clamps at the floor, so the trajectory *sits* on
+    the floor rather than passing through it. A test for ``previous > floor and end <
+    floor`` would therefore never fire on a real plan.
+
+    A pack already at or below the floor answers with the horizon's own head, which
+    is a real answer -- there is no time left before it gets there -- and must stay
+    distinguishable from ``None``. ``None`` means the plan does not take the pack to
+    its floor anywhere in this horizon, so it makes no such claim.
+    """
+    if not intervals:
+        return None
+    if intervals[0].start_energy_dc_kwh <= floor_energy_kwh + tolerance_kwh:
+        return intervals[0].index
+    for position, entry in enumerate(intervals):
+        end = interval_end_energy_dc_kwh(
+            intervals, position, plan_end_energy_dc_kwh=plan_end_energy_dc_kwh
+        )
+        if end is None:
+            continue
+        if end <= floor_energy_kwh + tolerance_kwh:
+            # The pack stands there from the *next* quarter, which is the same
+            # instant this one closes at.
+            return entry.index + 1
+    return None
+
+
+def objective_boundary_for(action: str) -> str | None:
+    """Return which meter face :attr:`EconomicRun.energy_kwh` is measured at. beta.53.
+
+    **The label that figure was published without, and it is the most misreadable
+    number this integration puts on an entity.** ``energy_kwh`` switches boundary
+    with the action -- battery terminals for a purchase or a discharge, the grid
+    meter for a sale -- and its own docstring says reporting one number for all four
+    would be wrong for three of them. It was then published unlabelled, leaving a
+    dashboard to infer which face it was looking at.
+
+    ``None`` for a curtailment, which declines production and is measured at neither
+    face, and for any action whose energy falls through to zero. Absent is the honest
+    answer there: a boundary for a figure that is zero by fallback would be a claim
+    about a quantity nobody reported.
+
+    **Not an AC/DC flag.** Every objective published anywhere in this integration is
+    AC. See :data:`const.OBJECTIVE_BOUNDARY_RULE`, and mirror this function against
+    ``energy_kwh`` rather than against an intent -- they must agree by construction,
+    because they describe one number.
+    """
+    if action in (
+        ECONOMIC_ACTION_CHARGE,
+        ECONOMIC_ACTION_SAFETY_BUY,
+        ECONOMIC_ACTION_DISCHARGE,
+    ):
+        return CAMPAIGN_BOUNDARY_BATTERY
+    if action == ECONOMIC_ACTION_EXPORT:
+        return CAMPAIGN_BOUNDARY_METER
+    return None
+
+
 def quarter_schedule_for(
     intervals: tuple[EconomicInterval, ...],
     *,

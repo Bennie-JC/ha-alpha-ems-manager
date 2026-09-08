@@ -4696,6 +4696,96 @@ LEDGER_BASES: Final = (
     LEDGER_BASIS_REVALUED,
 )
 
+#: Why the realised value decomposition withheld a component. beta.53.
+#:
+#: **A biased figure is refused, not published and explained away.** The three
+#: components answer "how much came from using my own solar, how much from selling
+#: it, and how much from moving it in time", and two known conditions make an
+#: individual component wrong while leaving their sum exact. Cancellation keeps the
+#: *total* sound; it does not make the components honest, and the components are the
+#: whole point of publishing them.
+#:
+#: Ordered most fundamental first, which is the order they are reported in.
+#: ``no_counterfactual_evidence`` means no load or production series reached the
+#: window at all, so there is nothing to compare against.
+#: ``export_price_missing_on_spilled_intervals`` means an interval spilled production
+#: with no sell price recorded: the counterfactual export volume accumulates there
+#: and its revenue does not, which understates the export component by exactly the
+#: amount it overstates the shifting one. ``interval_coverage_incomplete`` means
+#: actual cash was accumulated over more intervals than the counterfactual reached,
+#: so the two sides are not like for like.
+DECOMPOSITION_UNAVAILABLE_NO_EVIDENCE: Final = "no_counterfactual_evidence"
+DECOMPOSITION_UNAVAILABLE_SELL_PRICE_MISSING: Final = (
+    "export_price_missing_on_spilled_intervals"
+)
+DECOMPOSITION_UNAVAILABLE_COVERAGE_INCOMPLETE: Final = "interval_coverage_incomplete"
+
+DECOMPOSITION_UNAVAILABLE_REASONS: Final = (
+    DECOMPOSITION_UNAVAILABLE_NO_EVIDENCE,
+    DECOMPOSITION_UNAVAILABLE_SELL_PRICE_MISSING,
+    DECOMPOSITION_UNAVAILABLE_COVERAGE_INCOMPLETE,
+)
+
+#: What the realised decomposition is, published beside it.
+DECOMPOSITION_BASIS: Final = (
+    "measured cash against a stated counterfactual, split into three world "
+    "transitions that do not overlap. self_consumption is what the house used of "
+    "its own production as it was made, priced at the import price it displaced; "
+    "export_value is what a household with the same array and no battery would "
+    "have sold; load_shifting is what operating the battery changed on top of "
+    "that, and is the same figure as battery_benefit_eur. production that went "
+    "into the pack is in neither solar component -- it was not used when it was "
+    "made and it was not sold -- and appears once inside load_shifting. the three "
+    "sum to energy_value with no plug term. distinct from realised_today_eur, "
+    "which is the household's whole position and carries a planner valuation. a "
+    "component whose interval basis is incomplete is null with a reason, never a "
+    "zero, and takes the total with it"
+)
+
+#: Why no planner projection could be formed. beta.53.
+#:
+#: **Never a zero.** A projected state of charge was deliberately absent from this
+#: integration until beta.53 precisely because it needs a forecast, and a young
+#: installation whose forecast is still withheld has no honest answer to give. So
+#: the scalars are null and this says which fact was missing.
+PROJECTION_UNAVAILABLE_NO_PLAN: Final = "no_solved_horizon"
+PROJECTION_UNAVAILABLE_NO_BATTERY_STATE: Final = "no_battery_state"
+
+PROJECTION_UNAVAILABLE_REASONS: Final = (
+    PROJECTION_UNAVAILABLE_NO_PLAN,
+    PROJECTION_UNAVAILABLE_NO_BATTERY_STATE,
+)
+
+#: What the projection scalars are, published beside them.
+PROJECTION_BASIS: Final = (
+    "read off the interval trajectory of the plan the optimiser selected, never "
+    "recomputed: no second simulation, no efficiency factor and no load or "
+    "production series of its own, so these cannot disagree with the plan they "
+    "describe. energies are DC at the pack. each projection carries its own "
+    "instant and campaign id, so it never has to be matched against the upcoming "
+    "list -- which is capped at eight and may not contain it. the charge and "
+    "export instants are the first quarter of the first campaign of that boundary "
+    "the plan can actually arm. the floor is the configured minimum state of "
+    "charge, and minutes_until_reserve_floor is zero when the pack is already "
+    "there. null means the plan makes no such claim over this horizon; when no "
+    "projection could be formed at all, projection_unavailable_reason says why"
+)
+
+#: The rule a reader needs before applying anything to a published objective.
+#:
+#: **beta.53, and the omission it corrects is the most misreadable figure this
+#: integration publishes.** ``planned_kwh`` switches boundary with the action --
+#: battery terminals for a charge or a discharge, the grid meter for an export --
+#: and carried no label at all, so a dashboard had to infer it. Every one of those
+#: figures is AC; the boundary names the meter face, not AC against DC.
+OBJECTIVE_BOUNDARY_RULE: Final = (
+    "every objective and target energy published here is AC. objective_boundary "
+    "names the meter face it is measured at -- battery for a purchase, meter for a "
+    "sale -- and is not an AC/DC flag, so apply no efficiency factor to any of "
+    "them. null on a curtailment, which declines production and is measured at "
+    "neither face"
+)
+
 #: How many civil days the cross-midnight ledger view spans by default.
 #:
 #: Two, because the question the ledger exists to answer -- "was buying that energy

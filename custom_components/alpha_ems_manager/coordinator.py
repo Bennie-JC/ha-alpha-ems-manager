@@ -318,6 +318,9 @@ from .const import (
     PROBE_PHASE_BEFORE_START,
     PROBE_PHASE_IDLE,
     PROBE_PHASE_STEADY,
+    PROJECTION_BASIS,
+    PROJECTION_UNAVAILABLE_NO_BATTERY_STATE,
+    PROJECTION_UNAVAILABLE_NO_PLAN,
     PV_ABSORPTION_DISPATCH_ACTIVE,
     PV_ABSORPTION_EXCESS_EXPORT,
     PV_ABSORPTION_NO_SUPPRESSING_FEATURE,
@@ -423,9 +426,11 @@ from .economic import (
     execution_revision,
     execution_target,
     fingerprint_settings,
+    floor_reached_index,
     post_horizon_window,
     run_state_for_intent,
     select_bucket_kwh,
+    start_energy_at_index,
 )
 from .energy_balance import (
     COHERENCE_UNKNOWN,
@@ -1395,6 +1400,218 @@ def _export_check(
             "step, then recompute the commanded energy"
         ),
     }
+
+
+#: Which published boundary each executable intent is paid at, and the English word
+#: this feature uses for it. One pair per projection, so the two are built by the
+#: same code and cannot come to disagree about what "before the next charge" means.
+_PROJECTION_BOUNDARIES: tuple[tuple[str, str, str], ...] = (
+    ("charge", EXECUTION_INTENT_GRID_CHARGE, CAMPAIGN_BOUNDARY_BATTERY),
+    ("export", EXECUTION_INTENT_NET_EXPORT, CAMPAIGN_BOUNDARY_METER),
+)
+
+#: Every figure the projection publishes, so an unavailable projection has the same
+#: shape as an available one and a reader never has to ask whether a key is missing
+#: or null. Both mean the same thing here, and only one of them is checkable.
+_PROJECTION_FIELDS: tuple[str, ...] = (
+    "battery_before_next_charge_dc_kwh",
+    "battery_before_next_charge_soc_percent",
+    "next_charge_projection_at",
+    "next_charge_projection_end_at",
+    "next_charge_campaign_id",
+    "battery_before_next_export_dc_kwh",
+    "battery_before_next_export_soc_percent",
+    "next_export_projection_at",
+    "next_export_projection_end_at",
+    "next_export_campaign_id",
+    "minutes_until_reserve_floor",
+    "reserve_floor_reached_at",
+)
+
+
+def _armable_segment(
+    targets: Iterable[dict[str, Any]],
+    *,
+    intent: str,
+    index_of_instant: dict[datetime, int],
+) -> tuple[int, datetime, datetime | None, str] | None:
+    """Return the first quarter of this boundary the plan can actually arm.
+
+    **The first *armable* row, not the campaign's nominal start.** A campaign whose
+    opening quarter falls below the actuator's resolution is published with that row
+    refused and nothing is dispatched in it, so projecting the pack to that instant
+    would state an energy for a moment at which nothing happens.
+
+    **Matched by instant, in one frame.** A published row carries the absolute
+    instant it opens and the plan carries a chronological index; the caller supplies
+    the map between them, built from the plan's own entries. Nothing here does index
+    arithmetic, and equal instants in different zones compare and hash alike, so a
+    row published in UTC matches an entry resolved to local time.
+
+    Earliest by index rather than by string, because the index is the chronological
+    order and a string only happens to be.
+    """
+    best: tuple[int, datetime, datetime | None, str] | None = None
+    for target in targets:
+        if target.get("intent") != intent:
+            continue
+        campaign_id = target.get("campaign_id")
+        if not isinstance(campaign_id, str):
+            continue
+        for row in target.get("quarter_schedule") or ():
+            if row.get("not_executable") is not None:
+                continue
+            opened = _instant_or_none(row.get("start"))
+            if opened is None:
+                continue
+            index = index_of_instant.get(opened)
+            if index is None:
+                # Outside the horizon, so the plan states no pack energy for it.
+                continue
+            if best is None or index < best[0]:
+                best = (index, opened, None, campaign_id)
+            break
+    if best is None:
+        return None
+    index, opened, _unused, campaign_id = best
+    closes = _armable_close(targets, intent=intent, campaign_id=campaign_id)
+    return index, opened, closes, campaign_id
+
+
+def _armable_close(
+    targets: Iterable[dict[str, Any]], *, intent: str, campaign_id: str
+) -> datetime | None:
+    """Return when this campaign stops being armable, across all its targets.
+
+    A campaign is one decision executed through however many windows Stage B is
+    given, so its close is the last armable row of any of them -- not the end of
+    whichever window happened to hold the first.
+    """
+    closes: datetime | None = None
+    for target in targets:
+        if target.get("intent") != intent:
+            continue
+        if target.get("campaign_id") != campaign_id:
+            continue
+        for row in target.get("quarter_schedule") or ():
+            if row.get("not_executable") is not None:
+                continue
+            ends = _instant_or_none(row.get("end"))
+            if ends is None:
+                continue
+            if closes is None or ends > closes:
+                closes = ends
+    return closes
+
+
+def _instant_or_none(value: Any) -> datetime | None:
+    """Return a published instant as a datetime, or ``None`` if it is not one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def plan_projection(
+    *,
+    intervals: tuple[Any, ...],
+    plan_end_energy_dc_kwh: float,
+    floor_energy_kwh: float,
+    limits: Any,
+    targets: Iterable[dict[str, Any]],
+    moment: Callable[[int], datetime | None],
+    now: datetime,
+) -> dict[str, Any]:
+    """Return the pack states the chosen plan expects, as bounded scalars. beta.53.
+
+    **A scan over the plan the planner already chose, and nothing more.** Three
+    dashboard cards were each estimating the same three answers from coarser inputs
+    -- a daily load total spread flat over the day, a forecaster's own half-hour
+    rows, an approximate conversion loss, and a guess at which meter face a
+    published objective was measured at -- so the three disagreed with each other
+    and with the plan. The trajectory is already in memory after every refresh, one
+    entry per horizon interval, each carrying the pack energy the recursion stood
+    at. So this reads it.
+
+    Nothing here converts between the battery and the meter, and nothing recomputes
+    a load or a production series: the plan applied every physical conversion once,
+    where it belongs, and a second application here would put this figure and the
+    plan it describes into disagreement. That is the whole defect being removed, so
+    reintroducing it in the fix would be perverse. ``start_energy_dc_kwh`` is DC,
+    which is the frame a state of charge is expressed in, and the percentage comes
+    from the pack's own ``soc_for_energy``.
+
+    Each projection carries **its own instant and its own campaign identity**. The
+    published campaign list is capped at eight rows, so a bare number could not
+    always be attributed; here it never has to be, and the ninth campaign is
+    answered as completely as the first.
+
+    ``None`` where the plan makes no such claim -- no campaign of that boundary
+    ahead, or a horizon that never takes the pack to its floor -- and never a zero,
+    on the same terms as every other refusal in this integration. Where no
+    projection could be formed at all, ``projection_unavailable_reason`` says which
+    fact was missing.
+    """
+    payload: dict[str, Any] = dict.fromkeys(_PROJECTION_FIELDS)
+    payload["projection_basis"] = PROJECTION_BASIS
+    payload["projection_unavailable_reason"] = None
+    if not intervals:
+        payload["projection_unavailable_reason"] = PROJECTION_UNAVAILABLE_NO_PLAN
+        return payload
+    if limits is None:
+        payload["projection_unavailable_reason"] = (
+            PROJECTION_UNAVAILABLE_NO_BATTERY_STATE
+        )
+        return payload
+
+    # The one map between the plan's chronological index and absolute time, built
+    # from the plan's own entries with the index-to-instant helper every published
+    # instant on this integration already uses. No index arithmetic is written here.
+    index_of_instant: dict[datetime, int] = {}
+    for entry in intervals:
+        opened = moment(entry.index)
+        if opened is not None:
+            index_of_instant[opened] = entry.index
+
+    for word, intent, _boundary in _PROJECTION_BOUNDARIES:
+        segment = _armable_segment(
+            targets, intent=intent, index_of_instant=index_of_instant
+        )
+        if segment is None:
+            continue
+        index, opened, closes, campaign_id = segment
+        energy = start_energy_at_index(intervals, index)
+        if energy is None:  # pragma: no cover - the map is built from the same entries
+            continue
+        payload[f"battery_before_next_{word}_dc_kwh"] = round(energy, 3)
+        payload[f"battery_before_next_{word}_soc_percent"] = round(
+            limits.soc_for_energy(energy), 1
+        )
+        payload[f"next_{word}_projection_at"] = opened.isoformat()
+        payload[f"next_{word}_projection_end_at"] = (
+            None if closes is None else closes.isoformat()
+        )
+        payload[f"next_{word}_campaign_id"] = campaign_id
+
+    reached = floor_reached_index(
+        intervals,
+        floor_energy_kwh=floor_energy_kwh,
+        plan_end_energy_dc_kwh=plan_end_energy_dc_kwh,
+    )
+    if reached is not None:
+        at = moment(reached)
+        if at is not None:
+            payload["reserve_floor_reached_at"] = at.isoformat()
+            # **Never negative.** The horizon's head is the *next* interval, so the
+            # clock can already be past an instant the plan still describes, and a
+            # countdown running backwards is an artefact of two clocks rather than a
+            # fact about the plan. Zero is the honest floor: the pack is there now.
+            payload["minutes_until_reserve_floor"] = max(
+                0, round((at - now).total_seconds() / 60.0)
+            )
+    return payload
 
 
 def _reserve_horizon_edges(
@@ -4594,6 +4811,69 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # of those belong to the solver.
         summary["today_accounting"] = self._today_accounting(outcome, plan, moment)
         return summary
+
+    @callback
+    def plan_projection(self, now: datetime | None = None) -> dict[str, Any]:
+        """Return the projection scalars for this refresh. Publish-only. beta.53.
+
+        The calendar half lives here, because a chronological index becomes an
+        instant only against a civil day and its real length -- 92, 96 or 100
+        intervals -- and that is knowledge the planning layer deliberately does not
+        have. Everything else is :func:`plan_projection`.
+
+        **The desired plan, and that is not a detail.** ``_execution_targets``
+        iterates ``outcome.desired.intervals``, so the published campaigns and their
+        executability come from that trajectory. Reading the capability plan here
+        would describe a different future from the campaign rendered beside it.
+        """
+        outcome = (self.data or {}).get("economic")
+        plan = self.battery_plan
+        if (
+            not isinstance(outcome, EconomicOutcome)
+            or not outcome.available
+            or plan is None
+            or plan.target_day is None
+        ):
+            return plan_projection(
+                intervals=(),
+                plan_end_energy_dc_kwh=0.0,
+                floor_energy_kwh=0.0,
+                limits=None,
+                targets=(),
+                moment=lambda _index: None,
+                now=dt_util.now() if now is None else now,
+            )
+        day = plan.target_day
+        tz = dt_util.get_default_time_zone()
+        today = plan.forecast.get("today") or {}
+        count = today.get("interval_count")
+        today_count = count if isinstance(count, int) else 0
+
+        def moment(index: int) -> datetime | None:
+            """Return the local instant a chronological index opens at."""
+            if today_count <= 0 or index < 0:
+                return None
+            if index < today_count:
+                return dt_util.as_local(interval_start_utc(day, index, tz))
+            return dt_util.as_local(
+                interval_start_utc(day + timedelta(days=1), index - today_count, tz)
+            )
+
+        state = plan.state
+        return plan_projection(
+            intervals=outcome.desired.intervals,
+            plan_end_energy_dc_kwh=outcome.desired.end_energy_dc_kwh,
+            # **The configured minimum, which is the number the planning layer was
+            # handed.** ``terminal_floor_kwh`` bounds where the plan may end and the
+            # reachability floor is the hard floor plus an uncertainty margin --
+            # either would answer a different question, and both are close enough to
+            # have been picked by mistake.
+            floor_energy_kwh=(0.0 if state is None else state.floor_energy_kwh),
+            limits=(None if state is None else state.limits),
+            targets=self.execution_targets,
+            moment=moment,
+            now=dt_util.now() if now is None else now,
+        )
 
     @callback
     def _head_run_state(self, now: datetime | None = None) -> int:
