@@ -2156,17 +2156,6 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: Whether this refresh took up a persisted claim. Diagnostics only.
         self._adopted_this_refresh: bool = False
         self._campaign_realized_kwh: float = 0.0
-        #: Every kWh the pack took under this campaign, uncapped. beta.54.
-        #:
-        #: **The sibling of the figure above, and the difference between them is the
-        #: point.** A row's credited objective is ``min(measured, allowance)``, so
-        #: production stored above what the row promised is credited to absorption
-        #: rather than to the objective -- correctly, because the row never promised
-        #: it. The consequence is that the campaign total can only ever equal or
-        #: undershoot the sum of the allowances, and a reader cannot tell a campaign
-        #: that under-delivered from one that delivered into a smaller promise. This
-        #: is the same measurement with no cap applied, published beside it.
-        self._campaign_measured_kwh: float = 0.0
         self._campaign_quarters_admitted: int = 0
         #: How many executable rows the frozen objective was summed over.
         #:
@@ -3274,9 +3263,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Exactly once is a property of ``_campaign_accrued_row``, not of ordering,
         # so the ``accrue=False`` below is intent made visible rather than the
         # mechanism: a double call is already harmless.
-        self._accrue_campaign_progress(
-            row, self._row_objective_kwh(row), self._quarter_battery_kwh
-        )
+        self._accrue_campaign_progress(row, self._row_objective_kwh(row))
         if stop:
             # **Which scope, and beta.36 is the first release that asks. **
             #
@@ -3387,9 +3374,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # write, and sequencing it there let ``_close_campaign`` set
         # ``_campaign_id = None`` in between. The 2026-08-30 terminal reported
         # 0.27 kWh where its own three rows had realised 0.548.
-        self._accrue_campaign_progress(
-            finished, self._row_objective_kwh(finished), self._quarter_battery_kwh
-        )
+        self._accrue_campaign_progress(finished, self._row_objective_kwh(finished))
         await self._async_stop_dispatch(now, snapshot, stop_reason, scope=scope)
         (
             self._quarter_battery_kwh,
@@ -6354,7 +6339,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ``_accrue_campaign_progress`` makes a double call harmless anyway; the
         # switch keeps the intent visible rather than relying on it.
         if accrue:
-            self._accrue_campaign_progress(quarter, realised, self._quarter_battery_kwh)
+            self._accrue_campaign_progress(quarter, realised)
         self._completed_quarters.append(
             {
                 "quarter_start": quarter.quarter_start.isoformat(),
@@ -6474,10 +6459,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @callback
     def _accrue_campaign_progress(
-        self,
-        quarter: CarriedQuarter | None,
-        realised_kwh: float,
-        measured_kwh: float,
+        self, quarter: CarriedQuarter | None, realised_kwh: float
     ) -> None:
         """Add one completed quarter's realised objective to its campaign.
 
@@ -6506,7 +6488,6 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         self._campaign_accrued_row = quarter.quarter_start
         self._campaign_realized_kwh += max(0.0, realised_kwh)
-        self._campaign_measured_kwh += max(0.0, measured_kwh)
         self._campaign_quarters_admitted += 1
         if self._quarter_progress_unknown:
             # A restart lost a quarter of this campaign. The total is no longer a
@@ -6584,18 +6565,32 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @callback
     def _campaign_measured_now(self) -> float:
-        """Return every kWh the pack took under this campaign, open row included."""
-        measured = self._campaign_measured_kwh
+        """Return every kWh the pack took under this campaign, uncapped. beta.54.
+
+        **Summed from the rows already recorded rather than from an accumulator of
+        its own**, because ``realized_battery_kwh`` is published on every completed
+        row and a second running total would be a second thing to reset, capture,
+        restore and keep in step. A first attempt did add one, and paid for it by
+        widening ``_accrue_campaign_progress``'s signature -- which six tests and
+        two mutation operators depend on -- to hand in a figure all three callers
+        read from the same field anyway. This needs none of that.
+
+        The open row is added when it has not reached ``_completed_quarters`` yet,
+        on the same test ``_close_campaign`` already uses for its own pending row:
+        the terminal is filed before the closing row is recorded, and counting it
+        twice or not at all are both wrong.
+
+        Bounded by the completed-row ring, which holds a full civil day -- more than
+        any campaign spans -- and is the same bound ``objective_row_count`` and
+        ``rows_completed`` already rest on.
+        """
+        rows = self._campaign_row_records(self._campaign_id)
+        measured = sum(float(row.get("realized_battery_kwh") or 0.0) for row in rows)
         quarter = self._quarter
-        if (
-            quarter is not None
-            and quarter.campaign_id == self._campaign_id
-            and (
-                self._campaign_accrued_row is None
-                or quarter.quarter_start != self._campaign_accrued_row
-            )
-        ):
-            measured += max(0.0, self._quarter_battery_kwh)
+        if quarter is not None and quarter.campaign_id == self._campaign_id:
+            recorded = {row.get("quarter_start") for row in rows}
+            if quarter.quarter_start.isoformat() not in recorded:
+                measured += max(0.0, self._quarter_battery_kwh)
         return measured
 
     @callback
@@ -6763,7 +6758,6 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._campaign_classification_at_start = None
             self._campaign_opening_target_kwh = self._campaign_objective_kwh(current)
             self._campaign_realized_kwh = 0.0
-            self._campaign_measured_kwh = 0.0
             self._campaign_quarters_admitted = 0
             self._campaign_measurable = True
             self._campaign_accrued_row = None
@@ -7199,7 +7193,6 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._campaign_classification_at_start = None
         self._campaign_opening_target_kwh = None
         self._campaign_realized_kwh = 0.0
-        self._campaign_measured_kwh = 0.0
         self._campaign_quarters_admitted = 0
         self._campaign_objective_rows = 0
         self._campaign_accrued_row = None

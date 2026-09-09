@@ -411,3 +411,96 @@ def test_an_absent_attribution_grants_no_compulsory_authority() -> None:
     )
 
     assert plan._compelled_share(row) == 0.0
+
+
+# ===========================================================================
+# the uncapped campaign total
+# ===========================================================================
+
+
+def _measured_rig(rows, *, quarter=None, campaign="c-1"):
+    """Return a coordinator holding recorded rows for one campaign."""
+    from collections import deque
+    from types import SimpleNamespace
+
+    from custom_components.alpha_ems_manager.coordinator import AlphaEmsCoordinator
+
+    coordinator = object.__new__(AlphaEmsCoordinator)
+    coordinator._campaign_id = campaign
+    coordinator._completed_quarters = deque(rows)
+    coordinator._quarter = quarter
+    coordinator._quarter_battery_kwh = 0.0
+    if quarter is not None:
+        coordinator._quarter_battery_kwh = quarter.measured
+    return coordinator, SimpleNamespace()
+
+
+def _row(start, measured, campaign="c-1"):
+    return {
+        "quarter_start": start,
+        "campaign_id": campaign,
+        "realized_battery_kwh": measured,
+    }
+
+
+def test_the_uncapped_total_is_summed_from_the_rows_already_recorded() -> None:
+    """**No second accumulator, because every row already publishes the figure.**
+
+    ``realized_battery_kwh`` is every kWh the pack took, uncapped, on each completed
+    row. Summing those is the campaign total; a running counter beside them would be
+    one more thing to reset, capture and restore, and a first attempt at one widened
+    a signature six tests and two mutation operators depend on.
+    """
+    coordinator, _ = _measured_rig(
+        [_row("2026-09-09T14:00:00+00:00", 1.2), _row("2026-09-09T14:15:00+00:00", 1.3)]
+    )
+
+    assert coordinator._campaign_measured_now() == pytest.approx(2.5)
+
+
+def test_another_campaigns_rows_are_not_reachable() -> None:
+    """Matched on the campaign id, so a neighbour's energy cannot be borrowed."""
+    coordinator, _ = _measured_rig(
+        [
+            _row("2026-09-09T14:00:00+00:00", 1.2),
+            _row("2026-09-09T13:00:00+00:00", 9.9, campaign="c-other"),
+        ]
+    )
+
+    assert coordinator._campaign_measured_now() == pytest.approx(1.2)
+
+
+def test_the_open_row_is_counted_once_and_only_while_unrecorded() -> None:
+    """**The terminal is filed before the closing row is recorded.**
+
+    So the open row must be added while it is absent from the ring and dropped the
+    moment it appears there. Counting it twice, or not at all, are both wrong -- and
+    this is the same test ``_close_campaign`` already applies to its pending row.
+    """
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    start = datetime(2026, 9, 9, 14, 15, tzinfo=UTC)
+    open_row = SimpleNamespace(campaign_id="c-1", quarter_start=start, measured=0.8)
+
+    unrecorded, _ = _measured_rig(
+        [_row("2026-09-09T14:00:00+00:00", 1.2)], quarter=open_row
+    )
+    assert unrecorded._campaign_measured_now() == pytest.approx(2.0)
+
+    recorded, _ = _measured_rig(
+        [_row("2026-09-09T14:00:00+00:00", 1.2), _row(start.isoformat(), 0.8)],
+        quarter=open_row,
+    )
+    assert recorded._campaign_measured_now() == pytest.approx(2.0)
+
+
+def test_the_uncapped_total_can_exceed_the_credited_objective() -> None:
+    """Which is the whole reason it is published beside it.
+
+    A row's credited objective is capped at its own allowance, so production stored
+    above the promise is credited to absorption. The uncapped figure shows it.
+    """
+    coordinator, _ = _measured_rig([_row("2026-09-09T14:00:00+00:00", 3.0)])
+
+    assert coordinator._campaign_measured_now() > 1.0
