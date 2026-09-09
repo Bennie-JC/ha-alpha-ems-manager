@@ -7201,6 +7201,21 @@ def intent_for_action(action: str) -> str:
     return EXECUTION_INTENT_HOLD
 
 
+def _compelled_kwh(
+    safety_buy_kwh: float | None, coverage_buy_kwh: float | None
+) -> float | None:
+    """Return the compulsory energy of a charge run, or ``None``. beta.54.
+
+    Safety plus coverage, and nothing else. ``None`` when neither figure was formed,
+    so a caller can tell "no compulsory component" from "the attribution is not
+    available" -- and both deny the compulsory authority, which is the direction
+    that cannot over-buy.
+    """
+    if safety_buy_kwh is None and coverage_buy_kwh is None:
+        return None
+    return max(0.0, (safety_buy_kwh or 0.0) + (coverage_buy_kwh or 0.0))
+
+
 def purchase_purpose(
     action: str,
     *,
@@ -7269,6 +7284,7 @@ def execution_target(
     desired_grid_kw: float | None = None,
     safety_buy_kwh: float | None = None,
     economic_buy_kwh: float | None = None,
+    coverage_buy_kwh: float | None = None,
     intervals: tuple[EconomicInterval, ...] = (),
     moment: Any = None,
     campaign_id: str | None = None,
@@ -7356,6 +7372,20 @@ def execution_target(
             safety_buy_kwh=safety_buy_kwh,
             economic_buy_kwh=economic_buy_kwh,
         ),
+        # **How much of this run physical reachability compelled. beta.54.**
+        #
+        # Safety and coverage energy together: both exist because the pack could
+        # not otherwise hold its floor or cover its horizon, neither was chosen on
+        # price, and the planner already carves coverage out of the economic half so
+        # the two cannot overlap. The discretionary remainder is deliberately
+        # excluded -- promoting it would be exactly the error
+        # :func:`purchase_purpose` refuses to make.
+        #
+        # ``None`` where the attribution could not be formed -- no reachability this
+        # refresh, or a pre-beta.54 record -- because nothing may be treated as
+        # compelled on the strength of a missing figure. Absent is not zero, and
+        # here both read as "no compulsory authority", which is the safe direction.
+        "compelled_kwh": _compelled_kwh(safety_buy_kwh, coverage_buy_kwh),
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
         # When this was said, and how long it may be believed. Independent of the

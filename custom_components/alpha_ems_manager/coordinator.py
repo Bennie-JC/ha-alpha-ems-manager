@@ -98,6 +98,7 @@ from .const import (
     ARM_EVIDENCE_NO_TRANSITION,
     ARM_EVIDENCE_STALE_REGISTER,
     ARM_EVIDENCE_UNATTRIBUTABLE,
+    AUTHORISATION_SOURCE_FORECAST_GRID_SHARE,
     AUTHORITY_BASIS_ADMITTED_PLAN,
     AUTHORITY_BASIS_CARRIED_RUN,
     AUTHORITY_BASIS_NONE,
@@ -188,6 +189,8 @@ from .const import (
     DISPATCH_POWER_DEADBAND_KW,
     ECONOMIC_ACTION_CURTAIL,
     ECONOMIC_ACTION_EXPORT,
+    ECONOMIC_ACTION_MIXED_BUY,
+    ECONOMIC_ACTION_SAFETY_BUY,
     ECONOMIC_ANNOUNCE_LEAD_MINUTES,
     ECONOMIC_BLOCKED_ACTION_NOT_EXECUTABLE,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
@@ -269,6 +272,7 @@ from .const import (
     MAX_CONTROL_EVENTS_REPORTED,
     MAX_DISPATCH_START_ACTIVE_SAMPLES,
     MAX_DISPATCH_START_SAMPLES_REPORTED,
+    MAX_HISTORY_DAYS,
     MAX_METER_AUDITS_REPORTED,
     MAX_PHYSICAL_DECISIONS_REPORTED,
     MAX_QUARTER_REFUSALS_RECORDED,
@@ -343,6 +347,7 @@ from .const import (
     QUARTER_END_SAFETY,
     QUARTER_END_TARGET_REACHED,
     QUARTER_MINUTES,
+    QUARTER_SECONDS,
     QUARTER_TARGET_TOLERANCE_KWH,
     REALIZED_BENEFIT_BASIS_VERSION,
     REASON_VOCABULARY_CAMPAIGN_END,
@@ -361,6 +366,8 @@ from .const import (
     ROI_UNAVAILABLE_NO_HISTORY,
     ROI_UNAVAILABLE_NO_INVESTMENT,
     SAFETY_SAMPLE_SECONDS,
+    SEAL_PASS_BLOCKED_NO_PLAN,
+    SEAL_REFUSED_NO_DAY_RECORD,
     SEAL_REFUSED_PRICE_PARTITION_UNLOADED,
     SEAL_REFUSED_PRICES_LOST,
     SEAL_REFUSED_PRICES_NEVER_STORED,
@@ -2149,6 +2156,17 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: Whether this refresh took up a persisted claim. Diagnostics only.
         self._adopted_this_refresh: bool = False
         self._campaign_realized_kwh: float = 0.0
+        #: Every kWh the pack took under this campaign, uncapped. beta.54.
+        #:
+        #: **The sibling of the figure above, and the difference between them is the
+        #: point.** A row's credited objective is ``min(measured, allowance)``, so
+        #: production stored above what the row promised is credited to absorption
+        #: rather than to the objective -- correctly, because the row never promised
+        #: it. The consequence is that the campaign total can only ever equal or
+        #: undershoot the sum of the allowances, and a reader cannot tell a campaign
+        #: that under-delivered from one that delivered into a smaller promise. This
+        #: is the same measurement with no cap applied, published beside it.
+        self._campaign_measured_kwh: float = 0.0
         self._campaign_quarters_admitted: int = 0
         #: How many executable rows the frozen objective was summed over.
         #:
@@ -2170,6 +2188,18 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: computed for. See :meth:`_roi_price_basis` for why an entity read must
         #: not walk a year of stored issuances.
         self._roi_basis_cache: tuple[tuple[Any, ...], dict[str, Any]] | None = None
+        #: What the last sealing pass did, so a refusal can be told from a pass
+        #: that never ran. beta.54.
+        #:
+        #: **The pass discarded its own outcome until now.** It opens with
+        #: ``if plan is None: return 0`` and ``_build_battery_plan`` turns every
+        #: exception into ``None``, so a site whose plan cannot be built sealed
+        #: nothing, forever, and published no reason anywhere. Session-local on
+        #: purpose: it describes this process's attempts, and a stale claim from a
+        #: previous process would be worse than an absence.
+        self._last_seal_attempt_at: str | None = None
+        self._last_seal_count: int | None = None
+        self._last_seal_blocked_reason: str | None = None
         #: Memo for :meth:`unsealed_day_reasons`, on the same terms. beta.51.
         self._unsealed_reasons_cache: tuple[Any, dict[str, Any]] | None = None
         #: The finished campaign, latched. **Not consumed on read**: the surfaces
@@ -2466,8 +2496,38 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         store states for itself is that progress is re-measured from evidence rather
         than trusted from a snapshot.
         """
-        self.store.open_integration = None
         self._sample(moment)
+        self._snapshot_open_integration()
+
+    @callback
+    def _snapshot_open_integration(self) -> None:
+        """Record the open quarter's integral without sampling first. beta.54.
+
+        **The same snapshot, taken during ordinary operation instead of only at a
+        graceful stop.** beta.50 wrote this once, from ``async_shutdown_store``, and
+        said so explicitly: *"A crash therefore leaves nothing to resume and degrades
+        to exactly the old behaviour."* That asymmetry was deliberate and it is also
+        the reason an ungraceful restart still costs the whole civil day -- the
+        resumed quarter starts from zero, closes under ``MIN_QUARTER_COVERAGE`` and
+        is never written, and ``intervals_missing`` is terminal.
+
+        This is called from the sixty-second physical tick, so the in-memory record
+        is at most one tick stale. **It deliberately schedules no write.** The store
+        serialises a year of quarter data -- 1.3 MB on a mature installation -- and a
+        per-minute write of that is roughly two gigabytes a day onto whatever card
+        or disk Home Assistant is installed on. So the snapshot rides the next
+        routine write instead: a quarter boundary, an arm, a lifecycle event or a
+        seal, each of which already writes.
+
+        **What that means honestly.** A crash recovers whatever the last routine
+        write held rather than everything measured up to the crash, so the window is
+        narrowed and not closed. On an executing campaign, arms and execution
+        records make routine writes frequent and the recovery is usually most of the
+        quarter; on an idle quarter the nearest write may be the boundary itself, and
+        then this changes nothing. The alternative was a guarantee nobody should pay
+        for in disk wear.
+        """
+        self.store.open_integration = None
 
         house = self._accumulator
         if house.slot_start_utc is None or house.cursor_utc is None:
@@ -2534,6 +2594,23 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return "clock_stepped_back"
         if (now - cursor).total_seconds() > MAX_CATCHUP_SECONDS:
             return "snapshot_stale"
+        # **Refused now rather than dropped later. beta.54.**
+        #
+        # The guard above admits a snapshot up to twenty-four hours old, which is
+        # far looser than the arithmetic that actually decides the quarter's fate: a
+        # resumed quarter accrues nothing across the downtime, so its coverage is
+        # the seconds already banked plus the seconds left after the restart, and
+        # below ``MIN_QUARTER_COVERAGE`` the interval is discarded whatever happens
+        # here. Adopting a snapshot that cannot clear that bar reports a successful
+        # resume and then loses the interval anyway, which is the least useful pair
+        # of statements available. So the outage is measured against the bar and a
+        # snapshot that cannot clear it is refused with its own reason.
+        remaining = (
+            slot_start + timedelta(seconds=QUARTER_SECONDS) - now
+        ).total_seconds()
+        banked = max(0.0, (cursor - slot_start).total_seconds())
+        if banked + max(0.0, remaining) < QUARTER_SECONDS * MIN_QUARTER_COVERAGE:
+            return "outage_exceeds_coverage"
 
         accrued = snapshot.get("acc")
         if not isinstance(accrued, dict):
@@ -2790,6 +2867,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         moment = dt_util.as_local(now)
         self._sample(moment)
+        # **So an ungraceful restart has something to resume. beta.54.** Kept in
+        # memory only -- see ``_snapshot_open_integration`` for why this schedules no
+        # write -- and taken after the sample so the cursor is this tick's.
+        self._snapshot_open_integration()
         self._sample_balance()
         self.hass.async_create_task(self._async_physical_tick(moment))
 
@@ -3193,7 +3274,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Exactly once is a property of ``_campaign_accrued_row``, not of ordering,
         # so the ``accrue=False`` below is intent made visible rather than the
         # mechanism: a double call is already harmless.
-        self._accrue_campaign_progress(row, self._row_objective_kwh(row))
+        self._accrue_campaign_progress(
+            row, self._row_objective_kwh(row), self._quarter_battery_kwh
+        )
         if stop:
             # **Which scope, and beta.36 is the first release that asks. **
             #
@@ -3304,7 +3387,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # write, and sequencing it there let ``_close_campaign`` set
         # ``_campaign_id = None`` in between. The 2026-08-30 terminal reported
         # 0.27 kWh where its own three rows had realised 0.548.
-        self._accrue_campaign_progress(finished, self._row_objective_kwh(finished))
+        self._accrue_campaign_progress(
+            finished, self._row_objective_kwh(finished), self._quarter_battery_kwh
+        )
         await self._async_stop_dispatch(now, snapshot, stop_reason, scope=scope)
         (
             self._quarter_battery_kwh,
@@ -5356,7 +5441,48 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # own state is rebuilt on the economic cadence and would be a quarter of
             # an hour stale on the cadence that commands.
             retention_remaining_kwh=self._retainable_kwh(quarter),
+            # **The compulsory part of what this row still owes. beta.54.**
+            #
+            # Measured against the *objective*, not against every kWh the pack took:
+            # free production stored above the promise is credited to absorption and
+            # does not discharge a compulsory obligation the row made about bought
+            # energy. Frozen at admission, so no later publication can enlarge it,
+            # and clamped at zero once the compulsory share has been delivered.
+            compelled_remaining_kwh=max(
+                0.0, quarter.compelled_kwh - self._quarter_objective_kwh
+            ),
         )
+
+    @callback
+    def _production_share(
+        self, quarter: CarriedQuarter, objective: float, planned_grid: float
+    ) -> dict[str, Any]:
+        """Return the row's forecast and measured production contribution. beta.54.
+
+        Both sides come from figures this class already holds, so neither is a
+        second derivation of anything:
+
+        * forecast -- the objective less the frozen grid authorisation, which is
+          what the plan expected production to supply;
+        * measured -- every kWh the pack took less the grid share
+          ``_accrue_quarter_progress`` attributed to it, spending production first.
+
+        ``None`` throughout on an export: there is no such thing as free production
+        to discharge, so the split would be meaningless rather than merely zero.
+        """
+        if quarter.intent == EXECUTION_INTENT_NET_EXPORT:
+            return {
+                "forecast_pv_share_kwh": None,
+                "measured_pv_share_kwh": None,
+                "pv_shortfall_kwh": None,
+            }
+        forecast = max(0.0, objective - planned_grid)
+        measured = max(0.0, self._quarter_battery_kwh - self._quarter_grid_import_kwh)
+        return {
+            "forecast_pv_share_kwh": round(forecast, 3),
+            "measured_pv_share_kwh": round(measured, 3),
+            "pv_shortfall_kwh": round(forecast - measured, 3),
+        }
 
     @callback
     def _quarter_ring_fields(self, now: datetime) -> dict[str, Any]:
@@ -5606,6 +5732,53 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if row.intent == EXECUTION_INTENT_NET_EXPORT:
             return MIN_CONTROLLABLE_QUARTER_KWH
         return MIN_EXECUTABLE_QUARTER_KWH
+
+    @callback
+    def _compelled_kwh_for(self, row: CarriedQuarter) -> float | None:
+        """Return how much of ``row``'s objective is compulsory. beta.54.
+
+        **Read from the purpose frozen onto the row at admission**, never from the
+        live campaign classification. That classification is recomputed every
+        refresh and legitimately moves -- a campaign spanning two admitted plans
+        reads one category and then another -- so consulting it would let an open
+        row's authority change underneath it, which is the class of defect beta.38
+        exists to prevent.
+
+        Three answers, and the middle one is a published limitation rather than an
+        omission:
+
+        * ``safety_buy`` -- physical reachability compelled the whole objective, so
+          all of it is compulsory;
+        * ``mixed_buy`` -- reachability compelled part and the optimiser chose the
+          rest on price. The split is computed by ``purchase_purpose`` and is *not*
+          carried onto a row, so the compelled share is unknown here and is reported
+          as such. Guessing the whole objective would promote discretionary energy
+          to compulsory, which is exactly what ``purchase_purpose`` refuses to do;
+        * anything else -- no compulsory component, including an export and an
+          ordinary economic charge.
+
+        **The purpose is read from the admitted plan, not from the row.**
+        ``CarriedQuarter`` carries sixteen fields and the purpose is not among them
+        -- it lives on the ``AdmittedPlan`` the row was frozen out of, which is
+        equally immutable afterwards and is matched on ``plan_id`` here so another
+        plan's purpose can never be reached. Any release wanting this figure inside
+        a control decision will have to carry the purpose, and the compelled share,
+        onto the row itself.
+
+        Observability only in beta.54. Nothing that decides a setpoint reads this.
+        """
+        if row.intent != EXECUTION_INTENT_GRID_CHARGE:
+            return 0.0
+        plan = self._plan
+        if plan is None or plan.plan_id != row.plan_id:
+            # No frozen purpose is reachable for this row, which is a different
+            # answer from "no compulsory component" and is reported as one.
+            return None
+        if plan.purpose == ECONOMIC_ACTION_SAFETY_BUY:
+            return row.battery_allowance_kwh()
+        if plan.purpose == ECONOMIC_ACTION_MIXED_BUY:
+            return None
+        return 0.0
 
     @callback
     def _objective_kwh_for(self, row: CarriedQuarter | None) -> float:
@@ -6008,7 +6181,12 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Without a configured counter the status is ``not_configured`` and the verdict
         can never be ``exact``. That is the honest answer, not a degraded one.
         """
-        if quarter is None or quarter.intent != EXECUTION_INTENT_NET_EXPORT:
+        if quarter is None:
+            return
+        if quarter.intent == EXECUTION_INTENT_GRID_CHARGE:
+            self._file_charge_audit(quarter)
+            return
+        if quarter.intent != EXECUTION_INTENT_NET_EXPORT:
             return
         window = self._measured_window(quarter)
         started = self._quarter_counter_from
@@ -6052,6 +6230,65 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "attributed_export_kwh": attributed,
                 "unexplained_kwh": unexplained,
                 "status": verdict,
+            }
+        )
+
+    @callback
+    def _file_charge_audit(self, quarter: CarriedQuarter) -> None:
+        """File the charge boundary's own audit row. beta.54.
+
+        **The same block shape as the export audit, and the same refusal to
+        manufacture a verdict.** A charge objective is measured at the battery, so
+        the figure that matters is the AC energy the pack took; the grid share is an
+        attribution over the same measured window, computed by spending production
+        first, and the production share is the remainder.
+
+        The three published energies are one measurement and its stated split, so
+        their identity is true by construction and proves nothing about the plant.
+        This audit therefore reports ``not_configured`` and a verdict of
+        ``uncertain`` rather than inventing an ``unexplained_kwh`` out of a
+        tautology: **there is no cumulative grid-*import* counter in this
+        integration**, and the export counter cannot audit an import. Publishing
+        ``exact`` here would be the one result worth nothing, which is the argument
+        beta.48 already made against auditing our own arithmetic against itself.
+
+        What it is genuinely for is the window. Every figure is stated over exactly
+        the interval the accrual measured -- ``sampled_from`` to ``sampled_to``, with
+        ``unmeasured_seconds`` beside it -- so a reader comparing a charge row
+        against a house meter is comparing like with like, and the accrual reset
+        beta.48 measured is visible on a charge row for the first time.
+        """
+        window = self._measured_window(quarter)
+        battery = round(self._quarter_battery_kwh, 4)
+        grid = round(self._quarter_grid_import_kwh, 4)
+        self._meter_audits.append(
+            {
+                "scope": "quarter",
+                "row_start": quarter.quarter_start.isoformat(),
+                "row_end": quarter.quarter_end.isoformat(),
+                "claim_id": self._quarter_claim,
+                "campaign_id": quarter.campaign_id,
+                "objective_boundary": CAMPAIGN_BOUNDARY_BATTERY,
+                **window,
+                # No import counter exists to compare against, and saying so is the
+                # honest answer rather than a degraded one.
+                "counter_status": METER_COUNTER_NOT_CONFIGURED,
+                "attributed_charge_kwh": battery,
+                "grid_import_attributed_kwh": grid,
+                # The remainder, which is production having paid for the charge.
+                "pv_attributed_kwh": round(max(0.0, battery - grid), 4),
+                "physical_charge_kwh": None,
+                "unexplained_kwh": None,
+                "status": METER_AUDIT_UNCERTAIN,
+                "rule": (
+                    "the charge objective is measured at the battery, and the grid "
+                    "and production shares are an attribution over the same "
+                    "measured window that spends production first. the three sum by "
+                    "construction, so this row states the split and its window and "
+                    "withholds a verdict: no cumulative grid-import counter exists "
+                    "to audit it against, and an export counter cannot audit an "
+                    "import"
+                ),
             }
         )
 
@@ -6117,7 +6354,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ``_accrue_campaign_progress`` makes a double call harmless anyway; the
         # switch keeps the intent visible rather than relying on it.
         if accrue:
-            self._accrue_campaign_progress(quarter, realised)
+            self._accrue_campaign_progress(quarter, realised, self._quarter_battery_kwh)
         self._completed_quarters.append(
             {
                 "quarter_start": quarter.quarter_start.isoformat(),
@@ -6134,6 +6371,37 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "absorption_gate": quarter.retention_gate,
                 "planned_grid_kwh": round(planned_grid, 3),
                 "realized_grid_kwh": round(realised_grid, 3),
+                # **The production the row was counting on, and what arrived.
+                # beta.54, and this pair is the discriminator.**
+                #
+                # A charge row's objective is fed from two places: the grid, bounded
+                # by the frozen ``grid_authorised_kwh`` the plan forecast, and
+                # whatever production the array happens to deliver. So the forecast
+                # production share is the objective less that authorisation, and the
+                # measured share is every kWh the pack took less the grid share the
+                # attribution charged for it -- both already accumulated, neither
+                # re-derived.
+                #
+                # Their difference is what to compare against ``shortfall_kwh``. A
+                # row whose shortfall equals its production shortfall was throttled
+                # by the forecast being wrong rather than by anything physical, and
+                # that is a statement a reader can check with two subtractions
+                # instead of a hypothesis. Withheld on an export, which has no
+                # production share.
+                **self._production_share(quarter, objective, planned_grid),
+                # How much of the objective was compulsory, from the frozen purpose.
+                # ``None`` on a mixed buy: the split exists in the planner's
+                # attribution and is not carried onto a row. Reporting only.
+                "compelled_kwh": (
+                    None
+                    if (compelled := self._compelled_kwh_for(quarter)) is None
+                    else round(compelled, 3)
+                ),
+                "compelled_share_known": (self._compelled_kwh_for(quarter) is not None),
+                # What bounded the row's grid contribution. One value in beta.54,
+                # because nothing yet raises it -- published so a later release that
+                # does is legible against these rows rather than against none.
+                "authorisation_source": AUTHORISATION_SOURCE_FORECAST_GRID_SHARE,
                 # **The window that was actually integrated, and the gap. beta.48.**
                 # The nominal window is above; these say what was measured inside
                 # it. ``unmeasured_seconds`` is the difference, and it is a
@@ -6206,7 +6474,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @callback
     def _accrue_campaign_progress(
-        self, quarter: CarriedQuarter | None, realised_kwh: float
+        self,
+        quarter: CarriedQuarter | None,
+        realised_kwh: float,
+        measured_kwh: float,
     ) -> None:
         """Add one completed quarter's realised objective to its campaign.
 
@@ -6235,6 +6506,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         self._campaign_accrued_row = quarter.quarter_start
         self._campaign_realized_kwh += max(0.0, realised_kwh)
+        self._campaign_measured_kwh += max(0.0, measured_kwh)
         self._campaign_quarters_admitted += 1
         if self._quarter_progress_unknown:
             # A restart lost a quarter of this campaign. The total is no longer a
@@ -6309,6 +6581,22 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _campaign_realized_now(self) -> float:
         """Return the campaign's realised objective including the open quarter."""
         return self._campaign_realized_kwh + self._open_quarter_objective_kwh()
+
+    @callback
+    def _campaign_measured_now(self) -> float:
+        """Return every kWh the pack took under this campaign, open row included."""
+        measured = self._campaign_measured_kwh
+        quarter = self._quarter
+        if (
+            quarter is not None
+            and quarter.campaign_id == self._campaign_id
+            and (
+                self._campaign_accrued_row is None
+                or quarter.quarter_start != self._campaign_accrued_row
+            )
+        ):
+            measured += max(0.0, self._quarter_battery_kwh)
+        return measured
 
     @callback
     def _campaign_objective_kwh(self, campaign_id: str) -> float | None:
@@ -6475,6 +6763,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._campaign_classification_at_start = None
             self._campaign_opening_target_kwh = self._campaign_objective_kwh(current)
             self._campaign_realized_kwh = 0.0
+            self._campaign_measured_kwh = 0.0
             self._campaign_quarters_admitted = 0
             self._campaign_measurable = True
             self._campaign_accrued_row = None
@@ -6715,6 +7004,11 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             and self._campaign_accrued_row.isoformat() not in recorded_starts
         )
         target_kwh = self._campaign_frozen_target_kwh
+        # The live objective, read before anything below can clear the identity --
+        # the same ordering ``campaign_rows`` above relies on. ``None`` where no
+        # published target names this campaign any more, which is the ordinary case
+        # for a campaign whose rows are all behind the horizon head.
+        planned_final = self._campaign_objective_kwh(campaign_id)
         # **Including whatever the open quarter had moved.** A campaign cut short
         # mid-quarter delivered that energy, and dropping it would report a
         # shortfall the plant did not have. True since beta.36; see above.
@@ -6784,6 +7078,25 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 None if target_kwh is None else round(target_kwh, 3)
             ),
             "objective_realized_kwh": round(realized, 3),
+            # **Two bases the old pair could not express. beta.54, and both are
+            # additive -- neither figure above changes value.**
+            #
+            # ``objective_target_kwh`` is a high-water mark: it is grown by
+            # ``_grow_campaign_target`` and never shrinks, so a rolling replan that
+            # legitimately *reduces* a campaign's objective leaves the target at the
+            # largest figure ever published while the realised total reflects the
+            # smaller plan that actually ran. This is the objective as the plan last
+            # stated it, so the tracking error can be read against what was still
+            # intended rather than against the most anybody ever hoped for.
+            #
+            # And ``objective_realized_kwh`` is a sum of per-row figures each capped
+            # at that row's own allowance. This is the same measurement uncapped, so
+            # a campaign that stored more than it promised is visible as such rather
+            # than as one that merely met its promise.
+            "objective_planned_final_kwh": (
+                None if planned_final is None else round(planned_final, 3)
+            ),
+            "battery_measured_total_kwh": round(self._campaign_measured_now(), 3),
             "objective_measurable": measurable,
             # **Signed, and null below the actuator quantum.** A 13 % shortfall on
             # a 0.11 kWh objective and a 13 % shortfall on a 5 kWh one are
@@ -6886,6 +7199,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._campaign_classification_at_start = None
         self._campaign_opening_target_kwh = None
         self._campaign_realized_kwh = 0.0
+        self._campaign_measured_kwh = 0.0
         self._campaign_quarters_admitted = 0
         self._campaign_objective_rows = 0
         self._campaign_accrued_row = None
@@ -10321,6 +10635,9 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ),
                 safety_buy_kwh=attribution.get(run.start_index, (None, None))[0],
                 economic_buy_kwh=attribution.get(run.start_index, (None, None))[1],
+                # beta.54: the compulsory half, so a row can pursue the objective
+                # reachability compelled even when forecast production fails.
+                coverage_buy_kwh=outcome.coverage_buy_attribution.get(run.start_index),
                 # **The solved rows, so the per-quarter schedule can be built.**
                 # Omitting these is what published an empty ``quarter_schedule``
                 # for every run in beta.27: the parameter was an optional prebuilt
@@ -12076,6 +12393,23 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "benefit_before_accounting_start_eur": lifetime[
                     "benefit_before_accounting_start_eur"
                 ],
+                # **The reasons, and this is the branch that needs them most.
+                # beta.54.**
+                #
+                # beta.51 computed a refusal for every unsealed past day and
+                # beta.52 routed this installation into the one branch that
+                # omitted them: scoping the return to the accounting period made
+                # ``sample_days`` zero wherever every sealed day predates the
+                # purchase, so the release that added the explanation and the
+                # release that needed it cancelled out. ``unsealed_day_reasons``
+                # is reachable from ``_roi_provenance`` alone, which was spread
+                # into the available branch alone -- so on the installation both
+                # were written for, the answer existed and could not be read.
+                #
+                # Same argument as the three figures above, which beta.52 wrote
+                # twice: published even here, and especially here.
+                **self._roi_provenance(lifetime, today),
+                **self._seal_pass_report(),
             }
 
         short = self._trailing_benefit(today, ROI_TRAILING_SHORT_DAYS, since=since)
@@ -12109,6 +12443,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "pre_investment_days_included": lifetime["pre_investment_days_included"],
             **payback,
             **self._roi_provenance(lifetime, today),
+            **self._seal_pass_report(),
             **self._roi_price_basis(today),
         }
 
@@ -12225,6 +12560,21 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return max(purchased, available)
 
     @callback
+    def _seal_pass_report(self) -> dict[str, Any]:
+        """Return what the last sealing pass did. beta.54.
+
+        Three facts an unavailable return could not previously state: whether a pass
+        has run at all in this process, how many days it moved, and whether it was
+        refused before it started. ``None`` throughout on a fresh start, which is a
+        different claim from "ran and sealed nothing" and is kept distinct from it.
+        """
+        return {
+            "last_seal_attempt_at": self._last_seal_attempt_at,
+            "days_sealed_last_pass": self._last_seal_count,
+            "seal_pass_blocked_reason": self._last_seal_blocked_reason,
+        }
+
+    @callback
     def _roi_provenance(self, lifetime: dict[str, Any], today: date) -> dict[str, Any]:
         """Return what period the cumulative figure actually covers.
 
@@ -12242,12 +12592,30 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         start = None if bound is None else bound.isoformat()
         reasons = self.unsealed_day_reasons(today)
         inside = 0
+        absent = 0
         if start is not None:
             boundary = date.fromisoformat(start)
             inside = sum(
                 1
                 for day, record in self.store.days.items()
                 if boundary <= day < today and record.final_benefit is None
+            )
+            # **Days with no record at all, which no other count can see. beta.54.**
+            #
+            # ``unsealed_day_reasons`` iterates the records that exist, so a day the
+            # integration was not running for is absent from every figure it
+            # publishes -- neither unsealed nor sealed, simply missing. Inside the
+            # accounting period that absence is the whole story: it is terminal, and
+            # it is the difference between a return that is waiting for evidence and
+            # one waiting for evidence that will never arrive.
+            #
+            # Bounded by the retention window rather than by the configured date, so
+            # a purchase entered years ago cannot turn this into an unbounded scan.
+            first = max(boundary, today - timedelta(days=MAX_HISTORY_DAYS))
+            absent = sum(
+                1
+                for offset in range((today - first).days)
+                if (first + timedelta(days=offset)) not in self.store.days
             )
         # **A completeness claim that never looked inside its own span.** The old
         # test compared two endpoints, so it read ``true`` over a three-week hole in
@@ -12274,6 +12642,8 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # exactly the installations that have the most history. It is counted
             # under ``unresolved_holes_total`` instead: not weighed, but not hidden.
             "unsealed_days_in_accounting_period": inside,
+            #: Terminal by construction -- nothing writes an interval retroactively.
+            "days_with_no_record_in_accounting_period": absent,
             "unresolved_holes_total": reasons["unsealed_past_days"],
             "unsealed_by_reason": reasons["unsealed_by_reason"],
             "unsealed_recent": reasons["unsealed_recent"],
@@ -12439,8 +12809,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         idempotent twice over: :meth:`DayRecord.note_final_benefit` refuses a day
         that already has a figure, and the pass skips it before computing one.
         """
+        self._last_seal_attempt_at = dt_util.utcnow().isoformat()
         if plan is None:
+            # **Named rather than returned silently. beta.54.** ``_build_battery_plan``
+            # turns every exception into ``None``, so this branch is reachable on a
+            # site whose hardware facts are missing *and* on one whose plan raised.
+            # Either way nothing can be sealed -- the pass needs the plan's limits to
+            # convert a stored state of charge into energy -- and an operator seeing
+            # an unavailable return deserves to be told that rather than left to
+            # infer it from a figure that never appears.
+            self._last_seal_count = 0
+            self._last_seal_blocked_reason = SEAL_PASS_BLOCKED_NO_PLAN
             return 0
+        self._last_seal_blocked_reason = None
         candidates = self._seal_candidates(today, ROI_SEAL_CANDIDATE_BATCH)
         if candidates:
             try:
@@ -12474,6 +12855,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 sealed += 1
         if sealed:
             self.store.schedule_save()
+        self._last_seal_count = sealed
         return sealed
 
     @callback
@@ -12624,7 +13006,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return False, "day_not_past"
         record = self.store.days.get(day)
         if record is None:
-            return False, "no_day_record"
+            return False, SEAL_REFUSED_NO_DAY_RECORD
         usable, reason = self._day_data_complete(record)
         if not usable:
             return False, reason
@@ -12787,10 +13169,24 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _tally(by_reason, reason)
             # A day that only closed yesterday may still be waiting for the quarter
             # that spans midnight, so it is not called finished yet.
-            if reason in SEAL_TERMINAL_REFUSALS and day < today - timedelta(days=1):
+            is_terminal = reason in SEAL_TERMINAL_REFUSALS and day < today - timedelta(
+                days=1
+            )
+            if is_terminal:
                 terminal += 1
             if len(recent) < MAX_UNSEALED_DAYS_PUBLISHED:
-                recent.append({"d": day.isoformat(), "r": reason})
+                # **Which series, how many intervals, and whether it can still
+                # recover. beta.54.** Bounded by the same publication cap the
+                # reasons already respect, so this stays a handful of small
+                # mappings rather than a per-day scan of the whole year.
+                recent.append(
+                    {
+                        "d": day.isoformat(),
+                        "r": reason,
+                        "terminal": is_terminal,
+                        **self._missing_series_counts(day),
+                    }
+                )
 
         unsealed = sorted(
             day
@@ -12808,6 +13204,59 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
         self._unsealed_reasons_cache = (key, published)
         return dict(published)
+
+    @callback
+    def _missing_series_counts(self, day: date) -> dict[str, int | None]:
+        """Return how many intervals each prerequisite series is short. beta.54.
+
+        **A reason names the first gate that refused; this names the size of the
+        hole.** ``intervals_missing`` and ``grid_flows_incomplete`` are both
+        terminal and both mean "a measurement is gone", but one lost quarter and a
+        lost afternoon are different problems and only one of them is worth
+        investigating a sensor over. The gates themselves short-circuit on the first
+        ``None`` they find, so the counts are taken separately here.
+
+        Every series is counted independently, deliberately: an under-covered
+        production or grid interval stores nothing while invalidating nothing, so a
+        day can be perfect on the house series and short on one other -- which is
+        the shape a brief sensor outage leaves and is impossible to see from the
+        single reason string.
+
+        ``None`` where the question does not apply: prices when none were ever
+        stored, production on a site with no array configured.
+        """
+        record = self.store.days.get(day)
+        if record is None:
+            return {}
+        count = record.interval_count
+        resolved = self._prices_for_day(day, count)
+        buy = None if resolved is None else resolved[0]
+        production_configured = bool(self.config.has_pv and self.config.pv_power_entity)
+        return {
+            "intervals": count,
+            "missing_measured_intervals": sum(
+                1 for index in range(count) if record.measured[index] is None
+            ),
+            "missing_load_intervals": sum(
+                1 for index in range(count) if record.total_load_at(index) is None
+            ),
+            "missing_price_intervals": (
+                None
+                if buy is None
+                else sum(1 for index in range(count) if buy[index] is None)
+            ),
+            "missing_production_intervals": (
+                sum(1 for index in range(count) if record.pv_at(index) is None)
+                if production_configured
+                else None
+            ),
+            "missing_grid_intervals": sum(
+                1
+                for index in range(count)
+                if record.grid_import_at(index) is None
+                or record.grid_export_at(index) is None
+            ),
+        }
 
     @callback
     def _prices_for_day(

@@ -9,6 +9,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.54] - 2026-09-09
+
+**A compelled purchase now buys the production its forecast promised, and an
+unavailable investment return finally says why.**
+
+No planner decision, no campaign creation or selection, no reserve, no reachability,
+no terminal value, no switching cost, no grid-charge margin, no export permission, no
+economics. Seventy-nine neutrality tests pass unchanged and were not re-baselined.
+Stage B behaviour moves in exactly one place, described below, and it cannot move for
+a discretionary purchase.
+
+## The third instance of one defect
+
+A charge row's objective is fed from two places: whatever production arrives, and
+purchase bounded by the row's frozen `grid_authorised_kwh`. That authorisation is the
+import the charge was *predicted* to cause, computed inside the solve from forecast
+production. Since the plan sized the objective as `forecast_surplus +
+forecast_grid_share`, the ceiling the two bounds jointly impose is `measured_surplus +
+forecast_grid_share` -- so
+
+    ceiling - objective_rate  =  measured_surplus - forecast_surplus
+
+and **the battery is throttled by exactly the production forecast error.**
+
+The 2026-09-09 campaign is what that looks like. A 13.63 kWh objective over thirteen
+quarters is 4.194 kW; against a 2.2 kW production expectation that did not arrive the
+controller commands 1.90 kW. The campaign delivered **6.334 of 13.63 kWh at a
+1.95 kW mean**, ending `partial` / `window_ended` with the pack at 74 % and 5.5 kWh of
+headroom unused. Reconstructed prediction 6.175 kWh against 6.334 observed: 2.5 %.
+
+beta.36 stopped the row's authorisation capping battery power directly. beta.40
+stopped the run's remaining budget doing it as a flat pace. This is the same coupling
+surviving as *forecast* production, one level further out.
+
+**Two rival explanations were excluded rather than argued away.** A collapsed headroom
+ceiling commands 0.00 kW and the deadband holds 4.00 kW, so neither can produce a 46 %
+delivery over that window. All three signatures are pinned by tests.
+
+## What changed, and where it cannot reach
+
+Energy **physical reachability compelled** -- safety and coverage purchase -- may now
+be bought at the rate that finishes it, past the split its forecast assumed. The pack
+must reach its floor whether or not the sun arrived.
+
+Discretionary purchase is **bit-for-bit unchanged**. Buying more than the optimiser
+priced is a decision, and the fifteen-minute rolling replan is what makes it.
+
+**This is not catch-up.** The bound is the row's own frozen compulsory share less what
+it has already taken; the run's compulsory energy is apportioned across its rows in
+proportion to their objectives, so one run's rows can never together claim it more
+than once. No earlier row's deficit is reachable, nothing carries between quarters,
+and every clamp -- inverter power, pack headroom, state of charge, the actuator step
+-- applies unchanged and in the same order. A row that used the authority says so, and
+only where the raise actually changed the command.
+
+Where the attribution could not be formed, no compulsory authority is granted. Absent
+is not zero, and both read as "no authority" -- the only direction that cannot
+over-buy.
+
+## The investment return says why it has nothing to say
+
+beta.51 computed a refusal for every unsealed past day and published it. beta.52 then
+bounded the return to the accounting period, which made the sample count zero on an
+installation whose sealed days all predate its purchase -- and routed the payload into
+the one branch that omitted the refusals. `unsealed_day_reasons` is reachable through
+`_roi_provenance` alone, which was spread into the available branch alone. So the
+release that added the explanation and the release that needed it cancelled out, and
+on the reference installation the answer existed, was recomputed every refresh, and
+could not be read from the entity or the diagnostics download.
+
+Same argument beta.52 wrote twice for the three figures beside it: published even
+here, and especially here.
+
+Beside it, the sealing pass now reports itself -- `last_seal_attempt_at`,
+`days_sealed_last_pass`, and `seal_pass_blocked_reason`. The pass opens with a refusal
+when no battery plan could be built, and `_build_battery_plan` turns every exception
+into `None`, so a site in that state sealed nothing on every refresh and published no
+reason for it. A pass that has not run and a pass that found nothing to move are now
+different statements.
+
+## Which series, and how much of it
+
+Every unsealed day now carries its missing-interval counts per series -- measurement,
+load boundary, price, production, both grid legs -- with `terminal` beside them. One
+lost quarter and a lost afternoon are both `intervals_missing`, and only one of them is
+worth suspecting a sensor over. Production and grid intervals can go missing
+independently of the house series, which the single reason string could not show.
+
+A day the integration was not running for is now classified `terminal` and counted:
+`unsealed_day_reasons` iterates the records that exist, so such a day was previously
+absent from every published figure -- neither sealed nor unsealed.
+
+## Historical days are not reconstructed
+
+**An interval nobody measured cannot be recovered, and beta.54 does not pretend
+otherwise.** Nothing writes a measurement retroactively, and inventing one would put a
+fabricated number inside a sealed euro figure. Days that are terminally incomplete stay
+unsealed and now say exactly why.
+
+What changes is forward. The open quarter's integral is recorded on every
+sixty-second tick rather than only at a graceful stop, so an ungraceful restart has
+something to resume instead of starting the quarter from zero -- and the resumed
+quarter accrues nothing across the downtime, because the held power is still
+discarded. A snapshot whose outage already puts the quarter below its coverage
+threshold is now refused up front with its own reason, rather than adopted and then
+losing its interval anyway.
+
+**Honestly bounded:** the snapshot deliberately schedules no write of its own. The
+store serialises a year of quarter data -- measured at 1.31 MB -- so a per-minute
+write of it is roughly two gigabytes a day onto whatever card Home Assistant runs
+from. It rides the next routine write instead, which narrows the window rather than
+closing it. On an executing campaign, arms and execution records make those writes
+frequent; on an idle quarter the nearest one may be the boundary itself.
+
+## Also
+
+A charge row files its own reconciliation row, in the beta.48 block and with the same
+vocabulary: the AC energy the pack took, the grid share attributed to it, the
+production remainder, and the window each was measured over. It **withholds a
+verdict** -- there is no cumulative grid-import counter in this integration, and an
+export counter cannot audit an import, so publishing `exact` would be auditing our own
+arithmetic against itself.
+
+Two campaign figures gain the bases the old pair could not express, both additive with
+no published number changing value: `objective_planned_final_kwh`, the objective as the
+plan last stated it rather than the high-water mark it never falls below, and
+`battery_measured_total_kwh`, the same measurement without the per-row cap.
+
 ## [1.0.0-beta.53] - 2026-09-08
 
 **Three questions answered with the planner's own numbers instead of estimates of

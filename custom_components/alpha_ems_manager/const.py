@@ -2296,8 +2296,33 @@ SEAL_REFUSED_PRICES_LOST: Final = "prices_lost"
 #: ``measured[i]`` retroactively and a past day can never gain a price issuance, so
 #: those refusals are final; a partition that is merely not loaded is not, and
 #: filing it here would be the same error the conflated price token was.
+#: Why a sealing pass could not run at all. beta.54.
+#:
+#: **Distinct from a day-level refusal, and that is the point.** Every reason in
+#: :data:`SEAL_TERMINAL_REFUSALS` describes one day; this describes the pass. The
+#: pass opens with ``if plan is None: return 0`` and ``_build_battery_plan`` turns
+#: every exception into ``None``, so a site whose plan cannot be built sealed
+#: nothing on every refresh and published no reason for it anywhere -- the return
+#: simply stayed unavailable with a day-level story that was never the real one.
+SEAL_PASS_BLOCKED_NO_PLAN: Final = "no_battery_plan"
+
+SEAL_PASS_BLOCKED_REASONS: Final = (SEAL_PASS_BLOCKED_NO_PLAN,)
+
+#: No record for the day exists at all -- the integration was not running.
+#:
+#: **Terminal, and beta.54 is where it was classified.** It sat in neither set, so
+#: a day the integration was off for was counted as retryable while nothing could
+#: ever recover it: the only writer of an interval is the quarter that just closed,
+#: and that quarter is years gone. It is also unreachable from
+#: ``unsealed_day_reasons``, which iterates the records that exist -- so such a day
+#: was absent from every published count rather than merely mis-classified. It is
+#: counted inside the accounting period now, where its absence is the difference
+#: between "waiting" and "will never arrive".
+SEAL_REFUSED_NO_DAY_RECORD: Final = "no_day_record"
+
 SEAL_TERMINAL_REFUSALS: Final = (
     "intervals_missing",
+    SEAL_REFUSED_NO_DAY_RECORD,
     "load_boundary_incomplete",
     "price_hole",
     "production_incomplete",
@@ -3243,6 +3268,37 @@ DISPATCH_LIMIT_SENSOR_COHERENCE: Final = "sensor_coherence"
 #: the battery was asked for more than the row's own objective and that not one
 #: watt of it was bought -- see ``beta.40``.
 DISPATCH_LIMIT_FREE_PV_ABSORPTION: Final = "free_pv_absorption"
+
+#: The compulsory objective was allowed past its forecast grid share.
+#:
+#: **Not a clamp either, and for the mirror-image reason. beta.54.** Like
+#: :data:`DISPATCH_LIMIT_FREE_PV_ABSORPTION` this names a term that may *raise* a
+#: command, so it is absent from :data:`DISPATCH_CLAMP_ORDER`. It differs in what it
+#: spends: absorption is bounded by measured free production and can never buy a
+#: watt, while this one buys deliberately -- but only energy physical reachability
+#: already demanded, only up to the row's own frozen compulsory share, and only
+#: because the production that share was predicted to come from did not arrive.
+#:
+#: A reader seeing it knows the row bought past the split its forecast assumed, and
+#: that it bought no more than the objective it was already committed to.
+DISPATCH_LIMIT_COMPELLED_OBJECTIVE: Final = "compelled_objective"
+
+#: What bounded a charge row's grid contribution. beta.54.
+#:
+#: One value today, and it is published anyway. A charge row's objective is fed
+#: from production and from the grid, and the grid half is bounded by the frozen
+#: ``grid_authorised_kwh`` the plan forecast -- so when production falls short of
+#: forecast the row cannot make up the difference and under-delivers by exactly
+#: that shortfall. Naming the source on every row now means a later release that
+#: lets a *compelled* objective reach past the forecast share is legible against
+#: rows recorded before it, instead of against nothing.
+AUTHORISATION_SOURCE_FORECAST_GRID_SHARE: Final = "forecast_grid_share"
+AUTHORISATION_SOURCE_COMPELLED_OBJECTIVE: Final = "compelled_objective"
+
+AUTHORISATION_SOURCES: Final = (
+    AUTHORISATION_SOURCE_FORECAST_GRID_SHARE,
+    AUTHORISATION_SOURCE_COMPELLED_OBJECTIVE,
+)
 
 #: The clamp order, and the order is contractual.
 #:

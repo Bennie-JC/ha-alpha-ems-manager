@@ -333,7 +333,7 @@ async def test_campaign_006_realized_export_accumulates_across_the_gap(
     coordinator._note_campaign_progress(first.quarter_start, None)
     assert coordinator._campaign_id == identity, "the campaign must open"
 
-    coordinator._accrue_campaign_progress(first, 0.07)
+    coordinator._accrue_campaign_progress(first, 0.07, 0.07)
     assert coordinator._campaign_realized_kwh == pytest.approx(0.07)
 
     # The gap: no quarter at all, and the campaign is still planned.
@@ -347,7 +347,7 @@ async def test_campaign_006_realized_export_accumulates_across_the_gap(
     # The second export segment adds to the same total.
     coordinator._quarter = second
     coordinator._note_campaign_progress(second.quarter_start, None)
-    coordinator._accrue_campaign_progress(second, 9.00)
+    coordinator._accrue_campaign_progress(second, 9.00, 9.00)
     assert coordinator._campaign_realized_kwh == pytest.approx(9.07)
     assert coordinator._campaign_quarters_admitted == 2
 
@@ -393,7 +393,7 @@ async def test_campaign_007_008_009_freeze_immutability_and_one_terminal(
     )
     assert frozen == pytest.approx(expected)
 
-    coordinator._accrue_campaign_progress(quarter, 0.07)
+    coordinator._accrue_campaign_progress(quarter, 0.07, 0.07)
 
     # --- CAMPAIGN-008: a replacement plan may not shrink it or reset progress --
     shrunk = []

@@ -47,6 +47,7 @@ from .const import (
     CONTROL_EXECUTABLE_DISPATCH_MODES,
     CONTROL_EXECUTABLE_DISPATCH_SIGNS,
     CONTROL_TICK_ENERGY_HORIZON_SECONDS,
+    DISPATCH_LIMIT_COMPELLED_OBJECTIVE,
     DISPATCH_LIMIT_DEADBAND,
     DISPATCH_LIMIT_DIRECTION_GATE,
     DISPATCH_LIMIT_DYNAMIC_RESERVE,
@@ -548,6 +549,13 @@ class QuarterProgress:
     #: ``None`` is unbounded -- no curve and no ceiling, bounded by the physical
     #: clamps alone. Zero is a real bound and means "no further".
     retention_remaining_kwh: float | None = None
+    #: How much of this row's remaining objective is compulsory. beta.54.
+    #:
+    #: Safety and coverage energy: what physical reachability demanded rather than
+    #: what price recommended. ``0.0`` on a purely discretionary row, which is every
+    #: economic charge and every export, and that default is what makes this term
+    #: inert wherever it does not apply.
+    compelled_remaining_kwh: float = 0.0
 
     @property
     def hours(self) -> float:
@@ -563,6 +571,20 @@ class QuarterProgress:
     def grid_rate_kw(self) -> float:
         """Return the average grid rate the remaining authorisation permits."""
         return max(0.0, self.grid_remaining_kwh) / self.hours
+
+    @property
+    def compelled_rate_kw(self) -> float:
+        """Return the rate that would finish the compulsory part on time. beta.54.
+
+        Bounded by the row's own remaining objective, so it can never ask for
+        energy the row did not promise -- the compulsory share is a *part* of that
+        promise, never an addition to it.
+        """
+        owed = min(
+            max(0.0, self.compelled_remaining_kwh),
+            max(0.0, self.battery_remaining_kwh),
+        )
+        return owed / self.hours
 
     @property
     def retention_rate_kw(self) -> float | None:
@@ -603,8 +625,14 @@ def decide_charge(
       authorisation is never a deficit to consume. Treating it as a target buys
       energy the plan did not need -- measured at roughly a kilowatt-hour on a
       quarter where production outperformed.
-    * **Missing production cannot unlock extra buying.** The ceiling comes from the
-      authorisation, never from the battery deficit.
+    * **Missing production cannot unlock extra *discretionary* buying.** The ceiling
+      comes from the authorisation, never from the battery deficit -- and that
+      remains true for every purchase the optimiser chose on price. **beta.54
+      qualifies it in one place**: energy physical reachability *compelled* may be
+      bought at the rate that finishes it, because the pack must reach its floor
+      whether or not the sun arrived. The bound is then the row's own frozen
+      compulsory share, so the planner's objective is still what caps the purchase
+      and nothing carries between quarters.
     * **Behind schedule still speeds up**, up to ``pv_surplus + grid_rate_cap``.
     * **Free production is still absorbed once the grid budget is spent**: the cap
       falls to the surplus alone, and the charge continues under the battery,
@@ -679,6 +707,44 @@ def decide_charge(
     if limits.remaining_grid_kw is not None:
         grid_rate_cap_kw = min(grid_rate_cap_kw, max(0.0, limits.remaining_grid_kw))
 
+    # **A compelled objective may reach past its forecast grid share. beta.54, and
+    # it is the third correction in one family.**
+    #
+    # Both bounds above are forecasts. The row's ``grid_authorised_kwh`` is
+    # ``marginal_grid_import_kwh`` -- the import the charge was predicted to cause,
+    # computed inside the solve from forecast production -- and the run-level
+    # remainder is sized from ``expected_grid_to_battery_kwh``. Since a row's
+    # objective is fed from production plus purchase, the cap they jointly impose is
+    # ``measured_surplus + forecast_grid_share``, so
+    #
+    #     cap - objective_rate = measured_surplus - forecast_surplus
+    #
+    # and the battery is throttled by **exactly the production forecast error**.
+    # Measured on the 2026-09-09 campaign: a 4.194 kW objective rate against a
+    # 2.2 kW production expectation that did not arrive commands 1.90 kW, and the
+    # campaign delivered 6.334 of 13.63 kWh at a 1.95 kW mean.
+    #
+    # For discretionary energy that is correct and stays: buying more than the
+    # optimiser priced is a decision, and the fifteen-minute replan is what makes
+    # it. For energy **physical reachability compelled** it is not -- the pack must
+    # reach its floor whether or not the sun arrived -- so the compulsory part of
+    # the row may be bought at the rate that finishes it.
+    #
+    # beta.36 stopped the row's authorisation capping battery power directly and
+    # beta.40 stopped the run's budget doing it as a flat pace. This is the same
+    # coupling surviving as *forecast* production, and it is removed only where the
+    # objective was never a choice.
+    #
+    # **Not catch-up.** The bound is ``compelled_rate_kw``, which is this row's own
+    # frozen compulsory share less what it has already taken. No earlier row's
+    # deficit is reachable, nothing carries between quarters, and every clamp below
+    # -- inverter power, pack headroom, the state of charge -- still applies
+    # unchanged and in the same order.
+    forecast_cap_kw = grid_rate_cap_kw
+    compelled_rate_kw = progress.compelled_rate_kw
+    if compelled_rate_kw > grid_rate_cap_kw + 1e-9:
+        grid_rate_cap_kw = compelled_rate_kw
+
     applied_kw = required_battery_kw
     reason = DISPATCH_LIMIT_NONE
 
@@ -687,6 +753,13 @@ def decide_charge(
     if battery_cap_kw < applied_kw - 1e-9:
         applied_kw = battery_cap_kw
         reason = DISPATCH_LIMIT_REMAINING_GRID_ENERGY
+    elif pv_surplus_kw + forecast_cap_kw < applied_kw - 1e-9:
+        # **Named only where it changed the answer.** The compulsory authority is
+        # reported when the forecast-derived cap would have throttled this command
+        # and did not -- not merely when it was available. On a row whose production
+        # arrived as predicted the surplus covers the objective by itself, the raise
+        # is inert, and labelling it would claim a purchase that never happened.
+        reason = DISPATCH_LIMIT_COMPELLED_OBJECTIVE
 
     # **beta.40, the second domain: free production, and only free production.**
     #

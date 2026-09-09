@@ -73,6 +73,8 @@ class _Rig:
         self.c._quarter_key = None
         self.c._quarter_claim = None
         self.c._quarter_sampled_at = None
+        self.c._quarter_sampled_from = None
+        self.c._quarter_sampled_to = None
         self.c._quarter_battery_kwh = 0.0
         self.c._quarter_grid_import_kwh = 0.0
         self.c._quarter_grid_export_kwh = 0.0
@@ -385,7 +387,15 @@ def test_the_audit_publishes_the_gap_the_reset_created() -> None:
 
 
 def test_a_charge_row_files_no_export_reconciliation() -> None:
-    """Import is an attribution estimate, not a metered channel. Not audited here."""
+    """Import is an attribution estimate, not a metered channel. Never audited as one.
+
+    **beta.54 gives a charge row its own audit, and this test still holds.** What it
+    forbids is an *export* reconciliation on an import row -- the export counter
+    cannot audit an import, and publishing a physical figure or an
+    ``unexplained_kwh`` here would be auditing our own arithmetic against itself. So
+    the charge row states its split and its measured window and withholds the
+    verdict, which is the same discipline beta.48 applied to a missing counter.
+    """
     rig = _Rig()
     charge = quarter_at(ROW_OPENS)
     charge = CarriedQuarter(
@@ -403,7 +413,24 @@ def test_a_charge_row_files_no_export_reconciliation() -> None:
     )
     rig.c._file_meter_audit(charge)
 
-    assert list(rig.c._meter_audits) == []
+    filed = list(rig.c._meter_audits)
+    assert len(filed) == 1
+    row = filed[0]
+    # Measured at the battery, and it says so.
+    assert row["objective_boundary"] == "battery"
+    assert row["attributed_charge_kwh"] == 0.0
+    assert row["grid_import_attributed_kwh"] == 0.0
+    assert row["pv_attributed_kwh"] == 0.0
+    # **No export figure appears on an import row.** This is the invariant the test
+    # was written for and it is unchanged.
+    assert "physical_export_kwh" not in row
+    assert "attributed_export_kwh" not in row
+    assert "meter_counter_start_kwh" not in row
+    # And no verdict is manufactured: there is no import counter to earn one.
+    assert row["counter_status"] == "not_configured"
+    assert row["physical_charge_kwh"] is None
+    assert row["unexplained_kwh"] is None
+    assert row["status"] == "uncertain"
 
 
 def test_no_decision_path_reads_a_beta48_audit_figure() -> None:

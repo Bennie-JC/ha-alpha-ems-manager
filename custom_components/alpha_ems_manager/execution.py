@@ -959,6 +959,16 @@ class CarriedQuarter:
     #: than consulted live, so a run that later vanishes can neither enlarge this
     #: quarter nor reach back into it.
     frozen_remaining_at_admission_kwh: float | None = None
+    #: How much of this row's objective physical reachability compelled. beta.54.
+    #:
+    #: **Frozen at admission, like every other authority on this row.** It is the
+    #: run's compulsory energy apportioned to this row in proportion to its share of
+    #: the run's objective, so the rows of one run can never together claim more
+    #: compulsory authority than the run was granted. ``0.0`` on a purely
+    #: discretionary run and wherever the attribution was unavailable -- absent is
+    #: not zero, and both read as no compulsory authority, which is the only
+    #: direction that cannot over-buy.
+    compelled_kwh: float = 0.0
     #: The campaign this quarter belongs to, frozen at admission with everything
     #: else. ``None`` on a pre-beta.32 record; absent means run-level behaviour.
     campaign_id: str | None = None
@@ -1103,6 +1113,8 @@ class AdmittedPlan:
     #: than consulted live, so a run that later vanishes can neither enlarge this
     #: plan nor reach back into a row already open.
     frozen_remaining_at_admission_kwh: float | None = None
+    #: The run's compulsory energy, carried so each row can take its share. beta.54.
+    compelled_kwh: float | None = None
     #: The publication this plan was admitted from, kept whole.
     #:
     #: **beta.34, and it exists so a quarter-authority arm can write an ownership
@@ -1205,7 +1217,30 @@ class AdmittedPlan:
             retention_authorised=row.retention_authorised,
             retention_gate=row.retention_gate,
             retention_until_dc_kwh=row.retention_until_dc_kwh,
+            compelled_kwh=self._compelled_share(row),
         )
+
+    def _compelled_share(self, row: QuarterRow) -> float:
+        """Return ``row``'s share of the run's compulsory energy. beta.54.
+
+        **Apportioned, never repeated.** The attribution is a run-level figure and a
+        run has many rows, so granting each row the whole of it would let one run's
+        rows together claim several times the compulsory energy reachability
+        actually demanded. The share is this row's objective as a fraction of the
+        run's, which sums to the run's compelled total exactly and degrades to the
+        whole row on a run that is compulsory throughout.
+
+        ``0.0`` where the attribution is absent or the run promised nothing, so an
+        unavailable figure grants no authority rather than all of it.
+        """
+        compelled = self.compelled_kwh
+        if compelled is None or compelled <= 0.0:
+            return 0.0
+        promised = self.target.battery_target_kwh
+        if promised <= 0.0:
+            return 0.0
+        share = min(1.0, compelled / promised)
+        return max(0.0, row.battery_kwh * share)
 
     def as_dict(self) -> dict[str, Any]:
         """Return the bounded diagnostics form."""
@@ -1270,6 +1305,7 @@ def admit_plan(
         max_end_energy_kwh=target.max_end_energy_kwh,
         headroom_until=target.headroom_until,
         frozen_remaining_at_admission_kwh=frozen_remaining_kwh,
+        compelled_kwh=target.compelled_kwh,
         target=target,
     )
 
@@ -1497,6 +1533,13 @@ class Target:
     revision: int
     intent: str
     purpose: str
+    #: How much of ``battery_target_kwh`` physical reachability compelled. beta.54.
+    #:
+    #: Safety plus coverage energy, which the planner attributes separately from the
+    #: discretionary remainder. ``None`` on a pre-beta.54 record and wherever the
+    #: attribution could not be formed -- and ``None`` grants no compulsory
+    #: authority, so an absent figure can only ever under-buy.
+    compelled_kwh: float | None
     window_start: datetime
     window_end: datetime
     issued_at: datetime | None
@@ -1639,6 +1682,7 @@ def parse_target(raw: dict[str, Any]) -> Target | None:
         revision=int(revision) if isinstance(revision, int) else 1,
         intent=intent,
         purpose=str(raw.get("purpose") or intent),
+        compelled_kwh=_finite(raw.get("compelled_kwh")),
         window_start=opens,
         window_end=closes,
         issued_at=instant_of(raw.get("issued_at")),
@@ -1983,6 +2027,13 @@ def target_as_published(target: Target) -> dict[str, Any]:
         "revision": target.revision,
         "intent": target.intent,
         "purpose": target.purpose,
+        # **Round-tripped, so a restart cannot quietly revoke it. beta.54.** The
+        # claim exists to preserve a row's frozen authority across a process
+        # boundary, and the compulsory share is exactly that kind of authority.
+        # Omitting it would degrade safely -- absent grants nothing -- but it would
+        # silently return a compelled row to the forecast bound it was released
+        # from, for as long as that row stayed open.
+        "compelled_kwh": target.compelled_kwh,
         "window_start": moment(target.window_start),
         "window_end": moment(target.window_end),
         "issued_at": moment(target.issued_at),
