@@ -4834,6 +4834,14 @@ PROJECTION_BASIS: Final = (
 #: battery terminals for a charge or a discharge, the grid meter for an export --
 #: and carried no label at all, so a dashboard had to infer it. Every one of those
 #: figures is AC; the boundary names the meter face, not AC against DC.
+OBJECTIVE_BOUNDARY_RULE: Final = (
+    "every objective and target energy published here is AC. objective_boundary "
+    "names the meter face it is measured at -- battery for a purchase, meter for a "
+    "sale -- and is not an AC/DC flag, so apply no efficiency factor to any of "
+    "them. null on a curtailment, which declines production and is measured at "
+    "neither face"
+)
+
 #: How to read the two charge windows this integration publishes. beta.55.
 #:
 #: **They answer different questions and a reader must not merge them.** A charge
@@ -4855,14 +4863,6 @@ CHARGE_WINDOW_RULE: Final = (
     "grid_purchase_blocks on the campaign says how many stretches there are, and "
     "grid_purchase_kwh against production_charge_kwh says how much of the charge "
     "was bought and how much arrived free"
-)
-
-OBJECTIVE_BOUNDARY_RULE: Final = (
-    "every objective and target energy published here is AC. objective_boundary "
-    "names the meter face it is measured at -- battery for a purchase, meter for a "
-    "sale -- and is not an AC/DC flag, so apply no efficiency factor to any of "
-    "them. null on a curtailment, which declines production and is measured at "
-    "neither face"
 )
 
 #: How many civil days the cross-midnight ledger view spans by default.
