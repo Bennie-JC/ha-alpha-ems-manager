@@ -87,11 +87,23 @@ Regenerated from the beta.54 timing artifacts and split eight ways, with the pyt
 worker count **pinned at four** rather than following the runner's size, so the timing
 artifacts stay comparable between runs.
 
+Measured, whole run **29.67 -> 16.02 minutes**; slowest pytest step **27.82 -> 12.72**.
+All eight shards started within 1.7 minutes of each other, so the added shards run
+concurrently rather than queueing.
+
 **One measurement worth recording, because it bounds what any future split can buy:**
 `tests/test_beta40_hard_floor.py` is 26.78 minutes of summed test time -- 25.9 % of the
-suite -- and its slowest single case is 6.54 minutes. It occupies a shard alone at four
-shards and at ten, so the wall-clock floor is that one case, and splitting the file is
-what would move it. Recorded, not done.
+suite -- and it occupies a shard alone at four shards and at ten. That shard is now the
+run's wall clock at **12.72 minutes**, so no shard count reduces this further and
+splitting the file is the only remaining lever. Recorded, not done.
+
+Two things the timings say that the projections did not. The single large file
+parallelises well at four workers -- 26.78 minutes of tests in 12.72 -- while the
+multi-file shards barely do: 10.95 projected against 6.00-11.98 actual, because
+collection and fixture setup are real time that per-test durations do not record. So
+summed time per shard matters more than the projections imply, which is why eight
+shards helped where a regenerated four-way split would have left roughly 25 minutes of
+tests on each of three shards.
 
 ## [1.0.0-beta.54] - 2026-09-09
 
