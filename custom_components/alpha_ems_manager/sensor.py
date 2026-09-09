@@ -91,6 +91,7 @@ from .const import (
     CAMPAIGN_STATE_OPTIONS,
     CAMPAIGN_STATE_PLANNED,
     CAMPAIGN_STATE_STARTED,
+    CHARGE_WINDOW_RULE,
     CONTROL_MODE_ACTIVE,
     CONTROL_STATE_OPTIONS,
     DOMAIN,
@@ -101,6 +102,8 @@ from .const import (
     ECONOMIC_ACTION_OPTIONS,
     ECONOMIC_ACTION_SAFETY_BUY,
     ECONOMIC_BLOCKED_EXECUTION_UNAVAILABLE,
+    ECONOMIC_CHARGE_SOURCE_MIXED,
+    ECONOMIC_CHARGE_SOURCE_NONE,
     ECONOMIC_DIRECTION_CHARGE,
     ECONOMIC_EUR_PRECISION,
     EXECUTION_INTENT_GRID_CHARGE,
@@ -134,7 +137,7 @@ from .const import (
     SENSOR_LEARNING_DAYS,
     SENSOR_NEXT_PLANNED_ACTION,
 )
-from .coordinator import AlphaEmsCoordinator
+from .coordinator import AlphaEmsCoordinator, grid_purchase_blocks
 from .economic import (
     IMPLEMENTED_ACTIONS,
     EconomicOutcome,
@@ -854,6 +857,7 @@ def _next_planned_action_attributes(
         # same action the energy is, so the two cannot come apart.
         "objective_boundary": objective_boundary_for(run.action),
         "objective_boundary_rule": OBJECTIVE_BOUNDARY_RULE,
+        "charge_window_rule": CHARGE_WINDOW_RULE,
         "power_kw": _round(run.first_power_kw, BATTERY_KW_PRECISION),
         "purpose": target.get("purpose", run.action),
         "campaign_id": target.get("campaign_id"),
@@ -921,6 +925,22 @@ def _upcoming_campaigns(
                 "expected_value_eur": 0.0,
                 "will_execute": False,
                 "skip_reason": None,
+                # **What the campaign buys, beside what it moves. beta.55.**
+                #
+                # ``objective_kwh`` above is battery-side and includes free
+                # production: absorption is transparent to a charge run, so a
+                # campaign's span and its objective both cover the whole solar day.
+                # These say how much of it is actually bought, how much arrives free,
+                # and how many separate stretches of buying there are -- the count,
+                # so "one block" is distinguishable from "the first of five" without
+                # publishing an array.
+                #
+                # Campaign-wide on purpose. ``next_grid_purchase_at`` on
+                # ``Next Planned Action`` answers the other question, about one block.
+                "grid_purchase_kwh": 0.0,
+                "production_charge_kwh": None,
+                "grid_purchase_blocks": None,
+                "charge_source": None,
             }
             grouped[campaign_id] = entry
             order.append(campaign_id)
@@ -938,6 +958,28 @@ def _upcoming_campaigns(
         if isinstance(value, (int, float)):
             entry["expected_value_eur"] += float(value)
         export = intent == EXECUTION_INTENT_NET_EXPORT
+        if not export:
+            # The grid share is already frozen on every row, as the import the charge
+            # was predicted to cause. Summing it is the purchase; the remainder of the
+            # objective is production. No new arithmetic and no second source.
+            entry["grid_purchase_kwh"] += sum(
+                float(row.get("grid_authorised_kwh") or 0.0)
+                for row in target.get("quarter_schedule") or ()
+                if row.get("not_executable") is None
+            )
+            # **Combined from the per-run verdicts rather than recomputed.** Each
+            # target already carries ``charge_source`` from the exact marginal import;
+            # a campaign whose runs disagree is mixed by definition, which is the same
+            # answer recomputing the thresholds here would give and one fewer copy of
+            # the rule.
+            source = target.get("charge_source")
+            if isinstance(source, str) and source != ECONOMIC_CHARGE_SOURCE_NONE:
+                current = entry["charge_source"]
+                entry["charge_source"] = (
+                    source
+                    if current is None or current == source
+                    else ECONOMIC_CHARGE_SOURCE_MIXED
+                )
         for row in target.get("quarter_schedule") or ():
             refusal = row.get("not_executable")
             if refusal is not None:
@@ -955,6 +997,24 @@ def _upcoming_campaigns(
         if entry["will_execute"]:
             entry["skip_reason"] = None
         entry["objective_kwh"] = _round(entry["objective_kwh"], BATTERY_KWH_PRECISION)
+        if entry["objective_boundary"] == CAMPAIGN_BOUNDARY_BATTERY:
+            purchase = _round(entry["grid_purchase_kwh"], BATTERY_KWH_PRECISION) or 0.0
+            entry["grid_purchase_kwh"] = purchase
+            # Floored at zero: the two are rounded independently, and a rounding
+            # artefact must not publish a negative amount of free production.
+            entry["production_charge_kwh"] = _round(
+                max(0.0, (entry["objective_kwh"] or 0.0) - purchase),
+                BATTERY_KWH_PRECISION,
+            )
+            entry["grid_purchase_blocks"] = len(
+                grid_purchase_blocks(
+                    coordinator.execution_targets, campaign_id=campaign_id
+                )
+            )
+        else:
+            # An export campaign buys nothing, and saying ``0.0`` would invite the
+            # reading that it might have. Absent is the honest answer.
+            entry["grid_purchase_kwh"] = None
         entry["expected_value_eur"] = _round(
             entry["expected_value_eur"], ECONOMIC_EUR_PRECISION
         )

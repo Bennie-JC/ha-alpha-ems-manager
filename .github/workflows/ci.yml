@@ -101,7 +101,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -119,8 +119,9 @@ jobs:
       - run: pip install -r requirements-test.txt
 
       - name: Report the runner's parallelism
-        # `-n auto` resolves to whatever the runner gives us. Recording it makes the
-        # shard timings interpretable a month from now.
+        # Recorded so the shard timings stay interpretable a month from now, and so a
+        # change in the runner's size is visible rather than inferred. The worker
+        # count below is pinned rather than derived from this.
         run: |
           python -c "import os; print('cpus:', os.cpu_count())"
           nproc || true
@@ -137,8 +138,13 @@ jobs:
           echo "files=$files" >> "$GITHUB_OUTPUT"
 
       - name: Run this shard
+        # **Pinned rather than `-n auto`.** The runner reports four CPUs, so `auto`
+        # already resolved to four -- but a value that follows the runner's size is a
+        # value that changes without a commit, and the timing artifacts this job
+        # uploads are only comparable between runs if the worker count is not one of
+        # the variables. Four is what has been running; this states it.
         run: |
-          python -m pytest -q -n auto \
+          python -m pytest -q -n 4 \
             --junitxml=junit-${{ matrix.shard }}.xml \
             --durations=25 \
             ${{ steps.select.outputs.files }}

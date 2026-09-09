@@ -4834,6 +4834,29 @@ PROJECTION_BASIS: Final = (
 #: battery terminals for a charge or a discharge, the grid meter for an export --
 #: and carried no label at all, so a dashboard had to infer it. Every one of those
 #: figures is AC; the boundary names the meter face, not AC against DC.
+#: How to read the two charge windows this integration publishes. beta.55.
+#:
+#: **They answer different questions and a reader must not merge them.** A charge
+#: campaign runs from its first purchase to its last with every free-production
+#: quarter in between folded in -- absorption is transparent to a charge run, by
+#: design and with no bound on how many quarters may pass -- so on a sunny day the
+#: charging span is very nearly the solar day and its objective is mostly energy
+#: nobody bought. On the measured reference shape that was 90 % of the campaign.
+CHARGE_WINDOW_RULE: Final = (
+    "two windows, two questions. next_charge_projection_at and _end_at span "
+    "battery charging, which on a sunny day is most of the solar day: production "
+    "absorbed into the pack is charging, and it is transparent to a charge "
+    "campaign, so the span says when the battery is filling and not when energy "
+    "is bought. next_grid_purchase_at and _end_at are the next *contiguous* "
+    "stretch of quarters that actually take energy off the grid, ending at the "
+    "first quarter that buys nothing -- deliberately not the first purchase to the "
+    "last, which on an absorption-flanked campaign would restate the same "
+    "misreading. a later stretch is published once it becomes the next one. "
+    "grid_purchase_blocks on the campaign says how many stretches there are, and "
+    "grid_purchase_kwh against production_charge_kwh says how much of the charge "
+    "was bought and how much arrived free"
+)
+
 OBJECTIVE_BOUNDARY_RULE: Final = (
     "every objective and target energy published here is AC. objective_boundary "
     "names the meter face it is measured at -- battery for a purchase, meter for a "

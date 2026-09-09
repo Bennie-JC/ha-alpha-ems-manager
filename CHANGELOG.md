@@ -9,6 +9,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.55] - 2026-09-09
+
+**The charge window now says which hours it buys in.**
+
+No planner change. `economic.py` is not touched at all, and the five neutrality
+suites pass unchanged and were not re-baselined. No Stage B change, no accounting
+change, no storage change, no new entity. Everything here is publication, plus a CI
+split that is finally balanced.
+
+## A nine-hour charge campaign was never nine hours of buying
+
+A production-absorption quarter is **transparent to a charge run and to nothing
+else** -- deliberately, so a sunny quarter does not split a paid charging window in
+two and pay the switching fee twice -- and there is no bound on how many may pass. So
+one morning purchase, hours of free solar and one afternoon purchase are grouped as a
+single campaign: one run, one fee, one nine-hour span. Every figure published about it
+was then a battery-side aggregate.
+
+Measured through the production solver on the reference shape: a charge campaign
+moving **14.722 kWh**, of which **1.493 kWh was bought and 13.229 kWh arrived free**.
+Ninety per cent absorption, across **five** separate stretches of buying. The source
+had already recorded the scale in a comment -- absorption was *62 % of the live charge
+campaign's energy* -- and named this as a campaign-level question left for later.
+
+## The optimiser was never the problem, and is unchanged
+
+Its objective contains **no term** depending on interval count, run duration or power
+density. Every cost the recursion accumulates is an energy at a price, a fee at a run
+start, or a per-kWh rate. So for a given charge energy the cheapest quarters are
+strictly best, and ties already break to the *smallest* charge. The one shape-sensitive
+term, the switching fee, rewards *fewer* runs -- it points the other way.
+
+Adding a concentration preference would therefore have perturbed every plan's
+arithmetic to buy a property the solver already has. It was investigated and rejected
+on that evidence, and a characterisation test now pins the property so a future change
+cannot quietly lose it.
+
+## What is published
+
+**`next_grid_purchase_at` / `next_grid_purchase_end_at`** -- the next *contiguous*
+stretch of quarters that actually take energy off the grid.
+
+A block, not a span, and the distinction is the release. Publishing the first purchase
+to the last would have restated the same misreading one size smaller: on a day that
+buys a quarter at 07:15, absorbs until 15:45 and buys again at 16:00, first-to-last
+reads 07:15-16:15 and calls nine hours a purchase window. Each block ends at the first
+quarter that buys nothing. A later stretch stays a later stretch, and becomes the next
+one when the horizon advances past this one -- so no clock comparison is written.
+
+A quarter counts as buying when its **grid** authorisation clears the actuator floor.
+The grid figure, not the battery figure: an absorbing quarter carries a large battery
+objective and a grid authorisation of exactly zero, so asking the battery figure would
+call every sunny quarter a purchase. A sub-floor import forms no block and, just as
+importantly, cannot bridge two.
+
+**On each campaign:** `grid_purchase_kwh` and `production_charge_kwh` -- how much of
+the charge is bought and how much arrives free, summing to the objective exactly --
+`charge_source`, and `grid_purchase_blocks`, so "one block" is distinguishable from
+"the first of five" without publishing an array.
+
+**Unchanged:** `next_charge_projection_at` and `_end_at` keep describing battery
+charging, which is what they always measured, and now say so in
+`charge_window_rule` beside them. `objective_kwh`, `objective_boundary`, every export
+figure and all of beta.54's execution and accounting behaviour are exactly as
+released. No published value changes meaning.
+
+## CI: a shard split that reflects the suite
+
+The shard manifest had not been regenerated since beta.42, and
+`scripts/shard_plan.py` assigns any unplanned file to shard 1 by design -- silently
+skipping a new test file being the worse failure. Every test file added in twelve
+releases was therefore landing on shard 1, which ran **29.40 minutes** against 12-17
+for the others and set the whole run's wall clock.
+
+Regenerated from the beta.54 timing artifacts and split eight ways, with the pytest
+worker count **pinned at four** rather than following the runner's size, so the timing
+artifacts stay comparable between runs.
+
+**One measurement worth recording, because it bounds what any future split can buy:**
+`tests/test_beta40_hard_floor.py` is 26.78 minutes of summed test time -- 25.9 % of the
+suite -- and its slowest single case is 6.54 minutes. It occupies a shard alone at four
+shards and at ten, so the wall-clock floor is that one case, and splitting the file is
+what would move it. Recorded, not done.
+
 ## [1.0.0-beta.54] - 2026-09-09
 
 **A compelled purchase now buys the production its forecast promised, and an

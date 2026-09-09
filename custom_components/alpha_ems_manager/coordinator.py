@@ -1433,7 +1433,101 @@ _PROJECTION_FIELDS: tuple[str, ...] = (
     "next_export_campaign_id",
     "minutes_until_reserve_floor",
     "reserve_floor_reached_at",
+    "next_grid_purchase_at",
+    "next_grid_purchase_end_at",
 )
+
+
+def _is_purchasing_row(row: dict[str, Any]) -> bool:
+    """Return whether this quarter actually buys. beta.55.
+
+    Two conditions, both necessary. The row must be armable at all -- a refused row
+    dispatches nothing, so it cannot buy -- and its **grid** authorisation must clear
+    the actuator floor.
+
+    **The grid figure, not the battery figure, and that is the whole point.** A
+    quarter that fills the pack from surplus production carries a battery objective
+    well above the floor and a ``grid_authorised_kwh`` of exactly zero: ``absorbing``
+    means ``grid_import <= unavoidable_import``, so the marginal import is zero by
+    construction rather than by rounding. Asking the battery figure would call every
+    sunny quarter a purchase, which is the reading this release exists to correct.
+
+    ``MIN_EXECUTABLE_QUARTER_KWH`` rather than ``> 0``: one tenth of a kilowatt for a
+    quarter is the smallest energy an actuator step can express, and a marginal import
+    below it is arithmetic rather than a purchase anybody could act on. Reusing the
+    constant keeps one definition of "too small to act on".
+    """
+    if row.get("not_executable") is not None:
+        return False
+    try:
+        authorised = float(row.get("grid_authorised_kwh") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return authorised >= MIN_EXECUTABLE_QUARTER_KWH
+
+
+def grid_purchase_blocks(
+    targets: Iterable[dict[str, Any]], *, campaign_id: str | None = None
+) -> tuple[tuple[datetime, datetime], ...]:
+    """Return the contiguous grid-purchase blocks ahead, in order. beta.55.
+
+    **Blocks, never a first-to-last span, and the difference is the release.** A
+    charge campaign runs from its first purchase to its last with every free-solar
+    quarter in between folded in -- ``_resolved_run_state`` makes absorption
+    transparent to a charge run, with no bound on how many quarters may pass. So a
+    campaign that buys a quarter at 07:15, absorbs until 15:45 and buys again at
+    16:00 is one nine-hour campaign. Reporting *that* as the purchase window would
+    restate the same misreading one size smaller: nine hours to describe two quarters
+    of buying.
+
+    Each block therefore ends at the first quarter that buys nothing, and a later
+    block stays a later block.
+
+    **Adjacency is judged on instants, never on list position.** One campaign is
+    published as one target per run, so two purchasing quarters can be adjacent in
+    time while sitting in different ``quarter_schedule`` lists -- and a single list
+    can hold a refused row between two purchases. The test is that the next quarter
+    opens exactly when this one closes, which also keeps this free of index
+    arithmetic.
+
+    ``campaign_id`` narrows the walk to one campaign, for the per-campaign count.
+    Omitted, it spans every charge target, which is what the projection wants: the
+    next purchase is the next purchase whichever campaign owns it.
+    """
+    spans: list[tuple[datetime, datetime]] = []
+    for target in targets:
+        if target.get("intent") != EXECUTION_INTENT_GRID_CHARGE:
+            continue
+        if campaign_id is not None and target.get("campaign_id") != campaign_id:
+            continue
+        for row in target.get("quarter_schedule") or ():
+            if not _is_purchasing_row(row):
+                continue
+            opens = _instant_or_none(row.get("start"))
+            closes = _instant_or_none(row.get("end"))
+            if opens is None or closes is None:
+                continue
+            spans.append((opens, closes))
+    if not spans:
+        return ()
+
+    # Chronological, and de-duplicated: two targets of one campaign never describe
+    # the same quarter, but sorting is what makes the adjacency test below mean
+    # anything at all.
+    spans.sort()
+    blocks: list[tuple[datetime, datetime]] = []
+    start, end = spans[0]
+    for opens, closes in spans[1:]:
+        if opens == end:
+            end = closes
+            continue
+        if opens < end:  # pragma: no cover - one quarter cannot be published twice
+            end = max(end, closes)
+            continue
+        blocks.append((start, end))
+        start, end = opens, closes
+    blocks.append((start, end))
+    return tuple(blocks)
 
 
 def _armable_segment(
@@ -1601,6 +1695,21 @@ def plan_projection(
             None if closes is None else closes.isoformat()
         )
         payload[f"next_{word}_campaign_id"] = campaign_id
+
+    # **The next contiguous block of actual buying. beta.55.**
+    #
+    # Beside the charge projection above, which describes battery charging and
+    # always did -- on a sunny day that span is the solar day, because absorption is
+    # transparent to a charge run. This pair answers the other question: when does
+    # the plan next take energy off the grid, and until when without interruption.
+    # A later block is not folded in; the horizon head advances past a finished one,
+    # so the next refresh publishes the following block with no clock comparison
+    # written here.
+    purchase = grid_purchase_blocks(targets)
+    if purchase:
+        opens, closes = purchase[0]
+        payload["next_grid_purchase_at"] = opens.isoformat()
+        payload["next_grid_purchase_end_at"] = closes.isoformat()
 
     reached = floor_reached_index(
         intervals,
