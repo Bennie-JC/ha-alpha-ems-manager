@@ -67,16 +67,48 @@ no type segment at all** -- never the word "unknown".
 | `result` | action line | terminal line | reason shown |
 |---|---|---|---|
 | `success` | `... afgerond —> R / T` | `Campagne geëindigd —> R / T` | no |
-| `partial` | `... gedeeltelijk afgerond —> R / T` | `Campagne geëindigd —> R / T` | no |
-| `superseded` | `... gedeeltelijk afgerond —> R / T` | `Campagne geëindigd —> R / T` | no |
-| `canceled` | — | `Campagne geannuleerd —> R / T` | no |
+| `partial` | `... gedeeltelijk afgerond —> R / T` *(+ physical clause)* | `Campagne geëindigd —> R / T` | no |
+| `superseded` | `... gedeeltelijk afgerond —> R / T` | `Campagne vervangen door nieuwer plan —> R / T` | no |
+| `canceled` | — | `Campagne geannuleerd —> R / T —> <reason>` | **yes, since beta.56** |
 | `failed` | — | `Campagne mislukt —> R / T —> <reason>` | **only here** |
 | `not_executed` | — | `Campagne niet uitgevoerd` | no |
 
 `failed` and `not_executed` are terminal on their own: no `Campagne geëindigd` follows
-either. And `superseded` is **not** a failure -- the integration only renames a
-`partial` to `superseded` when a plan replaced it, so a campaign that met its tolerance
-stays `success` and one that did partial work reads as partial work.
+either. And `superseded` is **not** a failure -- it means a newer authoritative plan
+took over, so a campaign that met its tolerance stays `success` and one that did
+partial work reads as partial work.
+
+### What changed in beta.56, and why your templates may need it
+
+Three corrections, all of which change which words a campaign produces:
+
+1. **`canceled` now shows its reason.** It never did, so a withdrawal and a plant
+   problem produced the same sentence.
+2. **A replaced campaign reads `superseded`, not `canceled`.** Two separate bugs made
+   `superseded` unreachable from the live close path: the outcome ladder had no rung for
+   a withdrawal reason, and the remap below it required an outcome that path could not
+   reach. **If you template on `result == 'canceled'` to catch replans, move that to
+   `'superseded'`.**
+3. **A campaign that ran to its own planned end now says `window_ended`, not
+   `plan_replaced`.** The reason was compared across two different identity namespaces
+   -- an ended run's minted id against a publication id -- so it was structurally always
+   "replaced". The live 2026-09-10 charge ran its full 32 quarters to its planned end
+   and was filed as a cancellation for exactly this reason.
+
+**The physical clause.** A charge campaign's objective counts only the energy the plan
+set out to move; free solar absorbed on top of it is deliberately not progress. So a
+completed charge on a sunny day legitimately reports a shortfall, and beta.56 publishes
+the four figures that explain it. The live case now renders:
+
+```
+Laadsessie gedeeltelijk afgerond —> 14.22 kWh / 15.63 kWh — accu vol, 1.43 kWh extra zon
+```
+
+instead of `Campagne geannuleerd —> 14.22 kWh / 15.63 kWh`. Same measurements, and now
+a true sentence. The clause renders nothing when the pack was not full or when the pack
+reading was unavailable, and `absorbed_extra_kwh` is null for a sell campaign -- at a
+meter-bound objective the difference between the two totals is house load the battery
+covered, not absorbed sun.
 
 ## The automation
 
@@ -113,6 +145,17 @@ automation:
           pair: >-
             {{ '%.2f kWh / %.2f kWh'|format(r, t) if t is number
                else ('%.2f kWh'|format(r) if r is number else '') }}
+          # beta.56: what physically happened, so a `partial` can be explained
+          # rather than only reported. Absent fields render nothing at all --
+          # every one of them is null on an unreadable pack or a sell campaign,
+          # and a zero there would be a claim rather than a measurement.
+          full: "{{ e.battery_full_at_close is true }}"
+          absorbed: >-
+            {{ e.absorbed_extra_kwh if e.absorbed_extra_kwh is number else none }}
+          physical: >-
+            {% if full and absorbed is number and absorbed > 0.05 %}
+            {{ ' — accu vol, %.2f kWh extra zon'|format(absorbed) }}
+            {% elif full %} — accu vol{% endif %}
           window: >-
             {% if e.window_start and e.window_end %}
             {{ e.window_start | as_datetime | as_local | strftime('%H:%M') }} –
@@ -163,7 +206,7 @@ automation:
                         data:
                           name: Alpha EMS
                           message: >-
-                            {{ verb }} gedeeltelijk afgerond —> {{ pair }}
+                            {{ verb }} gedeeltelijk afgerond —> {{ pair }}{{ physical }}
               - choose:
                   - conditions: "{{ e.result == 'failed' }}"
                     sequence:
@@ -176,12 +219,20 @@ automation:
                     sequence:
                       - service: logbook.log
                         data: {name: Alpha EMS, message: Campagne niet uitgevoerd}
+                  - conditions: "{{ e.result == 'superseded' }}"
+                    sequence:
+                      - service: logbook.log
+                        data:
+                          name: Alpha EMS
+                          message: "Campagne vervangen door nieuwer plan —> {{ pair }}"
                   - conditions: "{{ e.result == 'canceled' }}"
                     sequence:
                       - service: logbook.log
                         data:
                           name: Alpha EMS
-                          message: "Campagne geannuleerd —> {{ pair }}"
+                          message: >-
+                            Campagne geannuleerd —> {{ pair }} —>
+                            {{ e.completion_reason }}"
                 default:
                   - service: logbook.log
                     data:

@@ -323,9 +323,57 @@ Hoe de vorige campagne is afgelopen.
 `completion_reason`, `objective_measurable`, `success_tolerance_kwh`,
 `final_classification`, de tijdstippen, en dezelfde opsplitsing als hierboven.
 
+**Sinds beta.56 staat er ook bij wat er fysiek is gebeurd:**
+
+| Attribuut | Wat het betekent |
+|---|---|
+| `battery_measured_total_kwh` | Elke kWh die de accu onder deze campagne heeft opgenomen, ongemaximeerd |
+| `absorbed_extra_kwh` | Hoeveel daarvan als gratis zon binnenkwam, bovenop wat het plan zich had voorgenomen |
+| `battery_full_at_close` | Of de accu vol was toen de campagne eindigde |
+| `headroom_at_close_kwh` | Hoeveel ruimte er nog in de accu zat |
+
 **Een geleverde hoeveelheid betekent op zichzelf geen succes.** Alleen het bevroren doel,
 binnen `success_tolerance_kwh`, telt als geslaagd. `not_executed` betekent: aangemaakt en
-nooit gestart. `superseded`: gestart en vervangen.
+nooit gestart. `superseded`: gestart en door een nieuwer plan vervangen.
+
+#### Waarom een laadsessie `partial` kan zijn en tóch klaar is
+
+Dit is de meest voorkomende verrassing, en het is geen storing.
+
+Het doel van een laadcampagne telt alleen de energie die het plan zich had voorgenomen te
+verplaatsen. Gratis zon die de accu **daarbovenop** heeft opgenomen, telt bewust niet mee
+als voortgang: zou dat wel zo zijn, dan schoot het cijfer op een zonnige middag voorbij
+een doel waar het plan nog niet klaar mee was, en stopte de campagne te vroeg.
+
+Op een zonnige dag leest een afgeronde laadsessie dus terecht:
+
+```
+result                      partial
+completion_reason           window_ended
+planned_kwh                 15,63
+realised_kwh                14,22
+battery_measured_total_kwh  15,65
+absorbed_extra_kwh          1,43
+battery_full_at_close       true
+```
+
+Samen gelezen: het plan wilde 15,63 kWh, daarvan telde 14,22 mee voor het doel, de accu
+heeft in werkelijkheid 15,65 kWh opgenomen doordat er extra zon bij kwam, en hij eindigde
+vol. **Er is niets misgegaan.** Er kon simpelweg niets meer bij.
+
+Staat `battery_full_at_close` op `false` en is `absorbed_extra_kwh` ongeveer nul, dan is
+het tekort een echt tekort — zie [Problemen oplossen](troubleshooting.md).
+
+Bij een **verkoop**campagne is `absorbed_extra_kwh` afwezig. Daar wordt het doel aan de
+meter gemeten terwijl het accucijfer batterij-energie is, dus hun verschil is huisverbruik
+dat de accu heeft gedekt en geen opgenomen zon — dat als opgenomen zon melden zou een
+verzinsel zijn.
+
+`completion_reason` houdt de twee gewone eindes uit elkaar van een echte onderbreking:
+`window_ended` betekent dat de campagne het einde van haar eigen schema heeft gehaald, en
+`plan_replaced` dat een nieuwer plan het heeft overgenomen — en dat leest nu `superseded`
+in plaats van `canceled`, want dat Stage A de toekomst herziet is niet iets wat er *met*
+je accu is gebeurd.
 
 ⚠️ **Deze sensor overleeft een herstart niet.** Na een herstart staat hij op `unknown`
 met `no_campaign_closed_yet`, tot de volgende campagne afloopt. Lees dat niet als een

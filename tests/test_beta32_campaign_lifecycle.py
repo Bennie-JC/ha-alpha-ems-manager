@@ -534,10 +534,16 @@ def test_the_completion_tolerance_has_left_the_activity_surface() -> None:
 def test_activity_still_carries_no_power_price_or_reserve_arithmetic() -> None:
     """The beta.31 guarantee, re-asserted over the beta.32 fields.
 
-    ``RunContent`` and ``TerminalView`` between them carry a category, one energy
-    pair, a window, an instant and an outcome. What is missing is the design: no
+    ``RunContent`` and ``TerminalView`` between them carry a category, energy
+    figures, a window, an instant and an outcome. What is missing is the design: no
     power, no price, no expected value, no charge-source prose. Adding a field here
     is how the old three-clause sentence comes back.
+
+    **The frozen list is the mechanism; the invariant is the sentence above.** So
+    beta.56 adds the *class* test beside it -- no field may name a power, a price,
+    an expected value or a reserve, whatever the list says. That is strictly
+    stronger than a list a reviewer has to eyeball, and it is what actually
+    forbids the regression this test was written for.
     """
     content_fields = set(RunContent.__dataclass_fields__)
     assert content_fields == {
@@ -557,11 +563,30 @@ def test_activity_still_carries_no_power_price_or_reserve_arithmetic() -> None:
         "reason",
         "measurable",
         "started",
+        # **beta.56, and argued rather than merely appended.** The physical
+        # context a shortfall needs to be legible: every kWh the pack took, how
+        # much of it was free sun beyond the objective, and whether the battery
+        # was full when the campaign ended. All three are *measured*, in the same
+        # class as the objective pair above them -- no power, no price, no
+        # valuation, and no arithmetic performed here. Without them the surface
+        # rendered a physically finished charge as an abandoned one, which is the
+        # 2026-09-10 line ``Campagne geannuleerd -- 14.22 kWh / 15.63 kWh``.
+        "battery_measured_total_kwh",
+        "absorbed_extra_kwh",
+        "battery_full_at_close",
     }
     # And the pair that used to let a renderer choose a boundary is gone.
     view_fields = set(ExecutionView.__dataclass_fields__)
     assert "target_kwh" not in view_fields
     assert "delivered_kwh" not in view_fields
+
+    # The invariant itself, independent of the lists above. Energy in kWh is
+    # allowed and always was -- the objective pair is energy; a *power*, a price,
+    # a valuation or a reserve bound is not.
+    forbidden = ("power", "price", "eur", "expected_value", "reserve", "floor")
+    for name in content_fields | terminal_fields:
+        assert not name.endswith("_kw"), name
+        assert not any(token in name for token in forbidden), name
 
 
 def test_no_campaign_line_mentions_a_power_or_a_price() -> None:

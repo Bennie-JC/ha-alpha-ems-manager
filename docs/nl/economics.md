@@ -54,6 +54,12 @@ inkoopkant zit een vaste opslag van ongeveer € 0,129/kWh aan inkoopmarge en en
 en aan de teruglever­kant niet. Bij een negatieve marktprijs kost afnemen dus nog steeds
 geld, terwijl terugleveren een negatief bedrag oplevert.
 
+⚠️ **Deze regel is niet je meter.** Hij beantwoordt de vraag "wat zou deze installatie
+*zonder* accu hebben verkocht". Dat moet ook zo: een deel van wat je meter het net op
+stuurde kwam uit de accu, en die verkoop staat al onder lastverschuiving. Hem hier ook
+meetellen zou één verkoop dubbel tellen. Wil je de meter zelf, zie
+[Wat er echt is teruggeleverd](#wat-er-echt-is-teruggeleverd) hieronder.
+
 ### Lastverschuiving
 
 Dit is het werk van de batterij zelf. Energie die 's middags goedkoop de accu in ging en
@@ -98,6 +104,40 @@ je het vaakst ziet:
 - `no_opening_valuation` — de eerste dag na installeren, tot de volgende middernacht
 - `horizon_short_of_midnight` — er is maar één prijsdag gepubliceerd, dus een deel van je
   dag heeft geen prijs. Los op door te wachten tot de prijzen van morgen er zijn.
+
+---
+
+## Wat er echt is teruggeleverd
+
+Twee teruglevercijfers, die twee verschillende vragen beantwoorden. Beide zijn juist, en ze
+door elkaar halen is de meest gemaakte fout bij het lezen van deze sensor.
+
+| Attribuut | De vraag die het beantwoordt |
+|---|---|
+| `realised_export_value_eur` | Wat een installatie als de jouwe **zonder accu** verkocht zou hebben. Onderdeel van de energiewaarde-som hierboven. |
+| `realised_metered_export_kwh` | Hoeveel energie er vandaag **echt je meter uit is gegaan**. |
+| `realised_metered_export_revenue_eur` | Wat die energie heeft opgebracht. |
+
+Een tegel met *Verkoop aan net — 0,49 kWh · € 0,11* wil het tweede paar.
+
+**Wat er in het metercijfer zit:** alles wat de meter uit is gegaan, of het nu van je
+panelen kwam of uit de accu. Je meter kan dat verschil niet zien, en dit cijfer is dat van
+je meter.
+
+⚠️ **De hoeveelheid is gemeten; de prijs kan gereconstrueerd zijn.** De kilowattuur komen
+van je netsensor en er zit geen enkele rendementsfactor op. Het tarief waartegen ze
+gewaardeerd worden is het terugleverbedrag dat per kwartier is vastgelegd, en dat leidt
+Alpha EMS af uit de marktprijs en jouw ingestelde teruglevercorrectie. Het is een goed
+getal om op te sturen, geen definitieve afrekening — de jaarnota van je leverancier is
+bepalend voor wat je werkelijk hebt ontvangen.
+
+**Tel het meterpaar niet op bij de energiewaarde-som.** Het staat er bewust buiten. De
+drie onderdelen dekken elke kilowattuur al precies één keer, en de meteropbrengst is
+dezelfde stroom onder een andere afspraak.
+
+Een kwartier waarin is teruggeleverd zonder dat er een terugleverbedrag is vastgelegd,
+wordt **overgeslagen** en niet op nul gezet. Het paar kan dus iets te laag uitvallen op
+een dag met een prijsgat, en nooit te hoog.
 
 ---
 

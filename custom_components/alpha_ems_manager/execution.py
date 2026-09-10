@@ -1571,6 +1571,13 @@ class Target:
     required_headroom_kwh: float | None = None
     max_end_energy_kwh: float | None = None
     headroom_until: datetime | None = None
+    #: Why the three figures above read as they do. **beta.56.** They are null
+    #: together or populated together, so a null triple was one silence over three
+    #: facts -- no ceiling known, the plan absorbs nothing later, or the plan does
+    #: cap this run -- and only the last is not a refusal. Carried through Stage B
+    #: rather than dropped at the boundary, because the report that publishes the
+    #: triple is exactly where a reader meets the silence.
+    headroom_reason: str | None = None
     #: The per-quarter execution rows Stage A already solved, in order.
     #:
     #: **Empty is a valid answer** and must degrade to run-level behaviour rather
@@ -1708,6 +1715,11 @@ def parse_target(raw: dict[str, Any]) -> Target | None:
         required_headroom_kwh=_finite(raw.get("required_headroom_kwh")),
         max_end_energy_kwh=_finite(raw.get("max_end_energy_kwh")),
         headroom_until=instant_of(raw.get("headroom_until")),
+        headroom_reason=(
+            raw.get("headroom_reason")
+            if isinstance(raw.get("headroom_reason"), str)
+            else None
+        ),
         campaign_id=(
             raw.get("campaign_id") if isinstance(raw.get("campaign_id"), str) else None
         ),
@@ -2053,6 +2065,9 @@ def target_as_published(target: Target) -> dict[str, Any]:
         "required_headroom_kwh": target.required_headroom_kwh,
         "max_end_energy_kwh": target.max_end_energy_kwh,
         "headroom_until": moment(target.headroom_until),
+        # beta.56: round-tripped with the triple it explains, so a restart does
+        # not turn a named absence back into a bare null.
+        "headroom_reason": target.headroom_reason,
         # **beta.34, and its absence was a silent campaign break.** beta.32 added
         # the campaign identity to the published target and to ``parse_target``,
         # and never added it here -- so the round trip this function's own
@@ -3057,12 +3072,32 @@ def _decide(
         # every fifteen minutes for the whole of any owned campaign, because
         # ``plan_id`` churns with the horizon -- stopping and resetting a run that
         # nothing had replaced. It was unreachable only because ownership was.
+        #
+        # **And the comparison is only meaningful between like identities.
+        # beta.56.** ``running_run_id`` is a minted run id -- intent, window start
+        # *and* admission instant -- while ``target.plan_id`` is a publication id
+        # over the first two. When the carry machine has just ended the run,
+        # ``carried`` is already ``None``, so ``known`` falls back to the
+        # publication id and the two are compared across namespaces: structurally
+        # unequal, every time, on every such refresh. The live 2026-09-10 charge
+        # campaign ran to its own planned end at 16:30 and was filed
+        # ``plan_replaced`` for exactly this reason, with a withdrawal basis
+        # asserting "a different run was running" that nothing had established.
+        #
+        # The carry machine watched the run end and named why, and its verdict is
+        # preferred here for the same reason the ``target is None`` branch above
+        # already prefers it. Only the reported reason changes: the stop, the
+        # reset and the selected target are exactly what they were, so a genuinely
+        # displaced run -- one where a carried run's own minted id differs, or
+        # where nothing ended and a foreign run really is running -- still reports
+        # ``plan_replaced``.
+        replaced = carried is not None or carry_ended is None
         return Decision(
             state=EXECUTION_STATE_STOPPING,
             ownership=ownership,
             target=target,
             progress=progress,
-            stop_reason=EXECUTION_STOP_PLAN_REPLACED,
+            stop_reason=(EXECUTION_STOP_PLAN_REPLACED if replaced else carry_ended),
             reset_required=True,
         )
 
@@ -3498,6 +3533,8 @@ def as_dict(
                     else target.headroom_until.isoformat()
                 ),
                 "headroom_constrained": target.constrained,
+                # beta.56: why the triple above is absent, when it is.
+                "headroom_reason": target.headroom_reason,
             }
         ),
         "progress": (

@@ -225,6 +225,10 @@ from .const import (
     EXECUTION_VERIFY_MARKER_ON,
     EXECUTION_VERIFY_NO_FAMILY_ACTIVE,
     EXECUTION_WITHDRAWAL_STOP_REASONS,
+    HEADROOM_REASON_CONSTRAINED,
+    HEADROOM_REASON_NO_CEILING,
+    HEADROOM_REASON_NO_LANDING_ENERGY,
+    HEADROOM_REASON_NO_LATER_ABSORPTION,
     HOLD_REASON_QUARTER_SATISFIED,
     HOLD_REASON_RATE_BELOW_RESOLUTION,
     HOLD_WRITE_FAILURE_LIMIT,
@@ -7126,6 +7130,53 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         measurable = self._campaign_measurable
         target_known = target_kwh is not None
         shortfall = None if target_kwh is None else target_kwh - realized
+        # **The physical half of the story, promoted out of diagnostics. beta.56.**
+        #
+        # ``battery_measured_total_kwh`` has been computed here since beta.54 and
+        # reached the diagnostics download and nothing else. So the only campaign
+        # figures a user could see were the objective pair, and on the live
+        # 2026-09-10 charge that pair read ``14.22 / 15.63 kWh`` while the pack had
+        # physically taken 15.65 kWh and finished at 100 %. Every number was
+        # correct and the sentence they formed was not.
+        #
+        # None of this redefines objective progress: absorbed production is still
+        # not progress, the frozen target is still the plan's own, and the four
+        # fields below are additive context published *beside* an unchanged
+        # verdict. They are what makes ``partial`` legible instead of alarming.
+        measured_total = self._campaign_measured_now()
+        # **Only where the two figures are the same kind of quantity.** For a
+        # battery-bound objective they are -- realised sums each row's capped
+        # battery energy and this sums the same rows uncapped, so the difference is
+        # exactly the free production the clamp left out. For a *meter*-bound
+        # export objective the realised figure is grid energy while this is battery
+        # energy, and their difference is house-load compensation, not absorption.
+        # Publishing it there would invent a figure, so it is withheld and the
+        # boundary already published beside it says why.
+        absorbed_extra = (
+            round(max(0.0, measured_total - realized), 3)
+            if self._campaign_boundary == CAMPAIGN_BOUNDARY_BATTERY
+            else None
+        )
+        # The pack's own state at the moment the terminal was written. ``None``
+        # rather than ``False`` on an unreadable pack: not knowing whether the
+        # battery is full and knowing that it is not are different answers, and
+        # only one of them is a measurement.
+        battery_full: bool | None = None
+        headroom_at_close: float | None = None
+        soc_at_close = self._read_soc_percent()
+        plan_at_close = self.battery_plan
+        if soc_at_close is not None:
+            battery_full = soc_at_close >= BATTERY_MAX_SOC_PERCENT
+            if plan_at_close is not None and plan_at_close.state is not None:
+                limits_at_close = plan_at_close.state.limits
+                headroom_at_close = round(
+                    max(
+                        0.0,
+                        limits_at_close.energy_for_soc(BATTERY_MAX_SOC_PERCENT)
+                        - limits_at_close.energy_for_soc(soc_at_close),
+                    ),
+                    3,
+                )
         if not measurable:
             outcome = OUTCOME_FAILED
         elif not target_known:
@@ -7137,6 +7188,24 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             outcome = OUTCOME_SUCCESS
         elif stop_reason in EXECUTION_FAILED_STOP_REASONS:
             outcome = OUTCOME_FAILED
+        elif stop_reason == EXECUTION_STOP_PLAN_REPLACED:
+            # **The withdrawal rung, and it is the one rung this ladder lacked.
+            # beta.56.** ``plan_replaced`` lives in
+            # ``EXECUTION_WITHDRAWAL_STOP_REASONS``, which nothing here branched
+            # on, so a displaced campaign fell to the generic ``elif stop_reason``
+            # and was filed ``canceled``. The ``superseded`` remap below it then
+            # required ``partial``, which a withdrawal with a *known* target could
+            # never reach -- so the word beta.42 added for precisely this case was
+            # unreachable for precisely this case.
+            #
+            # ``_recovered_outcome`` has had this rung, in this position, since
+            # beta.42. Identical evidence therefore closed as ``canceled`` live and
+            # ``superseded`` after a restart, and its docstring claimed parity
+            # while the two disagreed. Placed above the completion branch to match
+            # that ladder exactly; the two sets are disjoint, so nothing in
+            # ``EXECUTION_COMPLETION_STOP_REASONS`` -- ``window_ended`` first among
+            # them -- can reach it.
+            outcome = OUTCOME_SUPERSEDED
         elif stop_reason in EXECUTION_COMPLETION_STOP_REASONS:
             # **The ordinary way a campaign ends.** ``window_ended`` fires when the
             # last planned quarter closes, on every campaign that runs to
@@ -7199,7 +7268,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "objective_planned_final_kwh": (
                 None if planned_final is None else round(planned_final, 3)
             ),
-            "battery_measured_total_kwh": round(self._campaign_measured_now(), 3),
+            "battery_measured_total_kwh": round(measured_total, 3),
+            # **beta.56, and all four are additive.** No figure above changes
+            # value, and the outcome was decided before any of them was read.
+            "absorbed_extra_kwh": absorbed_extra,
+            "battery_full_at_close": battery_full,
+            "headroom_at_close_kwh": headroom_at_close,
+            "battery_soc_percent_at_close": soc_at_close,
             "objective_measurable": measurable,
             # **Signed, and null below the actuator quantum.** A 13 % shortfall on
             # a 0.11 kWh objective and a 13 % shortfall on a 5 kWh one are
@@ -7262,21 +7337,26 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "promised, not on the fraction of itself that happened to be "
                 "published when it started; the realised figure accumulates across "
                 "segments and across serve_load gaps and is reset only when the "
-                "campaign closes"
+                "campaign closes. battery_measured_total_kwh, absorbed_extra_kwh, "
+                "battery_full_at_close and headroom_at_close_kwh are physical "
+                "context published beside that verdict and never inside it: "
+                "absorbed production is not objective progress, so a campaign "
+                "whose shortfall equals its absorbed total is short of its "
+                "objective and physically finished at the same time, and both "
+                "facts are now readable. absorbed_extra_kwh is null for a "
+                "meter-bound objective, where the realised figure and the battery "
+                "total are not the same quantity"
             ),
         }
-        # **``superseded`` rather than ``partial`` for a started campaign the plan
-        # displaced. beta.42.** The shortfall is not the plant's: the campaign was
-        # overtaken by a newer authoritative plan, not missed. Applied only where the
-        # judgement above did not already reach something stronger, so an
-        # unmeasurable campaign is still ``failed`` and a met objective is still
-        # ``success`` -- the precedence is unchanged, this adds one leaf to it.
-        public_result = outcome
-        if outcome == OUTCOME_PARTIAL and stop_reason == EXECUTION_STOP_PLAN_REPLACED:
-            public_result = OUTCOME_SUPERSEDED
+        # **The public result is the outcome, with no second mapping. beta.56.**
+        # beta.42 remapped ``partial`` to ``superseded`` here, guarded on an
+        # outcome a withdrawal with a known target cannot reach -- so the remap was
+        # dead and the terminal and the event could in principle have disagreed
+        # about one campaign. The judgement now happens once, in the ladder above,
+        # where the energy was measured; this layer publishes it.
         self._lifecycle_removed(
             now,
-            result=public_result,
+            result=outcome,
             completion_reason=stop_reason,
             terminal=self._closed_campaign,
         )
@@ -10568,8 +10648,10 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return None, None
             return production, baseline
 
-        def headroom_of(run: Any) -> tuple[float | None, float | None, int | None]:
-            """Return the headroom this plan needs preserved after ``run``.
+        def headroom_of(
+            run: Any,
+        ) -> tuple[float | None, float | None, int | None, str]:
+            """Return the headroom this plan needs preserved after ``run``, and why.
 
             The plan's own landing energy is the constraint. Stage A chose to hold
             that much and no more, and it chose it knowing what production was
@@ -10580,10 +10662,33 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             production, because that is the first moment the headroom is spent.
             Absent when the plan absorbs nothing further: then nothing is being
             protected and the constraint would be noise.
+
+            **What this is not, stated here because the published rule string used
+            to claim otherwise. beta.56.** There is no price, no forecast and no
+            comparison in this function. It is arithmetic on the ceiling and on the
+            optimiser's *own* solved trajectory, so it can only restate a decision
+            already taken -- a Stage B faithfulness bound, which is a real and
+            useful job and a different one from deciding how much room is worth
+            keeping. That decision is ``edge_creditable_energy_kwh``, which caps
+            creditable terminal energy at ``ceiling - forecast_surplus`` inside the
+            objective's cost term, together with the per-interval pricing that
+            charges every absorbed kWh its foregone export. On the audited
+            2026-09-10 refresh that term was live and binding at
+            ``21.6 - 3.2 = 18.4`` while all three fields here were null.
+
+            Which is the fourth return value's whole purpose. The three figures
+            flip together, so ``null`` was one silence over three different facts,
+            and the one a reader most needed to distinguish -- "the plan absorbs
+            nothing later, so there is nothing to protect" -- looks identical to
+            "no ceiling is known". The constrained case is named too: a reason
+            field that is itself null on the interesting branch would repeat the
+            defect it exists to close.
             """
+            if ceiling is None:
+                return None, None, None, HEADROOM_REASON_NO_CEILING
             end_energy = landed.get(run.end_index)
-            if end_energy is None or ceiling is None:
-                return None, None, None
+            if end_energy is None:
+                return None, None, None, HEADROOM_REASON_NO_LANDING_ENERGY
             absorbs_at: int | None = None
             for entry in outcome.desired.intervals:
                 if entry.index <= run.end_index:
@@ -10592,8 +10697,13 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     absorbs_at = entry.index
                     break
             if absorbs_at is None:
-                return None, None, None
-            return max(0.0, ceiling - end_energy), end_energy, absorbs_at
+                return None, None, None, HEADROOM_REASON_NO_LATER_ABSORPTION
+            return (
+                max(0.0, ceiling - end_energy),
+                end_energy,
+                absorbs_at,
+                HEADROOM_REASON_CONSTRAINED,
+            )
 
         # **The retention gate, built once per refresh. beta.40.**
         #
@@ -10705,7 +10815,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 continue
             floor = required.get(run.start_index)
             production, baseline = window_totals(run)
-            headroom, max_end, absorbs_at = headroom_of(run)
+            headroom, max_end, absorbs_at, headroom_reason = headroom_of(run)
             until = None if absorbs_at is None else moment(absorbs_at)
             target = execution_target(
                 run,
@@ -10726,6 +10836,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 required_headroom_kwh=headroom,
                 max_end_energy_kwh=max_end,
                 headroom_until=until,
+                headroom_reason=headroom_reason,
+                # **beta.56: the pack ceiling, for one published bound.** The
+                # retention level is walked in whole lattice buckets, whose top
+                # sits up to one bucket above the battery, so beta.55 published
+                # 21.61 kWh as an authorisation bound on a 21.6 kWh pack. The
+                # ceiling is supplied from here because this is the layer that
+                # holds physical facts; the beta.40 gate deliberately holds none.
+                ceiling_dc_kwh=ceiling,
                 # **The meter target for the quarter the window opens on**, read
                 # off the solved plan own per-interval grid energies. The run
                 # first interval, matching ``first_power_kw`` beside it: a run
@@ -12029,6 +12147,19 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 None if terminal is None else terminal.get("success_tolerance_kwh")
             ),
         }
+        # **The physical context travels with the result. beta.56.** The event is
+        # what an automation and the Trading Log read; leaving these in the
+        # terminal alone would fix the diagnostics and leave the logbook line that
+        # started this saying ``14.22 / 15.63 kWh`` and nothing else. Projected
+        # from the terminal rather than recomputed, so the two cannot disagree.
+        for physical in (
+            "battery_measured_total_kwh",
+            "absorbed_extra_kwh",
+            "battery_full_at_close",
+            "headroom_at_close_kwh",
+            "objective_boundary",
+        ):
+            payload[physical] = None if terminal is None else terminal.get(physical)
         breakdown = self._campaign_classification(common["campaign_id"])
         for key in (
             "safety_buy_kwh",
@@ -12204,6 +12335,14 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Unmeasurable outranks a met objective, exactly as it does live: a total that
         is not a measurement cannot be evidence of success.
+
+        **And until beta.56 the claim of sameness above was false**, which is the
+        cost of writing a precedence out twice. This ladder has had the
+        ``plan_replaced`` rung since beta.42; the live one never grew it, so one
+        campaign's evidence closed ``canceled`` through the coordinator and
+        ``superseded`` through a restart. The two now agree rung for rung, and
+        ``test_beta56_campaign_completion`` asserts it over the whole reason
+        vocabulary rather than trusting this paragraph.
         """
         if not measurable:
             return OUTCOME_FAILED

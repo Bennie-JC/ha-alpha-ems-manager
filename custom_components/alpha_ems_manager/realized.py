@@ -74,6 +74,7 @@ from .const import (
     LEDGER_BASIS_MODEL_TERM,
     LEDGER_BASIS_PLANNER_DERIVED,
     LEDGER_BASIS_REVALUED,
+    METERED_EXPORT_RULE,
 )
 
 #: Rounding for published energies and euro figures, matching the rest of Phase 8.
@@ -593,6 +594,13 @@ def _basis_map() -> dict[str, str]:
         "today_accounting.realised_load_shifting_value_eur": LEDGER_BASIS_MEASURED,
         "today_accounting.realised_energy_value_eur": LEDGER_BASIS_MEASURED,
         "counterfactual_intervals_missing_sell_price": LEDGER_BASIS_MEASURED,
+        # beta.56. The metered pair, both spellings, for the same reason the four
+        # above map both: the euro half lands on a ``MONETARY`` entity, and an
+        # unmapped euro attribute there publishes ``unclassified`` silently.
+        "realised_metered_export_kwh": LEDGER_BASIS_MEASURED,
+        "realised_metered_export_revenue_eur": LEDGER_BASIS_MEASURED,
+        "today_accounting.realised_metered_export_kwh": LEDGER_BASIS_MEASURED,
+        "today_accounting.realised_metered_export_revenue_eur": (LEDGER_BASIS_MEASURED),
         # A verdict rather than a quantity -- and mapped for the same reason the
         # interval count above it is. It is derived from nothing but those counts:
         # no attribution rule, no model constant and no valuation enters it, so
@@ -812,6 +820,31 @@ class DayAccounting:
     #: checked rather than merely believed.
     counterfactual_intervals_missing_sell_price: int | None = None
 
+    # -- beta.56: what the meter actually sent out ----------------------------
+    #
+    #: **The measured outward flow, published beside the counterfactual and never
+    #: instead of it.** :attr:`realised_export_value_eur` answers "what would a
+    #: household with this array and no battery have sold" -- it is a stated
+    #: counterfactual, and it has to be, because measured export includes energy
+    #: the battery sent to the grid and that sale belongs to the shifting term.
+    #: The question an owner asks looking at their meter is a *different* one:
+    #: how much went out, and what did it fetch. Both are legitimate and until
+    #: beta.56 only the first reached an entity, so the second was read off the
+    #: first and came out wrong.
+    #:
+    #: Meter-bound: integrated from the grid sensor, with no efficiency factor
+    #: anywhere in it. The volume is measured; the price it is valued at is the
+    #: one recorded for that interval, which upstream may have reconstructed --
+    #: see the entity's own wording. An interval that exported with no sell price
+    #: is skipped by the window rather than valued at zero, so this is understated
+    #: rather than wrong when a price is missing, and the skip count says so.
+    #:
+    #: Scoped to the same closed slice as the four components above, deliberately:
+    #: a whole-day metered figure sitting beside a closed-slice counterfactual is
+    #: the arithmetic that made this pair necessary in the first place.
+    realised_metered_export_kwh: float | None = None
+    realised_metered_export_revenue_eur: float | None = None
+
     #: The two ends of the position, and the provenance of the opening valuation.
     opening_inventory_kwh: float | None = None
     opening_inventory_value_eur: float | None = None
@@ -854,6 +887,14 @@ class DayAccounting:
                 self.counterfactual_intervals_missing_sell_price
             ),
             "decomposition_basis": DECOMPOSITION_BASIS,
+            # beta.56. Measured export and what it fetched, beside the
+            # counterfactual above and outside the decomposition identity: these
+            # two are never addends of ``realised_energy_value_eur``.
+            "realised_metered_export_kwh": self.realised_metered_export_kwh,
+            "realised_metered_export_revenue_eur": (
+                self.realised_metered_export_revenue_eur
+            ),
+            "metered_export_rule": METERED_EXPORT_RULE,
             "partition": {
                 "interval_count": self.interval_count,
                 "realised_intervals": self.realised_interval_count,
@@ -1047,6 +1088,18 @@ def day_accounting(
             None
             if realised is None
             else realised.counterfactual_intervals_missing_sell_price
+        ),
+        # **Projected on exactly the beta.53 terms. beta.56.** The window already
+        # summed these two under its own pricing gate, and asking a second time is
+        # how one figure comes to be published two ways. They carry no
+        # counterfactual gate of their own: a measured flow at a recorded price is
+        # available whenever the window is, which is why they survive a missing
+        # sell price that withholds the decomposition beside them.
+        realised_metered_export_kwh=(
+            None if realised is None else realised.realized_grid_export_kwh
+        ),
+        realised_metered_export_revenue_eur=(
+            None if realised is None else realised.realized_export_revenue_eur
         ),
         opening_inventory_kwh=(
             None if realised is None else realised.opening_inventory_kwh

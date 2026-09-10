@@ -53,6 +53,11 @@ fixed markup of roughly € 0.129/kWh in sourcing margin and energy tax; the exp
 does not. So on a negative market price, importing still costs money while exporting earns
 a negative amount.
 
+⚠️ **This row is not your meter.** It answers "what would this array have sold *without*
+a battery". It has to: some of what your meter sent out came from the battery, and that
+sale is already counted under load shifting. Putting it here as well would count one sale
+twice. If you want the meter, see [Your actual export](#your-actual-export) below.
+
 ### Load shifting
 
 This is the battery's own work. Energy that went into the pack cheaply in the afternoon
@@ -96,6 +101,38 @@ likely to see:
 - `no_opening_valuation` — the first day after installing, until the next midnight
 - `horizon_short_of_midnight` — only one price day is published, so part of your day has
   no price. Resolves once tomorrow's prices arrive.
+
+---
+
+## Your actual export
+
+Two export figures, answering two different questions. Both are correct, and mixing them
+up is the most common way to read a wrong number off this sensor.
+
+| Attribute | The question it answers |
+|---|---|
+| `realised_export_value_eur` | What an array like yours **without a battery** would have sold. Part of the energy-value sum above. |
+| `realised_metered_export_kwh` | How much energy **actually left your meter** today. |
+| `realised_metered_export_revenue_eur` | What that energy fetched. |
+
+A tile reading *Sold to grid — 0.49 kWh · € 0.11* wants the second pair.
+
+**What the metered pair includes:** everything that crossed the meter outward, whether it
+came from your panels or from the battery. Your meter cannot tell the difference, and this
+figure is your meter's.
+
+⚠️ **The volume is measured; the price may be reconstructed.** The kilowatt-hours come
+from your grid sensor and carry no efficiency factor at all. The rate they are valued at
+is the export rate recorded for each quarter, which Alpha EMS reconstructs from the market
+price and your configured feed-in adjustment. It is a good figure to steer by, not a
+settled invoice — your supplier's annual statement is the authority on what you were paid.
+
+**Do not add the metered pair to the energy-value sum.** It is deliberately outside it. The
+three components already account for every kilowatt-hour exactly once, and the metered
+revenue is the same electricity under a different convention.
+
+A quarter that exported while no export rate was recorded is **skipped**, not valued at
+zero. So the pair can be a little low on a day with a price gap, and is never inflated.
 
 ---
 

@@ -3060,12 +3060,32 @@ available to the battery, because the house consumes throughout the window and t
 its share first. Publishing the gross figure would invite Stage B to preserve
 headroom against energy the house was always going to eat.
 
-**The headroom constraint.** ``required_headroom_kwh``, ``max_end_energy_kwh`` and
-``headroom_until``. An old cheap-grid charge target that fills the pack early
-displaces production the plan meant to absorb -- and deciding how much headroom is
-*worth* keeping is an economic question. So Stage A answers it from the trajectory it
-already chose: the plan's own landing energy is the cap, and the deadline is the next
-interval at which the plan absorbs surplus. ``null`` means unconstrained, never zero.
+**The headroom cap.** ``required_headroom_kwh``, ``max_end_energy_kwh``,
+``headroom_until`` and -- since beta.56 -- ``headroom_reason``. An old cheap-grid
+charge target that fills the pack early displaces production the plan meant to absorb,
+so Stage B is given a bound: the plan's own landing energy is the cap, and the deadline
+is the next interval at which the plan absorbs surplus. ``null`` means unconstrained,
+never zero, and the reason says which of three absences it is -- no reserve
+projection, no solved landing energy, or a plan that absorbs nothing further.
+
+**And it is a faithfulness bound, not the headroom economics.** Through beta.55 the
+published ``headroom_rule`` said it was "decided here because how much headroom is
+worth keeping is an economic question". That sentence was wrong about this mechanism
+and right about a different one, which is a costly kind of wrong: ``headroom_of``
+computes ``ceiling - landed[run.end_index]`` off the DP's *own* solved trajectory and
+contains no price, no forecast and no comparison at all. It can only restate a decision
+already taken -- which is a real job, stopping Stage B overshooting the plan, and the
+only one of the three fields with a consumer (``headroom_ceiling_kw``) does exactly
+that.
+
+The economics live in ``economic.edge_creditable_energy_kwh``, which caps *creditable*
+terminal inventory at ``ceiling - forecast_surplus`` inside the objective's cost term,
+together with the per-interval pricing that charges every absorbed kilowatt-hour its
+own foregone export revenue and the plain fact that a full pack loses the absorption
+move outright. On the audited 2026-09-10 refresh that cap was live and binding at
+``21.6 - 3.2 = 18.4`` while all three published fields read ``null`` -- a group of
+nulls that read as "nothing was protected" and meant "there is nothing left to
+protect". The reason field exists so that reading no longer requires a source audit.
 
 None of the four changes a plan. Every figure is an aggregate or projection of
 something the solve already computed, no new term enters the objective, and there are

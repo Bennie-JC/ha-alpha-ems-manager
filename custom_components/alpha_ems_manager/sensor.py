@@ -1304,7 +1304,36 @@ def _terminal_view(report: dict[str, Any]) -> TerminalView | None:
         reason=latched.get("reason"),
         measurable=bool(latched.get("objective_measurable", True)),
         started=bool(latched.get("started")),
+        # **The physical context, read on the same terms as everything else here:
+        # projected, never computed. beta.56.** Activity needs it to tell a
+        # campaign that ran out of time from one that physically finished, and
+        # deciding that here would put a comparison back into the layer beta.34
+        # took every comparison out of.
+        battery_measured_total_kwh=_optional_float(
+            latched.get("battery_measured_total_kwh")
+        ),
+        absorbed_extra_kwh=_optional_float(latched.get("absorbed_extra_kwh")),
+        battery_full_at_close=(
+            None
+            if latched.get("battery_full_at_close") is None
+            else bool(latched.get("battery_full_at_close"))
+        ),
     )
+
+
+def _optional_float(value: Any) -> float | None:
+    """Return ``value`` as a float, or ``None`` when it is absent or not a number.
+
+    Absent stays absent. A physical figure the coordinator withheld -- an
+    unreadable pack, or an absorbed total that would be meaningless at a meter
+    boundary -- must not arrive here as a zero that reads like a measurement.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _economic_blocked_reason(coordinator: AlphaEmsCoordinator) -> str:
@@ -1551,6 +1580,14 @@ _ECONOMIC_VALUE_FLAT = (
     "realised_energy_value_eur",
     "decomposition_unavailable_reason",
     "counterfactual_intervals_missing_sell_price",
+    # **The meter's own export, beside the counterfactual above. beta.56.**
+    # ``realised_export_value_eur`` is what a bare array *would* have sold, and a
+    # dashboard tile reading "sold to grid" was pointing at it because nothing
+    # else was published. These two are the meter: measured volume, at the price
+    # recorded for each interval, battery-sourced export included. They are
+    # outside the decomposition identity above and are never addends of it.
+    "realised_metered_export_kwh",
+    "realised_metered_export_revenue_eur",
     "accounting_basis",
     "accounting_reconciliation_error_eur",
     "accounting_unavailable_reason",
@@ -1641,6 +1678,9 @@ def _economic_value_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, An
             "realised_energy_value_eur",
             "decomposition_unavailable_reason",
             "counterfactual_intervals_missing_sell_price",
+            # beta.56, projected from the same block on the same terms.
+            "realised_metered_export_kwh",
+            "realised_metered_export_revenue_eur",
         ):
             payload[name] = accounting.get(name)
         partition = accounting.get("partition")
@@ -1651,6 +1691,10 @@ def _economic_value_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, An
             "reconciliation_error_eur"
         )
         payload["accounting_unavailable_reason"] = accounting.get("unavailable_reason")
+        # **The caveat travels with the pair.** A measured volume at a possibly
+        # reconstructed price is a different kind of number from a settled
+        # invoice, and the distinction has to be readable where the figure is.
+        payload["metered_export_rule"] = accounting.get("metered_export_rule")
 
     for name in _ECONOMIC_VALUE_FLAT:
         if name in payload:
@@ -1666,6 +1710,8 @@ def _economic_value_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, An
         if isinstance(payload.get(block), dict):
             attributes[block] = payload[block]
     attributes["day_split_rule"] = payload.get("day_split_rule")
+    if payload.get("metered_export_rule") is not None:
+        attributes["metered_export_rule"] = payload["metered_export_rule"]
     attributes["accounting_rule"] = _ECONOMIC_VALUE_ACCOUNTING_BASIS
     attributes["figure_basis"] = _figure_basis(attributes)
     return attributes
@@ -1856,7 +1902,15 @@ def _last_campaign_attributes(coordinator: AlphaEmsCoordinator) -> dict[str, Any
             "objective within success_tolerance_kwh does, and an unmeasurable total "
             "outranks even a met objective. not_executed means the campaign was "
             "publicly created and never started, so nothing under-delivered; "
-            "superseded means a started campaign was replaced by a newer plan"
+            "superseded means a started campaign was replaced by a newer plan. "
+            "beta.56: battery_measured_total_kwh is every kWh the pack took under "
+            "this campaign, uncapped, and absorbed_extra_kwh is how much of it "
+            "arrived as free production beyond the row objectives -- absorbed "
+            "production is deliberately not objective progress, so a campaign can "
+            "be short of its objective and physically finished at the same time, "
+            "and battery_full_at_close says whether it was. absorbed_extra_kwh is "
+            "null for a meter-bound objective, where the realised figure and the "
+            "battery total are not the same quantity"
         ),
     }
 

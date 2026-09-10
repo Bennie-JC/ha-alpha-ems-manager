@@ -4798,6 +4798,94 @@ DECOMPOSITION_BASIS: Final = (
     "zero, and takes the total with it"
 )
 
+# ---------------------------------------------------------------------------
+# why the published headroom triple is absent. **beta.56.**
+# ---------------------------------------------------------------------------
+#
+#: **Three distinct facts that used to arrive as one silence.** A target's
+#: ``required_headroom_kwh``, ``max_end_energy_kwh`` and ``headroom_until`` are
+#: null together or populated together, and on the reference installation they
+#: were null on every target of every refresh across a day the pack filled to
+#: 100 %. Reading that as "the plan protected nothing" took a full source audit,
+#: because ``null`` cannot distinguish "no ceiling is known" from "the plan
+#: absorbs nothing further" from "the plan does constrain this run" -- and the
+#: last of those is not a refusal at all.
+#:
+#: Named for the same reason ``retention_gate``, ``quarter_schedule_source`` and
+#: ``not_executable`` are named: a refusal a reader can act on beats a silence
+#: they have to reverse-engineer.
+HEADROOM_REASON_CONSTRAINED: Final = "plan_landing_energy"
+HEADROOM_REASON_NO_CEILING: Final = "no_reserve_projection"
+HEADROOM_REASON_NO_LANDING_ENERGY: Final = "no_planned_landing_energy"
+HEADROOM_REASON_NO_LATER_ABSORPTION: Final = "plan_absorbs_nothing_later"
+
+HEADROOM_REASONS: Final = (
+    HEADROOM_REASON_CONSTRAINED,
+    HEADROOM_REASON_NO_CEILING,
+    HEADROOM_REASON_NO_LANDING_ENERGY,
+    HEADROOM_REASON_NO_LATER_ABSORPTION,
+)
+
+#: What the published headroom triple actually is -- and, as importantly, what it
+#: is not. **beta.56 replaces a rule string that described a different function.**
+#:
+#: Through beta.55 this claimed the triple was "decided here because how much
+#: headroom is worth keeping is an economic question". That sentence is true of
+#: :func:`economic.edge_creditable_energy_kwh`, which caps terminal credit at
+#: ``ceiling - forecast_surplus`` inside the objective's cost term and was live
+#: and binding on the audited refresh. It is not true of the triple, which is
+#: arithmetic on the ceiling and the plan's *own* solved landing energy: no price,
+#: no forecast and no comparison enter it. A reader who believed the old string
+#: would conclude that a null meant the economics had declined to protect
+#: anything, when the economics live somewhere the payload never mentioned.
+HEADROOM_RULE: Final = (
+    "a Stage B faithfulness cap, not an economic calculation. "
+    "max_end_energy_kwh is the optimiser's own projected stored energy at the "
+    "end of this run, and required_headroom_kwh is the room the pack has left "
+    "at that level -- so honouring it means executing the plan's own trajectory "
+    "rather than overshooting it, and it can only ever restate what Stage A "
+    "already chose. headroom_until is the first later interval at which the plan "
+    "absorbs surplus production, which is when the room is spent. null means "
+    "unconstrained, NOT zero, and headroom_reason says which of the three "
+    "absences it is. THE ECONOMICS ARE ELSEWHERE: how much room is worth keeping "
+    "for forecast production is decided by edge_creditable_energy_kwh, which "
+    "caps creditable terminal energy at ceiling minus the forecast surplus "
+    "inside the objective's cost term, together with the per-interval pricing "
+    "that charges every absorbed kilowatt-hour its foregone export revenue. "
+    "Stage B may only reduce or stop to honour this cap: buying the difference "
+    "when production disappoints is a new economic decision and belongs in "
+    "Stage A"
+)
+
+#: What the metered export pair is, and what it deliberately is not. **beta.56.**
+#:
+#: **Two legitimate questions that beta.55 answered with one figure.**
+#: ``realised_export_value_eur`` is a *counterfactual*: what a household with the
+#: same array and no battery would have sold. It has to be, because measured
+#: export includes energy the battery sent to the grid, and that sale is already
+#: inside the load-shifting term -- using the meter there would count it twice.
+#: But an owner reading a dashboard tile asks the other question, about their own
+#: meter, and until beta.56 the counterfactual was the only export figure any
+#: entity published. So it was read as the meter and was smaller than it.
+#:
+#: These two are additive and outside the decomposition identity. They are never
+#: addends of ``realised_energy_value_eur`` and adding them to it would double the
+#: export leg.
+METERED_EXPORT_RULE: Final = (
+    "measured outward flow at the grid meter, valued at the export price "
+    "recorded for each interval. the volume is measured and carries no "
+    "efficiency factor; the price may have been reconstructed from the market "
+    "price and the configured feed-in adjustment, so the revenue is a measured "
+    "quantity at a possibly modelled price rather than a settled invoice. "
+    "battery-sourced export is included, because the meter cannot tell where a "
+    "kilowatt-hour came from and this figure is the meter's. deliberately NOT "
+    "realised_export_value_eur, which is the counterfactual a bare array would "
+    "have sold and is the export component of the decomposition; these two are "
+    "outside that identity and are never added into energy_value. an interval "
+    "that exported with no sell price is skipped rather than valued at zero, so "
+    "the pair is understated rather than wrong when a price is missing"
+)
+
 #: Why no planner projection could be formed. beta.53.
 #:
 #: **Never a zero.** A projected state of charge was deliberately absent from this

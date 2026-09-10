@@ -318,9 +318,57 @@ How the previous campaign ended.
 `completion_reason`, `objective_measurable`, `success_tolerance_kwh`,
 `final_classification`, the timestamps, and the same breakdown as above.
 
+**Since beta.56 it also carries what physically happened:**
+
+| Attribute | What it means |
+|---|---|
+| `battery_measured_total_kwh` | Every kWh the pack took under this campaign, uncapped |
+| `absorbed_extra_kwh` | How much of that arrived as free solar, beyond what the plan set out to achieve |
+| `battery_full_at_close` | Whether the battery was full when the campaign ended |
+| `headroom_at_close_kwh` | How much room was left in the pack |
+
 **A delivered amount is not by itself a success.** Only the frozen objective, within
 `success_tolerance_kwh`, counts as met. `not_executed` means created and never started;
-`superseded` means started and replaced.
+`superseded` means started and replaced by a newer plan.
+
+#### Why a charge can be `partial` and still have finished
+
+This is the most common surprise, and it is not a fault.
+
+A charge campaign's objective counts only the energy the plan set out to move. Free solar
+the battery absorbed **on top of that** is deliberately not counted as progress: if it
+were, a sunny afternoon would push the figure past a target the plan had not finished
+buying towards, and the campaign would stop early.
+
+So on a sunny day a completed charge legitimately reads:
+
+```
+result                      partial
+completion_reason           window_ended
+planned_kwh                 15.63
+realised_kwh                14.22
+battery_measured_total_kwh  15.65
+absorbed_extra_kwh          1.43
+battery_full_at_close       true
+```
+
+Read together: the plan wanted 15.63 kWh, 14.22 of it counted towards the objective, the
+pack actually took 15.65 kWh because extra sun arrived, and it ended full. **Nothing went
+wrong.** The battery could not have held any more.
+
+If `battery_full_at_close` is `false` and `absorbed_extra_kwh` is around zero, then the
+shortfall is a real one — see [Troubleshooting](troubleshooting.md).
+
+`absorbed_extra_kwh` is absent for a **sell** campaign. There the objective is measured at
+the meter while the pack figure is battery energy, so their difference is house load the
+battery covered, not absorbed solar — and reporting it as absorbed solar would be an
+invention.
+
+`completion_reason` distinguishes the two ordinary endings from a real interruption:
+`window_ended` means the campaign reached the end of its own schedule, while
+`plan_replaced` means a newer plan took over — and that now reads `superseded` rather than
+`canceled`, because Stage A revising the future is not something that happened *to* your
+battery.
 
 ⚠️ **This sensor does not survive a restart.** Afterwards it reads `unknown` with
 `no_campaign_closed_yet` until the next campaign ends. Do not read that as a campaign

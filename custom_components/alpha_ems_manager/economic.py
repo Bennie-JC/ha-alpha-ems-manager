@@ -186,6 +186,7 @@ from .const import (
     EXECUTION_INTENT_HOLD,
     EXECUTION_INTENT_NET_EXPORT,
     EXECUTION_INTENT_SERVE_LOAD,
+    HEADROOM_RULE,
     MARGINAL_VALUE_BASIS_RETENTION,
     MARGINAL_VALUE_KINK_TOLERANCE_EUR_KWH,
     MAX_ECONOMIC_RUN_INTERVALS_REPORTED,
@@ -5492,6 +5493,19 @@ class RetentionGate:
             last = bucket
         # The energy at the top of that step: a step from ``last`` to ``last + 1``
         # is worth taking, so the level it lands on is the level to stop at.
+        #
+        # **Unclamped by the pack, deliberately, and clamped by the caller.**
+        # The lattice is sized ``ceil(ceiling / bucket)``, so its top level
+        # over-represents the battery by up to one bucket, and a curve that still
+        # pays at its last step lands there: the reference installation published
+        # ``21.61`` for a 21.6 kWh pack. That is a real defect in a published
+        # authorisation bound -- and the fix does not belong here. This gate holds
+        # prices, a value curve and the lattice pitch, and nothing physical, so
+        # that the pack ceiling has exactly one home; beta.40's neutrality suite
+        # pins this field list against precisely the temptation to add one, by
+        # name. :func:`quarter_schedule_for` applies the ceiling as the row is
+        # published, and Stage B has always taken ``min(until, ceiling)`` before
+        # commanding anything, so no dispatch was ever endangered by it.
         return (last + 1) * self.bucket_dc_kwh
 
     def verdict(self, export_price: float | None) -> tuple[bool, str]:
@@ -5640,6 +5654,11 @@ def quarter_schedule_for(
     intent: str,
     moment: Any,
     retention: RetentionGate | None = None,
+    #: The pack's own ceiling, DC. **beta.56.** Supplied by the layer that owns
+    #: every physical bound, and used for one thing: keeping the published
+    #: retention level inside the battery. ``None`` leaves it exactly as beta.55
+    #: published it rather than inventing a limit.
+    ceiling_dc_kwh: float | None = None,
 ) -> list[dict[str, Any]]:
     """Return the per-quarter execution rows for one run. **No new solve.**
 
@@ -5770,6 +5789,16 @@ def quarter_schedule_for(
                     retention_until = retention.retain_until_dc_kwh(
                         entry.export_price_eur_kwh
                     )
+                    # **Brought back inside the hardware, here rather than in the
+                    # gate. beta.56.** The lattice is sized
+                    # ``ceil(ceiling / bucket)``, so its top level sits up to one
+                    # bucket above the pack and a curve that pays all the way up
+                    # lands there -- 21.61 kWh published for a 21.6 kWh battery on
+                    # the reference installation. A bound nobody can reach is not a
+                    # bound, and this is the layer that may hold the ceiling: the
+                    # gate may not, so that a physical limit has one home.
+                    if retention_until is not None and ceiling_dc_kwh is not None:
+                        retention_until = min(retention_until, ceiling_dc_kwh)
         row: dict[str, Any] = {
             "start": start.isoformat(),
             "end": end.isoformat(),
@@ -7281,6 +7310,7 @@ def execution_target(
     required_headroom_kwh: float | None = None,
     max_end_energy_kwh: float | None = None,
     headroom_until: datetime | None = None,
+    headroom_reason: str | None = None,
     desired_grid_kw: float | None = None,
     safety_buy_kwh: float | None = None,
     economic_buy_kwh: float | None = None,
@@ -7290,6 +7320,9 @@ def execution_target(
     campaign_id: str | None = None,
     campaign_end: datetime | None = None,
     retention: RetentionGate | None = None,
+    #: The pack ceiling, DC, passed straight through to the row builder so the
+    #: published retention level stays inside the battery. **beta.56.**
+    ceiling_dc_kwh: float | None = None,
 ) -> dict[str, Any]:
     """Return the machine-readable target a future Stage B would consume.
 
@@ -7335,6 +7368,14 @@ def execution_target(
     ``max_end_energy_kwh`` and ``headroom_until`` are ``None`` when the plan
     imposes no such constraint, and absent means *unconstrained* -- never zero,
     which would forbid the pack from filling at all.
+
+    **``headroom_reason`` since beta.56, and it is always present.** The three
+    fields above flip together, so ``null`` was one silence covering three facts:
+    no ceiling is known, the plan absorbs nothing later, or the plan genuinely
+    does cap this run. Only the third is not a refusal, and no consumer could tell
+    which it had. See :data:`const.HEADROOM_RULE` for what the cap is -- a Stage B
+    faithfulness bound on the plan's own trajectory -- and for where the headroom
+    *economics* actually live, which is not here.
     """
     intent = EXECUTION_INTENT_GRID_CHARGE if safety_buy else execution_intent(run)
     # One row per solved interval of this run, off the rows the optimizer already
@@ -7347,6 +7388,7 @@ def execution_target(
             intent=intent,
             moment=moment,
             retention=retention,
+            ceiling_dc_kwh=ceiling_dc_kwh,
         )
         if intervals and moment is not None
         else []
@@ -7493,15 +7535,11 @@ def execution_target(
         "headroom_until": (
             None if headroom_until is None else headroom_until.isoformat()
         ),
-        "headroom_rule": (
-            "the physical headroom Stage B must leave available, decided here "
-            "because how much headroom is worth keeping is an economic question. "
-            "max_end_energy_kwh caps stored energy at headroom_until so forecast "
-            "production this plan intends to absorb is not displaced by charging "
-            "the pack full early. null means unconstrained, NOT zero. Stage B may "
-            "only reduce or stop to honour it: buying the difference when "
-            "production disappoints is a new economic decision and belongs here"
-        ),
+        # **Why the three above read as they do. beta.56.** Never null itself:
+        # the constrained case is named too, so the field is an answer rather
+        # than a second silence.
+        "headroom_reason": headroom_reason,
+        "headroom_rule": HEADROOM_RULE,
         **(
             charge_window_balance(
                 run,

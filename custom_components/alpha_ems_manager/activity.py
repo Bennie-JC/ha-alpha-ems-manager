@@ -136,6 +136,7 @@ from .const import (
     OUTCOME_FAILED,
     OUTCOME_PARTIAL,
     OUTCOME_SUCCESS,
+    OUTCOME_SUPERSEDED,
 )
 
 #: The name every entry is filed under.
@@ -415,6 +416,42 @@ class TerminalView:
     #: applied that -- this is carried so the line can say so.
     measurable: bool = True
     started: bool = True
+    #: **The physical context, so a shortfall can be explained rather than only
+    #: reported. beta.56.** The objective pair alone said ``14.22 / 15.63 kWh``
+    #: about a live charge campaign whose pack finished full, having taken
+    #: 15.65 kWh -- every figure right and the sentence wrong. Absorbed production
+    #: is still not objective progress; these three are what let the line say so
+    #: instead of leaving a reader to assume the charge failed.
+    #:
+    #: ``None`` throughout means the coordinator withheld the figure -- an
+    #: unreadable pack, or a meter-bound objective where the battery total is not
+    #: the same quantity as the realised one. Nothing is inferred from an absence.
+    battery_measured_total_kwh: float | None = None
+    absorbed_extra_kwh: float | None = None
+    battery_full_at_close: bool | None = None
+
+    @property
+    def filled_from_production(self) -> bool:
+        """Whether the pack ended full and the shortfall is the absorbed surplus.
+
+        **A reading of figures the coordinator settled, not a judgement.** The
+        outcome arrived decided; this only asks whether the two facts that make a
+        ``partial`` legible are both present -- the pack is full, and free
+        production beyond the row objectives is what the objective is short by.
+
+        The comparison is deliberately coarse: within one absorbed kWh either way
+        rather than to a tolerance, because a tolerance here would be this module
+        deciding something again.
+        """
+        if not self.battery_full_at_close:
+            return False
+        absorbed = self.absorbed_extra_kwh
+        if absorbed is None or absorbed <= 0.0:
+            return False
+        if self.objective_target_kwh is None:
+            return False
+        shortfall = self.objective_target_kwh - self.objective_realized_kwh
+        return shortfall > 0.0 and absorbed >= shortfall - 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -850,9 +887,43 @@ def _campaign_terminal(
         # Success and Canceled, so a campaign that delivered most of what it
         # promised had to be filed as one or the other -- and it was filed as a
         # cancellation, which reads as though nothing happened.
+        #
+        # **And beta.56 says *why* it is partial when the reason is the pack.** A
+        # charge whose objective is short by exactly the free production it
+        # absorbed, ending on a full battery, is a partial campaign and a finished
+        # one, and a line carrying only the objective pair told the reader the
+        # first half of that. The clause is added, never substituted: the outcome
+        # word, the figures and the payload are unchanged.
+        detail = (
+            " — Battery Full — Extra Solar Absorbed"
+            if terminal.filled_from_production
+            else ""
+        )
         return ActivityEntry(
             kind=ECONOMIC_EVENT_FINISHED,
-            message=(f"Finished Plan ID: {lifecycle.plan_id} — Partial — {figures}"),
+            message=(
+                f"Finished Plan ID: {lifecycle.plan_id} — Partial{detail} — {figures}"
+            ),
+            state=state.with_closed(lifecycle.plan_id),
+            plan_id=lifecycle.plan_id,
+            data=_structured(
+                ECONOMIC_EVENT_FINISHED, lifecycle, outcome=terminal.outcome, **campaign
+            ),
+        )
+    if terminal.outcome == OUTCOME_SUPERSEDED:
+        # **A displaced campaign is not a cancelled one, and until beta.56 this
+        # surface could not tell them apart because nothing produced the word.**
+        # ``superseded`` was unreachable from the live close path -- the ladder had
+        # no withdrawal rung -- so a campaign a newer plan overtook fell into the
+        # branch below and printed "Canceled — Plan Replaced". That sentence is
+        # right about the mechanism and wrong about the event: Stage A revised the
+        # future, and nothing happened to the dispatch.
+        return ActivityEntry(
+            kind=ECONOMIC_EVENT_FINISHED,
+            message=(
+                f"Finished Plan ID: {lifecycle.plan_id} — Superseded — "
+                f"Replaced By A Newer Plan — {figures}"
+            ),
             state=state.with_closed(lifecycle.plan_id),
             plan_id=lifecycle.plan_id,
             data=_structured(

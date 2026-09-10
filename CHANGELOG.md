@@ -9,6 +9,213 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.56] - 2026-09-10
+
+**Three things the reference installation reported wrongly, and one bound it could
+not reach.**
+
+Not yet final: this release is being validated against live evidence and may take one
+further correction before it is published.
+
+No planner decision changes. The five neutrality suites pass unchanged and were not
+re-baselined; `economic.py` is touched in two places, neither of which enters the
+objective. No storage change, no migration, no sealing change, no new entity.
+
+## A charge that filled the battery, filed as an abandoned one
+
+The 2026-09-10 charge campaign ran from 09:00 to its own planned end at 16:30, took
+15.648 kWh into a 21.6 kWh pack, and finished at 100 %. The logbook recorded:
+
+```
+Campagne geannuleerd —> 14.22 kWh / 15.63 kWh        (canceled / plan_replaced)
+```
+
+Every figure in that line is correct. The sentence is wrong three times over, and the
+three faults are independent.
+
+**The reason was invented.** `_decide` compared the ended run's minted **run id**
+against the selected publication's **plan id**. A run id is
+`sha256(intent|window_start|admitted_at)`; a plan id is `sha256(intent|window_start)`.
+Two identity namespaces, so the inequality carries no information at all -- it is
+structurally true on every refresh where a run ends and a later publication is
+actionable. `plan_replaced` was then asserted as fact, with a withdrawal basis reading
+"a different run was running" that nothing had established. The carry machine had
+watched the run end and recorded `window_ended`, and its verdict is now preferred here
+for the same reason the neighbouring branch has always preferred it. A genuinely
+displaced run -- a carried run whose own minted id differs, or a foreign run with
+nothing ended -- still reports `plan_replaced`. The stop, the reset and the selected
+target are byte for byte what they were: only the reported string changed.
+
+**The outcome had no rung for it.** `plan_replaced` lives in
+`EXECUTION_WITHDRAWAL_STOP_REASONS`, which `_close_campaign`'s ladder never branched
+on, so it fell through to the generic `elif stop_reason` and became `canceled`. The
+`superseded` remap below it required `outcome == partial`, which a withdrawal with a
+known target could never reach -- so the word beta.42 added for exactly this case was
+dead for exactly this case. `_recovered_outcome` had the rung all along, under a
+docstring claiming it applied "the same precedence `_close_campaign` applies". It did
+not: identical evidence closed `canceled` live and `superseded` after a restart. The
+rung is added in the position the recovery ladder already uses, the dead remap is
+gone, and a test now sweeps every stop reason across both ladders rather than trusting
+a paragraph.
+
+**The physical evidence never left diagnostics.** `battery_measured_total_kwh` has
+been computed at close since beta.54 and reached the diagnostics download and nothing
+else. So the four terminal fields a reader needed did not exist, and the shortfall
+looked like a plant failure.
+
+It is not one, and the arithmetic says so exactly. A campaign's frozen target sums each
+row's **uncapped** allowance while its realised figure sums `min(measured, allowance)`
+**per row**, with no redistribution between rows -- so on a sunny day the shortfall
+*is* the absorbed production, by construction:
+
+```
+14.217  objective        (credited against the plan)
++ 1.431  free sun beyond the row allowances
+= 15.648  battery_measured_total_kwh
+```
+
+against a 1.4133 kWh "shortfall". The two agree to 0.018 kWh. The success tolerance was
+0.7815 kWh, so this campaign could never have been recorded as a success -- and that is
+a fact about the two definitions, not about the inverter.
+
+`battery_measured_total_kwh`, `absorbed_extra_kwh`, `battery_full_at_close` and
+`headroom_at_close_kwh` are now published on the terminal, the campaign event and the
+`Last Campaign Result` sensor, and the Activity line says *Partial — Battery Full —
+Extra Solar Absorbed* where the evidence supports it. `absorbed_extra_kwh` is derived
+from `battery_measured_total_kwh - objective_realized_kwh`, which already includes the
+row that caused the close -- summing per-row figures would be short by one row on every
+campaign, because beta.35's stop-before-record rule files the terminal first. It is
+**null** for a meter-bound export objective, where the realised figure is grid energy
+and the pack total is battery energy: their difference is house load the battery
+covered, and calling it absorbed sun would be an invention.
+
+**Absorbed production is still not objective progress, and that is deliberate.** If it
+were counted, a sunny afternoon would drive the realised figure past a target the plan
+had not finished buying towards and `_completion_scope` would end a live campaign
+early. The known charge/export asymmetry behind the gap therefore stays as it is; what
+changes is that the surface can now explain itself. Nothing about `objective_kwh`,
+the frozen target, per-row authority or cross-row catch-up moves.
+
+## The meter's own export had no entity
+
+`realised_export_value_eur` is a **counterfactual**: what an array like yours *without
+a battery* would have sold. It has to be, because measured export includes energy the
+battery sent to the grid and that sale already sits inside the load-shifting term.
+
+But a dashboard tile reading *Verkoop aan net — 0.49 kWh · € 0.11* is asking the other
+question, about the meter, and no entity published it. The figures existed --
+`realized_grid_export_kwh` and `realized_export_revenue_eur` have been summed in
+`realized_window` since beta.31 -- and reached the diagnostics download and nothing
+else. So the only export figure a card could bind to was the counterfactual, and it was
+the smaller number.
+
+`realised_metered_export_kwh` and `realised_metered_export_revenue_eur` are now
+published on `Economic Value`, projected from the window rather than recomputed. The
+volume is meter-bound and carries no efficiency factor anywhere in it; the revenue is
+that volume at the export price recorded for each interval, which may have been
+reconstructed from the market price and the configured feed-in adjustment -- so the pair
+is a measured quantity at a possibly modelled price rather than a settled invoice, and
+`metered_export_rule` says so beside it. A quarter that exported with no recorded sell
+price is skipped, never valued at zero, so the pair is understated rather than wrong
+when a price is missing.
+
+`realised_export_value_eur` keeps its exact meaning and its exact value, and the pair is
+deliberately **outside** the decomposition identity: adding it to
+`realised_energy_value_eur` would count the same electricity twice under two
+conventions. Both spellings are mapped in `_basis_map`, because an unmapped euro
+attribute publishes `unclassified` on a `MONETARY` entity silently.
+
+Today-scoped only. A lifetime figure is not publication-only -- a sealed day stores
+three keys and would need a storage bump -- and is out of scope here.
+
+## The headroom economics were right and the payload said otherwise
+
+The same day charged to 100 % while every published target read
+`required_headroom_kwh: null`, `max_end_energy_kwh: null`, `headroom_until: null`,
+`headroom_constrained: false`. As a group that reads as an optimiser that never
+protects room for forecast production.
+
+It is not, and the audit is arithmetic. `edge_creditable_energy_kwh` caps how much
+terminal inventory may be *valued* at `ceiling - forecast_surplus`, inside the
+objective's cost term, and on that refresh it was live and binding at
+`21.6 - 3.2 = 18.4` -- exactly the `edge_creditable_kwh` in the dump. Beside it, every
+absorbed kilowatt-hour is charged its own foregone export revenue per interval, a full
+pack loses the absorption move outright, and the backward pass sees that from the
+afternoon. Filling to 100 % was the right answer: net demand was positive from 16:45
+onward so no forecast surplus remained to protect, the marginal value of a stored kWh
+(0.3701) still cleared the import price (0.3255), and the evening export emptied the
+pack to its reserve floor leaving ~17 kWh of room for the next day's 13.46 kWh of sun.
+
+The published triple is a **different mechanism**. `headroom_of` computes
+`ceiling - landed[run.end_index]`, where `landed` is the plan's own solved end energy --
+no price, no forecast, no comparison. It asks the DP's answer whether the DP's answer
+needs constraining, so it can only restate a decision already taken, and it goes null
+whenever the plan absorbs nothing further: silent in precisely the case a reader most
+wants explained. That restatement is a real job -- `headroom_ceiling_kw` reads
+`max_end_energy_kwh` to stop Stage B overshooting the plan -- and it is kept.
+
+What was wrong was the words. The published `headroom_rule` claimed the triple was
+"decided here because how much headroom is worth keeping is an economic question",
+which is true of a function in another file that the payload never mentioned. It now
+describes what it is, names where the economics live, and every target carries a
+`headroom_reason`: `plan_landing_energy` when the cap is set, and otherwise
+`no_reserve_projection`, `no_planned_landing_energy` or `plan_absorbs_nothing_later`.
+Three facts that used to arrive as one silence.
+
+**No hard headroom constraint was added**, and none should be. A headroom term in the
+violation element would become safety-class, outrank every price in the horizon and
+could make states unreachable; in the cost element it would triple-count, since
+`edge_creditable_energy_kwh` already subtracts the whole forecast surplus and the
+per-interval pricing already charges the foregone export. The ~0.58 kWh that did reach
+the grid that day (~€ 0.16 in hindsight) is forecast under-prediction of surplus, not a
+planning error.
+
+## A retention bound the battery could not reach
+
+`retain_until_dc_kwh` walks the value curve in whole lattice buckets and returns the
+level at the top of the last paying step. The lattice is sized `ceil(ceiling / bucket)`,
+so its top level sits up to one bucket above the pack -- and the reference installation
+published **21.61 kWh** as an authorisation bound for a 21.6 kWh battery. Same error
+class as the export floor that once read 23.09 kWh on this pack and was interpreted as
+"never export".
+
+No dispatch was ever endangered: Stage B has always taken `min(until, ceiling)` before
+commanding anything. But a bound nobody can reach is not a bound.
+
+The clamp is applied where the row is published, in `quarter_schedule_for`, which
+receives the pack ceiling from the layer that owns every physical bound. It is
+deliberately **not** on `RetentionGate`: that gate holds prices, a value curve and the
+lattice pitch and nothing physical, so that a physical limit has exactly one home. A
+first attempt did put it there and the beta.40 neutrality suite rejected it by name,
+which is what that test is for. The gate's verdict is untouched, and the clamp may only
+ever reduce a bound the economics set lower.
+
+## Deliberately unchanged
+
+- beta.54 Stage B execution fidelity: `decide_charge`, the dispatch clamp order,
+  compulsory purchase semantics, frozen row authority, no cross-row catch-up, no
+  deficit transfer.
+- beta.55 publication: `grid_purchase_kwh`, `production_charge_kwh`,
+  `grid_purchase_blocks`, `charge_source`, `next_grid_purchase_at` and
+  `next_grid_purchase_end_at`.
+- The meter-bound export objective and the battery-bound purchase objective, each at
+  its own boundary. P1 stays authoritative for metered export; battery telemetry stays
+  authoritative for battery-bound charge progress.
+- Reserve feasibility stays lexicographically above cost.
+- The decomposition identity, every sealed figure, and `Battery Return`.
+- The charge/export `objective_kwh` asymmetry, and the ~60 seconds per quarter the
+  accrual does not integrate across a row boundary. Both are recorded and both are
+  someone else's release.
+
+## Behaviour change to be aware of
+
+A campaign a newer plan displaced now reads `superseded` where beta.55 read `canceled`,
+and one that ran to its admitted window end reads `partial` with reason `window_ended`
+where beta.55 read `canceled` / `plan_replaced`. **A dashboard or automation matching
+on `result == 'canceled'` to catch replans must move to `'superseded'`.** The Trading
+Log documentation carries the new mapping, the physical clause and the reason line
+`canceled` never had.
+
 ## [1.0.0-beta.55] - 2026-09-09
 
 **The charge window now says which hours it buys in.**
