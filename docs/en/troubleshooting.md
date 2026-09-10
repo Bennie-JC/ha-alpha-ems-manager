@@ -218,6 +218,29 @@ afternoon and a large fraction of a quiet one.
 **No threshold has been widened to silence it.** That would blind the check at every power
 level to explain one regime, and hiding a wiring or sign error is worse than the warning.
 
+### My numbers do not match the Alpha app
+
+Mostly expected. The two apps split the same day along different lines, and only one row
+is measured on the same basis in both.
+
+- **Sold to grid (kWh)** — this one *should* agree, with
+  `realised_metered_export_kwh`. Both are meter-side totals. If it does not reconcile,
+  that is worth reporting.
+- **Sold to grid (€)** — same energy, but the two apps can treat the export price
+  differently, so the euros may not match.
+- **Self-consumption** — Alpha EMS publishes no self-consumption **volume**, so there is
+  nothing to compare against Alpha's kWh figure, and the euro difference cannot currently
+  be traced to a single cause.
+- **Load shifting** and **the total** — different decomposition axis and different
+  baseline. Not expected to match.
+
+⚠️ Do not compare Alpha's *Sold to grid* against `realised_export_value_eur`. That is the
+no-battery counterfactual — what your array *without* a battery would have sold — and it
+matches no row in the Alpha app.
+
+The full mapping, with a worked example, is in
+[Economics](economics.md#comparing-with-the-alpha-app).
+
 ### A source drops out
 
 Gaps are recorded as missing coverage, never as zero. Short outages are absorbed; longer

@@ -203,7 +203,7 @@ Alpha EMS Manager is **not in the HACS default repository**, dus je voegt het to
    - **Repository:** `https://github.com/Bennie-JC/ha-alpha-ems-manager`
    - **Type:** `Integration`
 4. Klik **Add**, zoek daarna in HACS naar **Alpha EMS Manager** en installeer het.
-   Zet **Show beta versions** aan als `1.0.0-beta.56` niet wordt aangeboden.
+   Zet **Show beta versions** aan als `1.0.0-beta.57` niet wordt aangeboden.
 5. **Herstart Home Assistant.**
 
 Aanmelding voor de standaardlijst van HACS volgt zodra er een stabiele 1.0-release is.
@@ -273,7 +273,7 @@ Technische documentatie voor ontwikkelaars (Engelstalig):
 
 ## Beta-status en beperkingen
 
-`1.0.0-beta.56` is een **public beta**. Laden vanaf het net en terugleveren zijn beide
+`1.0.0-beta.57` is een **public beta**. Laden vanaf het net en terugleveren zijn beide
 op echte hardware uitgevoerd. Het leermodel is nog niet over genoeg volledige dagen
 gevolgd, en nog niet door een echte zomer-/wintertijdovergang, om stabiel genoemd te
 worden. Begin in Shadow en houd de eerste Live-runs in de gaten.

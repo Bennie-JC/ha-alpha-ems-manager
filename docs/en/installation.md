@@ -32,7 +32,7 @@ must already be working**, or you cannot add Alpha EMS at all.
    - **Type:** `Integration`
 4. Click **Add**.
 5. Search HACS for **Alpha EMS Manager** and click **Download**.
-   - This is a pre-release. Enable **Show beta versions** if `1.0.0-beta.56` is not
+   - This is a pre-release. Enable **Show beta versions** if `1.0.0-beta.57` is not
      offered.
 6. **Restart Home Assistant.**
 7. Continue with [Configuration](configuration.md).

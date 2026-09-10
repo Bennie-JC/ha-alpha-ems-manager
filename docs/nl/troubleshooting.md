@@ -225,6 +225,29 @@ verwaarloosbaar op een drukke middag en een flink deel van een rustige.
 vermogensniveau blind maken om één situatie te verklaren, en een bedradings- of tekenfout
 verbergen is erger dan de waarschuwing.
 
+### Mijn cijfers komen niet overeen met de Alpha-app
+
+Meestal hoort dat zo. De twee apps verdelen dezelfde dag langs andere lijnen, en maar één
+regel is in beide op dezelfde manier gemeten.
+
+- **Verkopen aan net (kWh)** — deze *moet* wél kloppen, met
+  `realised_metered_export_kwh`. Beide zijn totalen aan de meterkant. Klopt hij niet, dan
+  is dat het melden waard.
+- **Verkopen aan net (€)** — dezelfde energie, maar de twee apps kunnen het
+  terugleverbedrag anders behandelen, dus de euro's hoeven niet gelijk te zijn.
+- **Zelfverbruik** — Alpha EMS publiceert geen zelfverbruik in **kWh**, dus er is niets
+  om met het kWh-cijfer van Alpha te vergelijken, en het euroverschil valt op dit moment
+  niet aan één oorzaak toe te schrijven.
+- **Lastverschuiving** en **het totaal** — andere verdelingsas en ander vertrekpunt. Niet
+  te verwachten dat die kloppen.
+
+⚠️ Vergelijk *Verkopen aan net* uit Alpha niet met `realised_export_value_eur`. Dat is de
+tegenfeitelijke waarde zonder accu — wat je installatie *zonder* accu verkocht zou
+hebben — en die komt met geen enkele regel in de Alpha-app overeen.
+
+De volledige vertaaltabel, met een uitgewerkt voorbeeld, staat in
+[Economie](economics.md#vergelijken-met-de-alpha-app).
+
 ### Een bron is even weg
 
 Gaten worden geregistreerd als ontbrekende dekking, nooit als nul. Korte onderbrekingen

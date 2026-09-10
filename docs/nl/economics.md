@@ -141,6 +141,79 @@ een dag met een prijsgat, en nooit te hoog.
 
 ---
 
+## Vergelijken met de Alpha-app
+
+De Alpha-app die bij je omvormer hoort toont zijn eigen Impact-cijfers, en die komen
+**niet** regel voor regel overeen met deze attributen. Dat hoort ook zo: de twee apps
+verdelen dezelfde dag langs andere lijnen. Slechts één regel is in beide op dezelfde
+manier gemeten.
+
+Deze tabel gebruikt een echte doorgemeten dag, zodat de ordes van grootte concreet zijn.
+
+| Regel in Alpha | Vergelijk met | Wat je kunt verwachten |
+|---|---|---|
+| Verkopen aan net — **9,7 kWh** | `realised_metered_export_kwh` | **Zou goed moeten kloppen.** Beide zijn totalen aan de meterkant — de enige gelijkwaardige vergelijking hier. |
+| Verkopen aan net — **€ 5,65** | `realised_metered_export_revenue_eur` | Dezelfde fysieke energie, maar de euro's kunnen verschillen: de twee apps kunnen het terugleverbedrag anders behandelen. |
+| Zelfverbruik — **18,0 kWh** | *er wordt geen tegenhanger gepubliceerd* | **Niet direct vergelijkbaar** — zie hieronder. |
+| Zelfverbruik — **€ 2,98** | `realised_self_consumption_value_eur` (**€ 2,668** op die dag) | Er is een verschil. De oorzaak staat **niet vast** — zie hieronder. |
+| Lastverschuiving — **€ 2,77** | `realised_load_shifting_value_eur` | **Niet te verwachten dat dit klopt.** Andere verdelingsas. |
+| Totaal — **€ 11,40** | `realised_energy_value_eur` | De dichtstbijzijnde gerealiseerde vergelijking, maar met een **ander vertrekpunt**. |
+| — | `realised_export_value_eur` | **Komt met geen enkele Alpha-regel overeen.** |
+
+### Verkopen aan net is de regel die wél moet kloppen
+
+*Verkopen aan net* in Alpha is je **gemeten** teruglevering — alles wat eruit is gegaan,
+of het van de panelen kwam of uit de accu, want een netmeter kan de herkomst niet zien.
+Het is dus `realised_metered_export_kwh` die daarmee zou moeten kloppen.
+
+⚠️ **Vergelijk hem niet met `realised_export_value_eur`.** Dat attribuut beantwoordt een
+andere vraag: wat een installatie als de jouwe *zonder* accu verkocht zou hebben. Het is
+het teruglever­onderdeel van de energiewaarde-som, en het komt met **geen enkele regel in
+de Alpha-app** overeen.
+
+### Zelfverbruik is nog niet te vergelijken
+
+Op de doorgemeten dag:
+
+```
+Alpha-app          zelfverbruik                          18,0 kWh   € 2,98
+Alpha EMS Manager  realised_self_consumption_value_eur              € 2,668
+```
+
+Alpha EMS Manager **publiceert geen zelfverbruik in kWh**, dus er is niets om naast de
+18,0 kWh van Alpha te zetten. Zonder dat cijfer valt niet aan te tonen dat de twee definities
+dezelfde energie dekken — en dat doen ze misschien ook niet: het zelfverbruik van deze
+integratie is zon die is gebruikt *op het moment dat hij werd gemaakt*, en laat productie
+die eerst de accu in ging bewust buiten beschouwing; die zit één keer in de
+lastverschuiving. Wat de 18,0 kWh van Alpha meet, is hier niet gedocumenteerd.
+
+Twee dingen zouden elk een deel van het euroverschil kunnen verklaren — dat de twee apps
+verschillende energie meetellen, en dat ze die tegen verschillende prijzen waarderen.
+**Uit de cijfers die nu worden gepubliceerd zijn die twee niet te scheiden**, dus deze
+pagina wijst het verschil aan geen van beide toe. Om dat vast te stellen is een
+zelfverbruikvolume aan onze kant nodig, of een onafhankelijke opgave van wat de regel van
+Alpha meet.
+
+### Lastverschuiving en het totaal
+
+Bij **lastverschuiving** lijken de twee het minst op elkaar. De drie onderdelen van deze
+integratie zijn geen verdeling naar bestemming; het zijn twee opeenvolgende
+vergelijkingen — eerst wat zonnepanelen hebben veranderd, en daarna wat een accu daar
+bovenop verandert. Die accuvergelijking is `realised_load_shifting_value_eur`. Waar de
+regel van de Alpha-app ook uit is opgebouwd, er is geen reden waarom die twee gelijk
+zouden moeten zijn, en een verschil is hier geen fout in een van beide.
+
+**Ook de totalen beantwoorden verschillende vragen.** `realised_energy_value_eur` wordt
+gemeten tegen een huishouden met *geen* zonnepanelen en *geen* accu. Het totaal van Alpha
+heeft zo'n vertrekpunt niet. Het is de dichtstbijzijnde gerealiseerde vergelijking, en
+het is nog steeds niet dezelfde grootheid.
+
+⚠️ `total_economic_value_today_eur` is **niet** het cijfer om met het totaal van Alpha te
+vergelijken. Daar zit ook in wat het plan vóór middernacht nog verwacht en hoe opgeslagen
+energie is geherwaardeerd, en dat is geen van beide gerealiseerd geld.
+
+---
+
 ## Drie getallen die op elkaar lijken en dat niet zijn
 
 Dit is de meest gemaakte denkfout, dus expliciet:

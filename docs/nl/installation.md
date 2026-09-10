@@ -32,7 +32,7 @@ Prices moet al werken**, anders kun je Alpha EMS niet toevoegen.
    - **Type:** `Integration`
 4. Klik **Add**.
 5. Zoek in HACS naar **Alpha EMS Manager** en klik op **Download**.
-   - Dit is een pre-release. Zet **Show beta versions** aan als `1.0.0-beta.56` niet
+   - Dit is een pre-release. Zet **Show beta versions** aan als `1.0.0-beta.57` niet
      wordt aangeboden.
 6. **Herstart Home Assistant.**
 7. Ga verder met [Configuratie](configuration.md).

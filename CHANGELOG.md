@@ -9,6 +9,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.57] - 2026-09-10
+
+**How the Alpha app's Impact figures map onto this integration's metrics.**
+
+Documentation only. No integration code is touched: no optimiser or planner change, no
+Stage A or Stage B change, no change to any import or export decision price, no change
+to a realised accounting formula, no change to Battery Return, sealing or historical
+ledgers. Every runtime behaviour is identical to beta.56.
+
+## The question this answers
+
+A parity check against the Alpha app raised a specific worry: that
+`realised_export_value_eur` might be reporting all physical grid export, battery-origin
+energy included.
+
+**It is not, and it never was.** It is accumulated from measured production, measured
+house load and the recorded export price alone --
+`SUM max(0, PV_i - Load_i) * export_price_i` -- so no meter reading appears in the
+expression at all. It is the no-battery counterfactual: what an array like yours
+*without* a battery would have sold. That is the export leg of the energy-value
+decomposition, and it is deliberately not the meter.
+
+What the Alpha app's *Verkopen aan net* row corresponds to is the **metered** export
+pair beta.56 added, `realised_metered_export_kwh` and
+`realised_metered_export_revenue_eur` -- which does include battery-origin export,
+because a grid meter cannot tell where a kilowatt-hour came from. On the audited day the
+volumes agree in shape; the euros need not, because the two apps can treat the export
+price differently.
+
+So `realised_export_value_eur` corresponds to **no row in the Alpha app**, and the docs
+now say so beside the pair that does.
+
+## What is not claimed
+
+The audited day showed Alpha reporting 18.0 kWh / EUR 2.98 of self-consumption against
+this integration's `realised_self_consumption_value_eur` of EUR 2.668.
+
+This release deliberately **does not explain that difference**. There is no published
+self-consumption volume on this side, so the two definitions cannot be shown to cover
+the same energy -- and this integration's figure counts solar used as it was made,
+excluding production that went into the battery first, which appears once inside load
+shifting instead. A flow-definition difference and a price-basis difference could each
+account for part of the gap and **cannot currently be separated**, so the documentation
+states both figures and the uncertainty and attributes the cause to neither.
+
+Load shifting and the two totals are likewise documented as **not expected to
+reconcile**: the Alpha app organises its rows by where energy physically went, while
+this integration's three components are two successive comparisons -- what solar panels
+changed, then what adding a battery changed on top. `total_economic_value_today_eur` is
+named explicitly as the wrong row to compare, since it also carries what the plan still
+expects and how stored energy has been revalued.
+
+## Changed
+
+- `docs/en/economics.md`, `docs/nl/economics.md` -- a *Comparing with the Alpha app*
+  section with the full row-by-row mapping, immediately after the existing metered-export
+  section.
+- `docs/en/troubleshooting.md`, `docs/nl/troubleshooting.md` -- a *numbers do not match
+  the Alpha app* entry, linking to the mapping above.
+- Version metadata for this release.
+
+Dutch and English carry the same identifiers and the same figures, verified rather than
+assumed.
+
 ## [1.0.0-beta.56] - 2026-09-10
 
 **Three things the reference installation reported wrongly, and one bound it could

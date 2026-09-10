@@ -136,6 +136,76 @@ zero. So the pair can be a little low on a day with a price gap, and is never in
 
 ---
 
+## Comparing with the Alpha app
+
+The Alpha app that came with your inverter shows its own Impact figures, and they will
+**not** line up with these attributes row for row. That is expected: the two apps split
+the same day along different lines. Only one row is measured on the same basis in both.
+
+This table uses a real audited day so the sizes are concrete.
+
+| Alpha row | Compare against | What to expect |
+|---|---|---|
+| Sold to grid — **9.7 kWh** | `realised_metered_export_kwh` | **Should reconcile closely.** Both are meter-side totals — the one like-for-like comparison here. |
+| Sold to grid — **€ 5.65** | `realised_metered_export_revenue_eur` | Same physical energy, but the euros may differ: the two apps can treat the export price differently. |
+| Self-consumption — **18.0 kWh** | *no counterpart is published* | **Not directly comparable** — see below. |
+| Self-consumption — **€ 2.98** | `realised_self_consumption_value_eur` (**€ 2.668** on that day) | A difference exists. Its cause is **not established** — see below. |
+| Load shifting — **€ 2.77** | `realised_load_shifting_value_eur` | **Not expected to match.** Different decomposition axis. |
+| Total — **€ 11.40** | `realised_energy_value_eur` | Nearest realised comparison, but a **different baseline**. |
+| — | `realised_export_value_eur` | **Matches no Alpha row at all.** |
+
+### Sold to grid is the row that should agree
+
+Alpha's *Sold to grid* is your **metered** export — everything that went out, whether it
+came from the panels or from the battery, because a grid meter cannot tell the source. So
+it is `realised_metered_export_kwh` that should reconcile with it.
+
+⚠️ **Do not compare it against `realised_export_value_eur`.** That attribute answers a
+different question: what an array like yours *without a battery* would have sold. It is
+the export component of the energy-value sum, and it corresponds to **no row in the Alpha
+app**.
+
+### Self-consumption cannot be compared yet
+
+On the audited day:
+
+```
+Alpha app          self-consumption                      18.0 kWh   € 2.98
+Alpha EMS Manager  realised_self_consumption_value_eur              € 2.668
+```
+
+Alpha EMS Manager **publishes no self-consumption volume in kWh**, so there is nothing
+to put beside Alpha's 18.0 kWh. Without it, the two definitions cannot be shown to cover the
+same energy — and they may not: this integration's self-consumption is solar used *as it
+was made*, and deliberately excludes production that went into the battery first, which
+appears once inside load shifting instead. What Alpha's 18.0 kWh counts is not documented
+here.
+
+Two things could each explain part of the euro difference — the two apps counting
+different energy, and the two apps valuing it at different prices. **From the figures
+published today these cannot be separated**, so this page does not attribute the
+difference to either. Establishing it needs a self-consumption volume on our side, or an
+independent statement of what Alpha's row measures.
+
+### Load shifting and the total
+
+**Load shifting** is where the two are least alike. This integration's three components
+are not a split by destination; they are two successive comparisons — first what having
+solar panels changed, then what adding a battery changed on top of that. The battery
+comparison is `realised_load_shifting_value_eur`. Whatever the Alpha app's row is built
+from, there is no reason the two should be equal, and a mismatch here is not a fault in
+either.
+
+**The totals answer different questions too.** `realised_energy_value_eur` is measured
+against a household with *neither* solar nor a battery. Alpha's total has no such
+baseline. It is the nearest realised comparison, and it is still not the same quantity.
+
+⚠️ `total_economic_value_today_eur` is **not** the figure to compare with Alpha's total.
+It also carries what the plan still expects before midnight and how stored energy has
+been revalued, neither of which is realised cash.
+
+---
+
 ## Three numbers that look alike and are not
 
 This is the most common misreading, so explicitly:
