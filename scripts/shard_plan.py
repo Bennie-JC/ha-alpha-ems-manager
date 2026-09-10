@@ -15,12 +15,26 @@ the answer is to split a file, not to add shards.
 
 A file with no timing (new, or renamed since the artifact was produced) is assigned
 the median cost rather than zero, so an unmeasured file is never silently treated as
-free.
+free. A file missing from a *committed manifest* is handled separately -- see
+:func:`unplanned_for`.
 
 Usage:
-    python scripts/shard_plan.py timings.xml --shards 4
-    python scripts/shard_plan.py timings.xml --shards 4 --json manifest.json
-    python scripts/shard_plan.py timings.xml --shards 4 --shard 2   # that shard's files
+    python scripts/shard_plan.py timings.xml --shards 8
+    python scripts/shard_plan.py timings.xml --shards 8 --json manifest.json
+    python scripts/shard_plan.py timings.xml --shards 8 --shard 2   # that shard's files
+
+**Regenerating the committed manifest from a real CI run.** The timings come from
+the eight ``timings-shard-N`` artifacts CI uploads, and they are the only figures
+that reflect the runner rather than a developer's machine. There is no bot: this is
+run by hand, and it should be run whenever the split has drifted -- which the header
+of a plan tells you, by printing the projected slowest shard next to the ideal.
+
+    gh run download <run-id> --pattern 'timings-shard-*' --dir timings/
+    python scripts/shard_plan.py timings/*/junit-*.xml --shards 8 \\
+        --json tools/shards.json
+
+Between regenerations nothing is lost: a file the manifest has never seen is still
+run, distributed by :func:`unplanned_for` rather than dropped.
 """
 
 from __future__ import annotations
@@ -33,16 +47,24 @@ import sys
 import xml.etree.ElementTree as ET
 
 
-def measured_costs(report: pathlib.Path) -> dict[str, float]:
-    """Return seconds per test file, summed over every case in the report."""
+def measured_costs(*reports: pathlib.Path) -> dict[str, float]:
+    """Return seconds per test file, summed over every case in every report.
+
+    **Several reports, because CI produces several.** Each shard uploads its own
+    JUnit XML, so the timings for a whole suite arrive as eight artifacts and never
+    as one file. Summing across them here is what lets the manifest be regenerated
+    from a real run rather than from a local approximation of one; a single report
+    still works and is the same call with one argument.
+    """
     costs: dict[str, float] = {}
-    for case in ET.parse(report).iter("testcase"):
-        name = case.get("file") or (case.get("classname") or "").replace(".", "/")
-        if not name:
-            continue
-        if not name.endswith(".py"):
-            name = f"{name}.py"
-        costs[name] = costs.get(name, 0.0) + float(case.get("time") or 0.0)
+    for report in reports:
+        for case in ET.parse(report).iter("testcase"):
+            name = case.get("file") or (case.get("classname") or "").replace(".", "/")
+            if not name:
+                continue
+            if not name.endswith(".py"):
+                name = f"{name}.py"
+            costs[name] = costs.get(name, 0.0) + float(case.get("time") or 0.0)
     return costs
 
 
@@ -52,6 +74,44 @@ def collected_files(root: pathlib.Path) -> list[str]:
         str(path.relative_to(root)).replace("\\", "/")
         for path in (root / "tests").glob("test_*.py")
     )
+
+
+def unplanned_for(
+    known: set[str], planned: set[str], totals: list[float], index: int
+) -> list[str]:
+    """Return the un-manifested files this shard owns. **Never silently nobody's.**
+
+    A file added since the manifest was written still has to run, and until beta.57
+    every one of them went to shard 1 -- which is the shard the manifest already
+    loads heaviest, because the largest single file lives there and LPT cannot split
+    it. So each new test file was appended to the worst shard, and the imbalance grew
+    with the suite until somebody regenerated the manifest by hand. On the beta.57
+    run that was three files on top of a shard already at 2.07x the ideal.
+
+    Dealt out **lightest projected shard first**, cycling. That reuses the figure the
+    manifest already carries rather than inventing a second cost model, and it is a
+    deal rather than a hash: position *i* of the sorted list goes to the *i*-th
+    lightest shard, so every file lands in exactly one shard and no shard is skipped
+    before another is used twice. Sorting the names, and breaking a tie on shard load
+    by shard number, makes the answer identical on every worker -- which is the
+    property that matters, since eight processes compute this independently and a
+    disagreement means a test runs twice or not at all.
+
+    This is a fallback, not a plan: it distributes rather than balances, because the
+    cost of a brand-new file is exactly what nobody knows yet. Regenerating the
+    manifest is still what makes a file's cost count.
+    """
+    extra = sorted(known - planned)
+    if not extra:
+        return []
+    lightest_first = sorted(
+        range(len(totals)), key=lambda shard: (totals[shard], shard)
+    )
+    return [
+        name
+        for position, name in enumerate(extra)
+        if lightest_first[position % len(lightest_first)] == index
+    ]
 
 
 def plan(
@@ -77,7 +137,10 @@ def plan(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "report", nargs="?", type=pathlib.Path, help="a JUnit XML from pytest"
+        "report",
+        nargs="*",
+        type=pathlib.Path,
+        help="one or more JUnit XMLs from pytest; CI produces one per shard",
     )
     parser.add_argument(
         "--manifest",
@@ -108,15 +171,12 @@ def main() -> int:
             raise SystemExit(f"shard {args.shard} is outside 1..{len(buckets)}")
         known = set(collected_files(args.root.resolve()))
         planned = {name for bucket in buckets for name in bucket}
-        # A file added since the manifest was written belongs to shard 1 rather than
-        # to nobody. Silently not running a new test file is the worst outcome here.
-        extra = sorted(known - planned) if index == 0 else []
-        print(" ".join(buckets[index] + extra))
+        print(" ".join(buckets[index] + unplanned_for(known, planned, totals, index)))
         return 0
 
-    if args.report is None:
+    if not args.report:
         raise SystemExit("give a JUnit report, or --manifest with --shard")
-    costs = measured_costs(args.report)
+    costs = measured_costs(*args.report)
     files = collected_files(args.root.resolve())
     buckets, totals = plan(costs, files, args.shards)
 

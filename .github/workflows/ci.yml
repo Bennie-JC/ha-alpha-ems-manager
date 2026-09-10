@@ -143,8 +143,21 @@ jobs:
         # value that changes without a commit, and the timing artifacts this job
         # uploads are only comparable between runs if the worker count is not one of
         # the variables. Four is what has been running; this states it.
+        #
+        # **`--maxschedchunk=1`, and it is worth more than the worker count is.**
+        # xdist's `load` scheduler hands each worker an opening batch of
+        # `len(collection) // workers // 4` tests. Shard 1 collects 83, so that batch
+        # is five -- and the five most expensive tests in the suite are adjacent
+        # parametrisations of one function, so all five landed on one worker and ran
+        # serially: 1618 s of tests against a 1625 s shard, with three workers idle
+        # for most of it. Handing tests out one at a time costs a little scheduling
+        # chatter and lets the heavy ones spread across the workers that are there.
+        #
+        # Measured A/B on this shard's own file set: 701.7 s -> 211.8 s, 83 passed
+        # both ways. It changes only the order the work is handed out in -- no test,
+        # no selection and no assertion moves.
         run: |
-          python -m pytest -q -n 4 \
+          python -m pytest -q -n 4 --maxschedchunk=1 \
             --junitxml=junit-${{ matrix.shard }}.xml \
             --durations=25 \
             ${{ steps.select.outputs.files }}
