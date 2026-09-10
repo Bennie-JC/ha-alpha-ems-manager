@@ -15,8 +15,8 @@ consumption, learns a baseline demand profile and forecasts it. Phase 2 records
 each forecast and matches it against what actually happened. Phase 3 decides what
 the battery *should* do and simulates the consequence. **None of them issues a
 command to the battery, schedules anything, or calls a service.** Phase 3's
-recommendation is published so it can be watched for weeks before Phase 4 is
-allowed to act on it; nothing executes it.
+recommendation is published as advice; the executed path is Phase 8 Stage B, and
+it does not read the Phase-3 recommendation.
 
 Phase 2 adds no feedback loop. It *records* forecast error; nothing reads that
 error back into the model. Adaptive correction belongs to a much later phase, and
@@ -24,10 +24,29 @@ keeping the boundary sharp is what makes the recorded evidence trustworthy: the
 history is a measurement of the model, not a product of it.
 
 Phase 8 Stage A decides what would be economically best to do with the battery
-and publishes it. It executes none of it: `CONTROL_EXECUTION_AVAILABLE` is still
-false, no service call reaches the inverter, and export and photovoltaic
-curtailment have no actuator at all — they are *modelled* so the strategy can be
-validated before anything is built to perform them.
+and publishes it. **Stage B executes part of it.** `CONTROL_EXECUTABLE_ACTIONS` is
+`frozenset({ACTION_CHARGE})`, so the derived `CONTROL_EXECUTION_AVAILABLE` is
+**true**, and two Stage-B intents reach the inverter: `grid_charge`, and
+`net_export` inside an admitted quarter. Both use the Dispatch mode 2 surface
+only — negative power charges, positive exports — and the force-charging and
+force-discharging helper families are never written for either.
+
+`serve_load` and `curtail_pv` execute nothing, and for different reasons.
+`serve_load` has an economic action and a capability but no executable intent: it
+is refused at `direction_permitted`, again at `permitted_sign`, and a third time
+at the send site. `curtail_pv` is not an `EXECUTION_INTENT` at all — no actuator
+can decline production here — and is the one remaining live use of
+`ECONOMIC_BLOCKED_NO_PRIMITIVE_CURTAIL`.
+
+The authoritative statements of this scope live in the source, at
+`coordinator._EXECUTION_SCOPE` and `execution.execution_scope`. Prefer them to
+this paragraph if the two ever disagree.
+
+**Several module and constant docstrings still describe the pre-beta.24 world**
+— `select.py`, `reserve.py`, `alphaess_adapter.async_execute`,
+`const.CONTROL_EXECUTION_AVAILABLE` and `execution.py` among them. They are stale
+prose beside executable code that contradicts them; do not treat them as
+evidence.
 
 The previous 0.1.0 release contained an advisory battery and trading layer —
 `recommendation`, `reserve_satisfied`, a trade engine, a reserve model, a PV
@@ -70,7 +89,7 @@ generic `ConfigEntry` typing and coordinator `config_entry` support. Keep
 | `validation.py` | Entity validation used by the config and options flows. |
 | `coordinator.py` | Runtime orchestration: listeners, timers, both accumulators, ingest, derived values. |
 | `config_flow.py` | Five-step config flow, and a four-page options flow behind a menu: sources, battery planning, control, economics. |
-| `sensor.py` | The twelve sensors, and the one description that also files a logbook line. |
+| `sensor.py` | The seventeen sensors, and the one description that also files a logbook line. |
 | `diagnostics.py` | Everything that does not justify an entity. |
 | `__init__.py` | Entry lifecycle, config-entry migration guard, missing-source guard. |
 
@@ -1252,10 +1271,16 @@ directions — a corrupt forecast history does not take the battery down either.
 
 ## Phase 4: control
 
-Phase 4 builds the whole path from a decision to an inverter command, and then
-**cannot walk it**. Every stage is real: the intent, the safety gate, the vendor
-mapping, the ordered command list, the authorization. The last step is
-unreachable, by a single build-time constant.
+Phase 4 builds the whole path from a decision to an inverter command. Every stage
+is real: the intent, the safety gate, the vendor mapping, the ordered command
+list, the authorization.
+
+**As shipped in Phase 4 it could not walk that path** — the last step was closed by
+a single build-time constant, and the two paragraphs below record why. Phase 8
+Stage B opened it: `CONTROL_EXECUTABLE_ACTIONS` is no longer empty, and the
+ownership problem described here was solved by the owner marker plus a persisted
+causal record rather than by parameter matching. Read this section as the design
+of the gate, not as a statement that the gate is shut.
 
 That is not caution for its own sake. Two things are unresolved, and either alone
 would be enough (see *Ownership*, below and *Known open items*). It is also worth
@@ -1308,7 +1333,7 @@ refused whole, with one precise reason. There is deliberately no magnitude on
 command. A gate that trimmed a request to fit would have made a decision, and
 deciding is Phase 3's job.
 
-### Ownership — why real execution is still unreachable
+### Ownership — the problem that had to be solved first
 
 The control surface has exactly one arming path per direction, driven entirely by
 helper *values*. A dispatch armed from a dashboard and one armed by a service call
@@ -2176,10 +2201,14 @@ One question, and it is physical rather than economic:
 > unit of net demand it is physically capable of serving — the only grid import
 > being demand above the discharge power limit.
 
-Computed every refresh, published as one sensor and one diagnostics section, and
-**obeyed by nothing**. `build_plan` still calls `static_reserve`, so
-`effective_min_soc_percent` still equals the user's configured minimum and
-`ReserveGuardPolicy` still discharges to the same place. The published
+Computed every refresh, published as one sensor and one diagnostics section. **It
+does not raise the configured floor, and Phase 8 plans subject to it.**
+`build_plan` still calls `static_reserve`, so `effective_min_soc_percent` still
+equals the user's configured minimum and `ReserveGuardPolicy` still discharges to
+the same place; what changed with Phase 8 is that `horizon.planning_reserve_kwh`
+enters the optimiser's recursion as `violations`, ranked lexicographically above
+cost. The requirement therefore shapes the plan without ever moving the floor
+Stage B's clamp defends. The published
 recommendation, planned power, usable energy and control state are what beta.12
 produced for the same inputs, and `test_reserve_published` asserts it.
 
@@ -3007,9 +3036,10 @@ makes that safe.
 
 Stage A decides *what* should happen; Stage B decides *how* to make the inverter do
 it. ``execution_target`` is the seam. Since beta.19 it is **consumed by
-``execution.py``**, which computes the command a live run would send and sends
-nothing: ``CONTROL_EXECUTION_AVAILABLE`` is still false and no actuator is reachable
-from that path.
+``execution.py``**, and since beta.24 that path reaches a real actuator:
+``CONTROL_EXECUTION_AVAILABLE`` is true, and ``grid_charge`` and ``net_export`` are
+sent on the Dispatch mode 2 surface. In Shadow the same command is computed and
+none is sent, which is what makes Shadow a rehearsal rather than a simulation.
 
 Four things were added to the contract in beta.19, and each exists for the same
 reason: Stage B must be able to do its job without ever forming an economic view.
@@ -3119,10 +3149,12 @@ Three properties, each enforced by the shape of the code:
 - **It cannot claim the battery did anything.** The six event kinds partition
   into five about *advice* — `planned`, `changed`, `ended`, `refused`,
   `cancelled` — and one about *execution*, `started`. The execution kind is
-  refused outright while `CONTROL_EXECUTION_AVAILABLE` is false, and every advice
-  line carries the advisory qualifier. A line reading "charge started" on a
-  release that sends no command would be a lie about the hardware, which is the
-  one failure mode this surface must not have.
+  refused unless a command genuinely went out, and an advice line carries the
+  advisory qualifier only where the action really has no actuator. A line reading
+  "charge started" on a release that sent no command would be a lie about the
+  hardware, which is the one failure mode this surface must not have — and since
+  beta.32 the mirror of it would be too, so a Live sale no longer carries the
+  advisory marker.
 
   `cancelled` sat on the execution side until beta.16, on the reading that
   cancelling is something done to a command in flight. Withdrawing advice that
@@ -3583,23 +3615,124 @@ revenue is visible immediately and the value returns through inventory revaluati
 quarter close. The five terms still reconcile exactly; the consequence is that only
 `total_economic_value_today_eur` measures this release, never realised cash alone.
 
+## Campaign lifecycle, realised accounting and sealing
+
+Three layers that sit between "Stage B moved some energy" and "a figure a user can
+trust". They were built after the Stage-B seam above and are documented here
+because each has a rule that a reasonable-looking change would silently break.
+
+### The campaign, and why it is not a run
+
+`runs_from` groups adjacent intervals of one direction; `campaigns_from` groups
+runs into the thing a user recognises as *one decision*. A campaign therefore
+outlives a run, and one economic campaign can ask for several physical arm cycles.
+
+**A production-absorption quarter is transparent to a charge run and to nothing
+else.** `_resolved_run_state` folds `_RUN_ABSORB` into a charge that is already
+under way, with **no bound on how many may pass**, so a sunny quarter does not
+split a paid charging window in two and pay the switching fee twice. The
+consequence is that a charge campaign's *span* and its `objective_kwh` both cover
+free production, and on an absorb-heavy day most of both is energy nobody bought.
+A discharge has no equivalent state, which is the whole of the charge/export
+asymmetry.
+
+Lifecycle transitions fire `alpha_ems_campaign`, each kind exactly once, behind
+guards the integration already maintains — `created` where the instance id is
+minted, `started` behind a mark on the persisted record, `removed` behind a
+**persisted** `closed_lifecycle` latch. A restart therefore replays neither
+`created` nor `started`, and only genuinely unfinished terminals are published
+once. `MAX_CAMPAIGN_LIFECYCLE_REMEMBERED` bounds that latch set.
+
+Classification (`safety_buy` / `coverage_buy` / `economic_buy` / `mixed_buy` /
+`economic_export` / `serve_load`) is derived from the planner's purchase
+attribution, **never** from `activity.category_of()`. A safety buy is not a
+mechanism: it is what satisfying the reserve looks like, labelled by re-solving
+with the reserve relaxed and diffing.
+
+### Realised accounting
+
+Every euro published carries a **basis** from a closed vocabulary — `measured`,
+`attributed`, `estimated`, `planner_derived`, `model_term`, `revalued`, `forecast`,
+`unclassified`. `figure_basis` on `Economic Value` projects that map over every
+`_eur` attribute, so a reader can tell which figures may legitimately be summed.
+Adding figures of different basis is the defect this vocabulary exists to make
+visible.
+
+Two rules that are easy to break:
+
+- **One counterfactual throughout.** Every avoidance figure, realised and planned,
+  is measured against a household with no battery. The planner's own
+  `avoided_import_eur` uses a smaller baseline (leaving the battery alone *this*
+  interval) and the two are never added.
+- **The interval in flight is a separate term** and joins realised history only when
+  its measurement closes, which is what makes `realised_today_eur` monotone.
+
+A missing addend takes the total with it; `accounting_unavailable_reason` names it.
+There is never a zero standing in for an unknown.
+
+### Day sealing
+
+A civil day's realised benefit is computed once and **written once**. `day_finalizable`
+decides whether a day may seal, `_day_benefit_eur` computes it, and
+`note_final_benefit` is write-once — a sealed day never moves again, which is what
+makes the lifetime figure behind `Battery Return` additive rather than a rolling
+recomputation.
+
+`SEAL_TERMINAL_REFUSALS` separates days that can never seal from days that merely
+have not sealed yet, and `unsealed_day_reasons` is the instrument that says which.
+A day short of coverage, or lacking prices, stays unsealed rather than being sealed
+on partial evidence.
+
+`Battery Return` reads only sealed days. No forecast, no planner valuation and no
+day in progress reaches it — which is why it is the one money figure on the
+integration that is purely measured cash.
+
+### What beta.55 publishes about a charge window
+
+`grid_purchase_blocks()` walks the published rows and returns the contiguous
+stretches that actually take energy off the grid, judging adjacency on **instants**
+(`next.start == this.end`) rather than list position, because one campaign is
+published as one target per run.
+
+A block ends at the first quarter that buys nothing, and a later block stays a later
+block. **A first-to-last span would restate the very misreading the release
+corrects**: on a day that buys at 07:15, absorbs until 15:45 and buys again at
+16:00, first-to-last calls nine hours a purchase window. A quarter counts as buying
+when its **grid** authorisation clears `MIN_EXECUTABLE_QUARTER_KWH` — the grid
+figure, not the battery figure, because an absorbing quarter carries a large battery
+objective and a marginal grid import of exactly zero.
+
+Nothing in this reaches a decision: `grid_purchase_blocks()` has two call sites,
+both publication.
+
 ## Entity contract
 
-Exactly twelve sensors and one select — four from Phase 1, two from Phase 2,
-three from Phase 3, one sensor and the select from Phase 4, one from Phase 7, one
-from Phase 8. Phases 5 and 6 add **none**: expected production and price both reach the plan or
+**Seventeen sensors and one select.** Four from Phase 1, two from Phase 2, three
+from Phase 3, one sensor and the select from Phase 4, one from Phase 7, and six
+from Phase 8 — `Economic Action`, `Next Planned Action`, `Economic Value`,
+`Current Campaign`, `Last Campaign Result` and `Battery Return`. Phases 5 and 6
+add **none**: expected production and price both reach the plan or
 the diagnostics without becoming published state, and a price entity would
 duplicate one the source already publishes. Phase 7 adds one, because the
 requirement it computes is invisible in every existing entity — `Usable Battery
 Energy` is measured against the *configured* floor, so without a sensor the whole
 phase would be a diagnostics download from the user's chair. Its two
 counterfactuals, the peak, the constraint tallies and the provenance stay in
-diagnostics. Phase 8 adds one for the same reason: the action it
-computes appears in no existing entity, and without a sensor the whole phase would
-be a diagnostics download from the user's chair. Its eight attributes are capped as
-a *set* rather than a count, so a useful one cannot be swapped for a useless one;
-both plans' totals, the per-run detail, the counterfactuals, the solver figures and
-the provenance stay in diagnostics. Unique IDs
+diagnostics. Phase 8 adds six for the same reason: what it computes appears in
+no existing entity, and without them the whole phase would be a diagnostics
+download from the user's chair. `Economic Action` reports the executing quarter and
+`Next Planned Action` the plan ahead, because "now" and "next" are different
+questions and one sensor answering both was what made the tense ambiguous.
+`Economic Value` and `Battery Return` separate the *position* from the *realised
+cash*, and the two campaign sensors carry the lifecycle. Attribute sets are capped
+as a *set* rather than a count, so a useful attribute cannot be swapped for a
+useless one; both plans' totals, the per-run detail, the counterfactuals, the
+solver figures and the provenance stay in diagnostics.
+
+**"Trading Log" is not an entity.** `Economic Action` is the only sensor carrying an
+`activity_fn`, and it fires `EVENT_LOGBOOK_ENTRY` at each campaign-lifecycle
+transition. The rendering is Home Assistant's; see
+[TRADING_LOG.md](TRADING_LOG.md). Unique IDs
 `{entry_id}_{key}`, all on one service device named from the entry title. Names
 are literal English with **no** `translation_key`: Home Assistant derives the
 entity ID from the translated name, so a translation key would give a Dutch user
@@ -3655,8 +3788,8 @@ What each next phase needs, and where it plugs in:
 |---|---|---|
 | ~~**5** Solcast PV~~ | *shipped in beta.9* | production is a second series on the same index; the stepper still takes a sequence of demands. Asymmetric efficiency remains available and unused |
 | ~~**6** Frank prices~~ | *shipped in beta.12* | the series exists, normalised and stored, and is reachable from no module that decides anything. Phase 8 adds a cost function over the trajectories what-if already compares |
-| ~~**7** Dynamic reserve~~ | *shipped in beta.13, calculation only* | the requirement is computed and published; nothing obeys it. `dynamic_reserve` is deliberately **unwritten** and its tripwire test is still green, so this phase is structurally incapable of raising the floor. `interval_margin_kwh` remains unread, and the P10/P90 series remains unused — read `percentile_aggregation` first: a per-site sum is not a calibrated band |
-| ~~**8** Economic optimisation, automatic buy and sell, **safety buy**~~ | *Stage A shipped in beta.14, calculation only; corrected in beta.16 and beta.17* | the plan is computed and published; nothing executes it, and export and photovoltaic curtailment have no actuator at all. `HoldPolicy` turned out to serve twice — as the counterfactual every euro is measured against *and* as the terminal bound, and beta.16 made both read the same ambient walk so they cannot drift apart. The first live horizon showed the decisions were sound and the figures published about them were not; beta.16 fixes the reporting, makes solar absorption transparent to a charge campaign, and prices the terminal bound instead of changing it. beta.17 then found that three of the four things the *second* live day made look wrong were also reporting defects -- and that the one real finding was a state-space rounding that had left five per cent of the inverter unreachable. beta.18 **deleted the terminal bound**: pricing it had shown it cost real money, and measuring it properly showed it was a duplicate of the pointwise reserve that collapsed to "never discharge on balance" every evening. The reserve is now the only physical floor the optimizer is given, and `HoldPolicy` serves once again as the counterfactual alone. `dynamic_reserve` is still **unwritten** and its Phase-3 tripwire is still green: the optimizer plans subject to the reserve without raising the floor. Stage B is the actuators and the execution path |
+| ~~**7** Dynamic reserve~~ | *shipped in beta.13, calculation only* | the requirement is computed and published. **Phase 8 plans subject to it**: `horizon.planning_reserve_kwh` enters the recursion as `violations`, ranked lexicographically above cost, so reserve feasibility dominates economics without a mode switch. `dynamic_reserve` itself is still deliberately **unwritten** and its tripwire test is still green, so this phase remains structurally incapable of raising the configured floor -- the floor Stage B's clamp defends at runtime is the *configured* minimum SoC, not this curve. `interval_margin_kwh` remains unread, and the P10/P90 series remains unused — read `percentile_aggregation` first: a per-site sum is not a calibrated band |
+| ~~**8** Economic optimisation, automatic buy and sell, **safety buy**~~ | *Stage A shipped in beta.14, calculation only; corrected in beta.16 and beta.17* | the plan is computed and published, and **Stage B executes two intents of it** since beta.24 and beta.27: `grid_charge` and `net_export`. `serve_load` and photovoltaic curtailment still have no actuator. `HoldPolicy` turned out to serve twice — as the counterfactual every euro is measured against *and* as the terminal bound, and beta.16 made both read the same ambient walk so they cannot drift apart. The first live horizon showed the decisions were sound and the figures published about them were not; beta.16 fixes the reporting, makes solar absorption transparent to a charge campaign, and prices the terminal bound instead of changing it. beta.17 then found that three of the four things the *second* live day made look wrong were also reporting defects -- and that the one real finding was a state-space rounding that had left five per cent of the inverter unreachable. beta.18 **deleted the terminal bound**: pricing it had shown it cost real money, and measuring it properly showed it was a duplicate of the pointwise reserve that collapsed to "never discharge on balance" every evening. The reserve is now the only physical floor the optimizer is given, and `HoldPolicy` serves once again as the counterfactual alone. `dynamic_reserve` is still **unwritten** and its Phase-3 tripwire is still green: the optimizer plans subject to the reserve without raising the floor. Stage B is the actuators and the execution path |
 | **9** Adaptive feedback | provenance and joins | recorded state of charge joins the Phase-2 snapshot by chronological index and target day; plans are recomputable; `policy_version` prevents pooling generations; separate efficiency fields let them be learned |
 | **10** Multi-day | a longer horizon | the simulator is horizon-agnostic and already walks today plus tomorrow |
 
