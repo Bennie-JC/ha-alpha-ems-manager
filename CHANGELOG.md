@@ -14,8 +14,10 @@ Nothing yet.
 **Three things the reference installation reported wrongly, and one bound it could
 not reach.**
 
-Not yet final: this release is being validated against live evidence and may take one
-further correction before it is published.
+Validated against a live export soak on the reference installation before release: a
+9.10 kWh export objective realised 8.401 kWh at the meter against 9.226 kWh measured out
+of the pack, closing `partial` with reason `window_ended`. The ~0.70 kWh shortfall on
+that campaign is accepted for this release and is not addressed here.
 
 No planner decision changes. The five neutrality suites pass unchanged and were not
 re-baselined; `economic.py` is touched in two places, neither of which enters the
