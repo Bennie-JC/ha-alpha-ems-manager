@@ -113,9 +113,12 @@ from .const import (
     CAMPAIGN_CLASSIFICATION_EPSILON_KWH,
     CAMPAIGN_MEASUREMENT_RESOLUTION_PERCENT,
     CAMPAIGN_ORPHAN_GRACE_MINUTES,
+    CAMPAIGN_REACHABILITY_RULE,
     CAMPAIGN_SUCCESS_TOLERANCE_FRACTION,
     CAMPAIGN_SUCCESS_TOLERANCE_PER_QUARTER_KWH,
     CAMPAIGN_TARGET_UNAVAILABLE,
+    CAMPAIGN_UNREACHABLE_ROW_AUTHORITY,
+    CAMPAIGN_UNREACHABLE_WINDOW,
     CAP_NONE,
     CLAIM_SCHEMA_VERSION,
     COMPARATOR_MODEL_AMBIENT_ABSORB_ONLY,
@@ -3586,7 +3589,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             revised, cap = remaining_authorised_kwh(
                 now=dt_util.now(),
                 frozen_remaining_kwh=remaining,
-                forward=forward,
+                forward=self._forward_now(),
             )
             block["binding_cap"] = cap
             block["authorisation_reduced_by_replan"] = round(
@@ -3595,30 +3598,120 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return block
 
     @callback
-    def _frozen_remaining_kwh(self, now: datetime) -> float | None:
-        """Return the grid energy this run may still buy, or ``None`` if uncapped.
+    def _run_battery_delivered_kwh(self, run_id: str) -> float:
+        """Return the battery energy ``run_id`` has already delivered. Read-only.
 
-        The same two-cap composition the authorisation block publishes -- the
-        frozen remainder from the admitted window start, reduced by the forward
-        allowance from the latest publication's own boundary -- read here so a
-        quarter can snapshot it **at admission**.
+        **Deliberately not :meth:`_execution_progress`**, which *rebases* the
+        accumulators the moment it is handed an unfamiliar run id. This is read at
+        the admission site, which runs before the closing quarter has been
+        recorded, so rebasing there would erase that quarter's energy before
+        anybody wrote it down.
 
-        Snapshotted, because once a quarter is open the run-level caps must not
-        reach backwards into it. That is consistent with the forward cap rather than
-        an exception to it: ``remaining_authorised_kwh`` returns the frozen cap
-        whenever ``now < forward.forward_from``, and ``forward_from`` is by
-        construction the *next* boundary -- so the forward cap has always been a
-        "next quarter onward" instrument.
+        A run whose accumulators are not the ones in flight has delivered nothing
+        this layer can prove, and zero is the honest answer: it leaves the run's own
+        published target standing as the bound, which is the only direction that
+        cannot silently under-authorise a schedule Stage A meant to deliver.
         """
-        decision = self._stage_b_decision
-        demand = None if decision is None else decision.demand
-        if demand is None or demand.grid_cap_kwh is None:
+        if self._execution_run != run_id:
+            return 0.0
+        delivered = self._execution_closed_kwh or 0.0
+        accumulator = self._battery_charge_accumulator
+        if accumulator is not None and accumulator.started:
+            delivered += accumulator.open_energy_kwh
+        return max(0.0, delivered)
+
+    @callback
+    def _frozen_battery_remaining_kwh(self) -> float | None:
+        """Return the battery energy the admitted run may still move. **beta.58.**
+
+        The figure a quarter snapshots at admission, and the one
+        ``CarriedQuarter.battery_allowance_kwh`` bounds each row by. Battery-side AC
+        energy throughout: the run's own published battery target, less what that
+        same run has already delivered. ``None`` when there is no run to bound.
+
+        **This method is the beta.58 fix, and it replaces two faults at once.**
+
+        *The domain.* It used to return ``grid_cap_kwh - grid_charged_kwh`` -- the
+        run's remaining *grid purchase* -- and its own first line said so. That
+        figure then bounded a battery objective, which is not a reduction but a
+        category error. Grid purchase is still capped, in its own domain, by the
+        row's ``grid_authorised_kwh`` and by ``ChargeLimits.remaining_grid_kw``;
+        nothing here duplicates that, and clamp four is untouched.
+
+        *The provenance.* It read ``self._stage_b_decision``, which this refresh has
+        not yet assigned -- so a plan admitted now was bounded by the **previous**
+        run's demand. On 2026-09-11 the outgoing run's grid budget was 85 Wh from
+        spent, having over-consumed against a production forecast that never
+        arrived; the incoming twenty-one-row 11.71 kWh campaign inherited that
+        85 Wh and every row was capped at ``min(row, 0.085)``. Maximum deliverable
+        1.79 kWh, decided before a single row opened. It now reads the run being
+        admitted.
+
+        **The forward cap is deliberately not composed in here.** At admission the
+        run's own target *is* the freshest publication -- it was affirmed from it
+        this refresh -- so a second, separately tracked boundary figure adds nothing
+        and can only import the previous run's, which is the fault above wearing a
+        different hat. The forward cap keeps its live job, reducing at the clamp and
+        reporting ``binding_cap``, where its boundary is the one in force.
+        """
+        run = self._carried
+        if run is None:
             return None
-        remaining = max(0.0, demand.grid_cap_kwh - demand.grid_charged_kwh)
-        revised, _cap = remaining_authorised_kwh(
-            now=now, frozen_remaining_kwh=remaining, forward=self._forward
+        target_kwh = getattr(run.target, "battery_target_kwh", None)
+        if target_kwh is None:
+            return None
+        delivered = self._run_battery_delivered_kwh(run.run_id)
+        return max(0.0, float(target_kwh) - delivered)
+
+    @callback
+    def _battery_delivered_since(self, moment: datetime) -> float:
+        """Return the battery objective delivered from ``moment`` onward. beta.58.
+
+        Summed from the rows already recorded, plus the row in flight while it has
+        not reached the ring -- the same shape, and the same double-count guard,
+        that :meth:`_campaign_measured_now` uses. No accumulator of its own: a
+        second running total would be another thing to reset, capture and restore.
+
+        Objective-basis, because the figure it feeds is an *objective* allowance.
+        Absorbed production is not objective progress and must not spend a purchase
+        authorisation it never used.
+        """
+        total = 0.0
+        recorded: set[Any] = set()
+        for row in self._completed_quarters:
+            raw = row.get("quarter_start")
+            start = dt_util.parse_datetime(raw) if isinstance(raw, str) else None
+            if start is None or start < moment:
+                continue
+            recorded.add(raw)
+            total += float(row.get("objective_battery_kwh") or 0.0)
+        quarter = self._quarter
+        if (
+            quarter is not None
+            and quarter.quarter_start >= moment
+            and quarter.quarter_start.isoformat() not in recorded
+        ):
+            total += self._quarter_objective_kwh
+        return max(0.0, total)
+
+    @callback
+    def _forward_now(self) -> Any:
+        """Return the forward cap with its delivery measured rather than assumed.
+
+        **beta.58.** ``ForwardAuthorisation`` was built with
+        ``delivered_since_kwh`` at its ``0.0`` default and nothing ever wrote it, so
+        ``forward_left`` was permanently the whole allowance and this cap could not
+        bind however long its boundary went unrenewed. Measuring it can only shrink
+        ``forward_left``, so the repair is reduction-only by construction -- it can
+        never enlarge a run, a row, or a purchase.
+        """
+        forward = self._forward
+        if forward is None:
+            return None
+        return replace(
+            forward,
+            delivered_since_kwh=self._battery_delivered_since(forward.forward_from),
         )
-        return revised
 
     @callback
     def _affirming_target(self, carried: Any) -> Any:
@@ -3666,6 +3759,15 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
             "battery_target_this_quarter_kwh": (
                 None if quarter is None else round(quarter.battery_allowance_kwh(), 3)
+            ),
+            # **beta.58, and a projection rather than a second derivation.** It is
+            # the same quantity as ``battery_remaining_this_quarter_kwh`` -- the
+            # controller's name for it -- published again under the reachability
+            # vocabulary so the campaign ceiling can be checked row by row against
+            # the figures beside it. Recomputing it here is how two published
+            # numbers come to disagree, so it is read from the same progress.
+            "row_authority_remaining_kwh": (
+                None if progress is None else round(progress.battery_remaining_kwh, 3)
             ),
             "battery_realized_this_quarter_kwh": round(self._quarter_battery_kwh, 3),
             "battery_remaining_this_quarter_kwh": (
@@ -4496,6 +4598,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "campaign_realized_kwh": round(self._campaign_realized_now(), 3),
             "campaign_committed_kwh": round(self._campaign_realized_kwh, 3),
             "quarters_admitted": self._campaign_quarters_admitted,
+            **self._campaign_reachability(),
             "rule": (
                 "the realised figure accumulates across segments and holds "
                 "across serve_load gaps; it is reset only when the campaign "
@@ -6677,6 +6780,85 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._campaign_realized_kwh + self._open_quarter_objective_kwh()
 
     @callback
+    def _campaign_reachability(self) -> dict[str, Any]:
+        """Return whether the frozen target can still be met. **beta.58.**
+
+        **Diagnostics, and nothing reads it.** No clamp, no command, no campaign
+        outcome and no lifecycle transition consults these fields. An unreachable
+        campaign keeps its frozen target, keeps executing every row it still has,
+        and closes at its own window end exactly as it always did -- the only thing
+        that changes is that a reader can now see the target became impossible
+        instead of inferring it from a shortfall at the end.
+
+        **Why it can be impossible at all, and why that is correct.** A row that
+        closes short records the shortfall and carries nothing into its successor;
+        no later row is enlarged and the campaign target never shrinks. So a
+        campaign whose early rows under-delivered is short by exactly that much,
+        permanently, by design. On 2026-09-11 that was 5.2 kWh of an 11.71 kWh
+        target -- and the payload could only say ``ahead_or_behind_kwh: -3.844``
+        beside a ``rolling_required_kw`` asking for energy no row would ever
+        authorise.
+
+        The ceiling is summed over the same rows the target is: executable, before
+        ``campaign_end``, with the row in flight contributing only what it has left.
+        """
+        blank: dict[str, Any] = {
+            "campaign_authorised_remaining_kwh": None,
+            "campaign_max_reachable_kwh": None,
+            "campaign_reachable": None,
+            "campaign_unreachable_reason": None,
+            "deficit_not_recoverable_kwh": None,
+            "reachability_rule": CAMPAIGN_REACHABILITY_RULE,
+        }
+        target = self._campaign_frozen_target_kwh
+        # **Read defensively, because the block is built from bare instances.**
+        # ``_open_campaign_block`` is a pure publisher and is exercised against
+        # ``object.__new__`` coordinators carrying only the campaign fields, so a
+        # new read that is not total would turn "no schedule here" into an
+        # AttributeError on a diagnostics path.
+        plan = getattr(self, "_plan", None)
+        if target is None or plan is None or plan.campaign_id != self._campaign_id:
+            return blank
+
+        quarter = getattr(self, "_quarter", None)
+        mine = quarter is not None and quarter.campaign_id == self._campaign_id
+        delivered_open = self._quarter_objective_kwh if mine else 0.0
+        # **Anchored to the row in flight, not to a clock.** This block is rendered
+        # twice in one refresh -- once in the pure frame and again by
+        # ``_settle_execution_payload`` -- and a publisher that reads ``now()``
+        # would answer the two renders differently for no reason a reader could
+        # see. The open row's own boundary is settled state, and "every row that
+        # has not closed yet" is the question being asked anyway.
+        moment = (
+            quarter.quarter_start
+            if mine
+            else (getattr(self, "last_refresh_at", None) or plan.starts_at)
+        )
+        authorised = plan.remaining_battery_authority_kwh(
+            moment, delivered_in_open_row_kwh=delivered_open
+        )
+        max_reachable = self._campaign_realized_now() + authorised
+        tolerance = self._completion_tolerance_kwh(
+            target, self._campaign_quarters_admitted
+        )
+        reachable = max_reachable >= target - tolerance
+        reason = None
+        if not reachable:
+            reason = (
+                CAMPAIGN_UNREACHABLE_WINDOW
+                if authorised <= 0.0
+                else CAMPAIGN_UNREACHABLE_ROW_AUTHORITY
+            )
+        return {
+            "campaign_authorised_remaining_kwh": round(authorised, 3),
+            "campaign_max_reachable_kwh": round(max_reachable, 3),
+            "campaign_reachable": reachable,
+            "campaign_unreachable_reason": reason,
+            "deficit_not_recoverable_kwh": round(max(0.0, target - max_reachable), 3),
+            "reachability_rule": CAMPAIGN_REACHABILITY_RULE,
+        }
+
+    @callback
     def _campaign_measured_now(self) -> float:
         """Return every kWh the pack took under this campaign, uncapped. beta.54.
 
@@ -7592,7 +7774,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             revised, _cap = remaining_authorised_kwh(
                 now=now,
                 frozen_remaining_kwh=remaining_kwh,
-                forward=self._forward,
+                forward=self._forward_now(),
             )
             # **An energy ceiling, expressed at the row's own clock -- not a pace
             # across the whole run. beta.40, and this one cost 5.076 kWh.**
@@ -10318,7 +10500,7 @@ class AlphaEmsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.execution_targets,
             now,
             run=self._carried,
-            frozen_remaining_kwh=self._frozen_remaining_kwh(now),
+            frozen_remaining_kwh=self._frozen_battery_remaining_kwh(),
             executable_intents=CONTROL_LIVE_DISPATCH_INTENTS,
         )
         self._admission_refusal = refusal

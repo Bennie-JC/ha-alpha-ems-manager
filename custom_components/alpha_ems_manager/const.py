@@ -4195,6 +4195,43 @@ CAMPAIGN_OUTCOMES: Final = (
     OUTCOME_SUPERSEDED,
 )
 
+# --- campaign reachability, beta.58 ------------------------------------------
+#
+# **Diagnostics, and deliberately not an outcome.** A campaign whose frozen target
+# can no longer be met is still a campaign: it keeps its target, keeps running its
+# remaining rows, and closes at its window end as ``partial`` exactly as it always
+# did. Adding a rung to CAMPAIGN_OUTCOMES for it would change a lifecycle two
+# releases of tests pin, to say something these four fields already say -- and it
+# would mean an unreachable campaign stopped buying energy it was still authorised
+# to buy, which is worse than the silence being fixed.
+#
+# Prefixed CAMPAIGN_UNREACHABLE_ rather than joining any published family, so the
+# vocabulary guard's four scanned prefixes cannot collide with these.
+
+#: Earlier rows under-delivered and the rows that remain cannot make up the
+#: difference. The energy is not lost to a fault -- it is *no cross-row catch-up*
+#: working as designed, which is why the campaign is told rather than repaired.
+CAMPAIGN_UNREACHABLE_ROW_AUTHORITY: Final = "row_authority_exhausted"
+#: No executable row remains before the campaign's own end.
+CAMPAIGN_UNREACHABLE_WINDOW: Final = "window_too_short"
+
+CAMPAIGN_UNREACHABLE_REASONS: Final = (
+    CAMPAIGN_UNREACHABLE_ROW_AUTHORITY,
+    CAMPAIGN_UNREACHABLE_WINDOW,
+)
+
+CAMPAIGN_REACHABILITY_RULE: Final = (
+    "whether the frozen target can still be met from the authority the frozen "
+    "rows actually carry: realised objective plus every remaining executable "
+    "row's battery allowance, against the target and the same tolerance the "
+    "terminal is judged on. read by nothing -- no clamp, no command and no "
+    "campaign outcome consults it, and an unreachable campaign keeps its target "
+    "and closes normally at its window end. deficit_not_recoverable_kwh is the "
+    "objective already stranded by rows that closed short, which under no "
+    "cross-row catch-up no later row may deliver; stating it is not authority to "
+    "recover it. null reason means reachable"
+)
+
 #: The public campaign lifecycle event, and the four transitions it carries.
 #:
 #: **``stopped`` is defined at the irreversible boundary, not the physical one**,

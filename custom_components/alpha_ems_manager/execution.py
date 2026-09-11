@@ -955,9 +955,15 @@ class CarriedQuarter:
     plan_id: str
     revision: int
     admitted_at: datetime
-    #: The run-level frozen remainder at the instant of admission. Captured rather
-    #: than consulted live, so a run that later vanishes can neither enlarge this
-    #: quarter nor reach back into it.
+    #: The run-level frozen **battery** remainder at the instant of admission --
+    #: the admitted run's own battery target less what that same run has already
+    #: delivered. Captured rather than consulted live, so a run that later vanishes
+    #: can neither enlarge this quarter nor reach back into it.
+    #:
+    #: **Battery-side AC energy, never a grid figure.** See
+    #: :meth:`battery_allowance_kwh` for what happened when it was one. The name is
+    #: kept from beta.25 because it is a published diagnostics key; the domain is
+    #: stated here and enforced by its producer.
     frozen_remaining_at_admission_kwh: float | None = None
     #: How much of this row's objective physical reachability compelled. beta.54.
     #:
@@ -1009,11 +1015,25 @@ class CarriedQuarter:
         Bounded by the run-level frozen remainder as it stood at admission, which is
         how a run-level reduction reaches a quarter that has not yet opened without
         being able to reach one that has.
+
+        **Both figures are battery-side AC energy, and that is load-bearing.**
+        Through beta.57 the remainder handed in here was the run's remaining *grid
+        purchase* -- ``grid_cap_kwh - grid_charged_kwh`` -- and a grid figure
+        bounding a battery objective is not a reduction, it is a category error.
+        On 2026-09-11 a run admitted while the previous one's budget was 85 Wh from
+        spent inherited that 85 Wh, and every row of an 11.71 kWh twenty-one-row
+        campaign was capped at ``min(row, 0.085)``: 1.79 kWh deliverable against a
+        target of 11.71, decided before a single row opened.
+
+        beta.40 removed the same confusion one layer lower, where the run's grid
+        budget was capping battery *power* as a flat pace. This is that defect's
+        last instance. Grid purchase is still capped, in its own domain, by the
+        row's own ``grid_authorised_kwh`` and by ``ChargeLimits.remaining_grid_kw``
+        -- neither of which this method may duplicate.
         """
-        allowance = max(0.0, self.battery_target_kwh)
-        if self.frozen_remaining_at_admission_kwh is not None:
-            allowance = min(allowance, max(0.0, self.frozen_remaining_at_admission_kwh))
-        return allowance
+        return battery_allowance_of(
+            self.battery_target_kwh, self.frozen_remaining_at_admission_kwh
+        )
 
     def absorption_authorised(self) -> bool:
         """Return whether this quarter may keep free production. **beta.40.**
@@ -1034,7 +1054,13 @@ class CarriedQuarter:
         ordinary rolling replan carrying a slightly different production forecast
         would silently revoke an open row's authority, which is the class of defect
         beta.38 was released to close. So an opened row keeps the verdict it opened
-        with, and a later publication reaches only rows not yet open.
+        with.
+
+        **And once any row has opened, so does every other row of the plan.** The
+        schedule is admitted whole and :func:`carry_plan_verbose` returns an opened
+        plan unchanged, so a later publication reaches none of its rows -- not the
+        open one and not the unopened ones behind it. The beta.27 wording that said
+        otherwise described the single-row carrier this class replaced.
 
         **How much** is not asked here and never was: inverter power and pack
         headroom are physical bounds, they are applied to every charge Stage B
@@ -1069,6 +1095,22 @@ class CarriedQuarter:
                 "cannot describe this quarter"
             ),
         }
+
+
+def battery_allowance_of(
+    battery_target_kwh: float, frozen_remaining_kwh: float | None
+) -> float:
+    """Return the battery energy one row may move. **The single copy of the rule.**
+
+    Both arguments are battery-side AC energy. Extracted so the executing row and
+    the reachability walk cannot drift apart: a second transcription of ``min`` is
+    a second place for a domain to be confused, which is exactly the fault beta.58
+    was released to close.
+    """
+    allowance = max(0.0, battery_target_kwh)
+    if frozen_remaining_kwh is not None:
+        allowance = min(allowance, max(0.0, frozen_remaining_kwh))
+    return allowance
 
 
 @dataclass(frozen=True, slots=True)
@@ -1109,9 +1151,13 @@ class AdmittedPlan:
     reserve_floor_kwh: float = 0.0
     max_end_energy_kwh: float | None = None
     headroom_until: datetime | None = None
-    #: The run-level frozen remainder at the instant of admission. Captured rather
-    #: than consulted live, so a run that later vanishes can neither enlarge this
-    #: plan nor reach back into a row already open.
+    #: The run-level frozen **battery** remainder at the instant of admission.
+    #: Captured rather than consulted live, so a run that later vanishes can neither
+    #: enlarge this plan nor reach back into a row already open.
+    #:
+    #: Battery-side AC energy. It is in memory only -- no store writes it and no
+    #: restore reads it -- so a plan is always rebuilt from the live publication and
+    #: a figure captured by an older release can never reach a later one.
     frozen_remaining_at_admission_kwh: float | None = None
     #: The run's compulsory energy, carried so each row can take its share. beta.54.
     compelled_kwh: float | None = None
@@ -1220,6 +1266,40 @@ class AdmittedPlan:
             compelled_kwh=self._compelled_share(row),
         )
 
+    def remaining_battery_authority_kwh(
+        self, moment: datetime, *, delivered_in_open_row_kwh: float = 0.0
+    ) -> float:
+        """Return the battery objective this schedule can still authorise. beta.58.
+
+        **The honest ceiling on what is left, and diagnostics only.** It reads the
+        frozen rows and nothing else: no row is enlarged, no deficit is moved, and
+        nothing here reaches a command. A campaign whose target exceeds this figure
+        is one whose earlier rows under-delivered, and under *no cross-row
+        catch-up* that energy is gone -- which is a fact worth publishing, not an
+        authority to recover it.
+
+        Rows already closed contribute nothing, because their authority expired
+        with them. The row in flight contributes what it has left, so the figure
+        falls as the quarter is delivered rather than stepping at the boundary.
+        Rows at or past ``campaign_end`` are excluded on the same test
+        ``_campaign_objective_kwh`` uses, so the ceiling and the target it is
+        compared against are summed over one set of rows.
+        """
+        horizon = self.campaign_end
+        total = 0.0
+        for row in self.rows:
+            if not row.executable or row.end <= moment:
+                continue
+            if horizon is not None and row.start >= horizon:
+                continue
+            allowance = battery_allowance_of(
+                row.battery_kwh, self.frozen_remaining_at_admission_kwh
+            )
+            if row.covers(moment):
+                allowance -= max(0.0, delivered_in_open_row_kwh)
+            total += max(0.0, allowance)
+        return total
+
     def _compelled_share(self, row: QuarterRow) -> float:
         """Return ``row``'s share of the run's compulsory energy. beta.54.
 
@@ -1274,9 +1354,11 @@ class AdmittedPlan:
             "authority_rule": (
                 "the whole schedule is frozen at admission and the executing "
                 "quarter is derived from it, so a boundary is a lookup rather than "
-                "a hand-off and no quarter can be skipped. revisable until the "
-                "first row opens; economically immutable afterwards. withdrawal is "
-                "never inferred from a horizon that cannot describe an open quarter"
+                "a hand-off and no quarter can be skipped. the plan is replaceable "
+                "until its FIRST row opens and atomically immutable afterwards -- "
+                "no later publication reaches any row of it, opened or not. "
+                "withdrawal is never inferred from a horizon that cannot describe "
+                "an open quarter"
             ),
         }
 
@@ -1904,7 +1986,14 @@ class ForwardAuthorisation:
     authorised_kwh: float
     #: The boundary the allowance starts at -- the fresh publication window start.
     forward_from: datetime
-    #: Measured delivery since that boundary.
+    #: Measured battery delivery since that boundary, in the same domain as
+    #: :attr:`authorised_kwh`.
+    #:
+    #: **Fed from the recorded rows since beta.58.** It was constructed ``0.0`` and
+    #: never written, so ``forward_left`` was always the whole allowance and this
+    #: cap could not bind however long a boundary went unrenewed -- a reduction
+    #: instrument that could not reduce. Larger delivery can only shrink
+    #: ``forward_left``, so feeding it is reduction-only by construction.
     delivered_since_kwh: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
@@ -1916,7 +2005,9 @@ class ForwardAuthorisation:
         }
 
 
-def forward_authorisation(published: Target) -> ForwardAuthorisation:
+def forward_authorisation(
+    published: Target, *, delivered_since_kwh: float = 0.0
+) -> ForwardAuthorisation:
     """Return the forward cap an affirming publication sets.
 
     Read straight off the fresh publication, with no comparison to the frozen
@@ -1937,6 +2028,7 @@ def forward_authorisation(published: Target) -> ForwardAuthorisation:
     return ForwardAuthorisation(
         authorised_kwh=max(0.0, published.battery_target_kwh),
         forward_from=published.window_start,
+        delivered_since_kwh=max(0.0, delivered_since_kwh),
     )
 
 

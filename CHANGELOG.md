@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [1.0.0-beta.58] - 2026-09-11
+
+**A mixed-buy charge campaign could be throttled to a trickle by the run before it.**
+
+On a live afternoon this integration planned to put 11.71 kWh into the battery across
+twenty-one quarter-hour rows, buying in the cheapest hours. It delivered 0.633 kWh. The
+battery sat at 26 % through the whole cheap window, charging at about 0.3 kW.
+
+The plan was right. The prices were right. The schedule covered its own target to the
+cent and put the biggest purchases in the cheapest quarters. What was wrong was a single
+number handed to the executor.
+
+### What was happening
+
+Each quarter-hour row carries two separate allowances: how much energy the **battery**
+may take, and how much of it may be **bought from the grid**. They are different
+measurements and must never be confused -- a charge row can be worth more than any grid
+budget, because the difference is your own solar the planner expects to absorb.
+
+A run-level figure meant to let a revised plan shrink work that had not started yet was
+being taken from the *grid* budget and applied to the *battery* allowance. Worse, it was
+read from the run that was just **finishing** rather than the one starting. That
+outgoing run had nearly spent its grid budget, so the incoming campaign inherited
+85 Wh -- and every one of its twenty-one rows was capped at 85 Wh, including the ones
+asking for 2.5 kWh. The campaign was already impossible at the moment it was admitted,
+and nothing in the diagnostics said so.
+
+### What changed
+
+- **Battery and grid authority are kept in their own measurement domains.** The
+  run-level allowance is now the admitted run's own battery target less what that same
+  run has already delivered. Grid purchase is still capped exactly as before, by each
+  row's own import ceiling and by the run's grid budget -- neither was relaxed.
+- **Forward authorisation now uses measured battery delivery.** The figure that lets a
+  newer plan reduce an admitted one was never being written, so it could not reduce
+  anything. It is now fed from the delivery actually recorded. It remains
+  reduction-only: it can never enlarge a run, a row, or a purchase.
+- **Campaign reachability is published.** `campaign_reachable`,
+  `campaign_max_reachable_kwh`, `campaign_authorised_remaining_kwh`,
+  `campaign_unreachable_reason` and `deficit_not_recoverable_kwh` say whether a
+  campaign's frozen target can still be met from the authority its rows actually carry,
+  and how much is stranded if not.
+
+### What deliberately did not change
+
+No optimiser, planner, Stage A or pricing change of any kind. No change to how a
+campaign starts, ends or is judged, and no new campaign outcome. A quarter that
+under-delivers still records its shortfall and still never enlarges the next one --
+energy stranded that way stays stranded. beta.58 makes that visible; it does not grant
+authority to recover it. Reserve, headroom, pack-capacity and export protections are
+untouched.
+
 ## [1.0.0-beta.57] - 2026-09-10
 
 **How the Alpha app's Impact figures map onto this integration's metrics.**
